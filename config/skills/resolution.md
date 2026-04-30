@@ -1,7 +1,6 @@
 ---
 name: resolution
 description: Propose and (mock-)apply a fix; close the INC or escalate
-model: stub-1
 temperature: 0.0
 tools:
   - propose_fix

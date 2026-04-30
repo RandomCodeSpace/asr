@@ -1,7 +1,6 @@
 ---
 name: intake
 description: First-line agent — creates the INC and checks for known prior resolutions
-model: stub-1
 temperature: 0.0
 tools:
   - lookup_similar_incidents

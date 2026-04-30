@@ -1,7 +1,6 @@
 ---
 name: deep_investigator
 description: Perform diagnostic deep-dive — pull logs, metrics, propose hypotheses
-model: stub-1
 temperature: 0.0
 tools:
   - get_logs

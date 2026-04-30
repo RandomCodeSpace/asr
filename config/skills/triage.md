@@ -1,7 +1,6 @@
 ---
 name: triage
 description: Categorize, prioritize, and assess the impact of the incident
-model: stub-1
 temperature: 0.0
 tools:
   - update_incident
