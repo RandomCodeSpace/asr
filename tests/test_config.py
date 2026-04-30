@@ -11,6 +11,11 @@ def test_default_app_config_is_stub_provider():
     assert cfg.llm.provider == "stub"
     assert cfg.environments == ["production", "staging", "dev", "local"]
     assert cfg.incidents.similarity_threshold == 0.85
+    # Intervention defaults: 0.75 threshold + 3 oncall teams.
+    assert cfg.intervention.confidence_threshold == 0.75
+    assert cfg.intervention.escalation_teams == [
+        "platform-oncall", "data-oncall", "security-oncall",
+    ]
 
 
 def test_ollama_provider_requires_ollama_config():

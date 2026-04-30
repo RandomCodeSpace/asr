@@ -4,7 +4,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-IncidentStatus = Literal["new", "in_progress", "matched", "resolved", "escalated"]
+IncidentStatus = Literal[
+    "new", "in_progress", "matched", "resolved",
+    "escalated", "awaiting_input", "stopped",
+]
 
 
 class Reporter(BaseModel):
@@ -32,6 +35,8 @@ class AgentRun(BaseModel):
     ended_at: str
     summary: str
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    confidence: float | None = None
+    confidence_rationale: str | None = None
 
 
 class Findings(BaseModel):
@@ -58,6 +63,8 @@ class Incident(BaseModel):
     findings: Findings = Field(default_factory=Findings)
     resolution: Any = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    pending_intervention: dict | None = None
+    user_inputs: list[str] = Field(default_factory=list)
 
 
 from datetime import datetime, timezone

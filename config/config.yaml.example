@@ -55,3 +55,12 @@ incidents:
 paths:
   skills_dir: config/skills
   incidents_dir: incidents
+
+intervention:
+  # If the deep_investigator's reported confidence is below this threshold, the
+  # graph pauses and surfaces an intervention prompt to the UI.
+  confidence_threshold: 0.75
+  escalation_teams:
+    - platform-oncall
+    - data-oncall
+    - security-oncall

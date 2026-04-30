@@ -47,3 +47,9 @@ incidents:
 paths:
   skills_dir: config/skills
   incidents_dir: incidents
+intervention:
+  confidence_threshold: 0.75
+  escalation_teams:
+  - platform-oncall
+  - data-oncall
+  - security-oncall

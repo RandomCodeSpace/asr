@@ -55,6 +55,15 @@ class Paths(BaseModel):
     incidents_dir: str = "incidents"
 
 
+class InterventionConfig(BaseModel):
+    confidence_threshold: float = 0.75
+    escalation_teams: list[str] = Field(
+        default_factory=lambda: [
+            "platform-oncall", "data-oncall", "security-oncall",
+        ],
+    )
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
@@ -63,6 +72,7 @@ class AppConfig(BaseModel):
         default_factory=lambda: ["production", "staging", "dev", "local"]
     )
     paths: Paths = Field(default_factory=Paths)
+    intervention: InterventionConfig = Field(default_factory=InterventionConfig)
 
 
 import os
