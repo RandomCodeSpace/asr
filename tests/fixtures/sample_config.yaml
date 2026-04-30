@@ -1,0 +1,29 @@
+llm:
+  provider: ollama
+  default_model: llama3.1:70b
+  ollama:
+    base_url: https://ollama.com
+    api_key: ${OLLAMA_API_KEY}
+
+mcp:
+  servers:
+    - name: local_inc
+      transport: in_process
+      module: orchestrator.mcp_servers.incident
+      category: incident_management
+    - name: external_example
+      transport: http
+      url: ${EXTERNAL_MCP_URL}
+      headers:
+        Authorization: "Bearer ${EXT_TOKEN}"
+      category: ticketing
+      enabled: false
+
+environments:
+  - production
+  - staging
+  - dev
+
+incidents:
+  similarity_threshold: 0.9
+  similarity_method: keyword

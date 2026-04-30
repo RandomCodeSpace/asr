@@ -63,3 +63,32 @@ class AppConfig(BaseModel):
         default_factory=lambda: ["production", "staging", "dev", "local"]
     )
     paths: Paths = Field(default_factory=Paths)
+
+
+import os
+import re
+from pathlib import Path
+import yaml
+
+_ENV_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+
+
+def _interpolate(value):
+    if isinstance(value, str):
+        def replace(m):
+            name = m.group(1)
+            if name not in os.environ:
+                raise KeyError(f"Required env var not set: {name}")
+            return os.environ[name]
+        return _ENV_PATTERN.sub(replace, value)
+    if isinstance(value, dict):
+        return {k: _interpolate(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate(v) for v in value]
+    return value
+
+
+def load_config(path: str | Path) -> AppConfig:
+    raw = yaml.safe_load(Path(path).read_text())
+    resolved = _interpolate(raw)
+    return AppConfig(**resolved)
