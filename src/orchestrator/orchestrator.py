@@ -5,11 +5,11 @@ from typing import AsyncIterator
 from datetime import datetime, timezone
 
 from orchestrator.config import AppConfig
-from orchestrator.incident import IncidentStore
+from orchestrator.incident import IncidentStore, ToolCall
 from orchestrator.skill import load_all_skills, Skill
 from orchestrator.mcp_loader import load_tools, ToolRegistry
 from orchestrator.mcp_servers.incident import set_state as _set_inc_state
-from orchestrator.graph import build_graph, GraphState
+from orchestrator.graph import build_graph, build_resume_graph, GraphState
 
 
 class Orchestrator:
@@ -21,12 +21,13 @@ class Orchestrator:
 
     def __init__(self, cfg: AppConfig, store: IncidentStore,
                  skills: dict[str, Skill], registry: ToolRegistry, graph,
-                 exit_stack: AsyncExitStack):
+                 resume_graph, exit_stack: AsyncExitStack):
         self.cfg = cfg
         self.store = store
         self.skills = skills
         self.registry = registry
         self.graph = graph
+        self.resume_graph = resume_graph
         self._exit_stack = exit_stack
 
     @classmethod
@@ -40,7 +41,10 @@ class Orchestrator:
             registry = await load_tools(cfg.mcp, stack)
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry)
-            return cls(cfg, store, skills, registry, graph, stack)
+            resume_graph = await build_resume_graph(
+                cfg=cfg, skills=skills, store=store, registry=registry,
+            )
+            return cls(cfg, store, skills, registry, graph, resume_graph, stack)
         except BaseException:
             await stack.aclose()
             raise
@@ -112,6 +116,88 @@ class Orchestrator:
         ):
             yield self._to_ui_event(ev, inc.id)
         yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _now()}
+
+    async def resume_investigation(self, incident_id: str,
+                                   decision: dict) -> AsyncIterator[dict]:
+        """Resume a paused INC. ``decision`` shapes:
+
+        - ``{"action": "resume_with_input", "input": "<text>"}``
+        - ``{"action": "escalate", "team": "<team-name>"}``
+        - ``{"action": "stop"}``
+
+        Yields a small set of UI events: a ``resume_started`` event up front,
+        the underlying graph events for ``resume_with_input``, then a
+        ``resume_completed`` event with ``status`` set to the final state.
+        """
+        action = decision.get("action")
+        yield {"event": "resume_started", "incident_id": incident_id,
+               "action": action, "ts": _now()}
+
+        inc = self.store.load(incident_id)
+
+        if action == "stop":
+            inc.status = "stopped"
+            inc.pending_intervention = None
+            self.store.save(inc)
+            yield {"event": "resume_completed", "incident_id": incident_id,
+                   "status": "stopped", "ts": _now()}
+            return
+
+        if action == "escalate":
+            team = decision.get("team") or "platform-oncall"
+            message = (
+                f"INC {incident_id} escalated by user — team {team}. "
+                "Confidence below threshold."
+            )
+            tool_args = {"incident_id": incident_id, "message": message}
+            tool_result = await self._invoke_tool("notify_oncall", tool_args)
+            inc = self.store.load(incident_id)
+            inc.tool_calls.append(ToolCall(
+                agent="orchestrator",
+                tool="notify_oncall",
+                args=tool_args,
+                result=tool_result,
+                ts=_now(),
+            ))
+            inc.status = "escalated"
+            inc.pending_intervention = None
+            self.store.save(inc)
+            yield {"event": "resume_completed", "incident_id": incident_id,
+                   "status": "escalated", "team": team, "ts": _now()}
+            return
+
+        if action == "resume_with_input":
+            user_text = (decision.get("input") or "").strip()
+            if not user_text:
+                raise ValueError("resume_with_input requires a non-empty 'input'")
+            inc.user_inputs.append(user_text)
+            inc.pending_intervention = None
+            inc.status = "in_progress"
+            self.store.save(inc)
+            inc = self.store.load(incident_id)  # reload as canonical state
+            async for ev in self.resume_graph.astream_events(
+                GraphState(incident=inc, next_route=None, last_agent=None,
+                           error=None),
+                version="v2",
+            ):
+                yield self._to_ui_event(ev, incident_id)
+            final = self.store.load(incident_id)
+            yield {"event": "resume_completed", "incident_id": incident_id,
+                   "status": final.status, "ts": _now()}
+            return
+
+        raise ValueError(f"Unknown resume action: {action!r}")
+
+    async def _invoke_tool(self, name: str, args: dict):
+        """Call an MCP tool by name, going through the LangChain wrapper.
+
+        Used for orchestrator-driven tool calls (e.g. notify_oncall on
+        escalate) that aren't initiated by an LLM.
+        """
+        entry = self.registry.entries.get(name)
+        if entry is None:
+            raise KeyError(f"tool '{name}' not registered")
+        return await entry.tool.ainvoke(args)
 
     @staticmethod
     def _to_ui_event(raw: dict, incident_id: str) -> dict:
