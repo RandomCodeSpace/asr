@@ -1,6 +1,6 @@
 """Incident domain model."""
 from __future__ import annotations
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -28,8 +28,8 @@ class AgentRun(BaseModel):
 
 
 class Findings(BaseModel):
-    triage: dict | list | None = None
-    deep_investigator: dict | list | None = None
+    triage: Any = None
+    deep_investigator: Any = None
 
 
 class Incident(BaseModel):
@@ -49,7 +49,7 @@ class Incident(BaseModel):
     agents_run: list[AgentRun] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
     findings: Findings = Field(default_factory=Findings)
-    resolution: dict | None = None
+    resolution: Any = None
 
 
 from datetime import datetime, timezone
