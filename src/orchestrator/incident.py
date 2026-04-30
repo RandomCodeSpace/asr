@@ -50,3 +50,71 @@ class Incident(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     findings: Findings = Field(default_factory=Findings)
     resolution: dict | None = None
+
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _utc_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+class IncidentStore:
+    """JSON-file-backed incident store. One file per INC."""
+
+    def __init__(self, base_dir: str | Path):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+
+    def _next_id(self) -> str:
+        today = _utc_today()
+        prefix = f"INC-{today}-"
+        existing = [p.stem for p in self.base_dir.glob(f"{prefix}*.json")]
+        max_seq = 0
+        for stem in existing:
+            try:
+                max_seq = max(max_seq, int(stem.rsplit("-", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+        return f"{prefix}{max_seq + 1:03d}"
+
+    def create(self, *, query: str, environment: str,
+               reporter_id: str, reporter_team: str) -> Incident:
+        inc_id = self._next_id()
+        now = _utc_now_iso()
+        inc = Incident(
+            id=inc_id,
+            status="new",
+            created_at=now,
+            updated_at=now,
+            query=query,
+            environment=environment,
+            reporter=Reporter(id=reporter_id, team=reporter_team),
+        )
+        self.save(inc)
+        return inc
+
+    def save(self, incident: Incident) -> None:
+        incident.updated_at = _utc_now_iso()
+        path = self.base_dir / f"{incident.id}.json"
+        path.write_text(incident.model_dump_json(indent=2))
+
+    def load(self, incident_id: str) -> Incident:
+        path = self.base_dir / f"{incident_id}.json"
+        if not path.exists():
+            raise FileNotFoundError(incident_id)
+        return Incident.model_validate_json(path.read_text())
+
+    def list_all(self) -> list[Incident]:
+        return [self.load(p.stem) for p in self.base_dir.glob("INC-*.json")]
+
+    def list_recent(self, limit: int = 20) -> list[Incident]:
+        all_inc = self.list_all()
+        all_inc.sort(key=lambda i: (i.created_at, i.id), reverse=True)
+        return all_inc[:limit]
