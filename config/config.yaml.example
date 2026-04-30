@@ -1,0 +1,57 @@
+# config/config.yaml.example
+# Copy to config/config.yaml and edit. Env vars use ${VAR_NAME} syntax.
+
+llm:
+  provider: stub               # stub | ollama | azure_openai
+  default_model: stub-1
+  default_temperature: 0.0
+  ollama:
+    base_url: https://ollama.com
+    api_key: ${OLLAMA_API_KEY}
+  azure_openai:
+    endpoint: ${AZURE_ENDPOINT}
+    api_version: 2024-08-01-preview
+    api_key: ${AZURE_OPENAI_KEY}
+    deployment: gpt-4o
+
+mcp:
+  servers:
+    - name: local_inc
+      transport: in_process
+      module: orchestrator.mcp_servers.incident
+      category: incident_management
+    - name: local_observability
+      transport: in_process
+      module: orchestrator.mcp_servers.observability
+      category: observability
+    - name: local_remediation
+      transport: in_process
+      module: orchestrator.mcp_servers.remediation
+      category: remediation
+    - name: local_user_context
+      transport: in_process
+      module: orchestrator.mcp_servers.user_context
+      category: user_context
+    # Example remote MCP — disabled by default
+    - name: external_ticketing
+      transport: http
+      url: ${EXTERNAL_MCP_URL}
+      headers:
+        Authorization: "Bearer ${EXT_TOKEN}"
+      category: ticketing
+      enabled: false
+
+environments:
+  - production
+  - staging
+  - dev
+  - local
+
+incidents:
+  store_path: incidents
+  similarity_threshold: 0.85
+  similarity_method: keyword     # keyword | embedding
+
+paths:
+  skills_dir: config/skills
+  incidents_dir: incidents
