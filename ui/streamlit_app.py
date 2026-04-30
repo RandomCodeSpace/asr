@@ -39,12 +39,24 @@ def _load_metadata_dicts(cfg: AppConfig) -> tuple[list[dict], list[dict], list[s
     return asyncio.run(_go())
 
 
+_STATUS_BADGES = {
+    "new": "🟦",
+    "in_progress": "🟡",
+    "matched": "🟢",
+    "resolved": "✅",
+    "escalated": "🔴",
+    "awaiting_input": "🟠",
+    "stopped": "⛔",
+}
+
+
 def render_sidebar(store: IncidentStore) -> None:
     with st.sidebar:
         st.markdown("### Recent INCs")
         col_l, col_r = st.columns([3, 1])
         with col_l:
-            statuses = ["all", "new", "in_progress", "matched", "resolved", "escalated"]
+            statuses = ["all", "new", "in_progress", "matched", "resolved",
+                        "escalated", "awaiting_input", "stopped"]
             status_filter = st.selectbox("Filter", statuses, key="status_filter",
                                          label_visibility="collapsed")
         with col_r:
@@ -59,13 +71,7 @@ def render_sidebar(store: IncidentStore) -> None:
             st.caption("No incidents.")
             return
         for inc in recent[:20]:
-            badge = {
-                "new": "🟦",
-                "in_progress": "🟡",
-                "matched": "🟢",
-                "resolved": "✅",
-                "escalated": "🔴",
-            }.get(inc["status"], "⚪")
+            badge = _STATUS_BADGES.get(inc["status"], "⚪")
             toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
             tok_str = f" · {toks/1000:.1f}k tok" if toks >= 1000 else f" · {toks} tok"
             label = f"{badge} `{inc['id']}` — {inc['environment']}{tok_str}"
@@ -107,6 +113,23 @@ def _duration_seconds(start: str, end: str) -> int:
 
 def _fmt_tokens(n: int) -> str:
     return f"{n:,}"
+
+
+def _fmt_confidence_badge(conf: float | None) -> str:
+    """Inline coloured badge for an agent confidence value.
+
+    Green ≥0.75, amber 0.5–0.75, red <0.5, grey when None. Markdown only —
+    no HTML — so the badge survives Streamlit's sanitizer.
+    """
+    if conf is None:
+        return "⚪ confidence —"
+    if conf >= 0.75:
+        glyph = "🟢"
+    elif conf >= 0.5:
+        glyph = "🟡"
+    else:
+        glyph = "🔴"
+    return f"{glyph} confidence {conf:.2f}"
 
 
 def _render_hypothesis_list(items: list, label: str) -> None:
@@ -177,6 +200,10 @@ def render_incident_detail(store: IncidentStore) -> None:
         if inc.get("matched_prior_inc"):
             st.markdown(f"**Matched prior INC:** `{inc['matched_prior_inc']}`")
 
+        # --- Intervention prompt (only when paused on low confidence) -----
+        if inc.get("status") == "awaiting_input" and inc.get("pending_intervention"):
+            _render_intervention_block(inc, inc_id)
+
         # --- Agents run ---------------------------------------------------
         agents_run = inc.get("agents_run", [])
         if agents_run:
@@ -185,10 +212,16 @@ def render_incident_detail(store: IncidentStore) -> None:
                 a_dur = _duration_seconds(ar.get("started_at", ""),
                                           ar.get("ended_at", ""))
                 a_tok = (ar.get("token_usage") or {}).get("total_tokens", 0)
+                conf = ar.get("confidence")
+                badge = _fmt_confidence_badge(conf)
                 with st.container(border=True):
                     st.markdown(
-                        f"**{ar['agent']}** — {a_dur}s — {_fmt_tokens(a_tok)} tokens"
+                        f"**{ar['agent']}** — {a_dur}s — "
+                        f"{_fmt_tokens(a_tok)} tokens — {badge}"
                     )
+                    rationale = ar.get("confidence_rationale")
+                    if rationale:
+                        st.caption(f"Why: {rationale}")
                     st.write(ar.get("summary") or "_(no summary)_")
 
         # --- Findings -----------------------------------------------------
@@ -260,6 +293,80 @@ async def _run_investigation_async(cfg: AppConfig, query: str, environment: str,
                 log_area.code("\n".join(lines), language="text")
     finally:
         await orch.aclose()
+
+
+async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
+                        log_area, lines: list[str]) -> None:
+    """Build a fresh Orchestrator, stream resume events, aclose."""
+    orch = await Orchestrator.create(cfg)
+    try:
+        async for ev in orch.resume_investigation(inc_id, decision):
+            kind = ev.get("event")
+            ts = ev.get("ts", "")
+            if kind == "resume_started":
+                lines.append(f"[{ts}] resume {ev.get('action')}")
+            elif kind == "resume_completed":
+                lines.append(f"[{ts}] done   status={ev.get('status')}")
+            else:
+                line = _format_event(ev)
+                if line:
+                    lines.append(line)
+            log_area.code("\n".join(lines), language="text")
+    finally:
+        await orch.aclose()
+
+
+def _render_intervention_block(inc: dict, inc_id: str) -> None:
+    """Render the intervention prompt above the agents_run section.
+
+    Shows the confidence vs. threshold and a single form with an action
+    selector that swaps inputs (text box / team dropdown / nothing) and a
+    submit button. On submit, calls `_resume_async` and then reruns.
+    """
+    cfg = load_config(CONFIG_PATH)
+    pi = inc.get("pending_intervention") or {}
+    conf = pi.get("confidence")
+    threshold = pi.get("threshold", 0.75)
+    teams = pi.get("escalation_teams") or list(cfg.intervention.escalation_teams)
+
+    conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
+    with st.container(border=True):
+        st.markdown(
+            f"#### 🟠 Intervention required — confidence {conf_str} "
+            f"< threshold {threshold:.2f}"
+        )
+        st.caption(
+            "The deep investigator's confidence is below the configured "
+            "threshold. Choose how to proceed."
+        )
+        action = st.selectbox(
+            "Action", ["resume_with_input", "escalate", "stop"],
+            key=f"intervention_action_{inc_id}",
+        )
+        decision: dict = {"action": action}
+        if action == "resume_with_input":
+            decision["input"] = st.text_area(
+                "Add context for the investigator", height=120,
+                placeholder="Anything the agent should know — recent changes, "
+                            "logs you've already checked, suspected services…",
+                key=f"intervention_input_{inc_id}",
+            )
+        elif action == "escalate":
+            decision["team"] = st.selectbox(
+                "Escalate to team", teams, key=f"intervention_team_{inc_id}",
+            )
+
+        submit = st.button("Submit", type="primary",
+                           key=f"intervention_submit_{inc_id}")
+        if submit:
+            if action == "resume_with_input" and not (decision.get("input") or "").strip():
+                st.warning("Add some context before resuming.")
+                return
+            log_area = st.empty()
+            lines: list[str] = []
+            asyncio.run(_resume_async(cfg, inc_id, decision, log_area, lines))
+            st.success(f"Resume complete (action: {action}).")
+            st.rerun()
 
 
 def main() -> None:
