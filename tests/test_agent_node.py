@@ -39,3 +39,44 @@ async def test_agent_node_runs_llm_records_agent_run_and_routes(incident):
     assert intake_runs[0].token_usage.total_tokens == 0
     assert isinstance(reloaded.token_usage, TokenUsage)
     assert reloaded.token_usage.total_tokens == 0
+    # Stub does not emit a confidence patch, so AgentRun.confidence stays None.
+    assert intake_runs[0].confidence is None
+    assert intake_runs[0].confidence_rationale is None
+
+
+@pytest.mark.asyncio
+async def test_agent_node_captures_confidence_from_update_incident(incident):
+    inc, store = incident
+    skill = Skill(
+        name="triage", description="d",
+        routes=[RouteRule(when="default", next="deep_investigator")],
+        system_prompt="You are triage.",
+    )
+    # The stub emits a single update_incident tool call carrying confidence.
+    # The graph node should capture it and stamp it on the AgentRun.
+    llm = StubChatModel(
+        role="triage",
+        canned_responses={"triage": "done"},
+        tool_call_plan=[{
+            "name": "update_incident",
+            "args": {
+                "incident_id": inc.id,
+                "patch": {
+                    "severity": "sev3",
+                    "confidence": 0.83,
+                    "confidence_rationale": "deploy correlates with timing",
+                },
+            },
+        }],
+    )
+    node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=lambda inc: "default",
+        store=store,
+    )
+    await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    reloaded = store.load(inc.id)
+    triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
+    assert triage_runs
+    assert triage_runs[0].confidence == 0.83
+    assert triage_runs[0].confidence_rationale == "deploy correlates with timing"

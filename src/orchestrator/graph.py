@@ -98,7 +98,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
 
 
 def _format_intake_input(incident: Incident) -> str:
-    return (
+    base = (
         f"Incident {incident.id}\n"
         f"Environment: {incident.environment}\n"
         f"Query: {incident.query}\n"
@@ -106,6 +106,13 @@ def _format_intake_input(incident: Incident) -> str:
         f"Findings (triage): {incident.findings.triage}\n"
         f"Findings (deep_investigator): {incident.findings.deep_investigator}\n"
     )
+    if incident.user_inputs:
+        bullets = "\n".join(f"- {ui}" for ui in incident.user_inputs)
+        base += (
+            "\nUser-provided context (appended via intervention):\n"
+            f"{bullets}\n"
+        )
+    return base
 
 
 def make_agent_node(
@@ -151,18 +158,34 @@ def make_agent_node(
         # clobbers the tools' writes.
         incident = store.load(inc_id)
 
-        # Record tool calls from the agent's message trace.
+        # Record tool calls from the agent's message trace. While iterating,
+        # also harvest the latest `confidence` / `confidence_rationale` carried
+        # in any `update_incident` patch — those keys are stamped on the
+        # AgentRun (the MCP tool itself silently ignores extra patch keys).
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        agent_confidence: float | None = None
+        agent_rationale: str | None = None
         for msg in result.get("messages", []):
             tool_calls = getattr(msg, "tool_calls", None) or []
             for tc in tool_calls:
+                tc_name = tc.get("name", "unknown")
+                tc_args = tc.get("args", {}) or {}
                 incident.tool_calls.append(ToolCall(
                     agent=skill.name,
-                    tool=tc.get("name", "unknown"),
-                    args=tc.get("args", {}) or {},
+                    tool=tc_name,
+                    args=tc_args,
                     result=None,
                     ts=ts,
                 ))
+                if tc_name == "update_incident":
+                    patch = tc_args.get("patch") or {}
+                    if "confidence" in patch:
+                        try:
+                            agent_confidence = float(patch["confidence"])
+                        except (TypeError, ValueError):
+                            pass
+                    if "confidence_rationale" in patch:
+                        agent_rationale = str(patch["confidence_rationale"])
 
         # Pair tool responses with their tool calls.
         for msg in result.get("messages", []):
@@ -199,6 +222,8 @@ def make_agent_node(
                 output_tokens=agent_out,
                 total_tokens=agent_total,
             ),
+            confidence=agent_confidence,
+            confidence_rationale=agent_rationale,
         ))
         incident.token_usage.input_tokens += agent_in
         incident.token_usage.output_tokens += agent_out
