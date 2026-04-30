@@ -54,6 +54,27 @@ def render_incident_detail(orch: Orchestrator) -> None:
             st.json(inc)
 
 
+def _format_event(ev: dict) -> str | None:
+    kind = ev.get("event")
+    node = ev.get("node") or ""
+    ts = ev.get("ts", "")
+    if kind == "investigation_started":
+        return f"[{ts}] start  inc={ev.get('incident_id')}"
+    if kind == "investigation_completed":
+        return f"[{ts}] done   inc={ev.get('incident_id')}"
+    if kind == "on_chain_start" and node in {"intake", "triage", "deep_investigator", "resolution"}:
+        return f"[{ts}] enter  {node}"
+    if kind == "on_chain_end" and node in {"intake", "triage", "deep_investigator", "resolution"}:
+        return f"[{ts}] exit   {node}"
+    if kind == "on_tool_start":
+        return f"[{ts}] tool   {node}"
+    if kind == "on_tool_end":
+        result = (ev.get("data") or {}).get("output")
+        snippet = str(result)[:120] if result is not None else ""
+        return f"[{ts}] tool→  {node} {snippet}"
+    return None
+
+
 def main() -> None:
     st.set_page_config(page_title="ASR — Agent Orchestrator", layout="wide")
     orch = get_orchestrator()
@@ -64,8 +85,33 @@ def main() -> None:
 
     with tab_investigate:
         st.header("Start an investigation")
-        # Filled in by Task 24
-        st.info("Investigation form — implemented in Task 24.")
+        with st.form("investigate_form"):
+            query = st.text_area("What's happening?", height=100, key="form_query")
+            environment = st.selectbox("Impacted environment", orch.cfg.environments,
+                                       key="form_env")
+            submitted = st.form_submit_button("Start investigation", type="primary")
+
+        if submitted and query.strip():
+            timeline_box = st.container()
+            timeline_box.markdown("### Live timeline")
+            log_area = timeline_box.empty()
+            lines: list[str] = []
+
+            async def run_and_stream():
+                async for ev in orch.stream_investigation(query=query, environment=environment):
+                    line = _format_event(ev)
+                    if line:
+                        lines.append(line)
+                        log_area.code("\n".join(lines), language="text")
+
+            asyncio.run(run_and_stream())
+
+            # Surface the resulting INC for one-click drill-in
+            recent = orch.list_recent_incidents(limit=1)
+            if recent:
+                st.session_state["selected_incident"] = recent[0]["id"]
+                st.success(f"Investigation complete — {recent[0]['id']} ({recent[0]['status']})")
+                st.rerun()
 
     with tab_registry:
         st.header("Agents & Tools registry")
