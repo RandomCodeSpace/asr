@@ -52,7 +52,6 @@ class Incident(BaseModel):
     resolution: dict | None = None
 
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 

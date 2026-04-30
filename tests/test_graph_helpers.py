@@ -1,5 +1,5 @@
 import pytest
-from orchestrator.graph import GraphState, route_from_skill, AgentRunRecorder
+from orchestrator.graph import route_from_skill, AgentRunRecorder
 
 
 def test_route_from_skill_matches_known_route():

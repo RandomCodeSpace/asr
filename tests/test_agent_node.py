@@ -1,6 +1,6 @@
 import pytest
 from orchestrator.graph import GraphState, make_agent_node
-from orchestrator.incident import Incident, IncidentStore, Reporter
+from orchestrator.incident import IncidentStore
 from orchestrator.skill import Skill, RouteRule
 from orchestrator.llm import StubChatModel
 
