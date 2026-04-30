@@ -7,9 +7,13 @@ from langchain_core.messages import HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import create_react_agent
+from langgraph.graph import StateGraph, END
 
 from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore
 from orchestrator.skill import Skill
+from orchestrator.config import AppConfig
+from orchestrator.llm import get_llm
+from orchestrator.mcp_loader import load_tools
 
 
 class GraphState(TypedDict, total=False):
@@ -128,3 +132,74 @@ def make_agent_node(
                 "last_agent": skill.name, "error": None}
 
     return node
+
+
+# Per-agent route decision functions.
+def _decide_intake(inc: Incident) -> str:
+    return "matched_known_issue" if inc.matched_prior_inc else "default"
+
+
+def _decide_triage(inc: Incident) -> str:
+    return "default"
+
+
+def _decide_deep_investigator(inc: Incident) -> str:
+    return "default"
+
+
+def _decide_resolution(inc: Incident) -> str:
+    return "default"
+
+
+_DECIDERS: dict[str, Callable[[Incident], str]] = {
+    "intake": _decide_intake,
+    "triage": _decide_triage,
+    "deep_investigator": _decide_deep_investigator,
+    "resolution": _decide_resolution,
+}
+
+
+_STUB_CANNED = {
+    "intake": "Created INC, no prior matches. Routing to triage.",
+    "triage": "Severity sev3, category latency. No recent deploys correlate.",
+    "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
+    "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
+}
+
+
+async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore):
+    """Compile the LangGraph StateGraph from skills + tool registry."""
+    registry = await load_tools(cfg.mcp)
+
+    sg = StateGraph(GraphState)
+    for agent_name, skill in skills.items():
+        llm = get_llm(
+            cfg.llm,
+            role=agent_name,
+            model=skill.model,
+            temperature=skill.temperature,
+            stub_canned=_STUB_CANNED,
+        )
+        tools = registry.get(skill.tools)
+        decide = _DECIDERS.get(agent_name, lambda inc: "default")
+        node = make_agent_node(skill=skill, llm=llm, tools=tools,
+                               decide_route=decide, store=store)
+        sg.add_node(agent_name, node)
+
+    # Set entry point to the agent named 'intake'.
+    sg.set_entry_point("intake")
+
+    # Conditional edges: each agent's `next_route` (a node name OR "__end__") drives routing.
+    def _router(state: GraphState):
+        nr = state.get("next_route")
+        if nr in (None, "__end__"):
+            return END
+        return nr
+
+    for agent_name in skills.keys():
+        possible_targets = {s.name for s in skills.values()} | {END}
+        target_map = {name: name for name in possible_targets if name != END}
+        target_map[END] = END
+        sg.add_conditional_edges(agent_name, _router, target_map)
+
+    return sg.compile()

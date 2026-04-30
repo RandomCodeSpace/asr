@@ -40,6 +40,10 @@ class StubChatModel(BaseChatModel):
                          run_manager: Any = None, **kwargs: Any) -> ChatResult:
         return self._generate(messages, stop, run_manager, **kwargs)
 
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        """No-op binder: stub emits tool calls only via `tool_call_plan`, not via real binding."""
+        return self
+
 
 def get_llm(cfg: LLMConfig, *, role: str = "default", model: str | None = None,
             temperature: float | None = None,
