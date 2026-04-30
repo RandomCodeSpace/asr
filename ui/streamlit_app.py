@@ -1,24 +1,44 @@
 """Streamlit UI — 2 tabs + always-on sidebar with recent INCs."""
+# Lifecycle note: the Orchestrator owns FastMCP clients tied to a specific
+# asyncio event loop. Streamlit re-runs the script on every interaction and we
+# use `asyncio.run(...)` per call, which creates a fresh loop each time.
+# Caching an Orchestrator across reruns would leave its clients/transports
+# bound to a dead loop and the first tool call would raise:
+#     unable to perform operation on <TCPTransport closed=True ...>
+# So: build a fresh Orchestrator inside each `asyncio.run` and `aclose` it when
+# done. For pure metadata views (agents/tools) we use `_load_metadata_dicts` —
+# a one-shot fetch that captures plain dicts and disposes the orchestrator.
+# The sidebar uses IncidentStore directly, since incident JSON I/O is sync and
+# needs no MCP clients.
 from __future__ import annotations
 import asyncio
 from pathlib import Path
 import streamlit as st
 
-from orchestrator.config import load_config
+from orchestrator.config import load_config, AppConfig
+from orchestrator.incident import IncidentStore
 from orchestrator.orchestrator import Orchestrator
 
 
 CONFIG_PATH = Path("config/config.yaml")
 
 
-@st.cache_resource
-def get_orchestrator() -> Orchestrator:
-    """Build and cache the orchestrator across reruns (Streamlit re-runs the script per interaction)."""
-    cfg = load_config(CONFIG_PATH)
-    return asyncio.run(Orchestrator.create(cfg))
+def _load_metadata_dicts(cfg: AppConfig) -> tuple[list[dict], list[dict], list[str]]:
+    """Build a transient orchestrator, snapshot agents/tools/envs, then aclose.
+
+    Per-rerun cost is dominated by FastMCP client startup (~100-200ms total for
+    in-process servers); acceptable for a UI rerun.
+    """
+    async def _go():
+        orch = await Orchestrator.create(cfg)
+        try:
+            return orch.list_agents(), orch.list_tools(), list(orch.cfg.environments)
+        finally:
+            await orch.aclose()
+    return asyncio.run(_go())
 
 
-def render_sidebar(orch: Orchestrator) -> None:
+def render_sidebar(store: IncidentStore) -> None:
     with st.sidebar:
         st.markdown("### Recent INCs")
         col_l, col_r = st.columns([3, 1])
@@ -30,7 +50,7 @@ def render_sidebar(orch: Orchestrator) -> None:
             if st.button("↻", help="Refresh"):
                 st.rerun()
 
-        recent = orch.list_recent_incidents(limit=50)
+        recent = [i.model_dump() for i in store.list_recent(50)]
         if status_filter != "all":
             recent = [i for i in recent if i["status"] == status_filter]
 
@@ -50,12 +70,12 @@ def render_sidebar(orch: Orchestrator) -> None:
                 st.session_state["selected_incident"] = inc["id"]
 
 
-def render_incident_detail(orch: Orchestrator) -> None:
+def render_incident_detail(store: IncidentStore) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
         return
     with st.expander(f"INC detail: {inc_id}", expanded=True):
-        inc = orch.get_incident(inc_id)
+        inc = store.load(inc_id).model_dump()
         st.write(f"**Status:** {inc['status']} **Severity:** {inc.get('severity') or '—'}  "
                  f"**Category:** {inc.get('category') or '—'}")
         st.write(f"**Query:** {inc['query']}")
@@ -94,11 +114,30 @@ def _format_event(ev: dict) -> str | None:
     return None
 
 
+async def _run_investigation_async(cfg: AppConfig, query: str, environment: str,
+                                   log_area, lines: list[str]) -> None:
+    """Build a fresh Orchestrator, stream events, aclose. One asyncio.run frame."""
+    orch = await Orchestrator.create(cfg)
+    try:
+        async for ev in orch.stream_investigation(query=query, environment=environment):
+            line = _format_event(ev)
+            if line:
+                lines.append(line)
+                log_area.code("\n".join(lines), language="text")
+    finally:
+        await orch.aclose()
+
+
 def main() -> None:
     st.set_page_config(page_title="ASR — Agent Orchestrator", layout="wide")
-    orch = get_orchestrator()
+    cfg = load_config(CONFIG_PATH)
+    store = IncidentStore(cfg.paths.incidents_dir)
 
-    render_sidebar(orch)
+    # One-shot snapshot of agent/tool metadata + environments. ~100-200ms per
+    # rerun; acceptable, and keeps async resources strictly scoped.
+    agents, tools, environments = _load_metadata_dicts(cfg)
+
+    render_sidebar(store)
 
     tab_investigate, tab_registry = st.tabs(["Investigate", "Agents & Tools"])
 
@@ -106,7 +145,7 @@ def main() -> None:
         st.header("Start an investigation")
         with st.form("investigate_form"):
             query = st.text_area("What's happening?", height=100, key="form_query")
-            environment = st.selectbox("Impacted environment", orch.cfg.environments,
+            environment = st.selectbox("Impacted environment", environments,
                                        key="form_env")
             submitted = st.form_submit_button("Start investigation", type="primary")
 
@@ -116,17 +155,10 @@ def main() -> None:
             log_area = timeline_box.empty()
             lines: list[str] = []
 
-            async def run_and_stream():
-                async for ev in orch.stream_investigation(query=query, environment=environment):
-                    line = _format_event(ev)
-                    if line:
-                        lines.append(line)
-                        log_area.code("\n".join(lines), language="text")
-
-            asyncio.run(run_and_stream())
+            asyncio.run(_run_investigation_async(cfg, query, environment, log_area, lines))
 
             # Surface the resulting INC for one-click drill-in
-            recent = orch.list_recent_incidents(limit=1)
+            recent = [i.model_dump() for i in store.list_recent(1)]
             if recent:
                 st.session_state["selected_incident"] = recent[0]["id"]
                 st.success(f"Investigation complete — {recent[0]['id']} ({recent[0]['status']})")
@@ -138,7 +170,7 @@ def main() -> None:
         col_a, col_b = st.columns([1, 1])
         with col_a:
             st.subheader("Agents")
-            for a in orch.list_agents():
+            for a in agents:
                 with st.container(border=True):
                     st.markdown(f"**{a['name']}** — `{a['model']}`")
                     st.caption(a["description"])
@@ -149,7 +181,6 @@ def main() -> None:
 
         with col_b:
             st.subheader("Tools by category")
-            tools = orch.list_tools()
             by_cat: dict[str, list[dict]] = {}
             for t in tools:
                 by_cat.setdefault(t["category"], []).append(t)
@@ -159,7 +190,7 @@ def main() -> None:
                     bound = ", ".join(f"`{a}`" for a in t["bound_agents"]) or "_(unbound)_"
                     st.markdown(f"- `{t['name']}` — {t['description'][:80]}  \n  bound to: {bound}")
 
-    render_incident_detail(orch)
+    render_incident_detail(store)
 
 
 if __name__ == "__main__":
