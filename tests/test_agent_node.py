@@ -1,6 +1,6 @@
 import pytest
 from orchestrator.graph import GraphState, make_agent_node
-from orchestrator.incident import IncidentStore
+from orchestrator.incident import IncidentStore, TokenUsage
 from orchestrator.skill import Skill, RouteRule
 from orchestrator.llm import StubChatModel
 
@@ -30,4 +30,12 @@ async def test_agent_node_runs_llm_records_agent_run_and_routes(incident):
     assert out["next_route"] == "triage"
     assert out["last_agent"] == "intake"
     reloaded = store.load(inc.id)
-    assert any(r.agent == "intake" for r in reloaded.agents_run)
+    intake_runs = [r for r in reloaded.agents_run if r.agent == "intake"]
+    assert intake_runs
+    # Token usage field must exist on every AgentRun and on the incident.
+    # StubChatModel does not emit usage_metadata, so we assert structure
+    # (the fields are present and are TokenUsage instances) rather than values.
+    assert isinstance(intake_runs[0].token_usage, TokenUsage)
+    assert intake_runs[0].token_usage.total_tokens == 0
+    assert isinstance(reloaded.token_usage, TokenUsage)
+    assert reloaded.token_usage.total_tokens == 0

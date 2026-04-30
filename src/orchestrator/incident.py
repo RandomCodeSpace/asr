@@ -20,11 +20,18 @@ class ToolCall(BaseModel):
     ts: str
 
 
+class TokenUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+
 class AgentRun(BaseModel):
     agent: str
     started_at: str
     ended_at: str
     summary: str
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
 
 
 class Findings(BaseModel):
@@ -50,6 +57,7 @@ class Incident(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     findings: Findings = Field(default_factory=Findings)
     resolution: Any = None
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
 
 
 from datetime import datetime, timezone
