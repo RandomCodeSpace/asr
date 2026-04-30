@@ -70,6 +70,21 @@ def render_sidebar(store: IncidentStore) -> None:
                 st.session_state["selected_incident"] = inc["id"]
 
 
+def _render_value(v) -> None:
+    """Render a value the agents may produce (str/dict/list/None) safely.
+
+    `st.json` parses strings as JSON; LLM-produced free-form prose like
+    "The investigation found ..." breaks it. So: structured types -> st.json,
+    everything else -> st.write.
+    """
+    if v is None:
+        st.caption("_(none)_")
+    elif isinstance(v, (dict, list)):
+        st.json(v)
+    else:
+        st.write(v)
+
+
 def render_incident_detail(store: IncidentStore) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
@@ -80,15 +95,33 @@ def render_incident_detail(store: IncidentStore) -> None:
                  f"**Category:** {inc.get('category') or '—'}")
         st.write(f"**Query:** {inc['query']}")
         st.write(f"**Environment:** {inc['environment']}")
+        if inc.get("tags"):
+            st.write("**Tags:** " + ", ".join(f"`{t}`" for t in inc["tags"]))
+        if inc.get("summary"):
+            st.write(f"**Summary:** {inc['summary']}")
+        if inc.get("matched_prior_inc"):
+            st.write(f"**Matched prior INC:** `{inc['matched_prior_inc']}`")
+
         st.markdown("**Agents run:**")
         for ar in inc.get("agents_run", []):
             st.write(f"- `{ar['agent']}` ({ar['started_at']} → {ar['ended_at']}): {ar['summary']}")
+
         st.markdown("**Tool calls:**")
         for tc in inc.get("tool_calls", []):
-            st.write(f"- `{tc['agent']}` → `{tc['tool']}` args={tc['args']} result={tc['result']}")
-        if inc.get("resolution"):
+            st.write(f"- `{tc['agent']}` → `{tc['tool']}` args={tc['args']} "
+                     f"result={str(tc['result'])[:200]}")
+
+        findings = inc.get("findings") or {}
+        if findings.get("triage") is not None:
+            st.markdown("**Triage findings:**")
+            _render_value(findings["triage"])
+        if findings.get("deep_investigator") is not None:
+            st.markdown("**Deep investigator findings:**")
+            _render_value(findings["deep_investigator"])
+        if inc.get("resolution") is not None:
             st.markdown("**Resolution:**")
-            st.json(inc["resolution"])
+            _render_value(inc["resolution"])
+
         with st.expander("Raw JSON"):
             st.json(inc)
 
