@@ -1,6 +1,15 @@
 """Load MCP servers (in_process / stdio / http / sse) and build a tool registry."""
+# The FastMCP Client instances loaded here MUST stay open for the entire
+# lifetime of the returned ToolRegistry, otherwise the LangChain tool wrappers
+# hold references to a closed transport and the FIRST tool invocation raises:
+#     unable to perform operation on <TCPTransport closed=True ...>
+# To make the lifetime explicit, the caller passes an already-entered
+# contextlib.AsyncExitStack; each FastMCP client is registered into it via
+# `await stack.enter_async_context(client)`. The caller controls teardown by
+# calling `await stack.aclose()`.
 from __future__ import annotations
 import importlib
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -41,7 +50,8 @@ class ToolRegistry:
         return out
 
 
-async def _load_in_process(server_cfg: MCPServerConfig) -> list[BaseTool]:
+async def _load_in_process(server_cfg: MCPServerConfig,
+                           stack: AsyncExitStack) -> list[BaseTool]:
     if server_cfg.module is None:
         raise ValueError(f"in_process server '{server_cfg.name}' missing 'module'")
     mod = importlib.import_module(server_cfg.module)
@@ -49,14 +59,17 @@ async def _load_in_process(server_cfg: MCPServerConfig) -> list[BaseTool]:
     if fmcp is None:
         raise ValueError(f"Module {server_cfg.module} has no 'mcp' (FastMCP instance)")
     # FastMCP exposes tools as functions; convert to langchain tools via adapter.
-    # We use the in-memory client transport.
+    # We use the in-memory client transport. The client is registered into the
+    # caller's exit stack so its session/transport stays open while the loaded
+    # tools are in use.
     from fastmcp import Client
     client = Client(fmcp)
-    async with client:
-        return await load_mcp_tools(client.session)
+    await stack.enter_async_context(client)
+    return await load_mcp_tools(client.session)
 
 
-async def _load_remote(server_cfg: MCPServerConfig) -> list[BaseTool]:
+async def _load_remote(server_cfg: MCPServerConfig,
+                       stack: AsyncExitStack) -> list[BaseTool]:
     from fastmcp import Client
     if server_cfg.transport in ("http", "sse"):
         if not server_cfg.url:
@@ -68,19 +81,25 @@ async def _load_remote(server_cfg: MCPServerConfig) -> list[BaseTool]:
         client = Client({"command": server_cfg.command[0], "args": server_cfg.command[1:]})
     else:
         raise ValueError(f"Unknown transport: {server_cfg.transport}")
-    async with client:
-        return await load_mcp_tools(client.session)
+    await stack.enter_async_context(client)
+    return await load_mcp_tools(client.session)
 
 
-async def load_tools(cfg: MCPConfig) -> ToolRegistry:
+async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
+    """Load all enabled MCP servers and return a :class:`ToolRegistry`.
+
+    The caller MUST pass an already-entered :class:`AsyncExitStack`. Each
+    FastMCP ``Client`` is registered into it; the caller controls lifetime via
+    ``await stack.aclose()``.
+    """
     registry = ToolRegistry()
     for server_cfg in cfg.servers:
         if not server_cfg.enabled:
             continue
         if server_cfg.transport == "in_process":
-            tools = await _load_in_process(server_cfg)
+            tools = await _load_in_process(server_cfg, stack)
         else:
-            tools = await _load_remote(server_cfg)
+            tools = await _load_remote(server_cfg, stack)
         for t in tools:
             registry.add(ToolEntry(
                 name=t.name, description=t.description or "",

@@ -13,7 +13,7 @@ from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore
 from orchestrator.skill import Skill
 from orchestrator.config import AppConfig
 from orchestrator.llm import get_llm
-from orchestrator.mcp_loader import load_tools
+from orchestrator.mcp_loader import ToolRegistry
 
 
 class GraphState(TypedDict, total=False):
@@ -167,10 +167,16 @@ _STUB_CANNED = {
 }
 
 
-async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore):
-    """Compile the LangGraph StateGraph from skills + tool registry."""
-    registry = await load_tools(cfg.mcp)
+async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
+                      registry: ToolRegistry):
+    """Compile the LangGraph StateGraph from skills + tool registry.
 
+    The ``registry`` is provided by the caller — typically the
+    :class:`Orchestrator`, which loads MCP tools into an :class:`AsyncExitStack`
+    so the underlying FastMCP transports stay alive for the lifetime of the
+    compiled graph. This avoids double-loading (which would also create a
+    second set of clients, immediately closed).
+    """
     sg = StateGraph(GraphState)
     for agent_name, skill in skills.items():
         llm = get_llm(

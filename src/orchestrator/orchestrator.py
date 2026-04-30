@@ -1,5 +1,6 @@
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 from __future__ import annotations
+from contextlib import AsyncExitStack
 from typing import AsyncIterator
 from datetime import datetime, timezone
 
@@ -12,24 +13,47 @@ from orchestrator.graph import build_graph, GraphState
 
 
 class Orchestrator:
-    """High-level facade. Construct via `await Orchestrator.create(cfg)`."""
+    """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
+
+    The Orchestrator owns the lifecycle of the FastMCP clients underpinning the
+    tool registry. Always call :meth:`aclose` (or use ``async with``) when done.
+    """
 
     def __init__(self, cfg: AppConfig, store: IncidentStore,
-                 skills: dict[str, Skill], registry: ToolRegistry, graph):
+                 skills: dict[str, Skill], registry: ToolRegistry, graph,
+                 exit_stack: AsyncExitStack):
         self.cfg = cfg
         self.store = store
         self.skills = skills
         self.registry = registry
         self.graph = graph
+        self._exit_stack = exit_stack
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
-        store = IncidentStore(cfg.paths.incidents_dir)
-        _set_inc_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
-        skills = load_all_skills(cfg.paths.skills_dir)
-        registry = await load_tools(cfg.mcp)
-        graph = await build_graph(cfg=cfg, skills=skills, store=store)
-        return cls(cfg, store, skills, registry, graph)
+        stack = AsyncExitStack()
+        await stack.__aenter__()
+        try:
+            store = IncidentStore(cfg.paths.incidents_dir)
+            _set_inc_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
+            skills = load_all_skills(cfg.paths.skills_dir)
+            registry = await load_tools(cfg.mcp, stack)
+            graph = await build_graph(cfg=cfg, skills=skills, store=store,
+                                      registry=registry)
+            return cls(cfg, store, skills, registry, graph, stack)
+        except BaseException:
+            await stack.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        """Close all owned MCP clients/transports. Idempotent."""
+        await self._exit_stack.aclose()
+
+    async def __aenter__(self) -> "Orchestrator":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
 
     def list_agents(self) -> list[dict]:
         return [

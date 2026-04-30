@@ -50,5 +50,11 @@ async def build_app(cfg: AppConfig) -> FastAPI:
         )
         return InvestigateResponse(incident_id=inc_id)
 
+    @app.on_event("shutdown")
+    async def _shutdown():
+        # Release MCP clients/transports owned by the orchestrator on app
+        # shutdown. Without this the FastMCP transports leak past app teardown.
+        await orch.aclose()
+
     app.state.orchestrator = orch
     return app
