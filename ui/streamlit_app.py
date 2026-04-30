@@ -115,8 +115,30 @@ def main() -> None:
 
     with tab_registry:
         st.header("Agents & Tools registry")
-        # Filled in by Task 25
-        st.info("Registry view — implemented in Task 25.")
+
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            st.subheader("Agents")
+            for a in orch.list_agents():
+                with st.container(border=True):
+                    st.markdown(f"**{a['name']}** — `{a['model']}`")
+                    st.caption(a["description"])
+                    st.markdown("Tools: " + ", ".join(f"`{t}`" for t in a["tools"]))
+                    if a["routes"]:
+                        st.caption("Routes: " + ", ".join(
+                            f"`{r['when']}→{r['next']}`" for r in a["routes"]))
+
+        with col_b:
+            st.subheader("Tools by category")
+            tools = orch.list_tools()
+            by_cat: dict[str, list[dict]] = {}
+            for t in tools:
+                by_cat.setdefault(t["category"], []).append(t)
+            for cat in sorted(by_cat):
+                st.markdown(f"**{cat}**")
+                for t in by_cat[cat]:
+                    bound = ", ".join(f"`{a}`" for a in t["bound_agents"]) or "_(unbound)_"
+                    st.markdown(f"- `{t['name']}` — {t['description'][:80]}  \n  bound to: {bound}")
 
     render_incident_detail(orch)
 
