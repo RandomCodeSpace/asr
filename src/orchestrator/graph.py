@@ -10,7 +10,7 @@ from langchain_core.tools import BaseTool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, END
 
-from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore
+from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore, TokenUsage
 from orchestrator.skill import Skill
 from orchestrator.config import AppConfig
 from orchestrator.llm import get_llm
@@ -139,6 +139,7 @@ def make_agent_node(
             incident.agents_run.append(AgentRun(
                 agent=skill.name, started_at=started_at, ended_at=ended_at,
                 summary=f"agent failed: {exc}",
+                token_usage=TokenUsage(),
             ))
             store.save(incident)
             return {"incident": incident, "next_route": None,
@@ -178,11 +179,30 @@ def make_agent_node(
                 final_text = str(msg.content)[:500]
                 break
 
+        # Sum token usage across every message that reports it. langchain-ollama
+        # populates `usage_metadata` on AIMessages from Ollama's
+        # prompt_eval_count / eval_count fields. Stub/test models leave it
+        # absent — those simply contribute zero.
+        agent_in = agent_out = 0
+        for msg in result.get("messages", []):
+            um = getattr(msg, "usage_metadata", None) or {}
+            agent_in += int(um.get("input_tokens") or 0)
+            agent_out += int(um.get("output_tokens") or 0)
+        agent_total = agent_in + agent_out
+
         ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         incident.agents_run.append(AgentRun(
             agent=skill.name, started_at=started_at, ended_at=ended_at,
             summary=final_text or f"{skill.name} completed",
+            token_usage=TokenUsage(
+                input_tokens=agent_in,
+                output_tokens=agent_out,
+                total_tokens=agent_total,
+            ),
         ))
+        incident.token_usage.input_tokens += agent_in
+        incident.token_usage.output_tokens += agent_out
+        incident.token_usage.total_tokens += agent_total
 
         next_route_signal = decide_route(incident)
         store.save(incident)
