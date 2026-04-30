@@ -86,30 +86,48 @@ def make_agent_node(
 
     async def node(state: GraphState) -> dict:
         incident = state["incident"]
-        recorder = AgentRunRecorder(agent=skill.name, incident=incident)
-        recorder.start()
+        inc_id = incident.id
+        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         try:
             result = await agent_executor.ainvoke(
                 {"messages": [HumanMessage(content=_format_intake_input(incident))]}
             )
         except Exception as exc:  # noqa: BLE001
-            recorder.finish(summary=f"agent failed: {exc}")
+            # Reload to absorb any partial writes from tools that ran before the failure.
+            try:
+                incident = store.load(inc_id)
+            except FileNotFoundError:
+                pass
+            ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            incident.agents_run.append(AgentRun(
+                agent=skill.name, started_at=started_at, ended_at=ended_at,
+                summary=f"agent failed: {exc}",
+            ))
             store.save(incident)
             return {"incident": incident, "next_route": None,
                     "last_agent": skill.name, "error": str(exc)}
 
-        # Walk the ReAct trace; capture each tool call into the incident.
+        # Tools (e.g. update_incident) write straight to disk. Reload so the
+        # node's own append of agent_run + tool_calls happens against the
+        # tool-mutated state — otherwise saving the stale in-memory object
+        # clobbers the tools' writes.
+        incident = store.load(inc_id)
+
+        # Record tool calls from the agent's message trace.
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for msg in result.get("messages", []):
             tool_calls = getattr(msg, "tool_calls", None) or []
             for tc in tool_calls:
-                recorder.record_tool_call(
+                incident.tool_calls.append(ToolCall(
+                    agent=skill.name,
                     tool=tc.get("name", "unknown"),
                     args=tc.get("args", {}) or {},
                     result=None,
-                )
+                    ts=ts,
+                ))
 
-        # Capture tool responses as separate entries
+        # Pair tool responses with their tool calls.
         for msg in result.get("messages", []):
             if msg.__class__.__name__ == "ToolMessage":
                 for entry in reversed(incident.tool_calls):
@@ -117,14 +135,19 @@ def make_agent_node(
                         entry.result = getattr(msg, "content", None)
                         break
 
-        # Use the final AI message's text as the summary
+        # Final summary text from the agent's last AIMessage.
         final_text = ""
         for msg in reversed(result.get("messages", [])):
             if msg.__class__.__name__ == "AIMessage" and msg.content:
                 final_text = str(msg.content)[:500]
                 break
 
-        recorder.finish(summary=final_text or f"{skill.name} completed")
+        ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        incident.agents_run.append(AgentRun(
+            agent=skill.name, started_at=started_at, ended_at=ended_at,
+            summary=final_text or f"{skill.name} completed",
+        ))
+
         next_route_signal = decide_route(incident)
         store.save(incident)
         next_node = route_from_skill(skill, next_route_signal)
