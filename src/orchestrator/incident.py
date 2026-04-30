@@ -28,8 +28,8 @@ class AgentRun(BaseModel):
 
 
 class Findings(BaseModel):
-    triage: dict | None = None
-    deep_investigator: dict | None = None
+    triage: dict | list | None = None
+    deep_investigator: dict | list | None = None
 
 
 class Incident(BaseModel):
