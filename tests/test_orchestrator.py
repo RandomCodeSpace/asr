@@ -61,7 +61,11 @@ async def test_start_investigation_creates_incident_and_runs_graph(cfg):
         inc_id = await orch.start_investigation(query="api latency", environment="production")
         assert inc_id.startswith("INC-")
         inc = orch.get_incident(inc_id)
-        assert inc["status"] in {"in_progress", "matched", "resolved", "escalated", "new"}
+        # Stub LLM emits no confidence → gate halts and marks awaiting_input.
+        assert inc["status"] in {
+            "in_progress", "matched", "resolved", "escalated",
+            "new", "awaiting_input", "stopped",
+        }
         assert inc["agents_run"]
     finally:
         await orch.aclose()

@@ -271,17 +271,63 @@ _STUB_CANNED = {
 }
 
 
-async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
-                      registry: ToolRegistry):
-    """Compile the LangGraph StateGraph from skills + tool registry.
+def _latest_di_confidence(incident: Incident) -> float | None:
+    """Return the most recent deep_investigator AgentRun confidence, or None."""
+    for run in reversed(incident.agents_run):
+        if run.agent == "deep_investigator":
+            return run.confidence
+    return None
 
-    The ``registry`` is provided by the caller — typically the
-    :class:`Orchestrator`, which loads MCP tools into an :class:`AsyncExitStack`
-    so the underlying FastMCP transports stay alive for the lifetime of the
-    compiled graph. This avoids double-loading (which would also create a
-    second set of clients, immediately closed).
+
+def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
+    """Build the intervention gate node placed between DI and resolution.
+
+    If the latest deep_investigator confidence is below the configured
+    threshold (or absent), the gate marks the incident as `awaiting_input`,
+    populates `pending_intervention`, and routes to END. Otherwise it routes
+    to `resolution`.
+
+    Implemented as a plain async coroutine (not via ``make_agent_node``) so
+    it does not invoke an LLM — but it IS a real graph node, so streamed
+    events surface ``enter gate`` / ``exit gate``.
     """
-    sg = StateGraph(GraphState)
+    threshold = cfg.intervention.confidence_threshold
+    teams = list(cfg.intervention.escalation_teams)
+
+    async def gate(state: GraphState) -> dict:
+        incident = state["incident"]
+        # Reload from disk in case earlier nodes wrote tool-driven patches.
+        try:
+            incident = store.load(incident.id)
+        except FileNotFoundError:
+            pass
+        di_conf = _latest_di_confidence(incident)
+        if di_conf is None or di_conf < threshold:
+            incident.status = "awaiting_input"
+            incident.pending_intervention = {
+                "reason": "low_confidence",
+                "confidence": di_conf,
+                "threshold": threshold,
+                "options": ["resume_with_input", "escalate", "stop"],
+                "escalation_teams": teams,
+            }
+            store.save(incident)
+            return {"incident": incident, "next_route": "__end__",
+                    "last_agent": "gate", "error": None}
+        # Confidence met threshold — clear any stale intervention payload.
+        if incident.pending_intervention is not None:
+            incident.pending_intervention = None
+            store.save(incident)
+        return {"incident": incident, "next_route": "default",
+                "last_agent": "gate", "error": None}
+
+    return gate
+
+
+def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
+                       registry: ToolRegistry) -> dict:
+    """Materialize agent nodes from skills + registry. Reused by main + resume graphs."""
+    nodes: dict = {}
     for agent_name, skill in skills.items():
         llm = get_llm(
             cfg.llm,
@@ -292,24 +338,97 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         )
         tools = registry.get(skill.tools)
         decide = _DECIDERS.get(agent_name, lambda inc: "default")
-        node = make_agent_node(skill=skill, llm=llm, tools=tools,
-                               decide_route=decide, store=store)
-        sg.add_node(agent_name, node)
+        nodes[agent_name] = make_agent_node(
+            skill=skill, llm=llm, tools=tools,
+            decide_route=decide, store=store,
+        )
+    return nodes
 
-    # Set entry point to the agent named 'intake'.
+
+def _gate_router(state: GraphState):
+    nr = state.get("next_route")
+    if nr in (None, "__end__"):
+        return END
+    # gate's "default" means "advance to resolution".
+    return "resolution"
+
+
+async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
+                      registry: ToolRegistry):
+    """Compile the main LangGraph: intake -> triage -> deep_investigator -> gate -> resolution.
+
+    The ``registry`` is provided by the caller — typically the
+    :class:`Orchestrator`, which loads MCP tools into an :class:`AsyncExitStack`
+    so the underlying FastMCP transports stay alive for the lifetime of the
+    compiled graph.
+    """
+    sg = StateGraph(GraphState)
+    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
+    for agent_name, node in nodes.items():
+        sg.add_node(agent_name, node)
+    # Insert the human-in-the-loop gate between DI and resolution.
+    sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
+
     sg.set_entry_point("intake")
 
-    # Conditional edges: each agent's `next_route` (a node name OR "__end__") drives routing.
+    # Standard router for agent nodes: next_route is a target node or __end__.
     def _router(state: GraphState):
         nr = state.get("next_route")
         if nr in (None, "__end__"):
             return END
+        # deep_investigator's "default" forwards through the gate.
+        if state.get("last_agent") == "deep_investigator" and nr == "resolution":
+            return "gate"
         return nr
 
     for agent_name in skills.keys():
-        possible_targets = {s.name for s in skills.values()} | {END}
+        possible_targets = {s.name for s in skills.values()} | {END, "gate"}
         target_map = {name: name for name in possible_targets if name != END}
         target_map[END] = END
         sg.add_conditional_edges(agent_name, _router, target_map)
 
+    # Gate's edges: route to resolution on default, END on __end__.
+    sg.add_conditional_edges("gate", _gate_router, {
+        "resolution": "resolution", END: END,
+    })
+
+    return sg.compile()
+
+
+async def build_resume_graph(*, cfg: AppConfig, skills: dict,
+                             store: IncidentStore, registry: ToolRegistry):
+    """Compile a sub-graph that re-runs only deep_investigator -> gate -> resolution.
+
+    Used by ``Orchestrator.resume_investigation`` after the user supplies new
+    context: intake/triage already ran, so we resume from DI with the updated
+    incident. Same gate semantics — if the new run is still low-confidence,
+    we'll pause again.
+    """
+    sg = StateGraph(GraphState)
+    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
+    # Only DI + resolution agents participate; intake/triage are skipped.
+    for agent_name in ("deep_investigator", "resolution"):
+        if agent_name in nodes:
+            sg.add_node(agent_name, nodes[agent_name])
+    sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
+    sg.set_entry_point("deep_investigator")
+
+    def _router(state: GraphState):
+        nr = state.get("next_route")
+        if nr in (None, "__end__"):
+            return END
+        if state.get("last_agent") == "deep_investigator" and nr == "resolution":
+            return "gate"
+        return nr
+
+    for agent_name in ("deep_investigator", "resolution"):
+        sg.add_conditional_edges(agent_name, _router, {
+            "deep_investigator": "deep_investigator",
+            "resolution": "resolution",
+            "gate": "gate",
+            END: END,
+        })
+    sg.add_conditional_edges("gate", _gate_router, {
+        "resolution": "resolution", END: END,
+    })
     return sg.compile()

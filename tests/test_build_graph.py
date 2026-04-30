@@ -56,6 +56,9 @@ async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
         final_state = await graph.ainvoke(
             GraphState(incident=inc, next_route=None, last_agent=None, error=None)
         )
-        assert final_state["last_agent"] in {"resolution", "intake"}
+        # Stub DI never emits a confidence value, so the gate halts the graph
+        # before resolution. last_agent is then "gate" (or "intake" on the
+        # known-issue short-circuit path).
+        assert final_state["last_agent"] in {"resolution", "intake", "gate"}
         reloaded = store.load(inc.id)
         assert reloaded.agents_run, "expected at least one agent to run"
