@@ -12,6 +12,7 @@
 # needs no MCP clients.
 from __future__ import annotations
 import asyncio
+from datetime import datetime
 from pathlib import Path
 import streamlit as st
 
@@ -65,7 +66,9 @@ def render_sidebar(store: IncidentStore) -> None:
                 "resolved": "✅",
                 "escalated": "🔴",
             }.get(inc["status"], "⚪")
-            label = f"{badge} `{inc['id']}` — {inc['environment']}"
+            toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
+            tok_str = f" · {toks/1000:.1f}k tok" if toks >= 1000 else f" · {toks} tok"
+            label = f"{badge} `{inc['id']}` — {inc['environment']}{tok_str}"
             if st.button(label, key=f"inc_{inc['id']}", use_container_width=True):
                 st.session_state["selected_incident"] = inc["id"]
 
@@ -85,42 +88,140 @@ def _render_value(v) -> None:
         st.write(v)
 
 
+def _parse_iso(ts: str) -> datetime | None:
+    """Parse the project's ISO-like timestamp (`YYYY-MM-DDTHH:MM:SSZ`)."""
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+
+
+def _duration_seconds(start: str, end: str) -> int:
+    s, e = _parse_iso(start), _parse_iso(end)
+    if not s or not e:
+        return 0
+    return max(0, int((e - s).total_seconds()))
+
+
+def _fmt_tokens(n: int) -> str:
+    return f"{n:,}"
+
+
+def _render_hypothesis_list(items: list, label: str) -> None:
+    """Render a list of hypothesis-shaped dicts (cause/evidence/next_steps)
+    as bordered cards. Strings or scalar entries fall back to bullets.
+    """
+    for i, h in enumerate(items, 1):
+        with st.container(border=True):
+            if isinstance(h, dict):
+                st.markdown(f"**{label} {i}:** {h.get('cause', '—')}")
+                ev = h.get("evidence")
+                if ev:
+                    st.markdown("**Evidence:**")
+                    for e in (ev if isinstance(ev, list) else [ev]):
+                        st.markdown(f"- {e}")
+                ns = h.get("next_steps") or h.get("next_step") or h.get("probe")
+                if ns:
+                    st.markdown(f"**Next steps:** {ns}")
+                # Anything else in the dict that we haven't surfaced.
+                extra = {k: v for k, v in h.items()
+                         if k not in {"cause", "evidence", "next_steps",
+                                      "next_step", "probe"}}
+                if extra:
+                    st.json(extra)
+            else:
+                st.markdown(f"**{label} {i}:** {h}")
+
+
+def _render_findings_section(value, label: str) -> None:
+    """Findings can be a list of hypothesis dicts, a single dict, or free
+    prose. Pick the right renderer; never silently truncate.
+    """
+    if isinstance(value, list):
+        _render_hypothesis_list(value, label="Hypothesis")
+    elif isinstance(value, dict):
+        st.json(value)
+    elif isinstance(value, str):
+        st.write(value)
+    else:
+        _render_value(value)
+
+
 def render_incident_detail(store: IncidentStore) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
         return
     with st.expander(f"INC detail: {inc_id}", expanded=True):
         inc = store.load(inc_id).model_dump()
-        st.write(f"**Status:** {inc['status']} **Severity:** {inc.get('severity') or '—'}  "
-                 f"**Category:** {inc.get('category') or '—'}")
-        st.write(f"**Query:** {inc['query']}")
-        st.write(f"**Environment:** {inc['environment']}")
+
+        # --- Top metrics row ----------------------------------------------
+        token_total = (inc.get("token_usage") or {}).get("total_tokens", 0)
+        duration_s = _duration_seconds(inc.get("created_at", ""),
+                                       inc.get("updated_at", ""))
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Status", inc.get("status") or "—")
+        m2.metric("Severity", inc.get("severity") or "—")
+        m3.metric("Category", inc.get("category") or "—")
+        m4.metric("Total tokens", _fmt_tokens(token_total))
+        m5.metric("Duration", f"{duration_s}s")
+
+        # --- Header block -------------------------------------------------
+        st.markdown(f"**Query:** {inc['query']}")
+        st.markdown(f"**Environment:** `{inc['environment']}`")
         if inc.get("tags"):
-            st.write("**Tags:** " + ", ".join(f"`{t}`" for t in inc["tags"]))
+            st.markdown("**Tags:** " + " ".join(f"`{t}`" for t in inc["tags"]))
         if inc.get("summary"):
-            st.write(f"**Summary:** {inc['summary']}")
+            st.markdown(f"**Summary:** {inc['summary']}")
         if inc.get("matched_prior_inc"):
-            st.write(f"**Matched prior INC:** `{inc['matched_prior_inc']}`")
+            st.markdown(f"**Matched prior INC:** `{inc['matched_prior_inc']}`")
 
-        st.markdown("**Agents run:**")
-        for ar in inc.get("agents_run", []):
-            st.write(f"- `{ar['agent']}` ({ar['started_at']} → {ar['ended_at']}): {ar['summary']}")
+        # --- Agents run ---------------------------------------------------
+        agents_run = inc.get("agents_run", [])
+        if agents_run:
+            st.markdown("### Agents run")
+            for ar in agents_run:
+                a_dur = _duration_seconds(ar.get("started_at", ""),
+                                          ar.get("ended_at", ""))
+                a_tok = (ar.get("token_usage") or {}).get("total_tokens", 0)
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{ar['agent']}** — {a_dur}s — {_fmt_tokens(a_tok)} tokens"
+                    )
+                    st.write(ar.get("summary") or "_(no summary)_")
 
-        st.markdown("**Tool calls:**")
-        for tc in inc.get("tool_calls", []):
-            st.write(f"- `{tc['agent']}` → `{tc['tool']}` args={tc['args']} "
-                     f"result={str(tc['result'])[:200]}")
-
+        # --- Findings -----------------------------------------------------
         findings = inc.get("findings") or {}
-        if findings.get("triage") is not None:
-            st.markdown("**Triage findings:**")
-            _render_value(findings["triage"])
-        if findings.get("deep_investigator") is not None:
-            st.markdown("**Deep investigator findings:**")
-            _render_value(findings["deep_investigator"])
+        f_triage = findings.get("triage")
+        f_di = findings.get("deep_investigator")
+        if f_triage is not None or f_di is not None:
+            st.markdown("### Findings")
+        if f_triage is not None:
+            with st.container(border=True):
+                st.markdown("**Triage**")
+                _render_findings_section(f_triage, label="Finding")
+        if f_di is not None:
+            with st.container(border=True):
+                st.markdown("**Deep investigator**")
+                _render_findings_section(f_di, label="Hypothesis")
+
+        # --- Resolution ---------------------------------------------------
         if inc.get("resolution") is not None:
-            st.markdown("**Resolution:**")
-            _render_value(inc["resolution"])
+            st.markdown("### Resolution")
+            with st.container(border=True):
+                _render_value(inc["resolution"])
+
+        # --- Tool calls ---------------------------------------------------
+        tool_calls = inc.get("tool_calls", [])
+        if tool_calls:
+            st.markdown("### Tool calls")
+            for idx, tc in enumerate(tool_calls):
+                with st.expander(f"`{tc['agent']}` → `{tc['tool']}`"):
+                    st.markdown("**Args:**")
+                    st.json(tc.get("args") or {})
+                    st.markdown("**Result:**")
+                    _render_value(tc.get("result"))
 
         with st.expander("Raw JSON"):
             st.json(inc)
