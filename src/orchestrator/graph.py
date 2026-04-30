@@ -1,5 +1,6 @@
 """LangGraph state, routing helpers, and node runner."""
 from __future__ import annotations
+import asyncio
 from typing import TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
 
@@ -62,6 +63,40 @@ class AgentRunRecorder:
         ))
 
 
+_TRANSIENT_MARKERS = (
+    "internal server error",
+    "status code: -1",
+    "status code: 500",
+    "status code: 502",
+    "status code: 503",
+    "status code: 504",
+    "remoteprotocolerror",
+    "incomplete chunked read",
+    "connection reset",
+)
+
+
+async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
+                              base_delay: float = 1.5):
+    """Wrap a LangGraph agent invocation with retry on transient cloud errors.
+
+    Retries on common Ollama Cloud / streaming hiccups (500, status -1, etc.).
+    Non-transient exceptions (4xx, validation, etc.) propagate immediately.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await executor.ainvoke(input_)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            transient = any(m in msg for m in _TRANSIENT_MARKERS)
+            if not transient or attempt == max_attempts - 1:
+                raise
+            last_exc = exc
+            await asyncio.sleep(base_delay * (attempt + 1))
+    raise last_exc  # pragma: no cover  (unreachable)
+
+
 def _format_intake_input(incident: Incident) -> str:
     return (
         f"Incident {incident.id}\n"
@@ -90,8 +125,9 @@ def make_agent_node(
         started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         try:
-            result = await agent_executor.ainvoke(
-                {"messages": [HumanMessage(content=_format_intake_input(incident))]}
+            result = await _ainvoke_with_retry(
+                agent_executor,
+                {"messages": [HumanMessage(content=_format_intake_input(incident))]},
             )
         except Exception as exc:  # noqa: BLE001
             # Reload to absorb any partial writes from tools that ran before the failure.
