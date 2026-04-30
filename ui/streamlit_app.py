@@ -21,12 +21,31 @@ def get_orchestrator() -> Orchestrator:
 def render_sidebar(orch: Orchestrator) -> None:
     with st.sidebar:
         st.markdown("### Recent INCs")
-        recent = orch.list_recent_incidents(limit=20)
+        col_l, col_r = st.columns([3, 1])
+        with col_l:
+            statuses = ["all", "new", "in_progress", "matched", "resolved", "escalated"]
+            status_filter = st.selectbox("Filter", statuses, key="status_filter",
+                                         label_visibility="collapsed")
+        with col_r:
+            if st.button("↻", help="Refresh"):
+                st.rerun()
+
+        recent = orch.list_recent_incidents(limit=50)
+        if status_filter != "all":
+            recent = [i for i in recent if i["status"] == status_filter]
+
         if not recent:
-            st.caption("No incidents yet.")
+            st.caption("No incidents.")
             return
-        for inc in recent:
-            label = f"`{inc['id']}` — {inc['status']}"
+        for inc in recent[:20]:
+            badge = {
+                "new": "🟦",
+                "in_progress": "🟡",
+                "matched": "🟢",
+                "resolved": "✅",
+                "escalated": "🔴",
+            }.get(inc["status"], "⚪")
+            label = f"{badge} `{inc['id']}` — {inc['environment']}"
             if st.button(label, key=f"inc_{inc['id']}", use_container_width=True):
                 st.session_state["selected_incident"] = inc["id"]
 
