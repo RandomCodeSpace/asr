@@ -15,7 +15,6 @@ import yaml
 
 from datetime import datetime, timezone
 
-
 # ----- imports for similarity.py -----
 """Similarity scoring for incident matching."""
 
@@ -286,6 +285,10 @@ def load_config(path: str | Path) -> AppConfig:
 
 # ====== module: orchestrator/incident.py ======
 
+_INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
+_UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
 IncidentStatus = Literal[
     "new", "in_progress", "matched", "resolved",
     "escalated", "awaiting_input", "stopped",
@@ -351,7 +354,7 @@ class Incident(BaseModel):
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
 
 def _utc_today() -> str:
@@ -394,11 +397,19 @@ class IncidentStore:
         return inc
 
     def save(self, incident: Incident) -> None:
+        if not _INC_ID_RE.match(incident.id):
+            raise ValueError(
+                f"Invalid incident id {incident.id!r}; expected INC-YYYYMMDD-NNN"
+            )
         incident.updated_at = _utc_now_iso()
         path = self.base_dir / f"{incident.id}.json"
         path.write_text(incident.model_dump_json(indent=2))
 
     def load(self, incident_id: str) -> Incident:
+        if not _INC_ID_RE.match(incident_id):
+            raise ValueError(
+                f"Invalid incident id {incident_id!r}; expected INC-YYYYMMDD-NNN"
+            )
         path = self.base_dir / f"{incident_id}.json"
         if not path.exists():
             raise FileNotFoundError(incident_id)
@@ -596,6 +607,35 @@ class StubChatModel(BaseChatModel):
         return self
 
 
+def _build_ollama_llm(cfg: "LLMConfig", actual_model: str, actual_temp: float) -> BaseChatModel:
+    from langchain_ollama import ChatOllama
+    if cfg.ollama is None:
+        raise ValueError("ollama provider requires llm.ollama config")
+    kwargs: dict[str, Any] = {
+        "base_url": cfg.ollama.base_url,
+        "model": actual_model,
+        "temperature": actual_temp,
+    }
+    api_key = cfg.ollama.api_key or os.environ.get("OLLAMA_API_KEY")
+    if api_key:
+        kwargs["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
+    return ChatOllama(**kwargs)
+
+
+def _build_azure_llm(cfg: "LLMConfig", actual_temp: float) -> BaseChatModel:
+    from langchain_openai import AzureChatOpenAI
+    if cfg.azure_openai is None:
+        raise ValueError("azure_openai provider requires llm.azure_openai config")
+    _ak = cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY")
+    return AzureChatOpenAI(
+        azure_endpoint=cfg.azure_openai.endpoint,
+        api_version=cfg.azure_openai.api_version,
+        azure_deployment=cfg.azure_openai.deployment,
+        api_key=SecretStr(_ak) if _ak else None,
+        temperature=actual_temp,
+    )
+
+
 def get_llm(cfg: LLMConfig, *, role: str = "default", model: str | None = None,
             temperature: float | None = None,
             stub_canned: dict[str, str] | None = None,
@@ -610,29 +650,9 @@ def get_llm(cfg: LLMConfig, *, role: str = "default", model: str | None = None,
             tool_call_plan=stub_tool_plan,
         )
     if cfg.provider == "ollama":
-        from langchain_ollama import ChatOllama
-        if cfg.ollama is None:
-            raise ValueError("ollama provider requires llm.ollama config")
-        kwargs: dict[str, Any] = {
-            "base_url": cfg.ollama.base_url,
-            "model": actual_model,
-            "temperature": actual_temp,
-        }
-        api_key = cfg.ollama.api_key or os.environ.get("OLLAMA_API_KEY")
-        if api_key:
-            kwargs["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
-        return ChatOllama(**kwargs)
+        return _build_ollama_llm(cfg, actual_model, actual_temp)
     if cfg.provider == "azure_openai":
-        from langchain_openai import AzureChatOpenAI
-        if cfg.azure_openai is None:
-            raise ValueError("azure_openai provider requires llm.azure_openai config")
-        return AzureChatOpenAI(
-            azure_endpoint=cfg.azure_openai.endpoint,
-            api_version=cfg.azure_openai.api_version,
-            azure_deployment=cfg.azure_openai.deployment,
-            api_key=SecretStr(_ak) if (_ak := cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY")) else None,
-            temperature=actual_temp,
-        )
+        return _build_azure_llm(cfg, actual_temp)
     raise ValueError(f"Unknown provider: {cfg.provider}")
 
 # ====== module: orchestrator/mcp_servers/incident.py ======
@@ -1143,16 +1163,16 @@ class AgentRunRecorder:
         self._started_at: str | None = None
 
     def start(self) -> None:
-        self._started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
     def record_tool_call(self, tool: str, args: dict, result) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
         self.incident.tool_calls.append(
             ToolCall(agent=self.agent, tool=tool, args=args, result=result, ts=ts)
         )
 
     def finish(self, *, summary: str) -> None:
-        ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
         self.incident.agents_run.append(AgentRun(
             agent=self.agent,
             started_at=self._started_at or ended_at,
@@ -1213,6 +1233,76 @@ def _format_agent_input(incident: Incident) -> str:
     return base
 
 
+def _harvest_tool_calls_and_patches(
+    messages: list,
+    skill_name: str,
+    incident: Incident,
+    ts: str,
+) -> tuple[float | None, str | None, str | None]:
+    """Iterate agent messages, record ToolCall entries on the incident, and
+    harvest any confidence / confidence_rationale / signal from update_incident
+    patches.
+
+    Returns ``(agent_confidence, agent_rationale, agent_signal)``.
+    """
+    agent_confidence: float | None = None
+    agent_rationale: str | None = None
+    agent_signal: str | None = None
+    for msg in messages:
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls:
+            tc_name = tc.get("name", "unknown")
+            tc_args = tc.get("args", {}) or {}
+            incident.tool_calls.append(ToolCall(
+                agent=skill_name,
+                tool=tc_name,
+                args=tc_args,
+                result=None,
+                ts=ts,
+            ))
+            if tc_name == "update_incident":
+                patch = tc_args.get("patch") or {}
+                if "confidence" in patch:
+                    agent_confidence = _coerce_confidence(patch["confidence"])
+                if "confidence_rationale" in patch:
+                    agent_rationale = _coerce_rationale(patch["confidence_rationale"])
+                if "signal" in patch:
+                    agent_signal = _coerce_signal(patch["signal"])
+    return agent_confidence, agent_rationale, agent_signal
+
+
+def _pair_tool_responses(messages: list, incident: Incident) -> None:
+    """Match ToolMessage responses back to their corresponding ToolCall entries."""
+    for msg in messages:
+        if msg.__class__.__name__ == "ToolMessage":
+            for entry in reversed(incident.tool_calls):
+                if entry.tool == getattr(msg, "name", None) and entry.result is None:
+                    entry.result = getattr(msg, "content", None)
+                    break
+
+
+def _extract_final_text(messages: list) -> str:
+    """Return the text content of the last non-empty AIMessage, or empty string."""
+    for msg in reversed(messages):
+        if msg.__class__.__name__ == "AIMessage" and msg.content:
+            return str(msg.content)
+    return ""
+
+
+def _sum_token_usage(messages: list) -> TokenUsage:
+    """Sum input/output token counts across all messages that report usage_metadata."""
+    agent_in = agent_out = 0
+    for msg in messages:
+        um = getattr(msg, "usage_metadata", None) or {}
+        agent_in += int(um.get("input_tokens") or 0)
+        agent_out += int(um.get("output_tokens") or 0)
+    return TokenUsage(
+        input_tokens=agent_in,
+        output_tokens=agent_out,
+        total_tokens=agent_in + agent_out,
+    )
+
+
 def make_agent_node(
     *,
     skill: Skill,
@@ -1227,7 +1317,7 @@ def make_agent_node(
     async def node(state: GraphState) -> dict:
         incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         inc_id = incident.id
-        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
         try:
             result = await _ainvoke_with_retry(
@@ -1240,7 +1330,7 @@ def make_agent_node(
                 incident = store.load(inc_id)
             except FileNotFoundError:
                 pass
-            ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
             incident.agents_run.append(AgentRun(
                 agent=skill.name, started_at=started_at, ended_at=ended_at,
                 summary=f"agent failed: {exc}",
@@ -1256,81 +1346,33 @@ def make_agent_node(
         # clobbers the tools' writes.
         incident = store.load(inc_id)
 
-        # Record tool calls from the agent's message trace. While iterating,
-        # also harvest the latest `confidence` / `confidence_rationale` carried
-        # in any `update_incident` patch — those keys are stamped on the
-        # AgentRun (the MCP tool itself silently ignores extra patch keys).
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        agent_confidence: float | None = None
-        agent_rationale: str | None = None
-        agent_signal: str | None = None
-        for msg in result.get("messages", []):
-            tool_calls = getattr(msg, "tool_calls", None) or []
-            for tc in tool_calls:
-                tc_name = tc.get("name", "unknown")
-                tc_args = tc.get("args", {}) or {}
-                incident.tool_calls.append(ToolCall(
-                    agent=skill.name,
-                    tool=tc_name,
-                    args=tc_args,
-                    result=None,
-                    ts=ts,
-                ))
-                if tc_name == "update_incident":
-                    patch = tc_args.get("patch") or {}
-                    if "confidence" in patch:
-                        agent_confidence = _coerce_confidence(patch["confidence"])
-                    if "confidence_rationale" in patch:
-                        agent_rationale = _coerce_rationale(patch["confidence_rationale"])
-                    if "signal" in patch:
-                        agent_signal = _coerce_signal(patch["signal"])
+        messages = result.get("messages", [])
+        ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # Record tool calls and harvest confidence/signal from update_incident patches.
+        agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
+            messages, skill.name, incident, ts,
+        )
 
         # Pair tool responses with their tool calls.
-        for msg in result.get("messages", []):
-            if msg.__class__.__name__ == "ToolMessage":
-                for entry in reversed(incident.tool_calls):
-                    if entry.tool == getattr(msg, "name", None) and entry.result is None:
-                        entry.result = getattr(msg, "content", None)
-                        break
+        _pair_tool_responses(messages, incident)
 
-        # Final summary text from the agent's last AIMessage. Persist it
-        # verbatim — concision is enforced via the skill prompts (each one
-        # instructs the agent to keep the final reply ≤150 words). Storing
-        # the full message preserves the audit trail; mid-fence truncation
-        # used to corrupt downstream markdown rendering.
-        final_text = ""
-        for msg in reversed(result.get("messages", [])):
-            if msg.__class__.__name__ == "AIMessage" and msg.content:
-                final_text = str(msg.content)
-                break
+        # Final summary text and token usage.
+        final_text = _extract_final_text(messages)
+        usage = _sum_token_usage(messages)
 
-        # Sum token usage across every message that reports it. langchain-ollama
-        # populates `usage_metadata` on AIMessages from Ollama's
-        # prompt_eval_count / eval_count fields. Stub/test models leave it
-        # absent — those simply contribute zero.
-        agent_in = agent_out = 0
-        for msg in result.get("messages", []):
-            um = getattr(msg, "usage_metadata", None) or {}
-            agent_in += int(um.get("input_tokens") or 0)
-            agent_out += int(um.get("output_tokens") or 0)
-        agent_total = agent_in + agent_out
-
-        ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
         incident.agents_run.append(AgentRun(
             agent=skill.name, started_at=started_at, ended_at=ended_at,
             summary=final_text or f"{skill.name} completed",
-            token_usage=TokenUsage(
-                input_tokens=agent_in,
-                output_tokens=agent_out,
-                total_tokens=agent_total,
-            ),
+            token_usage=usage,
             confidence=agent_confidence,
             confidence_rationale=agent_rationale,
             signal=agent_signal,
         ))
-        incident.token_usage.input_tokens += agent_in
-        incident.token_usage.output_tokens += agent_out
-        incident.token_usage.total_tokens += agent_total
+        incident.token_usage.input_tokens += usage.input_tokens
+        incident.token_usage.output_tokens += usage.output_tokens
+        incident.token_usage.total_tokens += usage.total_tokens
 
         next_route_signal = decide_route(incident)
         store.save(incident)
@@ -1521,7 +1563,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
     _router = _make_router(gated_edges)
 
-    for agent_name in skills.keys():
+    for agent_name, _skill in skills.items():
         possible_targets = {s.name for s in skills.values()} | {END, "gate"}
         # Exclude targets that are intercepted via a gated edge for this agent:
         # the router redirects (agent_name, gated_target) -> "gate", so the
@@ -1597,8 +1639,8 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
 
     _router = _make_router(gated_edges)
 
-    for agent_name in (resume_from, gate_target):
-        sg.add_conditional_edges(agent_name, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+    for _resume_agent in (resume_from, gate_target):
+        sg.add_conditional_edges(_resume_agent, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
             resume_from: resume_from,
             gate_target: gate_target,
             "gate": "gate",
@@ -1789,47 +1831,53 @@ class Orchestrator:
             return
 
         if action == "resume_with_input":
-            user_text = (decision.get("input") or "").strip()
-            if not user_text:
-                raise ValueError("resume_with_input requires a non-empty 'input'")
-            # Snapshot the intervention payload BEFORE we mutate the INC, so
-            # we can restore it if the sub-graph blows up. Without this an
-            # apply_fix exception leaves the INC stuck at in_progress with a
-            # cleared pending_intervention — the user can no longer resolve it
-            # via the UI.
-            saved_pi = inc.pending_intervention
-            inc.user_inputs.append(user_text)
-            inc.pending_intervention = None
-            inc.status = "in_progress"
-            self.store.save(inc)
-            inc = self.store.load(incident_id)  # reload as canonical state
-            try:
-                async for ev in self.resume_graph.astream_events(
-                    GraphState(incident=inc, next_route=None, last_agent=None,
-                               error=None),
-                    version="v2",
-                ):
-                    yield self._to_ui_event(ev, incident_id)
-            except Exception as exc:  # noqa: BLE001 — restore on any failure
-                # Reload from disk to absorb any partial writes from tools
-                # that ran before the failure, then restore intervention
-                # state so the UI can reprompt the user.
-                try:
-                    inc = self.store.load(incident_id)
-                except FileNotFoundError:
-                    pass
-                inc.pending_intervention = saved_pi
-                inc.status = "awaiting_input"
-                self.store.save(inc)
-                yield {"event": "resume_failed", "incident_id": incident_id,
-                       "error": str(exc), "ts": _now()}
-                return
-            final = self.store.load(incident_id)
-            yield {"event": "resume_completed", "incident_id": incident_id,
-                   "status": final.status, "ts": _now()}
+            async for ev in self._resume_with_input(incident_id, inc, decision):
+                yield ev
             return
 
         raise ValueError(f"Unknown resume action: {action!r}")
+
+    async def _resume_with_input(self, incident_id: str, inc, decision: dict):
+        """Handle the resume_with_input action: append user text, re-run sub-graph,
+        restore state on failure. Yields UI events."""
+        user_text = (decision.get("input") or "").strip()
+        if not user_text:
+            raise ValueError("resume_with_input requires a non-empty 'input'")
+        # Snapshot the intervention payload BEFORE we mutate the INC, so
+        # we can restore it if the sub-graph blows up. Without this an
+        # apply_fix exception leaves the INC stuck at in_progress with a
+        # cleared pending_intervention — the user can no longer resolve it
+        # via the UI.
+        saved_pi = inc.pending_intervention
+        inc.user_inputs.append(user_text)
+        inc.pending_intervention = None
+        inc.status = "in_progress"
+        self.store.save(inc)
+        inc = self.store.load(incident_id)  # reload as canonical state
+        try:
+            async for ev in self.resume_graph.astream_events(
+                GraphState(incident=inc, next_route=None, last_agent=None,
+                           error=None),
+                version="v2",
+            ):
+                yield self._to_ui_event(ev, incident_id)
+        except Exception as exc:  # noqa: BLE001 — restore on any failure
+            # Reload from disk to absorb any partial writes from tools
+            # that ran before the failure, then restore intervention
+            # state so the UI can reprompt the user.
+            try:
+                inc = self.store.load(incident_id)
+            except FileNotFoundError:
+                pass
+            inc.pending_intervention = saved_pi
+            inc.status = "awaiting_input"
+            self.store.save(inc)
+            yield {"event": "resume_failed", "incident_id": incident_id,
+                   "error": str(exc), "ts": _now()}
+            return
+        final = self.store.load(incident_id)
+        yield {"event": "resume_completed", "incident_id": incident_id,
+               "status": final.status, "ts": _now()}
 
     async def _invoke_tool(self, name: str, args: dict):
         """Call an MCP tool by name, going through the LangChain wrapper.
@@ -1895,7 +1943,7 @@ async def build_app(cfg: AppConfig) -> FastAPI:
     async def incident(incident_id: str):
         return orch.get_incident(incident_id)
 
-    @app.post("/investigate", response_model=InvestigateResponse)
+    @app.post("/investigate")
     async def investigate(req: InvestigateRequest) -> InvestigateResponse:
         inc_id = await orch.start_investigation(
             query=req.query, environment=req.environment,
@@ -2167,7 +2215,7 @@ def _render_hypothesis_list(items: list, label: str) -> None:
                 st.markdown(f"**{label} {i}:** {h}")
 
 
-def _render_findings_section(value, label: str) -> None:
+def _render_findings_section(value, _label: str) -> None:
     """Findings can be a list of hypothesis dicts, a single dict, or free
     prose. Pick the right renderer; never silently truncate.
     """
