@@ -41,17 +41,44 @@ def _strip_intra_imports(src: str) -> str:
 
 
 def _split_imports_and_body(src: str) -> tuple[list[str], str]:
-    """Return (top-of-file imports, rest)."""
+    """Return (top-of-file imports, rest).
+
+    Treats multi-line module docstrings as atomic — an opening ``\"\"\"`` on
+    one line keeps every subsequent line in *imports* until the closing
+    ``\"\"\"`` is seen, even if the body of the docstring contains lines that
+    don't otherwise look like imports. Without this, the opening triple-quote
+    landed in *imports* while the closing one fell through to *body*, leaving
+    the bundled file with an unterminated triple-quote and Python parsing the
+    rest of the world as one giant string.
+    """
     imports: list[str] = []
     body_lines: list[str] = []
     in_imports = True
+    in_docstring = False  # set True between an unmatched """ / ''' pair
+
+    def _odd_triple_quotes(s: str) -> bool:
+        return ((s.count('"""') + s.count("'''")) % 2) == 1
+
     for line in src.splitlines():
+        if in_docstring:
+            # Inside a multi-line docstring — every line is import-zone until
+            # the matching triple-quote arrives.
+            imports.append(line)
+            if _odd_triple_quotes(line):
+                in_docstring = False
+            continue
         stripped = line.strip()
         if in_imports:
+            opens_docstring = (stripped.startswith('"""')
+                               or stripped.startswith("'''"))
             if (stripped.startswith("import ") or stripped.startswith("from ")
                     or stripped == "" or stripped.startswith("#")
-                    or stripped.startswith('"""') or stripped.startswith("'''")):
+                    or opens_docstring):
                 imports.append(line)
+                # If the line has an odd number of triple-quotes, it leaves a
+                # docstring open across the line boundary.
+                if opens_docstring and _odd_triple_quotes(line):
+                    in_docstring = True
             else:
                 in_imports = False
                 body_lines.append(line)
