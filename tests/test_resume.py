@@ -104,6 +104,37 @@ async def test_resume_escalate_pages_oncall_and_marks_escalated(cfg):
 
 
 @pytest.mark.asyncio
+async def test_resume_rejects_when_not_awaiting_input(cfg):
+    """An INC that has already moved on (e.g. resolved) must NOT be resumable.
+
+    The orchestrator must yield a `resume_rejected` event citing the actual
+    status, and must NOT advance to escalate / stop / re-run side effects.
+    """
+    orch = await Orchestrator.create(cfg)
+    try:
+        inc_id = _seed_paused_incident(orch, di_confidence=0.42)
+        # Move INC out of awaiting_input
+        inc = orch.store.load(inc_id)
+        inc.status = "resolved"
+        orch.store.save(inc)
+
+        events = []
+        async for ev in orch.resume_investigation(inc_id, {"action": "stop"}):
+            events.append(ev)
+
+        rejected = [e for e in events if e["event"] == "resume_rejected"]
+        assert rejected, f"expected resume_rejected, got {events}"
+        assert "not_awaiting_input" in rejected[-1]["reason"]
+        assert "resolved" in rejected[-1]["reason"]
+        # Status must be unchanged (still resolved, not stopped).
+        assert orch.store.load(inc_id).status == "resolved"
+        # No resume_completed should have been emitted.
+        assert not any(e["event"] == "resume_completed" for e in events)
+    finally:
+        await orch.aclose()
+
+
+@pytest.mark.asyncio
 async def test_resume_with_input_reruns_di_and_resolution(cfg):
     orch = await Orchestrator.create(cfg)
     try:

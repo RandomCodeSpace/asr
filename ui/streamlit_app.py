@@ -296,8 +296,15 @@ async def _run_investigation_async(cfg: AppConfig, query: str, environment: str,
 
 
 async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
-                        log_area, lines: list[str]) -> None:
-    """Build a fresh Orchestrator, stream resume events, aclose."""
+                        log_area, lines: list[str]) -> dict:
+    """Build a fresh Orchestrator, stream resume events, aclose.
+
+    Returns a small summary dict describing the outcome so the caller can show
+    a banner: ``{"rejected": <reason or None>}``. ``rejected`` is set when the
+    orchestrator emits a ``resume_rejected`` event (e.g. INC no longer
+    awaiting_input, invalid escalation team).
+    """
+    outcome: dict = {"rejected": None}
     orch = await Orchestrator.create(cfg)
     try:
         async for ev in orch.resume_investigation(inc_id, decision):
@@ -307,6 +314,12 @@ async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
                 lines.append(f"[{ts}] resume {ev.get('action')}")
             elif kind == "resume_completed":
                 lines.append(f"[{ts}] done   status={ev.get('status')}")
+            elif kind == "resume_rejected":
+                lines.append(f"[{ts}] rejected {ev.get('reason')}")
+                outcome["rejected"] = ev.get("reason")
+            elif kind == "resume_failed":
+                lines.append(f"[{ts}] failed {ev.get('error')}")
+                outcome["rejected"] = ev.get("error")
             else:
                 line = _format_event(ev)
                 if line:
@@ -314,6 +327,7 @@ async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
             log_area.code("\n".join(lines), language="text")
     finally:
         await orch.aclose()
+    return outcome
 
 
 def _render_intervention_block(inc: dict, inc_id: str) -> None:
@@ -364,7 +378,14 @@ def _render_intervention_block(inc: dict, inc_id: str) -> None:
                 return
             log_area = st.empty()
             lines: list[str] = []
-            asyncio.run(_resume_async(cfg, inc_id, decision, log_area, lines))
+            outcome = asyncio.run(_resume_async(cfg, inc_id, decision, log_area, lines))
+            if outcome.get("rejected"):
+                # Don't auto-rerun — let the user read the warning before the
+                # form goes away. Common causes: INC already closed, invalid
+                # escalation team, or a sub-graph exception that restored the
+                # INC to awaiting_input.
+                st.warning(f"Resume rejected: {outcome['rejected']}")
+                return
             st.success(f"Resume complete (action: {action}).")
             st.rerun()
 

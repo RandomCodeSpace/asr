@@ -135,6 +135,15 @@ class Orchestrator:
 
         inc = self.store.load(incident_id)
 
+        # Guard: only paused INCs are resumable. A resolved/stopped/escalated
+        # INC must not be advanced again — that would silently corrupt state
+        # (e.g. re-pinging on-call after the incident has already closed).
+        if inc.status != "awaiting_input":
+            yield {"event": "resume_rejected", "incident_id": incident_id,
+                   "reason": f"not_awaiting_input (status={inc.status})",
+                   "ts": _now()}
+            return
+
         if action == "stop":
             inc.status = "stopped"
             inc.pending_intervention = None
