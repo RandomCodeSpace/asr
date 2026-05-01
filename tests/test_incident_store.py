@@ -35,6 +35,43 @@ def test_list_recent_returns_newest_first(store, monkeypatch):
     assert [i.id for i in items] == [b.id, a.id]
 
 
-def test_load_missing_raises(store):
+def test_load_invalid_id_raises_value_error(store):
+    """IDs not matching INC-YYYYMMDD-NNN must be rejected before any path ops."""
+    with pytest.raises(ValueError, match="Invalid incident id"):
+        store.load("../../etc/passwd")
+
+
+def test_save_invalid_id_raises_value_error(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso", lambda: "2026-04-30T10:00:00Z")
+    inc = store.create(query="Q", environment="dev", reporter_id="u", reporter_team="t")
+    inc.id = "../../malicious"
+    with pytest.raises(ValueError, match="Invalid incident id"):
+        store.save(inc)
+
+
+def test_load_missing_raises(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
     with pytest.raises(FileNotFoundError):
-        store.load("INC-DOESNOTEXIST")
+        store.load("INC-20260430-999")
+
+
+@pytest.mark.parametrize("bad_id", [
+    "../../etc/passwd",
+    "../incidents/INC-20260430-001",
+    "INC-20260430-001.json",
+    "INC-ABC-001",
+    "",
+    "INC-20260430-1",  # too short sequence
+])
+def test_load_rejects_traversal_and_malformed_ids(store, bad_id):
+    with pytest.raises(ValueError, match="Invalid incident id"):
+        store.load(bad_id)
+
+
+def test_valid_id_loads_correctly(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso", lambda: "2026-04-30T10:00:00Z")
+    inc = store.create(query="valid", environment="dev", reporter_id="u", reporter_team="t")
+    loaded = store.load(inc.id)
+    assert loaded.id == inc.id

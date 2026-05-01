@@ -1,5 +1,6 @@
 from pathlib import Path
 import pytest
+from pytest import approx
 from orchestrator.config import load_config
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_config.yaml"
@@ -14,7 +15,7 @@ def test_loads_yaml_and_resolves_env_vars(monkeypatch):
     assert cfg.llm.ollama.api_key == "secret-ollama"
     assert cfg.mcp.servers[1].url == "https://x.example/mcp"
     assert cfg.mcp.servers[1].headers["Authorization"] == "Bearer ext-tok"
-    assert cfg.incidents.similarity_threshold == 0.9
+    assert cfg.incidents.similarity_threshold == approx(0.9)
 
 
 def test_unset_env_var_raises(monkeypatch):

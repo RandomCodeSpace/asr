@@ -42,7 +42,7 @@ async def build_app(cfg: AppConfig) -> FastAPI:
     async def incident(incident_id: str):
         return orch.get_incident(incident_id)
 
-    @app.post("/investigate", response_model=InvestigateResponse)
+    @app.post("/investigate")
     async def investigate(req: InvestigateRequest) -> InvestigateResponse:
         inc_id = await orch.start_investigation(
             query=req.query, environment=req.environment,

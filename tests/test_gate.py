@@ -1,5 +1,6 @@
 """Tests for the intervention gate node between deep_investigator and resolution."""
 import pytest
+from pytest import approx
 
 from orchestrator.config import AppConfig, InterventionConfig, LLMConfig, MCPConfig
 from orchestrator.graph import (
@@ -44,7 +45,7 @@ async def test_gate_pauses_when_no_di_confidence(tmp_path):
     reloaded = store.load(inc.id)
     assert reloaded.status == "awaiting_input"
     assert reloaded.pending_intervention["reason"] == "low_confidence"
-    assert reloaded.pending_intervention["threshold"] == 0.75
+    assert reloaded.pending_intervention["threshold"] == approx(0.75)
     assert reloaded.pending_intervention["confidence"] is None
     assert set(reloaded.pending_intervention["options"]) == {
         "resume_with_input", "escalate", "stop",
@@ -62,7 +63,7 @@ async def test_gate_pauses_when_below_threshold(tmp_path):
     assert out["next_route"] == "__end__"
     reloaded = store.load(inc.id)
     assert reloaded.status == "awaiting_input"
-    assert reloaded.pending_intervention["confidence"] == 0.42
+    assert reloaded.pending_intervention["confidence"] == approx(0.42)
 
 
 @pytest.mark.asyncio
@@ -107,13 +108,13 @@ async def test_gate_pauses_when_string_label_confidence_below_threshold(tmp_path
         skill=skill, llm=llm, tools=[],
         decide_route=lambda i: "default", store=store,
     )
-    out = await di_node(GraphState(incident=inc, next_route=None,
-                                   last_agent=None, error=None))
+    await di_node(GraphState(incident=inc, next_route=None,
+                             last_agent=None, error=None))
     # DI run recorded with the coerced 0.3 value.
-    assert _coerce_confidence("low") == 0.3
+    assert _coerce_confidence("low") == approx(0.3)
     reloaded = store.load(inc.id)
     di_runs = [r for r in reloaded.agents_run if r.agent == "deep_investigator"]
-    assert di_runs and di_runs[-1].confidence == 0.3
+    assert di_runs and di_runs[-1].confidence == approx(0.3)
     # Gate sees 0.3 < 0.75 → pauses.
     gate = make_gate_node(cfg=_cfg(threshold=0.75), store=store)
     out = await gate(GraphState(incident=reloaded, next_route=None,

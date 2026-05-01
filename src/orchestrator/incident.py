@@ -1,9 +1,13 @@
 """Incident domain model."""
 from __future__ import annotations
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from pydantic import BaseModel, Field
+
+_INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
+_UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 IncidentStatus = Literal[
@@ -71,7 +75,7 @@ class Incident(BaseModel):
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
 
 def _utc_today() -> str:
@@ -114,11 +118,19 @@ class IncidentStore:
         return inc
 
     def save(self, incident: Incident) -> None:
+        if not _INC_ID_RE.match(incident.id):
+            raise ValueError(
+                f"Invalid incident id {incident.id!r}; expected INC-YYYYMMDD-NNN"
+            )
         incident.updated_at = _utc_now_iso()
         path = self.base_dir / f"{incident.id}.json"
         path.write_text(incident.model_dump_json(indent=2))
 
     def load(self, incident_id: str) -> Incident:
+        if not _INC_ID_RE.match(incident_id):
+            raise ValueError(
+                f"Invalid incident id {incident_id!r}; expected INC-YYYYMMDD-NNN"
+            )
         path = self.base_dir / f"{incident_id}.json"
         if not path.exists():
             raise FileNotFoundError(incident_id)

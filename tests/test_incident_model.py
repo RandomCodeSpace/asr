@@ -1,3 +1,4 @@
+import pytest
 from orchestrator.incident import (
     Incident, Reporter,
 )
@@ -38,7 +39,7 @@ def test_agent_run_with_confidence_round_trips():
         summary="ok", confidence=0.42, confidence_rationale="weak signal",
     )
     again = AgentRun.model_validate_json(run.model_dump_json())
-    assert again.confidence == 0.42
+    assert again.confidence == pytest.approx(0.42)
     assert again.confidence_rationale == "weak signal"
 
 
@@ -62,7 +63,6 @@ def test_status_must_be_valid_enum():
         )
 
 
-import pytest  # noqa: E402  (kept here for self-contained file)
 
 
 def test_agent_run_signal_defaults_to_none():

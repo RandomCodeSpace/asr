@@ -11,7 +11,7 @@ from langchain_core.tools import BaseTool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, END
 
-from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore, TokenUsage
+from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore, TokenUsage, _UTC_TS_FMT
 from orchestrator.skill import Skill
 from orchestrator.config import AppConfig
 from orchestrator.llm import get_llm
@@ -132,16 +132,16 @@ class AgentRunRecorder:
         self._started_at: str | None = None
 
     def start(self) -> None:
-        self._started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
     def record_tool_call(self, tool: str, args: dict, result) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
         self.incident.tool_calls.append(
             ToolCall(agent=self.agent, tool=tool, args=args, result=result, ts=ts)
         )
 
     def finish(self, *, summary: str) -> None:
-        ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
         self.incident.agents_run.append(AgentRun(
             agent=self.agent,
             started_at=self._started_at or ended_at,
@@ -202,6 +202,76 @@ def _format_agent_input(incident: Incident) -> str:
     return base
 
 
+def _harvest_tool_calls_and_patches(
+    messages: list,
+    skill_name: str,
+    incident: Incident,
+    ts: str,
+) -> tuple[float | None, str | None, str | None]:
+    """Iterate agent messages, record ToolCall entries on the incident, and
+    harvest any confidence / confidence_rationale / signal from update_incident
+    patches.
+
+    Returns ``(agent_confidence, agent_rationale, agent_signal)``.
+    """
+    agent_confidence: float | None = None
+    agent_rationale: str | None = None
+    agent_signal: str | None = None
+    for msg in messages:
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls:
+            tc_name = tc.get("name", "unknown")
+            tc_args = tc.get("args", {}) or {}
+            incident.tool_calls.append(ToolCall(
+                agent=skill_name,
+                tool=tc_name,
+                args=tc_args,
+                result=None,
+                ts=ts,
+            ))
+            if tc_name == "update_incident":
+                patch = tc_args.get("patch") or {}
+                if "confidence" in patch:
+                    agent_confidence = _coerce_confidence(patch["confidence"])
+                if "confidence_rationale" in patch:
+                    agent_rationale = _coerce_rationale(patch["confidence_rationale"])
+                if "signal" in patch:
+                    agent_signal = _coerce_signal(patch["signal"])
+    return agent_confidence, agent_rationale, agent_signal
+
+
+def _pair_tool_responses(messages: list, incident: Incident) -> None:
+    """Match ToolMessage responses back to their corresponding ToolCall entries."""
+    for msg in messages:
+        if msg.__class__.__name__ == "ToolMessage":
+            for entry in reversed(incident.tool_calls):
+                if entry.tool == getattr(msg, "name", None) and entry.result is None:
+                    entry.result = getattr(msg, "content", None)
+                    break
+
+
+def _extract_final_text(messages: list) -> str:
+    """Return the text content of the last non-empty AIMessage, or empty string."""
+    for msg in reversed(messages):
+        if msg.__class__.__name__ == "AIMessage" and msg.content:
+            return str(msg.content)
+    return ""
+
+
+def _sum_token_usage(messages: list) -> TokenUsage:
+    """Sum input/output token counts across all messages that report usage_metadata."""
+    agent_in = agent_out = 0
+    for msg in messages:
+        um = getattr(msg, "usage_metadata", None) or {}
+        agent_in += int(um.get("input_tokens") or 0)
+        agent_out += int(um.get("output_tokens") or 0)
+    return TokenUsage(
+        input_tokens=agent_in,
+        output_tokens=agent_out,
+        total_tokens=agent_in + agent_out,
+    )
+
+
 def make_agent_node(
     *,
     skill: Skill,
@@ -216,7 +286,7 @@ def make_agent_node(
     async def node(state: GraphState) -> dict:
         incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         inc_id = incident.id
-        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
         try:
             result = await _ainvoke_with_retry(
@@ -229,7 +299,7 @@ def make_agent_node(
                 incident = store.load(inc_id)
             except FileNotFoundError:
                 pass
-            ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
             incident.agents_run.append(AgentRun(
                 agent=skill.name, started_at=started_at, ended_at=ended_at,
                 summary=f"agent failed: {exc}",
@@ -245,81 +315,33 @@ def make_agent_node(
         # clobbers the tools' writes.
         incident = store.load(inc_id)
 
-        # Record tool calls from the agent's message trace. While iterating,
-        # also harvest the latest `confidence` / `confidence_rationale` carried
-        # in any `update_incident` patch — those keys are stamped on the
-        # AgentRun (the MCP tool itself silently ignores extra patch keys).
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        agent_confidence: float | None = None
-        agent_rationale: str | None = None
-        agent_signal: str | None = None
-        for msg in result.get("messages", []):
-            tool_calls = getattr(msg, "tool_calls", None) or []
-            for tc in tool_calls:
-                tc_name = tc.get("name", "unknown")
-                tc_args = tc.get("args", {}) or {}
-                incident.tool_calls.append(ToolCall(
-                    agent=skill.name,
-                    tool=tc_name,
-                    args=tc_args,
-                    result=None,
-                    ts=ts,
-                ))
-                if tc_name == "update_incident":
-                    patch = tc_args.get("patch") or {}
-                    if "confidence" in patch:
-                        agent_confidence = _coerce_confidence(patch["confidence"])
-                    if "confidence_rationale" in patch:
-                        agent_rationale = _coerce_rationale(patch["confidence_rationale"])
-                    if "signal" in patch:
-                        agent_signal = _coerce_signal(patch["signal"])
+        messages = result.get("messages", [])
+        ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # Record tool calls and harvest confidence/signal from update_incident patches.
+        agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
+            messages, skill.name, incident, ts,
+        )
 
         # Pair tool responses with their tool calls.
-        for msg in result.get("messages", []):
-            if msg.__class__.__name__ == "ToolMessage":
-                for entry in reversed(incident.tool_calls):
-                    if entry.tool == getattr(msg, "name", None) and entry.result is None:
-                        entry.result = getattr(msg, "content", None)
-                        break
+        _pair_tool_responses(messages, incident)
 
-        # Final summary text from the agent's last AIMessage. Persist it
-        # verbatim — concision is enforced via the skill prompts (each one
-        # instructs the agent to keep the final reply ≤150 words). Storing
-        # the full message preserves the audit trail; mid-fence truncation
-        # used to corrupt downstream markdown rendering.
-        final_text = ""
-        for msg in reversed(result.get("messages", [])):
-            if msg.__class__.__name__ == "AIMessage" and msg.content:
-                final_text = str(msg.content)
-                break
+        # Final summary text and token usage.
+        final_text = _extract_final_text(messages)
+        usage = _sum_token_usage(messages)
 
-        # Sum token usage across every message that reports it. langchain-ollama
-        # populates `usage_metadata` on AIMessages from Ollama's
-        # prompt_eval_count / eval_count fields. Stub/test models leave it
-        # absent — those simply contribute zero.
-        agent_in = agent_out = 0
-        for msg in result.get("messages", []):
-            um = getattr(msg, "usage_metadata", None) or {}
-            agent_in += int(um.get("input_tokens") or 0)
-            agent_out += int(um.get("output_tokens") or 0)
-        agent_total = agent_in + agent_out
-
-        ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
         incident.agents_run.append(AgentRun(
             agent=skill.name, started_at=started_at, ended_at=ended_at,
             summary=final_text or f"{skill.name} completed",
-            token_usage=TokenUsage(
-                input_tokens=agent_in,
-                output_tokens=agent_out,
-                total_tokens=agent_total,
-            ),
+            token_usage=usage,
             confidence=agent_confidence,
             confidence_rationale=agent_rationale,
             signal=agent_signal,
         ))
-        incident.token_usage.input_tokens += agent_in
-        incident.token_usage.output_tokens += agent_out
-        incident.token_usage.total_tokens += agent_total
+        incident.token_usage.input_tokens += usage.input_tokens
+        incident.token_usage.output_tokens += usage.output_tokens
+        incident.token_usage.total_tokens += usage.total_tokens
 
         next_route_signal = decide_route(incident)
         store.save(incident)
@@ -510,7 +532,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
     _router = _make_router(gated_edges)
 
-    for agent_name in skills.keys():
+    for agent_name, _skill in skills.items():
         possible_targets = {s.name for s in skills.values()} | {END, "gate"}
         # Exclude targets that are intercepted via a gated edge for this agent:
         # the router redirects (agent_name, gated_target) -> "gate", so the
@@ -586,8 +608,8 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
 
     _router = _make_router(gated_edges)
 
-    for agent_name in (resume_from, gate_target):
-        sg.add_conditional_edges(agent_name, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+    for _resume_agent in (resume_from, gate_target):
+        sg.add_conditional_edges(_resume_agent, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
             resume_from: resume_from,
             gate_target: gate_target,
             "gate": "gate",

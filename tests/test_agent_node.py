@@ -1,6 +1,7 @@
 import logging
 
 import pytest
+from pytest import approx
 from orchestrator.graph import GraphState, _decide_from_signal, make_agent_node
 from orchestrator.incident import IncidentStore, TokenUsage
 from orchestrator.skill import Skill, RouteRule
@@ -80,7 +81,7 @@ async def test_agent_node_captures_confidence_from_update_incident(incident):
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
-    assert triage_runs[0].confidence == 0.83
+    assert triage_runs[0].confidence == approx(0.83)
     assert triage_runs[0].confidence_rationale == "deploy correlates with timing"
 
 
@@ -138,7 +139,7 @@ async def test_confidence_coerces_string_labels(incident, label, expected):
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
-    assert triage_runs[0].confidence == expected
+    assert triage_runs[0].confidence == approx(expected)
 
 
 @pytest.mark.asyncio
@@ -151,7 +152,7 @@ async def test_confidence_clamps_out_of_range(incident, caplog, raw, expected):
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
-    assert triage_runs[0].confidence == expected
+    assert triage_runs[0].confidence == approx(expected)
     # A clamp warning must be emitted.
     assert any("clamp" in rec.getMessage().lower() for rec in caplog.records)
 

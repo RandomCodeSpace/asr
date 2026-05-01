@@ -1,3 +1,4 @@
+import pytest
 from orchestrator.similarity import KeywordSimilarity, find_similar
 
 
@@ -6,7 +7,7 @@ def test_keyword_overlap_score():
     s = sim.score("api latency spike production", "api latency p99 production")
     assert 0.4 < s < 1.0
     assert sim.score("a b c", "x y z") == 0.0
-    assert sim.score("identical text here", "identical text here") == 1.0
+    assert sim.score("identical text here", "identical text here") == pytest.approx(1.0)
 
 
 def test_find_similar_returns_threshold_passing_only():

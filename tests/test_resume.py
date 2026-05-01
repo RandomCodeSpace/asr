@@ -181,9 +181,11 @@ async def test_resume_handles_subgraph_exception(cfg, monkeypatch):
 
         # Force the sub-graph to blow up partway through.
         async def _boom(*_args, **_kwargs):
-            # Make it look like an async iterator that raises before yielding.
+            # Yield nothing and then raise — makes this a proper async generator
+            # that raises on first iteration, simulating a sub-graph failure.
+            if False:  # noqa: SIM210
+                yield  # makes this function an async generator
             raise RuntimeError("apply_fix exploded mid-stream")
-            yield  # pragma: no cover — make this an async generator
 
         monkeypatch.setattr(orch.resume_graph, "astream_events", _boom)
 
