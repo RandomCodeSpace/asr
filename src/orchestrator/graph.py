@@ -302,6 +302,35 @@ def _handle_agent_failure(
             "last_agent": skill_name, "error": str(exc)}
 
 
+def _record_success_run(
+    *,
+    incident: "Incident",
+    skill_name: str,
+    started_at: str,
+    final_text: str,
+    usage: "TokenUsage",
+    confidence: float | None,
+    rationale: str | None,
+    signal: str | None,
+    store: "IncidentStore",
+) -> None:
+    """Append the success-path AgentRun, update the incident's running token
+    totals, and persist. Mutates ``incident`` in place."""
+    ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+    incident.agents_run.append(AgentRun(
+        agent=skill_name, started_at=started_at, ended_at=ended_at,
+        summary=final_text or f"{skill_name} completed",
+        token_usage=usage,
+        confidence=confidence,
+        confidence_rationale=rationale,
+        signal=signal,
+    ))
+    incident.token_usage.input_tokens += usage.input_tokens
+    incident.token_usage.output_tokens += usage.output_tokens
+    incident.token_usage.total_tokens += usage.total_tokens
+    store.save(incident)
+
+
 def make_agent_node(
     *,
     skill: Skill,
@@ -350,21 +379,13 @@ def make_agent_node(
         final_text = _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
-        ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-        incident.agents_run.append(AgentRun(
-            agent=skill.name, started_at=started_at, ended_at=ended_at,
-            summary=final_text or f"{skill.name} completed",
-            token_usage=usage,
-            confidence=agent_confidence,
-            confidence_rationale=agent_rationale,
-            signal=agent_signal,
-        ))
-        incident.token_usage.input_tokens += usage.input_tokens
-        incident.token_usage.output_tokens += usage.output_tokens
-        incident.token_usage.total_tokens += usage.total_tokens
-
+        _record_success_run(
+            incident=incident, skill_name=skill.name, started_at=started_at,
+            final_text=final_text, usage=usage,
+            confidence=agent_confidence, rationale=agent_rationale, signal=agent_signal,
+            store=store,
+        )
         next_route_signal = decide_route(incident)
-        store.save(incident)
         next_node = route_from_skill(skill, next_route_signal)
         return {"incident": incident, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
