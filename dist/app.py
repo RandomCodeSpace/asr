@@ -1571,7 +1571,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         # in would cause LangGraph to register a visible direct edge in the
         # compiled graph, defeating the structural assertion in the test (and
         # misleading graph visualisations).
-        gated_targets_for_agent = {to for (frm, to) in gated_edges if frm == agent_name}
+        gated_targets_for_agent = {to for (frm, to) in gated_edges.keys() if frm == agent_name}
         target_map = {
             name: name
             for name in possible_targets
@@ -1586,7 +1586,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     # edges with different downstream agents in the future, the closure
     # below will need a state-aware lookup; for now we assert "exactly one"
     # and error loudly otherwise.
-    gate_targets = {to for (_from, to) in gated_edges}
+    gate_targets = {to for (_from, to) in gated_edges.keys()}
     if len(gate_targets) > 1:
         raise ValueError(
             f"multiple gated downstream targets {sorted(gate_targets)} not "
