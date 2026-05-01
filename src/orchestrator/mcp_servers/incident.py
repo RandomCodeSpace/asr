@@ -16,7 +16,6 @@ working without churn.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any
 from fastmcp import FastMCP
 
 from orchestrator.incident import IncidentStore
@@ -165,9 +164,3 @@ async def create_incident(query: str, environment: str,
 
 async def update_incident(incident_id: str, patch: dict) -> dict:
     return await _default_server._tool_update_incident(incident_id, patch)
-
-
-# Test/diagnostic accessor so tests that need to peek at the live state can do
-# so without reaching into the dataclass directly. Keeps the surface narrow.
-def _get_default_server() -> IncidentMCPServer:
-    return _default_server
