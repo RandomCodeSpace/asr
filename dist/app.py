@@ -2215,12 +2215,12 @@ def _render_hypothesis_list(items: list, label: str) -> None:
                 st.markdown(f"**{label} {i}:** {h}")
 
 
-def _render_findings_section(value, _label: str) -> None:
+def _render_findings_section(value, label: str) -> None:
     """Findings can be a list of hypothesis dicts, a single dict, or free
     prose. Pick the right renderer; never silently truncate.
     """
     if isinstance(value, list):
-        _render_hypothesis_list(value, label="Hypothesis")
+        _render_hypothesis_list(value, label=label)
     elif isinstance(value, dict):
         _render_kv_block(value)
     elif isinstance(value, str):

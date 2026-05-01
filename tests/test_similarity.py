@@ -6,7 +6,7 @@ def test_keyword_overlap_score():
     sim = KeywordSimilarity()
     s = sim.score("api latency spike production", "api latency p99 production")
     assert 0.4 < s < 1.0
-    assert sim.score("a b c", "x y z") == 0.0
+    assert sim.score("a b c", "x y z") == pytest.approx(0.0)
     assert sim.score("identical text here", "identical text here") == pytest.approx(1.0)
 
 
