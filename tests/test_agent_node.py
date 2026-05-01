@@ -167,3 +167,122 @@ async def test_confidence_unknown_string_is_none(incident, caplog):
     assert triage_runs
     assert triage_runs[0].confidence is None
     assert any("meh" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_agent_node_captures_signal_from_update_incident(incident):
+    inc, store = incident
+    skill = Skill(
+        name="triage", description="d",
+        routes=[RouteRule(when="success", next="deep_investigator"),
+                RouteRule(when="default", next="deep_investigator")],
+        system_prompt="You are triage.",
+    )
+    llm = StubChatModel(
+        role="triage",
+        canned_responses={"triage": "done"},
+        tool_call_plan=[{
+            "name": "update_incident",
+            "args": {"incident_id": inc.id,
+                     "patch": {"signal": "success"}},
+        }],
+    )
+    node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=lambda inc: "default",
+        store=store,
+    )
+    await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    reloaded = store.load(inc.id)
+    triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
+    assert triage_runs and triage_runs[-1].signal == "success"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw,expected", [
+    ("success", "success"), ("SUCCESS", "success"),
+    ("failed", "failed"), ("Failed", "failed"),
+    ("needs_input", "needs_input"),
+])
+async def test_agent_node_signal_normalises_case(incident, raw, expected):
+    inc, store = incident
+    skill = Skill(
+        name="triage", description="d",
+        routes=[RouteRule(when="default", next="deep_investigator")],
+        system_prompt="You are triage.",
+    )
+    llm = StubChatModel(
+        role="triage",
+        canned_responses={"triage": "done"},
+        tool_call_plan=[{
+            "name": "update_incident",
+            "args": {"incident_id": inc.id,
+                     "patch": {"signal": raw}},
+        }],
+    )
+    node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=lambda inc: "default",
+        store=store,
+    )
+    await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    reloaded = store.load(inc.id)
+    assert reloaded.agents_run[-1].signal == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_node_signal_unknown_string_is_none(incident, caplog):
+    inc, store = incident
+    skill = Skill(
+        name="triage", description="d",
+        routes=[RouteRule(when="default", next="deep_investigator")],
+        system_prompt="You are triage.",
+    )
+    llm = StubChatModel(
+        role="triage",
+        canned_responses={"triage": "done"},
+        tool_call_plan=[{
+            "name": "update_incident",
+            "args": {"incident_id": inc.id,
+                     "patch": {"signal": "halfway"}},
+        }],
+    )
+    node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=lambda inc: "default",
+        store=store,
+    )
+    with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
+        await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    reloaded = store.load(inc.id)
+    assert reloaded.agents_run[-1].signal is None
+    assert any("halfway" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_agent_node_signal_rejects_bool(incident, caplog):
+    inc, store = incident
+    skill = Skill(
+        name="triage", description="d",
+        routes=[RouteRule(when="default", next="deep_investigator")],
+        system_prompt="You are triage.",
+    )
+    llm = StubChatModel(
+        role="triage",
+        canned_responses={"triage": "done"},
+        tool_call_plan=[{
+            "name": "update_incident",
+            "args": {"incident_id": inc.id,
+                     "patch": {"signal": True}},
+        }],
+    )
+    node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=lambda inc: "default",
+        store=store,
+    )
+    with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
+        await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    reloaded = store.load(inc.id)
+    assert reloaded.agents_run[-1].signal is None
+    assert any("bool" in rec.getMessage().lower() for rec in caplog.records)

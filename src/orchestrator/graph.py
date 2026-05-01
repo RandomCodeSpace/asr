@@ -63,6 +63,35 @@ def _coerce_rationale(raw) -> str | None:
         logger.warning("uncoercible confidence_rationale %r; dropping", raw)
         return None
 
+
+_VALID_SIGNALS: frozenset[str] = frozenset({"success", "failed", "needs_input"})
+
+
+def _coerce_signal(raw) -> str | None:
+    """Coerce a raw signal value emitted by an LLM to a canonical lowercase
+    string, or None when the value cannot be interpreted.
+
+    Recognised signals are ``success``, ``failed``, and ``needs_input``. Any
+    other string emits a warning and yields None — the route lookup then
+    falls back to ``when: default``. ``bool`` is rejected explicitly because
+    Python treats it as ``int`` and string-coerces to ``"True"``/``"False"``.
+    """
+    if isinstance(raw, bool):
+        logger.warning("signal value is bool (%r); rejecting", raw)
+        return None
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        logger.warning("non-string signal %r (%s); rejecting",
+                       raw, type(raw).__name__)
+        return None
+    key = raw.strip().lower()
+    if key in _VALID_SIGNALS:
+        return key
+    logger.warning("unknown signal %r; treating as None (will fall through to default)", raw)
+    return None
+
+
 from langchain_core.messages import HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
@@ -224,6 +253,7 @@ def make_agent_node(
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         agent_confidence: float | None = None
         agent_rationale: str | None = None
+        agent_signal: str | None = None
         for msg in result.get("messages", []):
             tool_calls = getattr(msg, "tool_calls", None) or []
             for tc in tool_calls:
@@ -242,6 +272,8 @@ def make_agent_node(
                         agent_confidence = _coerce_confidence(patch["confidence"])
                     if "confidence_rationale" in patch:
                         agent_rationale = _coerce_rationale(patch["confidence_rationale"])
+                    if "signal" in patch:
+                        agent_signal = _coerce_signal(patch["signal"])
 
         # Pair tool responses with their tool calls.
         for msg in result.get("messages", []):
@@ -284,6 +316,7 @@ def make_agent_node(
             ),
             confidence=agent_confidence,
             confidence_rationale=agent_rationale,
+            signal=agent_signal,
         ))
         incident.token_usage.input_tokens += agent_in
         incident.token_usage.output_tokens += agent_out
