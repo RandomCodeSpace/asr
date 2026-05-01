@@ -122,3 +122,20 @@ async def test_build_graph_inserts_gate_for_gated_route(cfg, tmp_path):
             f"expected gate -> resolution edge; got edges from gate: "
             f"{[e for e in compiled.edges if e.source == 'gate']}"
         )
+
+
+@pytest.mark.asyncio
+async def test_build_graph_raises_on_unknown_entry_agent(cfg, tmp_path):
+    """Misconfigured entry_agent must raise loudly at build time, not silently
+    produce a broken graph."""
+    from orchestrator.config import OrchestratorConfig
+    skills = load_all_skills("config/skills")
+    store = IncidentStore(tmp_path)
+    cfg2 = cfg.model_copy(update={
+        "orchestrator": OrchestratorConfig(entry_agent="nonexistent"),
+    })
+    async with AsyncExitStack() as stack:
+        registry = await load_tools(cfg2.mcp, stack)
+        with pytest.raises(ValueError, match="not a known skill"):
+            await build_graph(cfg=cfg2, skills=skills, store=store,
+                              registry=registry)
