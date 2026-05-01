@@ -162,9 +162,12 @@ The module-level ``get_app()`` is a no-arg factory suitable for
 ``config/config.yaml``) and returns a fresh app.
 """
 
+import json
 from contextlib import asynccontextmanager
+from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 
@@ -1969,6 +1972,11 @@ class InvestigateResponse(BaseModel):
     incident_id: str
 
 
+class ResumeRequest(BaseModel):
+    decision: Literal["resume_with_input", "escalate", "stop"]
+    user_input: str | None = None
+
+
 def _make_lifespan(cfg: AppConfig):
     """Build the lifespan context manager for an app constructed with ``cfg``.
 
@@ -1980,6 +1988,7 @@ def _make_lifespan(cfg: AppConfig):
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         orch = await Orchestrator.create(cfg)
         app.state.orchestrator = orch
+        app.state.environments = list(cfg.environments)
         try:
             yield
         finally:
@@ -2025,6 +2034,39 @@ def build_app(cfg: AppConfig) -> FastAPI:
             reporter_id=req.reporter_id, reporter_team=req.reporter_team,
         )
         return InvestigateResponse(incident_id=inc_id)
+
+    @fastapi_app.get("/environments")
+    async def environments():
+        return fastapi_app.state.environments
+
+    @fastapi_app.post("/investigate/stream")
+    async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
+        orch = fastapi_app.state.orchestrator
+
+        async def _events():
+            async for ev in orch.stream_investigation(
+                query=req.query, environment=req.environment,
+                reporter_id=req.reporter_id, reporter_team=req.reporter_team,
+            ):
+                yield f"data: {json.dumps(ev, default=str)}\n\n"
+
+        return StreamingResponse(_events(), media_type="text/event-stream")
+
+    @fastapi_app.post("/incidents/{incident_id}/resume")
+    async def resume_incident(incident_id: str, req: ResumeRequest) -> StreamingResponse:
+        orch = fastapi_app.state.orchestrator
+        decision: dict = {"action": req.decision}
+        if req.user_input is not None:
+            decision["input"] = req.user_input
+
+        async def _events():
+            try:
+                async for ev in orch.resume_investigation(incident_id, decision):
+                    yield f"data: {json.dumps(ev, default=str)}\n\n"
+            except Exception as exc:  # noqa: BLE001
+                yield f"data: {json.dumps({'event': 'error', 'error': str(exc)}, default=str)}\n\n"
+
+        return StreamingResponse(_events(), media_type="text/event-stream")
 
     return fastapi_app
 

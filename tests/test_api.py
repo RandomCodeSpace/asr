@@ -1,3 +1,4 @@
+import json
 import pytest
 from contextlib import asynccontextmanager
 from httpx import AsyncClient, ASGITransport
@@ -73,3 +74,55 @@ async def test_investigate_endpoint_creates_incident(cfg):
     assert res.status_code == 200
     body = res.json()
     assert body["incident_id"].startswith("INC-")
+
+
+@pytest.mark.asyncio
+async def test_environments_endpoint_returns_list(cfg):
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        res = await client.get("/environments")
+    assert res.status_code == 200
+    envs = res.json()
+    assert isinstance(envs, list)
+    assert len(envs) > 0
+    assert any(e in envs for e in ["production", "staging", "dev", "local"])
+
+
+@pytest.mark.asyncio
+async def test_investigate_stream_emits_events(cfg):
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        async with client.stream(
+            "POST", "/investigate/stream",
+            json={"query": "api latency", "environment": "production"},
+        ) as res:
+            assert res.status_code == 200
+            assert "text/event-stream" in res.headers["content-type"]
+            events = []
+            async for line in res.aiter_lines():
+                if line.startswith("data:"):
+                    events.append(json.loads(line[len("data:"):].strip()))
+    assert events, "expected at least one SSE event"
+    assert all(isinstance(e, dict) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_resume_endpoint_streams_error_for_unknown_incident(cfg):
+    """Route is registered and returns SSE; unknown/invalid INC ID yields an
+    error event rather than an unhandled 500."""
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        async with client.stream(
+            "POST", "/incidents/INC-does-not-exist/resume",
+            json={"decision": "stop"},
+        ) as res:
+            assert res.status_code == 200
+            assert "text/event-stream" in res.headers["content-type"]
+            events = []
+            async for line in res.aiter_lines():
+                if line.startswith("data:"):
+                    events.append(json.loads(line[len("data:"):].strip()))
+    # Must emit at least one event (an error event for the bad ID).
+    assert events
+    event_types = {e.get("event") for e in events}
+    assert event_types & {"error", "resume_rejected", "resume_started"}
