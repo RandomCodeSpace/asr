@@ -63,3 +63,16 @@ def test_status_must_be_valid_enum():
 
 
 import pytest  # noqa: E402  (kept here for self-contained file)
+
+
+def test_agent_run_signal_defaults_to_none():
+    from orchestrator.incident import AgentRun
+    run = AgentRun(agent="intake", started_at="t0", ended_at="t1", summary="ok")
+    assert run.signal is None
+
+
+def test_agent_run_signal_explicit():
+    from orchestrator.incident import AgentRun
+    run = AgentRun(agent="intake", started_at="t0", ended_at="t1",
+                   summary="ok", signal="success")
+    assert run.signal == "success"

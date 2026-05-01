@@ -37,6 +37,7 @@ class AgentRun(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     confidence: float | None = None
     confidence_rationale: str | None = None
+    signal: str | None = None
 
 
 class Findings(BaseModel):
