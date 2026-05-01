@@ -296,7 +296,7 @@ def make_agent_node(
 
 # Per-agent route decision functions.
 def _decide_intake(inc: Incident) -> str:
-    return "matched_known_issue" if inc.matched_prior_inc else "default"
+    return "default"
 
 
 def _decide_triage(inc: Incident) -> str:

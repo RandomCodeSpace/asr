@@ -7,8 +7,6 @@ tools:
   - get_user_context
   - update_incident
 routes:
-  - when: matched_known_issue
-    next: resolution
   - when: default
     next: triage
 ---
@@ -26,8 +24,8 @@ You MUST call these tools, in this order:
 3. `update_incident(incident_id=<exact Incident ID from input>, patch=<dict>)` with at minimum these patch keys:
    - `summary` (string, ≤200 chars): environment + error signature + reported time, e.g. `"production: api p99 > 2s starting 14:30"`.
    - `tags` (list of strings): include `env:<environment>`, `component:<inferred>`, `symptom:<inferred>`.
-   - `status`: `"matched"` if step 1 returned a strong similar resolved INC; otherwise `"in_progress"`.
-   - `matched_prior_inc` (string): the matching INC ID, ONLY if status == "matched"; otherwise omit this key.
+   - `status`: always `"in_progress"`. Every INC continues to triage + deep investigation regardless of similarity matches — same symptom can have different root causes (code bug vs. network vs. resource), so a similar prior INC is a *hypothesis to validate*, not a verdict.
+   - `matched_prior_inc` (string): the matching INC ID if step 1 returned a strong similar resolved INC; otherwise omit this key. This becomes a hypothesis for downstream agents to test against fresh evidence.
 
 After the three tool calls, reply with ONE short sentence summarizing what you did.
 
