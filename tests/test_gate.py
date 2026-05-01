@@ -2,8 +2,12 @@
 import pytest
 
 from orchestrator.config import AppConfig, InterventionConfig, LLMConfig, MCPConfig
-from orchestrator.graph import GraphState, make_gate_node
+from orchestrator.graph import (
+    GraphState, make_agent_node, make_gate_node, _coerce_confidence,
+)
 from orchestrator.incident import AgentRun, IncidentStore
+from orchestrator.llm import StubChatModel
+from orchestrator.skill import RouteRule, Skill
 
 
 def _cfg(threshold: float = 0.75) -> AppConfig:
@@ -73,6 +77,49 @@ async def test_gate_passes_when_at_or_above_threshold(tmp_path):
     # Status stays whatever DI left it (e.g. in_progress); no intervention payload.
     assert reloaded.pending_intervention is None
     assert reloaded.status != "awaiting_input"
+
+
+@pytest.mark.asyncio
+async def test_gate_pauses_when_string_label_confidence_below_threshold(tmp_path):
+    """End-to-end: an LLM emits a "low" string label, the agent node coerces
+    it via _coerce_confidence (fix 1), the gate then pauses on the resulting
+    0.3 because it's below 0.75. This pins that fix-1 plays nicely with the
+    gate's threshold logic.
+    """
+    store = IncidentStore(tmp_path)
+    inc = store.create(query="api latency", environment="production",
+                       reporter_id="u", reporter_team="t")
+    skill = Skill(
+        name="deep_investigator", description="d",
+        routes=[RouteRule(when="default", next="resolution")],
+        system_prompt="You are DI.",
+    )
+    llm = StubChatModel(
+        role="deep_investigator",
+        canned_responses={"deep_investigator": "weak"},
+        tool_call_plan=[{
+            "name": "update_incident",
+            "args": {"incident_id": inc.id,
+                     "patch": {"confidence": "low"}},
+        }],
+    )
+    di_node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=lambda i: "default", store=store,
+    )
+    out = await di_node(GraphState(incident=inc, next_route=None,
+                                   last_agent=None, error=None))
+    # DI run recorded with the coerced 0.3 value.
+    assert _coerce_confidence("low") == 0.3
+    reloaded = store.load(inc.id)
+    di_runs = [r for r in reloaded.agents_run if r.agent == "deep_investigator"]
+    assert di_runs and di_runs[-1].confidence == 0.3
+    # Gate sees 0.3 < 0.75 → pauses.
+    gate = make_gate_node(cfg=_cfg(threshold=0.75), store=store)
+    out = await gate(GraphState(incident=reloaded, next_route=None,
+                                last_agent="deep_investigator", error=None))
+    assert out["next_route"] == "__end__"
+    assert store.load(inc.id).status == "awaiting_input"
 
 
 @pytest.mark.asyncio
