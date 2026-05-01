@@ -272,6 +272,33 @@ def _sum_token_usage(messages: list) -> TokenUsage:
     )
 
 
+def _handle_agent_failure(
+    *,
+    skill_name: str,
+    started_at: str,
+    exc: Exception,
+    inc_id: str,
+    store: "IncidentStore",
+    incident: "Incident",
+) -> dict:
+    """Reload incident (absorbing partial tool writes), stamp a failure AgentRun,
+    persist, and return the error state dict for the LangGraph node.
+    """
+    try:
+        incident = store.load(inc_id)
+    except FileNotFoundError:
+        pass
+    ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+    incident.agents_run.append(AgentRun(
+        agent=skill_name, started_at=started_at, ended_at=ended_at,
+        summary=f"agent failed: {exc}",
+        token_usage=TokenUsage(),
+    ))
+    store.save(incident)
+    return {"incident": incident, "next_route": None,
+            "last_agent": skill_name, "error": str(exc)}
+
+
 def make_agent_node(
     *,
     skill: Skill,
@@ -294,20 +321,10 @@ def make_agent_node(
                 {"messages": [HumanMessage(content=_format_agent_input(incident))]},
             )
         except Exception as exc:  # noqa: BLE001
-            # Reload to absorb any partial writes from tools that ran before the failure.
-            try:
-                incident = store.load(inc_id)
-            except FileNotFoundError:
-                pass
-            ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-            incident.agents_run.append(AgentRun(
-                agent=skill.name, started_at=started_at, ended_at=ended_at,
-                summary=f"agent failed: {exc}",
-                token_usage=TokenUsage(),
-            ))
-            store.save(incident)
-            return {"incident": incident, "next_route": None,
-                    "last_agent": skill.name, "error": str(exc)}
+            return _handle_agent_failure(
+                skill_name=skill.name, started_at=started_at, exc=exc,
+                inc_id=inc_id, store=store, incident=incident,
+            )
 
         # Tools (e.g. update_incident) write straight to disk. Reload so the
         # node's own append of agent_run + tool_calls happens against the
