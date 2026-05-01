@@ -39,15 +39,72 @@ def _load_metadata_dicts(cfg: AppConfig) -> tuple[list[dict], list[dict], list[s
     return asyncio.run(_go())
 
 
-_STATUS_BADGES = {
-    "new": "🟦",
-    "in_progress": "🟡",
-    "matched": "🟢",
-    "resolved": "✅",
-    "escalated": "🔴",
-    "awaiting_input": "🟠",
-    "stopped": "⛔",
+# Color palette for st.badge — Streamlit accepts: blue/green/orange/red/violet/gray/primary.
+_STATUS_COLOR = {
+    "new": "gray",
+    "in_progress": "blue",
+    "matched": "violet",
+    "resolved": "green",
+    "escalated": "red",
+    "awaiting_input": "orange",
+    "stopped": "gray",
 }
+
+# Human-readable labels — awaiting_input is highlighted as the action-required state.
+_STATUS_LABEL = {
+    "new": "NEW",
+    "in_progress": "IN PROGRESS",
+    "matched": "MATCHED",
+    "resolved": "RESOLVED",
+    "escalated": "ESCALATED",
+    "awaiting_input": "⚠ NEEDS INPUT",
+    "stopped": "STOPPED",
+}
+
+_SEVERITY_COLOR = {
+    "low": "green",
+    "medium": "orange",
+    "high": "red",
+}
+
+_CATEGORY_COLOR = {
+    "latency": "orange",
+    "availability": "red",
+    "data": "violet",
+    "security": "red",
+    "capacity": "blue",
+    "performance": "orange",
+    "config": "gray",
+}
+
+
+def _badge(label: str, color: str) -> None:
+    """Render an inline coloured pill via st.badge.
+
+    Centralised so the small label/colour decisions live in one place and
+    the rest of the UI can call ``_status_badge(inc)`` etc. without
+    touching the palette dicts directly.
+    """
+    st.badge(label, color=color)
+
+
+def _status_badge(status: str | None) -> None:
+    if not status:
+        return
+    _badge(_STATUS_LABEL.get(status, status.upper()),
+           _STATUS_COLOR.get(status, "gray"))
+
+
+def _severity_badge(severity: str | None) -> None:
+    if not severity:
+        return
+    _badge(severity.upper(), _SEVERITY_COLOR.get(severity, "gray"))
+
+
+def _category_badge(category: str | None) -> None:
+    if not category:
+        return
+    _badge(category, _CATEGORY_COLOR.get(category, "gray"))
 
 
 def render_sidebar(store: IncidentStore) -> None:
@@ -71,12 +128,26 @@ def render_sidebar(store: IncidentStore) -> None:
             st.caption("No incidents.")
             return
         for inc in recent[:20]:
-            badge = _STATUS_BADGES.get(inc["status"], "⚪")
-            toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
-            tok_str = f" · {toks/1000:.1f}k tok" if toks >= 1000 else f" · {toks} tok"
-            label = f"{badge} `{inc['id']}` — {inc['environment']}{tok_str}"
-            if st.button(label, key=f"inc_{inc['id']}", use_container_width=True):
-                st.session_state["selected_incident"] = inc["id"]
+            with st.container(border=True):
+                top_l, top_r = st.columns([3, 2])
+                with top_l:
+                    st.markdown(
+                        f"**`{inc['id']}`** · _{inc['environment']}_"
+                    )
+                with top_r:
+                    _status_badge(inc.get("status"))
+                meta_l, meta_r = st.columns(2)
+                with meta_l:
+                    _severity_badge(inc.get("severity"))
+                with meta_r:
+                    _category_badge(inc.get("category"))
+                toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
+                tok_str = (f"{toks/1000:.1f}k tok" if toks >= 1000
+                           else f"{toks} tok")
+                if st.button(f"View · {tok_str}",
+                             key=f"inc_{inc['id']}",
+                             use_container_width=True):
+                    st.session_state["selected_incident"] = inc["id"]
 
 
 def _render_value(v) -> None:
@@ -179,16 +250,36 @@ def render_incident_detail(store: IncidentStore) -> None:
     with st.expander(f"INC detail: {inc_id}", expanded=True):
         inc = store.load(inc_id).model_dump()
 
-        # --- Top metrics row ----------------------------------------------
+        # --- Top status / severity / category badges ----------------------
+        b1, b2, b3 = st.columns([1, 1, 1])
+        with b1:
+            st.caption("Status")
+            _status_badge(inc.get("status"))
+        with b2:
+            st.caption("Severity")
+            _severity_badge(inc.get("severity"))
+        with b3:
+            st.caption("Category")
+            _category_badge(inc.get("category"))
+
+        # Prominent action-required call-out when the gate has paused the
+        # graph. Sits above the (separate) intervention prompt block so the
+        # user can't miss it on a long page.
+        if inc.get("status") == "awaiting_input":
+            st.warning(
+                "**Human intervention required.** The intervention gate "
+                "paused this INC because deep-investigator confidence was "
+                "below the configured threshold. Use the controls below to "
+                "resume with input, escalate, or stop."
+            )
+
+        # --- Numeric metrics ----------------------------------------------
         token_total = (inc.get("token_usage") or {}).get("total_tokens", 0)
         duration_s = _duration_seconds(inc.get("created_at", ""),
                                        inc.get("updated_at", ""))
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Status", inc.get("status") or "—")
-        m2.metric("Severity", inc.get("severity") or "—")
-        m3.metric("Category", inc.get("category") or "—")
-        m4.metric("Total tokens", _fmt_tokens(token_total))
-        m5.metric("Duration", f"{duration_s}s")
+        m1, m2 = st.columns(2)
+        m1.metric("Total tokens", _fmt_tokens(token_total))
+        m2.metric("Duration", f"{duration_s}s")
 
         # --- Header block -------------------------------------------------
         st.markdown(f"**Query:** {inc['query']}")
