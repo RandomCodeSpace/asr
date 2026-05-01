@@ -2,21 +2,24 @@ from __future__ import annotations
 # ----- imports for config.py -----
 """Config schemas for the orchestrator."""
 
-from typing import Literal
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal
 from pydantic import BaseModel, Field
+import yaml
 
 
 # ----- imports for incident.py -----
 """Incident domain model."""
 
-from typing import Any, Literal
+from datetime import datetime, timezone
 
 
 # ----- imports for similarity.py -----
 """Similarity scoring for incident matching."""
 
 from typing import Protocol
-import re
 
 # ----- imports for skill.py -----
 """Skill loader.
@@ -47,21 +50,18 @@ Structured config is validated through the :class:`Skill` /
 :class:`RouteRule` Pydantic models; markdown content is loaded verbatim.
 """
 
-from pathlib import Path
-import yaml
 from pydantic import BaseModel, Field, field_validator
 
 
 # ----- imports for llm.py -----
 """LLM provider abstraction with stub/ollama/azure_openai backends."""
 
-import os
 from typing import Any
 from uuid import uuid4
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 
 
@@ -98,7 +98,6 @@ from datetime import datetime, timezone, timedelta
 # ----- imports for mcp_servers/remediation.py -----
 """FastMCP server: remediation mock tools."""
 
-from datetime import datetime, timezone
 
 # ----- imports for mcp_servers/user_context.py -----
 """FastMCP server: user_context mock tool."""
@@ -128,6 +127,15 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 import asyncio
 import logging
 from typing import TypedDict, Callable, Awaitable
+
+from langchain_core.messages import HumanMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.graph import StateGraph, END
+
+
+
+
+
 
 # ----- imports for orchestrator.py -----
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
@@ -251,15 +259,10 @@ class AppConfig(BaseModel):
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
 
 
-import os
-import re
-from pathlib import Path
-import yaml
-
 _ENV_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
-def _interpolate(value):
+def _interpolate(value: Any) -> Any:
     if isinstance(value, str):
         def replace(m):
             name = m.group(1)
@@ -345,10 +348,6 @@ class Incident(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
-
-
-from datetime import datetime, timezone
-from pathlib import Path
 
 
 def _utc_now_iso() -> str:
@@ -631,7 +630,7 @@ def get_llm(cfg: LLMConfig, *, role: str = "default", model: str | None = None,
             azure_endpoint=cfg.azure_openai.endpoint,
             api_version=cfg.azure_openai.api_version,
             azure_deployment=cfg.azure_openai.deployment,
-            api_key=cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY"),
+            api_key=SecretStr(_ak) if (_ak := cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY")) else None,
             temperature=actual_temp,
         )
     raise ValueError(f"Unknown provider: {cfg.provider}")
@@ -1116,18 +1115,6 @@ def _coerce_signal(raw) -> str | None:
     return None
 
 
-from langchain_core.messages import HumanMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.tools import BaseTool
-from langgraph.prebuilt import create_react_agent
-from langgraph.graph import StateGraph, END
-
-
-
-
-
-
-
 class GraphState(TypedDict, total=False):
     incident: Incident
     next_route: str | None
@@ -1205,7 +1192,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
                 raise
             last_exc = exc
             await asyncio.sleep(base_delay * (attempt + 1))
-    raise last_exc  # pragma: no cover  (unreachable)
+    raise last_exc or RuntimeError("retry exhausted with no attempts")  # pragma: no cover
 
 
 def _format_agent_input(incident: Incident) -> str:
@@ -1238,7 +1225,7 @@ def make_agent_node(
     agent_executor = create_react_agent(llm, tools, prompt=skill.system_prompt)
 
     async def node(state: GraphState) -> dict:
-        incident = state["incident"]
+        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1412,7 +1399,7 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
     teams = list(cfg.intervention.escalation_teams)
 
     async def gate(state: GraphState) -> dict:
-        incident = state["incident"]
+        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
             incident = store.load(incident.id)
@@ -1549,7 +1536,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
             if name != END and name not in gated_targets_for_agent
         }
         target_map[END] = END
-        sg.add_conditional_edges(agent_name, _router, target_map)
+        sg.add_conditional_edges(agent_name, _router, target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
 
     # Determine where the gate forwards on a "default" pass — there is at
     # most one downstream agent per gated edge; with one gate type today
@@ -1566,7 +1553,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     gate_target = next(iter(gate_targets), None)
     if gate_target is not None:
         _gate_to = _make_gate_to(gate_target)
-        sg.add_conditional_edges("gate", _gate_to, {
+        sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
             gate_target: gate_target, END: END,
         })
     else:
@@ -1611,7 +1598,7 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
     _router = _make_router(gated_edges)
 
     for agent_name in (resume_from, gate_target):
-        sg.add_conditional_edges(agent_name, _router, {
+        sg.add_conditional_edges(agent_name, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
             resume_from: resume_from,
             gate_target: gate_target,
             "gate": "gate",
@@ -1619,7 +1606,7 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
         })
 
     _gate_to = _make_gate_to(gate_target)
-    sg.add_conditional_edges("gate", _gate_to, {
+    sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
         gate_target: gate_target, END: END,
     })
     return sg.compile()
