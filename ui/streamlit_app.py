@@ -150,17 +150,62 @@ def render_sidebar(store: IncidentStore) -> None:
                     st.session_state["selected_incident"] = inc["id"]
 
 
-def _render_value(v) -> None:
-    """Render a value the agents may produce (str/dict/list/None) safely.
+def _render_kv_block(d: dict) -> None:
+    """Render a dict as labeled markdown lines, recursing into nested
+    dicts and lists.
 
-    `st.json` parses strings as JSON; LLM-produced free-form prose like
-    "The investigation found ..." breaks it. So: structured types -> st.json,
-    everything else -> st.write.
+    Replaces ``st.json`` everywhere structured agent output bleeds into
+    the main detail panel — the JSON braces look out of place between
+    bordered cards and prose. The deliberately raw views (the "Args"
+    block on a tool call and the bottom-of-page "Raw JSON" expander)
+    keep ``st.json`` because they exist precisely to expose the wire
+    shape.
+    """
+    for k, v in d.items():
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        key = k.replace("_", " ").capitalize()
+        if isinstance(v, dict):
+            st.markdown(f"**{key}:**")
+            with st.container(border=True):
+                _render_kv_block(v)
+        elif isinstance(v, list):
+            st.markdown(f"**{key}:**")
+            for item in v:
+                if isinstance(item, dict):
+                    with st.container(border=True):
+                        _render_kv_block(item)
+                else:
+                    st.markdown(f"- {item}")
+        elif isinstance(v, bool):
+            st.markdown(f"**{key}:** `{str(v).lower()}`")
+        else:
+            st.markdown(f"**{key}:** {v}")
+
+
+def _render_value(v) -> None:
+    """Render an agent-produced value (str / dict / list / None) safely.
+
+    Strings → ``st.write`` (markdown-aware). Dicts and lists → the labeled
+    block renderer above. ``st.json`` is reserved for the explicit raw
+    viewers; routing everything through it leaks JSON braces into the
+    prose-y main flow.
     """
     if v is None:
         st.caption("_(none)_")
-    elif isinstance(v, (dict, list)):
-        st.json(v)
+    elif isinstance(v, dict):
+        _render_kv_block(v)
+    elif isinstance(v, list):
+        if not v:
+            st.caption("_(empty)_")
+            return
+        for i, item in enumerate(v):
+            if isinstance(item, dict):
+                if i > 0:
+                    st.markdown("---")
+                _render_kv_block(item)
+            else:
+                st.markdown(f"- {item}")
     else:
         st.write(v)
 
@@ -224,7 +269,7 @@ def _render_hypothesis_list(items: list, label: str) -> None:
                          if k not in {"cause", "evidence", "next_steps",
                                       "next_step", "probe"}}
                 if extra:
-                    st.json(extra)
+                    _render_kv_block(extra)
             else:
                 st.markdown(f"**{label} {i}:** {h}")
 
@@ -236,7 +281,7 @@ def _render_findings_section(value, label: str) -> None:
     if isinstance(value, list):
         _render_hypothesis_list(value, label="Hypothesis")
     elif isinstance(value, dict):
-        st.json(value)
+        _render_kv_block(value)
     elif isinstance(value, str):
         st.write(value)
     else:
