@@ -286,3 +286,61 @@ async def test_agent_node_signal_rejects_bool(incident, caplog):
     reloaded = store.load(inc.id)
     assert reloaded.agents_run[-1].signal is None
     assert any("bool" in rec.getMessage().lower() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_agent_node_routes_on_emitted_signal(incident):
+    """When the agent emits signal=failed, the node should pick the route
+    rule with when=failed even though when=default also matches."""
+    inc, store = incident
+    skill = Skill(
+        name="intake", description="d",
+        routes=[
+            RouteRule(when="success", next="triage"),
+            RouteRule(when="failed", next="__end__"),
+            RouteRule(when="default", next="triage"),
+        ],
+        system_prompt="You are intake.",
+    )
+    llm = StubChatModel(
+        role="intake",
+        canned_responses={"intake": "no luck"},
+        tool_call_plan=[{
+            "name": "update_incident",
+            "args": {"incident_id": inc.id,
+                     "patch": {"signal": "failed"}},
+        }],
+    )
+    from orchestrator.graph import _decide_from_signal
+    node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=_decide_from_signal,
+        store=store,
+    )
+    out = await node(GraphState(incident=inc, next_route=None,
+                                last_agent=None, error=None))
+    assert out["next_route"] == "__end__"
+
+
+@pytest.mark.asyncio
+async def test_agent_node_falls_back_to_default_when_no_signal(incident):
+    inc, store = incident
+    skill = Skill(
+        name="intake", description="d",
+        routes=[
+            RouteRule(when="success", next="resolution"),
+            RouteRule(when="default", next="triage"),
+        ],
+        system_prompt="You are intake.",
+    )
+    # Stub emits no signal at all.
+    llm = StubChatModel(role="intake", canned_responses={"intake": "ok"})
+    from orchestrator.graph import _decide_from_signal
+    node = make_agent_node(
+        skill=skill, llm=llm, tools=[],
+        decide_route=_decide_from_signal,
+        store=store,
+    )
+    out = await node(GraphState(incident=inc, next_route=None,
+                                last_agent=None, error=None))
+    assert out["next_route"] == "triage"

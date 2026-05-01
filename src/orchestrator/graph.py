@@ -331,29 +331,19 @@ def make_agent_node(
     return node
 
 
-# Per-agent route decision functions.
-def _decide_intake(inc: Incident) -> str:
-    return "default"
+def _decide_from_signal(inc: Incident) -> str:
+    """Return the latest agent's emitted signal, or "default" if absent.
 
-
-def _decide_triage(inc: Incident) -> str:
-    return "default"
-
-
-def _decide_deep_investigator(inc: Incident) -> str:
-    return "default"
-
-
-def _decide_resolution(inc: Incident) -> str:
-    return "default"
-
-
-_DECIDERS: dict[str, Callable[[Incident], str]] = {
-    "intake": _decide_intake,
-    "triage": _decide_triage,
-    "deep_investigator": _decide_deep_investigator,
-    "resolution": _decide_resolution,
-}
+    Agents emit one of {success, failed, needs_input} via the ``signal``
+    key of their final ``update_incident`` patch (see ``_coerce_signal``).
+    The node harvests it onto ``AgentRun.signal``; this decider then reads
+    the *most recent* run (which is the one that just finished, since the
+    node has already appended it). If no signal is present we return
+    "default" so ``route_from_skill`` picks the fallback rule.
+    """
+    if not inc.agents_run:
+        return "default"
+    return inc.agents_run[-1].signal or "default"
 
 
 _STUB_CANNED = {
@@ -430,7 +420,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
             stub_canned=_STUB_CANNED,
         )
         tools = registry.get(skill.tools)
-        decide = _DECIDERS.get(agent_name, lambda inc: "default")
+        decide = _decide_from_signal
         nodes[agent_name] = make_agent_node(
             skill=skill, llm=llm, tools=tools,
             decide_route=decide, store=store,
