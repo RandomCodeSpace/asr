@@ -2,6 +2,7 @@ import pytest
 from orchestrator.incident import IncidentStore
 from orchestrator.mcp_servers.incident import (
     set_state, lookup_similar_incidents, create_incident, update_incident,
+    IncidentMCPServer,
 )
 
 
@@ -38,3 +39,33 @@ async def test_update_incident_appends_finding(setup_store, monkeypatch):
     loaded = setup_store.load(inc["id"])
     assert loaded.severity == "sev3"
     assert loaded.category == "latency"
+
+
+@pytest.mark.asyncio
+async def test_two_servers_have_independent_stores(tmp_path, monkeypatch):
+    """Two IncidentMCPServer instances must NOT share their store reference.
+
+    The previous module-level ``_state`` dict made the second instance clobber
+    the first; this test pins the per-instance scoping.
+    """
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso", lambda: "2026-04-30T10:00:00Z")
+
+    store_a = IncidentStore(tmp_path / "a")
+    store_b = IncidentStore(tmp_path / "b")
+    server_a = IncidentMCPServer()
+    server_b = IncidentMCPServer()
+    server_a.configure(store=store_a, similarity_threshold=0.5)
+    server_b.configure(store=store_b, similarity_threshold=0.5)
+
+    inc_a = await server_a._tool_create_incident(
+        query="a-side", environment="dev", reporter_id="u", reporter_team="t",
+    )
+    inc_b = await server_b._tool_create_incident(
+        query="b-side", environment="dev", reporter_id="u", reporter_team="t",
+    )
+    # Each store sees only its own INC.
+    assert {p.stem for p in (tmp_path / "a").glob("INC-*.json")} == {inc_a["id"]}
+    assert {p.stem for p in (tmp_path / "b").glob("INC-*.json")} == {inc_b["id"]}
+    # And the FastMCP instances are distinct objects (no shared global server).
+    assert server_a.mcp is not server_b.mcp
