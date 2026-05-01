@@ -42,7 +42,7 @@ environments:
 - local
 incidents:
   store_path: incidents
-  similarity_threshold: 0.85
+  similarity_threshold: 0.2
   similarity_method: keyword
 paths:
   skills_dir: config/skills
