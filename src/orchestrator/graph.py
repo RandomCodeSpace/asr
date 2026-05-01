@@ -428,39 +428,53 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     return nodes
 
 
-def _gate_router(state: GraphState):
-    nr = state.get("next_route")
-    if nr in (None, "__end__"):
-        return END
-    # gate's "default" means "advance to resolution".
-    return "resolution"
+def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
+    """Return ``{(from_agent, to_node): gate_type}`` for every route rule
+    whose ``gate`` is set. Today only ``gate: confidence`` is recognised."""
+    edges: dict[tuple[str, str], str] = {}
+    for agent_name, skill in skills.items():
+        for rule in skill.routes:
+            if rule.gate:
+                edges[(agent_name, rule.next)] = rule.gate
+    return edges
 
 
 async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
                       registry: ToolRegistry):
-    """Compile the main LangGraph: intake -> triage -> deep_investigator -> gate -> resolution.
+    """Compile the main LangGraph from configured skills and routes.
+
+    The entry agent is read from ``cfg.orchestrator.entry_agent``. Gate
+    insertions are derived from each skill's route rules: a rule with
+    ``gate: confidence`` causes the router to redirect ``(this_agent, next)``
+    through the ``gate`` node.
 
     The ``registry`` is provided by the caller — typically the
     :class:`Orchestrator`, which loads MCP tools into an :class:`AsyncExitStack`
     so the underlying FastMCP transports stay alive for the lifetime of the
     compiled graph.
     """
+    entry = cfg.orchestrator.entry_agent
+    if entry not in skills:
+        raise ValueError(
+            f"orchestrator.entry_agent={entry!r} is not a known skill "
+            f"(known: {sorted(skills.keys())})"
+        )
+    gated_edges = _collect_gated_edges(skills)
+
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
-    # Insert the human-in-the-loop gate between DI and resolution.
     sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
 
-    sg.set_entry_point("intake")
+    sg.set_entry_point(entry)
 
-    # Standard router for agent nodes: next_route is a target node or __end__.
     def _router(state: GraphState):
         nr = state.get("next_route")
         if nr in (None, "__end__"):
             return END
-        # deep_investigator's "default" forwards through the gate.
-        if state.get("last_agent") == "deep_investigator" and nr == "resolution":
+        la = state.get("last_agent")
+        if (la, nr) in gated_edges:
             return "gate"
         return nr
 
@@ -470,48 +484,88 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         target_map[END] = END
         sg.add_conditional_edges(agent_name, _router, target_map)
 
-    # Gate's edges: route to resolution on default, END on __end__.
-    sg.add_conditional_edges("gate", _gate_router, {
-        "resolution": "resolution", END: END,
-    })
+    # Determine where the gate forwards on a "default" pass — there is at
+    # most one downstream agent per gated edge; with one gate type today
+    # we collapse to a single target. If the user defines multiple gated
+    # edges with different downstream agents in the future, the closure
+    # below will need a state-aware lookup; for now we assert "exactly one"
+    # and error loudly otherwise.
+    gate_targets = {to for (_from, to) in gated_edges}
+    if len(gate_targets) > 1:
+        raise ValueError(
+            f"multiple gated downstream targets {sorted(gate_targets)} not "
+            f"yet supported; only one gated edge per graph"
+        )
+    gate_target = next(iter(gate_targets), None)
+    if gate_target is not None:
+        def _gate_to(state: GraphState):
+            nr = state.get("next_route")
+            if nr in (None, "__end__"):
+                return END
+            return gate_target
+        sg.add_conditional_edges("gate", _gate_to, {
+            gate_target: gate_target, END: END,
+        })
+    else:
+        sg.add_edge("gate", END)
 
     return sg.compile()
 
 
 async def build_resume_graph(*, cfg: AppConfig, skills: dict,
                              store: IncidentStore, registry: ToolRegistry):
-    """Compile a sub-graph that re-runs only deep_investigator -> gate -> resolution.
+    """Compile a sub-graph that re-runs from the *upstream* end of the
+    (single) gated edge through to the gate's downstream target.
 
-    Used by ``Orchestrator.resume_investigation`` after the user supplies new
-    context: intake/triage already ran, so we resume from DI with the updated
-    incident. Same gate semantics — if the new run is still low-confidence,
-    we'll pause again.
+    Used by ``Orchestrator.resume_investigation`` after the user supplies
+    new context: agents before the gated edge already ran, so we resume
+    from the gated agent with the updated incident. Same gate semantics —
+    if the new run is still low-confidence, we'll pause again.
     """
+    gated_edges = _collect_gated_edges(skills)
+    if not gated_edges:
+        raise ValueError(
+            "build_resume_graph requires at least one route with gate set; "
+            "no gated edges were found in the configured skills"
+        )
+    if len(gated_edges) > 1:
+        raise ValueError(
+            f"multiple gated edges {sorted(gated_edges.keys())} not yet "
+            f"supported; resume entry is ambiguous"
+        )
+    resume_from, gate_target = next(iter(gated_edges.keys()))
+
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
-    # Only DI + resolution agents participate; intake/triage are skipped.
-    for agent_name in ("deep_investigator", "resolution"):
+    for agent_name in (resume_from, gate_target):
         if agent_name in nodes:
             sg.add_node(agent_name, nodes[agent_name])
     sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
-    sg.set_entry_point("deep_investigator")
+    sg.set_entry_point(resume_from)
 
     def _router(state: GraphState):
         nr = state.get("next_route")
         if nr in (None, "__end__"):
             return END
-        if state.get("last_agent") == "deep_investigator" and nr == "resolution":
+        la = state.get("last_agent")
+        if (la, nr) in gated_edges:
             return "gate"
         return nr
 
-    for agent_name in ("deep_investigator", "resolution"):
+    for agent_name in (resume_from, gate_target):
         sg.add_conditional_edges(agent_name, _router, {
-            "deep_investigator": "deep_investigator",
-            "resolution": "resolution",
+            resume_from: resume_from,
+            gate_target: gate_target,
             "gate": "gate",
             END: END,
         })
-    sg.add_conditional_edges("gate", _gate_router, {
-        "resolution": "resolution", END: END,
+
+    def _gate_to(state: GraphState):
+        nr = state.get("next_route")
+        if nr in (None, "__end__"):
+            return END
+        return gate_target
+    sg.add_conditional_edges("gate", _gate_to, {
+        gate_target: gate_target, END: END,
     })
     return sg.compile()

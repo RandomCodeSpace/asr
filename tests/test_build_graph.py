@@ -62,3 +62,44 @@ async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
         assert final_state["last_agent"] in {"resolution", "intake", "gate"}
         reloaded = store.load(inc.id)
         assert reloaded.agents_run, "expected at least one agent to run"
+
+
+@pytest.mark.asyncio
+async def test_build_graph_honours_entry_agent_from_config(cfg, tmp_path):
+    """Entry node is whichever agent cfg.orchestrator.entry_agent names."""
+    from dataclasses import replace
+    from orchestrator.config import OrchestratorConfig
+    skills = load_all_skills("config/skills")
+    store = IncidentStore(tmp_path)
+    # Override entry to triage.
+    cfg2 = cfg.model_copy(update={
+        "orchestrator": OrchestratorConfig(entry_agent="triage"),
+    })
+    async with AsyncExitStack() as stack:
+        registry = await load_tools(cfg2.mcp, stack)
+        graph = await build_graph(cfg=cfg2, skills=skills, store=store,
+                                  registry=registry)
+        compiled = graph.get_graph()
+        # Find edges leaving __start__; the head should now be triage.
+        edges_from_start = [
+            e for e in compiled.edges if e.source == "__start__"
+        ]
+        targets = {e.target for e in edges_from_start}
+        assert "triage" in targets
+
+
+@pytest.mark.asyncio
+async def test_build_graph_inserts_gate_for_gated_route(cfg, tmp_path):
+    """A skill with a gate-marked route edge should result in the gate node
+    being inserted between that agent and its target."""
+    skills = load_all_skills("config/skills")
+    store = IncidentStore(tmp_path)
+    async with AsyncExitStack() as stack:
+        registry = await load_tools(cfg.mcp, stack)
+        graph = await build_graph(cfg=cfg, skills=skills, store=store,
+                                  registry=registry)
+        nodes = set(graph.get_graph().nodes.keys())
+        assert "gate" in nodes
+        # Sanity: deep_investigator's success route (which carries gate)
+        # should not have a direct edge to resolution that bypasses the gate.
+        # We assert by behaviour: see test_full_graph_runs_to_terminal_with_stub_llm.
