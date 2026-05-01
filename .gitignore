@@ -1,14 +1,46 @@
+# --- Python ----------------------------------------------------------
 __pycache__/
-*.pyc
-*.pyo
-.venv/
-.env
-.env.local
+*.py[cod]
+*$py.class
 *.egg-info/
+.python-version
+
+# --- Virtualenvs / packaging -----------------------------------------
+.venv/
+venv/
+
+# --- Test / lint caches ----------------------------------------------
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Build artifacts -------------------------------------------------
 dist/app.py
+
+# --- Runtime data (user-specific, not source) ------------------------
 incidents/*.json
 !incidents/.gitkeep
+
+# --- Secrets ---------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Editor / IDE ----------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS scratch ------------------------------------------------------
 .DS_Store
+Thumbs.db
+
+# --- Logs / temp -----------------------------------------------------
+*.log
+.cache/
