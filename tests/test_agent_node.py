@@ -1,7 +1,7 @@
 import logging
 
 import pytest
-from orchestrator.graph import GraphState, make_agent_node
+from orchestrator.graph import GraphState, _decide_from_signal, make_agent_node
 from orchestrator.incident import IncidentStore, TokenUsage
 from orchestrator.skill import Skill, RouteRule
 from orchestrator.llm import StubChatModel
@@ -311,7 +311,6 @@ async def test_agent_node_routes_on_emitted_signal(incident):
                      "patch": {"signal": "failed"}},
         }],
     )
-    from orchestrator.graph import _decide_from_signal
     node = make_agent_node(
         skill=skill, llm=llm, tools=[],
         decide_route=_decide_from_signal,
@@ -324,6 +323,8 @@ async def test_agent_node_routes_on_emitted_signal(incident):
 
 @pytest.mark.asyncio
 async def test_agent_node_falls_back_to_default_when_no_signal(incident):
+    """When the agent emits no signal, the decider returns "default" and
+    the node picks the route rule with when=default."""
     inc, store = incident
     skill = Skill(
         name="intake", description="d",
@@ -335,7 +336,6 @@ async def test_agent_node_falls_back_to_default_when_no_signal(incident):
     )
     # Stub emits no signal at all.
     llm = StubChatModel(role="intake", canned_responses={"intake": "ok"})
-    from orchestrator.graph import _decide_from_signal
     node = make_agent_node(
         skill=skill, llm=llm, tools=[],
         decide_route=_decide_from_signal,
