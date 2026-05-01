@@ -1,5 +1,4 @@
 """Tests for Orchestrator.resume_investigation across all three actions."""
-from pathlib import Path
 import pytest
 
 from orchestrator.config import (

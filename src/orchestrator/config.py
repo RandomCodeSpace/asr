@@ -1,7 +1,11 @@
 """Config schemas for the orchestrator."""
 from __future__ import annotations
-from typing import Literal
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal
 from pydantic import BaseModel, Field
+import yaml
 
 
 class OllamaConfig(BaseModel):
@@ -80,15 +84,10 @@ class AppConfig(BaseModel):
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
 
 
-import os
-import re
-from pathlib import Path
-import yaml
-
 _ENV_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
-def _interpolate(value):
+def _interpolate(value: Any) -> Any:
     if isinstance(value, str):
         def replace(m):
             name = m.group(1)

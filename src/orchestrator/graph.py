@@ -5,6 +5,18 @@ import logging
 from typing import TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
 
+from langchain_core.messages import HumanMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.tools import BaseTool
+from langgraph.prebuilt import create_react_agent
+from langgraph.graph import StateGraph, END
+
+from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore, TokenUsage
+from orchestrator.skill import Skill
+from orchestrator.config import AppConfig
+from orchestrator.llm import get_llm
+from orchestrator.mcp_loader import ToolRegistry
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,19 +104,6 @@ def _coerce_signal(raw) -> str | None:
     return None
 
 
-from langchain_core.messages import HumanMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.tools import BaseTool
-from langgraph.prebuilt import create_react_agent
-from langgraph.graph import StateGraph, END
-
-from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore, TokenUsage
-from orchestrator.skill import Skill
-from orchestrator.config import AppConfig
-from orchestrator.llm import get_llm
-from orchestrator.mcp_loader import ToolRegistry
-
-
 class GraphState(TypedDict, total=False):
     incident: Incident
     next_route: str | None
@@ -182,7 +181,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
                 raise
             last_exc = exc
             await asyncio.sleep(base_delay * (attempt + 1))
-    raise last_exc  # pragma: no cover  (unreachable)
+    raise last_exc or RuntimeError("retry exhausted with no attempts")  # pragma: no cover
 
 
 def _format_agent_input(incident: Incident) -> str:
@@ -215,7 +214,7 @@ def make_agent_node(
     agent_executor = create_react_agent(llm, tools, prompt=skill.system_prompt)
 
     async def node(state: GraphState) -> dict:
-        incident = state["incident"]
+        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -389,7 +388,7 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
     teams = list(cfg.intervention.escalation_teams)
 
     async def gate(state: GraphState) -> dict:
-        incident = state["incident"]
+        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
             incident = store.load(incident.id)
@@ -526,7 +525,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
             if name != END and name not in gated_targets_for_agent
         }
         target_map[END] = END
-        sg.add_conditional_edges(agent_name, _router, target_map)
+        sg.add_conditional_edges(agent_name, _router, target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
 
     # Determine where the gate forwards on a "default" pass — there is at
     # most one downstream agent per gated edge; with one gate type today
@@ -543,7 +542,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     gate_target = next(iter(gate_targets), None)
     if gate_target is not None:
         _gate_to = _make_gate_to(gate_target)
-        sg.add_conditional_edges("gate", _gate_to, {
+        sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
             gate_target: gate_target, END: END,
         })
     else:
@@ -588,7 +587,7 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
     _router = _make_router(gated_edges)
 
     for agent_name in (resume_from, gate_target):
-        sg.add_conditional_edges(agent_name, _router, {
+        sg.add_conditional_edges(agent_name, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
             resume_from: resume_from,
             gate_target: gate_target,
             "gate": "gate",
@@ -596,7 +595,7 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
         })
 
     _gate_to = _make_gate_to(gate_target)
-    sg.add_conditional_edges("gate", _gate_to, {
+    sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
         gate_target: gate_target, END: END,
     })
     return sg.compile()

@@ -6,7 +6,7 @@ from uuid import uuid4
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 from orchestrator.config import LLMConfig
 
@@ -79,7 +79,7 @@ def get_llm(cfg: LLMConfig, *, role: str = "default", model: str | None = None,
             azure_endpoint=cfg.azure_openai.endpoint,
             api_version=cfg.azure_openai.api_version,
             azure_deployment=cfg.azure_openai.deployment,
-            api_key=cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY"),
+            api_key=SecretStr(_ak) if (_ak := cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY")) else None,
             temperature=actual_temp,
         )
     raise ValueError(f"Unknown provider: {cfg.provider}")

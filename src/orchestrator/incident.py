@@ -1,5 +1,7 @@
 """Incident domain model."""
 from __future__ import annotations
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 from pydantic import BaseModel, Field
 
@@ -66,10 +68,6 @@ class Incident(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
-
-
-from datetime import datetime, timezone
-from pathlib import Path
 
 
 def _utc_now_iso() -> str:
