@@ -6,5 +6,9 @@ tools:
   - notify_oncall
   - update_incident
 routes:
+  - when: success
+    next: __end__
+  - when: failed
+    next: __end__
   - when: default
     next: __end__

@@ -5,5 +5,9 @@ tools:
   - get_service_health
   - check_deployment_history
 routes:
+  - when: success
+    next: deep_investigator
+  - when: failed
+    next: __end__
   - when: default
     next: deep_investigator

@@ -53,3 +53,5 @@ intervention:
   - platform-oncall
   - data-oncall
   - security-oncall
+orchestrator:
+  entry_agent: intake

@@ -5,5 +5,9 @@ tools:
   - get_user_context
   - update_incident
 routes:
+  - when: success
+    next: triage
+  - when: failed
+    next: __end__
   - when: default
     next: triage

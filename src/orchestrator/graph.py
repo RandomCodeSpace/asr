@@ -502,7 +502,18 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
     for agent_name in skills.keys():
         possible_targets = {s.name for s in skills.values()} | {END, "gate"}
-        target_map = {name: name for name in possible_targets if name != END}
+        # Exclude targets that are intercepted via a gated edge for this agent:
+        # the router redirects (agent_name, gated_target) -> "gate", so the
+        # gated_target must NOT appear in this agent's target_map. Leaving it
+        # in would cause LangGraph to register a visible direct edge in the
+        # compiled graph, defeating the structural assertion in the test (and
+        # misleading graph visualisations).
+        gated_targets_for_agent = {to for (frm, to) in gated_edges if frm == agent_name}
+        target_map = {
+            name: name
+            for name in possible_targets
+            if name != END and name not in gated_targets_for_agent
+        }
         target_map[END] = END
         sg.add_conditional_edges(agent_name, _router, target_map)
 

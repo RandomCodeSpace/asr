@@ -90,15 +90,35 @@ async def test_build_graph_honours_entry_agent_from_config(cfg, tmp_path):
 @pytest.mark.asyncio
 async def test_build_graph_inserts_gate_for_gated_route(cfg, tmp_path):
     """A skill with a gate-marked route edge should result in the gate node
-    being inserted between that agent and its target."""
+    being inserted between that agent and its target — there must be NO
+    direct edge from deep_investigator to resolution; the path must go
+    through the gate."""
     skills = load_all_skills("config/skills")
     store = IncidentStore(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
         graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                   registry=registry)
-        nodes = set(graph.get_graph().nodes.keys())
+        compiled = graph.get_graph()
+        nodes = set(compiled.nodes.keys())
         assert "gate" in nodes
-        # Sanity: deep_investigator's success route (which carries gate)
-        # should not have a direct edge to resolution that bypasses the gate.
-        # We assert by behaviour: see test_full_graph_runs_to_terminal_with_stub_llm.
+        # The gated edge (deep_investigator -> resolution, gate: confidence)
+        # must redirect through the gate. There should be NO direct edge
+        # from deep_investigator straight to resolution.
+        di_to_resolution = [
+            e for e in compiled.edges
+            if e.source == "deep_investigator" and e.target == "resolution"
+        ]
+        assert not di_to_resolution, (
+            f"expected no direct deep_investigator -> resolution edge "
+            f"(must go through gate); got {di_to_resolution}"
+        )
+        # And the gate must connect to resolution.
+        gate_to_resolution = [
+            e for e in compiled.edges
+            if e.source == "gate" and e.target == "resolution"
+        ]
+        assert gate_to_resolution, (
+            f"expected gate -> resolution edge; got edges from gate: "
+            f"{[e for e in compiled.edges if e.source == 'gate']}"
+        )

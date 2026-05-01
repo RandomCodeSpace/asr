@@ -5,5 +5,11 @@ tools:
   - get_metrics
   - update_incident
 routes:
+  - when: success
+    next: resolution
+    gate: confidence
+  - when: failed
+    next: __end__
   - when: default
     next: resolution
+    gate: confidence
