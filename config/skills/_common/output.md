@@ -8,4 +8,4 @@ In your final `update_incident` patch, **always** include a `signal` field set t
 - `failed` — a tool errored, you produced no useful output, or you are confident no further work on this incident makes sense at this stage.
 - `needs_input` — you cannot proceed without additional human-supplied context.
 
-The orchestrator routes the workflow to the next node based on this signal. If you omit it, the route falls back to the rule marked `when: default`.
+The orchestrator routes the workflow to the next node based on this signal. If you omit it — or emit `needs_input`, which has no dedicated route today — the route falls back to the rule marked `when: default`. Pausing for human input is handled separately by the confidence gate, not by the `needs_input` signal.
