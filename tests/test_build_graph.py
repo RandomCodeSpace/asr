@@ -67,7 +67,6 @@ async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
 @pytest.mark.asyncio
 async def test_build_graph_honours_entry_agent_from_config(cfg, tmp_path):
     """Entry node is whichever agent cfg.orchestrator.entry_agent names."""
-    from dataclasses import replace
     from orchestrator.config import OrchestratorConfig
     skills = load_all_skills("config/skills")
     store = IncidentStore(tmp_path)

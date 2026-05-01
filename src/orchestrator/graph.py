@@ -185,7 +185,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     raise last_exc  # pragma: no cover  (unreachable)
 
 
-def _format_intake_input(incident: Incident) -> str:
+def _format_agent_input(incident: Incident) -> str:
     base = (
         f"Incident {incident.id}\n"
         f"Environment: {incident.environment}\n"
@@ -222,7 +222,7 @@ def make_agent_node(
         try:
             result = await _ainvoke_with_retry(
                 agent_executor,
-                {"messages": [HumanMessage(content=_format_intake_input(incident))]},
+                {"messages": [HumanMessage(content=_format_agent_input(incident))]},
             )
         except Exception as exc:  # noqa: BLE001
             # Reload to absorb any partial writes from tools that ran before the failure.
@@ -428,6 +428,35 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     return nodes
 
 
+def _make_router(gated_edges: dict[tuple[str, str], str]):
+    """Build a state router that intercepts gated edges into the gate node.
+
+    Used by both ``build_graph`` and ``build_resume_graph`` — they share
+    the same routing semantics, so this factory eliminates duplication.
+    """
+    def _router(state: GraphState):
+        nr = state.get("next_route")
+        if nr in (None, "__end__"):
+            return END
+        la = state.get("last_agent")
+        if (la, nr) in gated_edges:
+            return "gate"
+        return nr
+    return _router
+
+
+def _make_gate_to(gate_target: str):
+    """Build the gate's outbound router. On a "default" pass, the gate
+    forwards to its single downstream target; on "__end__", it terminates.
+    """
+    def _gate_to(state: GraphState):
+        nr = state.get("next_route")
+        if nr in (None, "__end__"):
+            return END
+        return gate_target
+    return _gate_to
+
+
 def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
     """Return ``{(from_agent, to_node): gate_type}`` for every route rule
     whose ``gate`` is set. Today only ``gate: confidence`` is recognised."""
@@ -469,14 +498,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
     sg.set_entry_point(entry)
 
-    def _router(state: GraphState):
-        nr = state.get("next_route")
-        if nr in (None, "__end__"):
-            return END
-        la = state.get("last_agent")
-        if (la, nr) in gated_edges:
-            return "gate"
-        return nr
+    _router = _make_router(gated_edges)
 
     for agent_name in skills.keys():
         possible_targets = {s.name for s in skills.values()} | {END, "gate"}
@@ -498,11 +520,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         )
     gate_target = next(iter(gate_targets), None)
     if gate_target is not None:
-        def _gate_to(state: GraphState):
-            nr = state.get("next_route")
-            if nr in (None, "__end__"):
-                return END
-            return gate_target
+        _gate_to = _make_gate_to(gate_target)
         sg.add_conditional_edges("gate", _gate_to, {
             gate_target: gate_target, END: END,
         })
@@ -526,7 +544,9 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
     if not gated_edges:
         raise ValueError(
             "build_resume_graph requires at least one route with gate set; "
-            "no gated edges were found in the configured skills"
+            "no gated edges were found in the configured skills — add "
+            "'gate: confidence' to the relevant agent's route in "
+            "config/skills/<agent>/config.yaml"
         )
     if len(gated_edges) > 1:
         raise ValueError(
@@ -543,14 +563,7 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
     sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
     sg.set_entry_point(resume_from)
 
-    def _router(state: GraphState):
-        nr = state.get("next_route")
-        if nr in (None, "__end__"):
-            return END
-        la = state.get("last_agent")
-        if (la, nr) in gated_edges:
-            return "gate"
-        return nr
+    _router = _make_router(gated_edges)
 
     for agent_name in (resume_from, gate_target):
         sg.add_conditional_edges(agent_name, _router, {
@@ -560,11 +573,7 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
             END: END,
         })
 
-    def _gate_to(state: GraphState):
-        nr = state.get("next_route")
-        if nr in (None, "__end__"):
-            return END
-        return gate_target
+    _gate_to = _make_gate_to(gate_target)
     sg.add_conditional_edges("gate", _gate_to, {
         gate_target: gate_target, END: END,
     })
