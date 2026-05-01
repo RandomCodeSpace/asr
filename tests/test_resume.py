@@ -135,6 +135,38 @@ async def test_resume_rejects_when_not_awaiting_input(cfg):
 
 
 @pytest.mark.asyncio
+async def test_resume_rejects_invalid_team(cfg):
+    """Escalating to a team not in escalation_teams must be rejected.
+
+    Otherwise an attacker / careless caller could fire ``notify_oncall`` with
+    an arbitrary team string, and the INC would be marked escalated against a
+    team that doesn't exist in the configured roster.
+    """
+    orch = await Orchestrator.create(cfg)
+    try:
+        inc_id = _seed_paused_incident(orch, di_confidence=0.40)
+        # Default escalation_teams = ["platform-oncall", "data-oncall", "security-oncall"]
+        events = []
+        async for ev in orch.resume_investigation(
+            inc_id, {"action": "escalate", "team": "marketing"},
+        ):
+            events.append(ev)
+
+        rejected = [e for e in events if e["event"] == "resume_rejected"]
+        assert rejected, f"expected resume_rejected, got {events}"
+        assert "marketing" in rejected[-1]["reason"]
+        assert "escalation_teams" in rejected[-1]["reason"]
+
+        # INC must NOT have been escalated — still awaiting_input, no
+        # notify_oncall tool call recorded.
+        inc = orch.store.load(inc_id)
+        assert inc.status == "awaiting_input"
+        assert not any(tc.tool == "notify_oncall" for tc in inc.tool_calls)
+    finally:
+        await orch.aclose()
+
+
+@pytest.mark.asyncio
 async def test_resume_handles_subgraph_exception(cfg, monkeypatch):
     """If the resume sub-graph raises, the INC must be restored to
     awaiting_input with its original pending_intervention payload — not left

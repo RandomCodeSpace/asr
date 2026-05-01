@@ -154,6 +154,18 @@ class Orchestrator:
 
         if action == "escalate":
             team = decision.get("team") or "platform-oncall"
+            allowed = list(self.cfg.intervention.escalation_teams)
+            if team not in allowed:
+                # Reject the request entirely. The INC stays awaiting_input
+                # so the user can retry with a valid team. Logging the
+                # allowed roster on the event makes it actionable in the UI.
+                yield {"event": "resume_rejected", "incident_id": incident_id,
+                       "reason": (
+                           f"team '{team}' not in allowed escalation_teams "
+                           f"({allowed})"
+                       ),
+                       "ts": _now()}
+                return
             message = (
                 f"INC {incident_id} escalated by user — team {team}. "
                 "Confidence below threshold."
