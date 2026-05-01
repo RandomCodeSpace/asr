@@ -202,6 +202,26 @@ def _format_agent_input(incident: Incident) -> str:
     return base
 
 
+def _merge_patch_metadata(
+    patch: dict,
+    confidence: float | None,
+    rationale: str | None,
+    signal: str | None,
+) -> tuple[float | None, str | None, str | None]:
+    """Update the (confidence, rationale, signal) trio with whatever the
+    patch carries; preserve the prior value when the patch is silent on a
+    field. Centralises the per-key conditional that used to nest 3 deep
+    inside ``_harvest_tool_calls_and_patches``.
+    """
+    new_conf = _coerce_confidence(patch["confidence"]) if "confidence" in patch else confidence
+    new_rationale = (
+        _coerce_rationale(patch["confidence_rationale"])
+        if "confidence_rationale" in patch else rationale
+    )
+    new_signal = _coerce_signal(patch["signal"]) if "signal" in patch else signal
+    return new_conf, new_rationale, new_signal
+
+
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
@@ -231,12 +251,9 @@ def _harvest_tool_calls_and_patches(
             ))
             if tc_name == "update_incident":
                 patch = tc_args.get("patch") or {}
-                if "confidence" in patch:
-                    agent_confidence = _coerce_confidence(patch["confidence"])
-                if "confidence_rationale" in patch:
-                    agent_rationale = _coerce_rationale(patch["confidence_rationale"])
-                if "signal" in patch:
-                    agent_signal = _coerce_signal(patch["signal"])
+                agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
+                    patch, agent_confidence, agent_rationale, agent_signal,
+                )
     return agent_confidence, agent_rationale, agent_signal
 
 
