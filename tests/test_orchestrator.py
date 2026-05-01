@@ -1,12 +1,10 @@
 import pytest
-from pathlib import Path
 from orchestrator.config import AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths
 from orchestrator.orchestrator import Orchestrator
 
 
 @pytest.fixture
 def cfg(tmp_path):
-    skills_dir = Path("config/skills")
     return AppConfig(
         llm=LLMConfig(provider="stub", default_model="stub-1"),
         mcp=MCPConfig(servers=[
@@ -23,7 +21,7 @@ def cfg(tmp_path):
                             module="orchestrator.mcp_servers.user_context",
                             category="user_context"),
         ]),
-        paths=Paths(skills_dir=str(skills_dir), incidents_dir=str(tmp_path)),
+        paths=Paths(skills_file="config/skills.yaml", incidents_dir=str(tmp_path)),
     )
 
 

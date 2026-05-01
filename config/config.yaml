@@ -45,7 +45,7 @@ incidents:
   similarity_threshold: 0.2
   similarity_method: keyword
 paths:
-  skills_dir: config/skills
+  skills_file: config/skills.yaml
   incidents_dir: incidents
 intervention:
   confidence_threshold: 0.75

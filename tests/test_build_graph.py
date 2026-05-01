@@ -32,7 +32,7 @@ def cfg(tmp_path):
 
 @pytest.mark.asyncio
 async def test_build_graph_compiles_with_4_agents(cfg, tmp_path):
-    skills = load_all_skills("config/skills")
+    skills = load_all_skills("config/skills.yaml")
     store = IncidentStore(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
@@ -45,7 +45,7 @@ async def test_build_graph_compiles_with_4_agents(cfg, tmp_path):
 
 @pytest.mark.asyncio
 async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
-    skills = load_all_skills("config/skills")
+    skills = load_all_skills("config/skills.yaml")
     store = IncidentStore(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
