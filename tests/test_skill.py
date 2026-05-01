@@ -69,6 +69,36 @@ def test_load_all_skills_skips_dirs_without_config_yaml(tmp_path):
     assert set(skills) == {"intake"}
 
 
+def test_common_prompt_is_appended_to_every_agent(tmp_path):
+    _write_agent(tmp_path, "intake")
+    _write_agent(tmp_path, "triage", config={**_BASE_CONFIG, "name": "triage", "description": "t"})
+    common = tmp_path / "_common"
+    common.mkdir()
+    (common / "confidence.md").write_text("## Confidence\nbe calibrated")
+    (common / "output.md").write_text("## Output\nbe terse")
+    skills = load_all_skills(tmp_path)
+    for name in ("intake", "triage"):
+        sp = skills[name].system_prompt
+        # agent's own content stays first
+        assert sp.startswith("You are the agent."), sp
+        # globals appended in alphabetical order, joined with blank lines
+        assert sp.endswith("## Confidence\nbe calibrated\n\n## Output\nbe terse"), sp
+
+
+def test_underscore_prefixed_dirs_are_never_agents(tmp_path):
+    _write_agent(tmp_path, "intake")
+    # Even with a config.yaml, an _-prefixed dir must not become a skill.
+    _write_agent(tmp_path, "_drafts", config={**_BASE_CONFIG, "name": "drafts"})
+    skills = load_all_skills(tmp_path)
+    assert set(skills) == {"intake"}
+
+
+def test_no_common_dir_leaves_prompt_untouched(tmp_path):
+    _write_agent(tmp_path, "intake")
+    skills = load_all_skills(tmp_path)
+    assert skills["intake"].system_prompt == "You are the agent.\nBe terse."
+
+
 def test_load_skill_missing_config_raises(tmp_path):
     d = tmp_path / "broken"
     d.mkdir()

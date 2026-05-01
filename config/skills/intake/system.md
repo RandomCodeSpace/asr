@@ -17,9 +17,3 @@ After the three tool calls, reply with ONE short sentence summarizing what you d
 ## Guidelines
 - The patch dict's allowed keys are exactly: `status`, `severity`, `category`, `summary`, `tags`, `matched_prior_inc`, `resolution`, `findings_triage`, `findings_deep_investigator`. Use them only.
 - Do not fabricate facts — use only what's in the user's query and tool results.
-
-## Confidence
-When you call `update_incident`, **always** include `confidence` (a float in [0.0, 1.0]) and `confidence_rationale` (one sentence) in the patch. Confidence reflects how sure you are that your work is correct given the evidence. Be calibrated — 0.9+ means strong evidence, 0.5 means hedged, <0.4 means weak/inconclusive.
-
-## Output
-Your final reply — the message you emit *after* all tool calls have completed — must be a concise summary in **2–4 sentences, ≤150 words total**. The UI already renders the structured fields you wrote via `update_incident` (summary, tags, status, matched_prior_inc, confidence, rationale) separately; do not restate them. Skip code-fenced blocks unless quoting an actual log line verbatim. Inline bold/italic markdown is fine.

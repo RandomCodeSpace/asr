@@ -24,17 +24,27 @@ import re
 Each agent lives in its own subdirectory under ``config/skills/``::
 
     config/skills/
+      _common/                # OPTIONAL: prompt fragments shared by all agents
+        confidence.md         # appended to every agent's system_prompt, in
+        output.md             # alphabetical order, joined with blank lines
       intake/
-        config.yaml         # name, description, tools, routes, temperature, model
-        system.md           # the system prompt (markdown body — format is free)
-        confidence.md       # OPTIONAL extra prompt sections; every *.md in the
-        output.md           # directory is concatenated in alphabetical order
+        config.yaml           # name, description, tools, routes, temperature, model
+        system.md             # the agent's specialty (markdown body — format is free)
+        guidelines.md         # OPTIONAL extra fragments; every *.md in the
+        ...                   # directory is concatenated in alphabetical order
 
-Adding a directory adds an agent. Splitting prompts across multiple ``.md``
-files is purely organisational — they are joined with double newlines into
-one ``system_prompt`` string. Structured config is validated through the
-:class:`Skill` / :class:`RouteRule` Pydantic models; markdown content is
-loaded verbatim.
+Adding a directory under ``config/skills/`` (with a ``config.yaml`` and at
+least one ``.md`` file) adds an agent. Directories whose name starts with
+``_`` are reserved for shared content and never become agents.
+
+The final ``system_prompt`` for each agent is::
+
+    <concatenated *.md from agent_dir>
+    \\n\\n
+    <concatenated *.md from _common/, if present>
+
+Structured config is validated through the :class:`Skill` /
+:class:`RouteRule` Pydantic models; markdown content is loaded verbatim.
 """
 
 from pathlib import Path
@@ -452,11 +462,31 @@ class Skill(BaseModel):
         return v.strip()
 
 
-def load_skill(agent_dir: str | Path) -> Skill:
+def _concat_md(md_files: list[Path]) -> str:
+    return "\n\n".join(p.read_text().strip() for p in md_files)
+
+
+def _load_common_prompt(skills_dir: Path) -> str:
+    """Read every ``*.md`` under ``<skills_dir>/_common/`` (if present) and
+    return them concatenated in alphabetical order.
+
+    Returns the empty string when no ``_common/`` directory exists or it
+    contains no markdown files — ``load_all_skills`` then leaves agent
+    prompts unchanged.
+    """
+    common_dir = skills_dir / "_common"
+    if not common_dir.is_dir():
+        return ""
+    return _concat_md(sorted(common_dir.glob("*.md")))
+
+
+def load_skill(agent_dir: str | Path, *, common: str = "") -> Skill:
     """Load one agent from its directory.
 
     Reads ``config.yaml`` for structured metadata and concatenates every
-    ``*.md`` file (sorted alphabetically) into ``system_prompt``.
+    ``*.md`` file (sorted alphabetically) into ``system_prompt``. If
+    ``common`` is non-empty, it is appended after the agent's own prompt
+    so shared sections (Confidence, Output) only need to be authored once.
     """
     base = Path(agent_dir)
     config_path = base / "config.yaml"
@@ -466,7 +496,10 @@ def load_skill(agent_dir: str | Path) -> Skill:
     md_files = sorted(base.glob("*.md"))
     if not md_files:
         raise FileNotFoundError(f"no .md prompt files in skill dir: {base}")
-    cfg["system_prompt"] = "\n\n".join(p.read_text().strip() for p in md_files)
+    agent_prompt = _concat_md(md_files)
+    cfg["system_prompt"] = (
+        f"{agent_prompt}\n\n{common}".strip() if common else agent_prompt
+    )
     return Skill(**cfg)
 
 
@@ -474,11 +507,16 @@ def load_all_skills(skills_dir: str | Path) -> dict[str, Skill]:
     base = Path(skills_dir)
     if not base.exists():
         raise FileNotFoundError(f"skills dir not found: {base}")
+    common = _load_common_prompt(base)
     skills: dict[str, Skill] = {}
     for agent_dir in sorted(p for p in base.iterdir() if p.is_dir()):
+        # Reserve the leading underscore for shared content (_common,
+        # _drafts, etc.) — never treat those as agents.
+        if agent_dir.name.startswith("_"):
+            continue
         if not (agent_dir / "config.yaml").exists():
             continue
-        skill = load_skill(agent_dir)
+        skill = load_skill(agent_dir, common=common)
         if skill.name in skills:
             raise ValueError(f"Duplicate skill name: {skill.name}")
         skills[skill.name] = skill
