@@ -1,4 +1,3 @@
-name: resolution
 description: Propose and (mock-)apply a fix; close the INC or escalate
 temperature: 0.0
 tools:

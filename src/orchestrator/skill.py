@@ -26,9 +26,29 @@ Structured config is validated through the :class:`Skill` /
 :class:`RouteRule` Pydantic models; markdown content is loaded verbatim.
 """
 from __future__ import annotations
+import re
 from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, field_validator
+
+
+_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _validate_agent_name(name: str, *, source: str) -> None:
+    """Reject directory names that can't safely become agent identifiers.
+
+    Agent names appear in route targets (``next: triage``), LangGraph node
+    IDs, and INC tags. Restricting them to ``[a-z][a-z0-9_]{0,63}`` keeps
+    them grep-able, shell-safe, and free of case-sensitivity surprises
+    across filesystems.
+    """
+    if not _AGENT_NAME_RE.match(name):
+        raise ValueError(
+            f"invalid agent name {name!r} (from {source}): must match "
+            f"[a-z][a-z0-9_]{{0,63}} — lowercase, start with a letter, "
+            f"alphanumerics + underscore only, max 64 chars"
+        )
 
 
 class RouteRule(BaseModel):
@@ -72,16 +92,29 @@ def _load_common_prompt(skills_dir: Path) -> str:
 def load_skill(agent_dir: str | Path, *, common: str = "") -> Skill:
     """Load one agent from its directory.
 
-    Reads ``config.yaml`` for structured metadata and concatenates every
-    ``*.md`` file (sorted alphabetically) into ``system_prompt``. If
-    ``common`` is non-empty, it is appended after the agent's own prompt
-    so shared sections (Confidence, Output) only need to be authored once.
+    The directory name is the agent's ``name`` (single source of truth).
+    Reads ``config.yaml`` for the rest of the structured metadata and
+    concatenates every ``*.md`` file (sorted alphabetically) into
+    ``system_prompt``. If ``common`` is non-empty, it is appended after
+    the agent's own prompt so shared sections (Confidence, Output) only
+    need to be authored once.
+
+    Raises ``ValueError`` if ``config.yaml`` declares its own ``name`` —
+    the duplication used to drift silently when a directory was renamed
+    without updating the config.
     """
     base = Path(agent_dir)
     config_path = base / "config.yaml"
     if not config_path.exists():
         raise FileNotFoundError(f"missing config.yaml in skill dir: {base}")
+    _validate_agent_name(base.name, source=f"directory {base}")
     cfg = yaml.safe_load(config_path.read_text()) or {}
+    if "name" in cfg:
+        raise ValueError(
+            f"config.yaml at {config_path} must not declare 'name' — the "
+            f"agent name is taken from the directory ({base.name!r})"
+        )
+    cfg["name"] = base.name
     md_files = sorted(base.glob("*.md"))
     if not md_files:
         raise FileNotFoundError(f"no .md prompt files in skill dir: {base}")
