@@ -251,11 +251,14 @@ def make_agent_node(
                         entry.result = getattr(msg, "content", None)
                         break
 
-        # Final summary text from the agent's last AIMessage.
+        # Final summary text from the agent's last AIMessage. Cap exists
+        # solely to bound a runaway LLM emission — keep it generous so the
+        # markdown the model writes survives intact (a truncated mid-fence
+        # response renders **bold** as literal asterisks in the UI).
         final_text = ""
         for msg in reversed(result.get("messages", [])):
             if msg.__class__.__name__ == "AIMessage" and msg.content:
-                final_text = str(msg.content)[:500]
+                final_text = str(msg.content)[:4000]
                 break
 
         # Sum token usage across every message that reports it. langchain-ollama
