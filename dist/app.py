@@ -235,6 +235,10 @@ class InterventionConfig(BaseModel):
     )
 
 
+class OrchestratorConfig(BaseModel):
+    entry_agent: str = "intake"
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
@@ -244,6 +248,7 @@ class AppConfig(BaseModel):
     )
     paths: Paths = Field(default_factory=Paths)
     intervention: InterventionConfig = Field(default_factory=InterventionConfig)
+    orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
 
 
 import os
@@ -311,6 +316,7 @@ class AgentRun(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     confidence: float | None = None
     confidence_rationale: str | None = None
+    signal: str | None = None
 
 
 class Findings(BaseModel):
@@ -464,6 +470,7 @@ def _validate_agent_name(name: str, *, source: str) -> None:
 class RouteRule(BaseModel):
     when: str
     next: str
+    gate: str | None = None
 
 
 class Skill(BaseModel):
@@ -1080,6 +1087,35 @@ def _coerce_rationale(raw) -> str | None:
         logger.warning("uncoercible confidence_rationale %r; dropping", raw)
         return None
 
+
+_VALID_SIGNALS: frozenset[str] = frozenset({"success", "failed", "needs_input"})
+
+
+def _coerce_signal(raw) -> str | None:
+    """Coerce a raw signal value emitted by an LLM to a canonical lowercase
+    string, or None when the value cannot be interpreted.
+
+    Recognised signals are ``success``, ``failed``, and ``needs_input``. Any
+    other string emits a warning and yields None — the route lookup then
+    falls back to ``when: default``. ``bool`` is rejected explicitly because
+    Python treats it as ``int`` and string-coerces to ``"True"``/``"False"``.
+    """
+    if isinstance(raw, bool):
+        logger.warning("signal value is bool (%r); rejecting", raw)
+        return None
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        logger.warning("non-string signal %r (%s); rejecting",
+                       raw, type(raw).__name__)
+        return None
+    key = raw.strip().lower()
+    if key in _VALID_SIGNALS:
+        return key
+    logger.warning("unknown signal %r; treating as None (will fall through to default)", raw)
+    return None
+
+
 from langchain_core.messages import HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
@@ -1172,7 +1208,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     raise last_exc  # pragma: no cover  (unreachable)
 
 
-def _format_intake_input(incident: Incident) -> str:
+def _format_agent_input(incident: Incident) -> str:
     base = (
         f"Incident {incident.id}\n"
         f"Environment: {incident.environment}\n"
@@ -1209,7 +1245,7 @@ def make_agent_node(
         try:
             result = await _ainvoke_with_retry(
                 agent_executor,
-                {"messages": [HumanMessage(content=_format_intake_input(incident))]},
+                {"messages": [HumanMessage(content=_format_agent_input(incident))]},
             )
         except Exception as exc:  # noqa: BLE001
             # Reload to absorb any partial writes from tools that ran before the failure.
@@ -1240,6 +1276,7 @@ def make_agent_node(
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         agent_confidence: float | None = None
         agent_rationale: str | None = None
+        agent_signal: str | None = None
         for msg in result.get("messages", []):
             tool_calls = getattr(msg, "tool_calls", None) or []
             for tc in tool_calls:
@@ -1258,6 +1295,8 @@ def make_agent_node(
                         agent_confidence = _coerce_confidence(patch["confidence"])
                     if "confidence_rationale" in patch:
                         agent_rationale = _coerce_rationale(patch["confidence_rationale"])
+                    if "signal" in patch:
+                        agent_signal = _coerce_signal(patch["signal"])
 
         # Pair tool responses with their tool calls.
         for msg in result.get("messages", []):
@@ -1300,6 +1339,7 @@ def make_agent_node(
             ),
             confidence=agent_confidence,
             confidence_rationale=agent_rationale,
+            signal=agent_signal,
         ))
         incident.token_usage.input_tokens += agent_in
         incident.token_usage.output_tokens += agent_out
@@ -1314,29 +1354,19 @@ def make_agent_node(
     return node
 
 
-# Per-agent route decision functions.
-def _decide_intake(inc: Incident) -> str:
-    return "default"
+def _decide_from_signal(inc: Incident) -> str:
+    """Return the latest agent's emitted signal, or "default" if absent.
 
-
-def _decide_triage(inc: Incident) -> str:
-    return "default"
-
-
-def _decide_deep_investigator(inc: Incident) -> str:
-    return "default"
-
-
-def _decide_resolution(inc: Incident) -> str:
-    return "default"
-
-
-_DECIDERS: dict[str, Callable[[Incident], str]] = {
-    "intake": _decide_intake,
-    "triage": _decide_triage,
-    "deep_investigator": _decide_deep_investigator,
-    "resolution": _decide_resolution,
-}
+    Agents emit one of {success, failed, needs_input} via the ``signal``
+    key of their final ``update_incident`` patch (see ``_coerce_signal``).
+    The node harvests it onto ``AgentRun.signal``; this decider then reads
+    the *most recent* run (which is the one that just finished, since the
+    node has already appended it). If no signal is present we return
+    "default" so ``route_from_skill`` picks the fallback rule.
+    """
+    if not inc.agents_run:
+        return "default"
+    return inc.agents_run[-1].signal or "default"
 
 
 _STUB_CANNED = {
@@ -1413,7 +1443,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
             stub_canned=_STUB_CANNED,
         )
         tools = registry.get(skill.tools)
-        decide = _DECIDERS.get(agent_name, lambda inc: "default")
+        decide = _decide_from_signal
         nodes[agent_name] = make_agent_node(
             skill=skill, llm=llm, tools=tools,
             decide_route=decide, store=store,
@@ -1421,91 +1451,165 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     return nodes
 
 
-def _gate_router(state: GraphState):
-    nr = state.get("next_route")
-    if nr in (None, "__end__"):
-        return END
-    # gate's "default" means "advance to resolution".
-    return "resolution"
+def _make_router(gated_edges: dict[tuple[str, str], str]):
+    """Build a state router that intercepts gated edges into the gate node.
+
+    Used by both ``build_graph`` and ``build_resume_graph`` — they share
+    the same routing semantics, so this factory eliminates duplication.
+    """
+    def _router(state: GraphState):
+        nr = state.get("next_route")
+        if nr in (None, "__end__"):
+            return END
+        la = state.get("last_agent")
+        if (la, nr) in gated_edges:
+            return "gate"
+        return nr
+    return _router
+
+
+def _make_gate_to(gate_target: str):
+    """Build the gate's outbound router. On a "default" pass, the gate
+    forwards to its single downstream target; on "__end__", it terminates.
+    """
+    def _gate_to(state: GraphState):
+        nr = state.get("next_route")
+        if nr in (None, "__end__"):
+            return END
+        return gate_target
+    return _gate_to
+
+
+def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
+    """Return ``{(from_agent, to_node): gate_type}`` for every route rule
+    whose ``gate`` is set. Today only ``gate: confidence`` is recognised."""
+    edges: dict[tuple[str, str], str] = {}
+    for agent_name, skill in skills.items():
+        for rule in skill.routes:
+            if rule.gate:
+                edges[(agent_name, rule.next)] = rule.gate
+    return edges
 
 
 async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
                       registry: ToolRegistry):
-    """Compile the main LangGraph: intake -> triage -> deep_investigator -> gate -> resolution.
+    """Compile the main LangGraph from configured skills and routes.
+
+    The entry agent is read from ``cfg.orchestrator.entry_agent``. Gate
+    insertions are derived from each skill's route rules: a rule with
+    ``gate: confidence`` causes the router to redirect ``(this_agent, next)``
+    through the ``gate`` node.
 
     The ``registry`` is provided by the caller — typically the
     :class:`Orchestrator`, which loads MCP tools into an :class:`AsyncExitStack`
     so the underlying FastMCP transports stay alive for the lifetime of the
     compiled graph.
     """
+    entry = cfg.orchestrator.entry_agent
+    if entry not in skills:
+        raise ValueError(
+            f"orchestrator.entry_agent={entry!r} is not a known skill "
+            f"(known: {sorted(skills.keys())})"
+        )
+    gated_edges = _collect_gated_edges(skills)
+
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
-    # Insert the human-in-the-loop gate between DI and resolution.
     sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
 
-    sg.set_entry_point("intake")
+    sg.set_entry_point(entry)
 
-    # Standard router for agent nodes: next_route is a target node or __end__.
-    def _router(state: GraphState):
-        nr = state.get("next_route")
-        if nr in (None, "__end__"):
-            return END
-        # deep_investigator's "default" forwards through the gate.
-        if state.get("last_agent") == "deep_investigator" and nr == "resolution":
-            return "gate"
-        return nr
+    _router = _make_router(gated_edges)
 
     for agent_name in skills.keys():
         possible_targets = {s.name for s in skills.values()} | {END, "gate"}
-        target_map = {name: name for name in possible_targets if name != END}
+        # Exclude targets that are intercepted via a gated edge for this agent:
+        # the router redirects (agent_name, gated_target) -> "gate", so the
+        # gated_target must NOT appear in this agent's target_map. Leaving it
+        # in would cause LangGraph to register a visible direct edge in the
+        # compiled graph, defeating the structural assertion in the test (and
+        # misleading graph visualisations).
+        gated_targets_for_agent = {to for (frm, to) in gated_edges if frm == agent_name}
+        target_map = {
+            name: name
+            for name in possible_targets
+            if name != END and name not in gated_targets_for_agent
+        }
         target_map[END] = END
         sg.add_conditional_edges(agent_name, _router, target_map)
 
-    # Gate's edges: route to resolution on default, END on __end__.
-    sg.add_conditional_edges("gate", _gate_router, {
-        "resolution": "resolution", END: END,
-    })
+    # Determine where the gate forwards on a "default" pass — there is at
+    # most one downstream agent per gated edge; with one gate type today
+    # we collapse to a single target. If the user defines multiple gated
+    # edges with different downstream agents in the future, the closure
+    # below will need a state-aware lookup; for now we assert "exactly one"
+    # and error loudly otherwise.
+    gate_targets = {to for (_from, to) in gated_edges}
+    if len(gate_targets) > 1:
+        raise ValueError(
+            f"multiple gated downstream targets {sorted(gate_targets)} not "
+            f"yet supported; only one gated edge per graph"
+        )
+    gate_target = next(iter(gate_targets), None)
+    if gate_target is not None:
+        _gate_to = _make_gate_to(gate_target)
+        sg.add_conditional_edges("gate", _gate_to, {
+            gate_target: gate_target, END: END,
+        })
+    else:
+        sg.add_edge("gate", END)
 
     return sg.compile()
 
 
 async def build_resume_graph(*, cfg: AppConfig, skills: dict,
                              store: IncidentStore, registry: ToolRegistry):
-    """Compile a sub-graph that re-runs only deep_investigator -> gate -> resolution.
+    """Compile a sub-graph that re-runs from the *upstream* end of the
+    (single) gated edge through to the gate's downstream target.
 
-    Used by ``Orchestrator.resume_investigation`` after the user supplies new
-    context: intake/triage already ran, so we resume from DI with the updated
-    incident. Same gate semantics — if the new run is still low-confidence,
-    we'll pause again.
+    Used by ``Orchestrator.resume_investigation`` after the user supplies
+    new context: agents before the gated edge already ran, so we resume
+    from the gated agent with the updated incident. Same gate semantics —
+    if the new run is still low-confidence, we'll pause again.
     """
+    gated_edges = _collect_gated_edges(skills)
+    if not gated_edges:
+        raise ValueError(
+            "build_resume_graph requires at least one route with gate set; "
+            "no gated edges were found in the configured skills — add "
+            "'gate: confidence' to the relevant agent's route in "
+            "config/skills/<agent>/config.yaml"
+        )
+    if len(gated_edges) > 1:
+        raise ValueError(
+            f"multiple gated edges {sorted(gated_edges.keys())} not yet "
+            f"supported; resume entry is ambiguous"
+        )
+    resume_from, gate_target = next(iter(gated_edges.keys()))
+
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
-    # Only DI + resolution agents participate; intake/triage are skipped.
-    for agent_name in ("deep_investigator", "resolution"):
+    for agent_name in (resume_from, gate_target):
         if agent_name in nodes:
             sg.add_node(agent_name, nodes[agent_name])
     sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
-    sg.set_entry_point("deep_investigator")
+    sg.set_entry_point(resume_from)
 
-    def _router(state: GraphState):
-        nr = state.get("next_route")
-        if nr in (None, "__end__"):
-            return END
-        if state.get("last_agent") == "deep_investigator" and nr == "resolution":
-            return "gate"
-        return nr
+    _router = _make_router(gated_edges)
 
-    for agent_name in ("deep_investigator", "resolution"):
+    for agent_name in (resume_from, gate_target):
         sg.add_conditional_edges(agent_name, _router, {
-            "deep_investigator": "deep_investigator",
-            "resolution": "resolution",
+            resume_from: resume_from,
+            gate_target: gate_target,
             "gate": "gate",
             END: END,
         })
-    sg.add_conditional_edges("gate", _gate_router, {
-        "resolution": "resolution", END: END,
+
+    _gate_to = _make_gate_to(gate_target)
+    sg.add_conditional_edges("gate", _gate_to, {
+        gate_target: gate_target, END: END,
     })
     return sg.compile()
 
