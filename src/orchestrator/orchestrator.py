@@ -8,7 +8,7 @@ from orchestrator.config import AppConfig
 from orchestrator.incident import IncidentStore, ToolCall
 from orchestrator.skill import load_all_skills, Skill
 from orchestrator.mcp_loader import load_tools, ToolRegistry
-from orchestrator.mcp_servers.incident import set_state as _set_inc_state
+from orchestrator.mcp_servers.incident import set_state
 from orchestrator.graph import build_graph, build_resume_graph, GraphState
 
 
@@ -36,7 +36,7 @@ class Orchestrator:
         await stack.__aenter__()
         try:
             store = IncidentStore(cfg.paths.incidents_dir)
-            _set_inc_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
+            set_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
             skills = load_all_skills(cfg.paths.skills_dir)
             registry = await load_tools(cfg.mcp, stack)
             graph = await build_graph(cfg=cfg, skills=skills, store=store,

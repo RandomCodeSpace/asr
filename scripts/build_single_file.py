@@ -1,7 +1,10 @@
-"""Concatenate src/orchestrator/**/*.py + ui/streamlit_app.py into dist/app.py.
+"""Build two deployment bundles from src/orchestrator/ + ui/streamlit_app.py.
 
-Rewrites `from orchestrator...` imports by removing them — the symbols are inlined.
-External imports (stdlib + 3rd-party) are deduplicated and hoisted to the top.
+- dist/app.py  — orchestrator core + FastAPI service (uvicorn --factory)
+- dist/ui.py   — Streamlit UI only; rewrites `from orchestrator.X import Y`
+                  to `from app import Y` (sibling module reference)
+
+Run: python scripts/build_single_file.py
 """
 from __future__ import annotations
 import re
@@ -9,10 +12,11 @@ from pathlib import Path
 
 SRC_ROOT = Path("src/orchestrator")
 UI = Path("ui/streamlit_app.py")
-OUT = Path("dist/app.py")
+OUT_APP = Path("dist/app.py")
+OUT_UI = Path("dist/ui.py")
 
 # Order matters — emit modules in dependency order.
-MODULE_ORDER = [
+CORE_MODULE_ORDER = [
     "config.py",
     "incident.py",
     "similarity.py",
@@ -28,8 +32,14 @@ MODULE_ORDER = [
     "api.py",
 ]
 
-INTRA_IMPORT_RE = re.compile(r"^\s*from\s+orchestrator(\.[\w.]+)?\s+import\s+.*$", re.MULTILINE)
+INTRA_IMPORT_RE = re.compile(
+    r"^\s*from\s+orchestrator(\.[\w.]+)?\s+import\s+.*$", re.MULTILINE
+)
 PACKAGE_INIT_RE = re.compile(r"^\s*from\s+__future__\s+import\s+.*$", re.MULTILINE)
+_FROM_ORCH_RE = re.compile(
+    r"^\s*from\s+orchestrator(?:\.[\w.]+)?\s+import\s+(.*?)\s*$",
+    re.MULTILINE,
+)
 
 
 def _read(path: Path) -> str:
@@ -38,6 +48,35 @@ def _read(path: Path) -> str:
 
 def _strip_intra_imports(src: str) -> str:
     return INTRA_IMPORT_RE.sub("", src)
+
+
+def _rewrite_intra_imports_for_ui(src: str) -> str:
+    """Replace all `from orchestrator(.X)? import A, B` with `from app import A, B`.
+
+    Collects all symbols from every such import line, deduplicates, and emits
+    a single consolidated `from app import ...` line just after the
+    `from __future__ import annotations` line (or at the top if absent).
+    """
+    symbols: set[str] = set()
+
+    def _collect(m: re.Match) -> str:
+        for s in m.group(1).split(","):
+            s = s.strip()
+            if s:
+                symbols.add(s)
+        return ""  # remove the original line
+
+    src = _FROM_ORCH_RE.sub(_collect, src)
+    if symbols:
+        emit = "from app import " + ", ".join(sorted(symbols))
+        future_pattern = re.compile(
+            r"^(from\s+__future__\s+import\s+.*)$", re.MULTILINE
+        )
+        if future_pattern.search(src):
+            src = future_pattern.sub(r"\1\n" + emit, src, count=1)
+        else:
+            src = emit + "\n" + src
+    return src
 
 
 def _split_imports_and_body(src: str) -> tuple[list[str], str]:
@@ -87,16 +126,32 @@ def _split_imports_and_body(src: str) -> tuple[list[str], str]:
     return imports, "\n".join(body_lines)
 
 
-def main() -> None:
-    OUT.parent.mkdir(parents=True, exist_ok=True)
+def _dedup_and_sort_future(all_imports: list[str]) -> list[str]:
+    """Deduplicate imports and hoist __future__ lines to the top."""
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for line in all_imports:
+        key = line.strip()
+        if key.startswith(("import ", "from __future__", "from ")):
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(line)
+    future_lines = [l for l in deduped if l.strip().startswith("from __future__")]
+    other_lines = [l for l in deduped if not l.strip().startswith("from __future__")]
+    return future_lines + other_lines
+
+
+def build_app() -> None:
+    """Build dist/app.py — orchestrator core + FastAPI, no Streamlit."""
+    OUT_APP.parent.mkdir(parents=True, exist_ok=True)
     all_imports: list[str] = []
     bodies: list[str] = []
 
-    for rel in MODULE_ORDER:
+    for rel in CORE_MODULE_ORDER:
         path = SRC_ROOT / rel
         src = _read(path)
         src = _strip_intra_imports(src)
-        # __future__ imports must be first; collect all and emit once at top.
         future_imports = PACKAGE_INIT_RE.findall(src)
         src = PACKAGE_INIT_RE.sub("", src)
         imports, body = _split_imports_and_body(src)
@@ -107,8 +162,23 @@ def main() -> None:
         bodies.append(f"\n# ====== module: orchestrator/{rel} ======\n")
         bodies.append(body)
 
-    # UI
-    ui_src = _strip_intra_imports(_read(UI))
+    final_imports = _dedup_and_sort_future(all_imports)
+    OUT_APP.write_text(
+        "\n".join(final_imports) + "\n\n" + "\n".join(bodies) + "\n"
+    )
+    print(f"wrote {OUT_APP} ({OUT_APP.stat().st_size:,} bytes)")
+
+
+def build_ui() -> None:
+    """Build dist/ui.py — Streamlit UI only; imports from sibling app module."""
+    OUT_UI.parent.mkdir(parents=True, exist_ok=True)
+    all_imports: list[str] = []
+    bodies: list[str] = []
+
+    ui_src = _read(UI)
+    # Rewrite `from orchestrator.X import Y` → `from app import Y`
+    # (must happen before stripping __future__ so the future line anchor works)
+    ui_src = _rewrite_intra_imports_for_ui(ui_src)
     future_ui = PACKAGE_INIT_RE.findall(ui_src)
     ui_src = PACKAGE_INIT_RE.sub("", ui_src)
     ui_imports, ui_body = _split_imports_and_body(ui_src)
@@ -119,25 +189,16 @@ def main() -> None:
     bodies.append("\n# ====== module: ui/streamlit_app.py ======\n")
     bodies.append(ui_body)
 
-    # Deduplicate external imports while preserving first-seen order.
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for line in all_imports:
-        key = line.strip()
-        if key.startswith(("import ", "from __future__", "from ")):
-            if key in seen:
-                continue
-            seen.add(key)
-        deduped.append(line)
+    final_imports = _dedup_and_sort_future(all_imports)
+    OUT_UI.write_text(
+        "\n".join(final_imports) + "\n\n" + "\n".join(bodies) + "\n"
+    )
+    print(f"wrote {OUT_UI} ({OUT_UI.stat().st_size:,} bytes)")
 
-    # __future__ imports must be the very first executable statement; ensure
-    # nothing precedes them except an optional module docstring (we don't emit one).
-    future_lines = [line for line in deduped if line.strip().startswith("from __future__")]
-    other_lines = [line for line in deduped if not line.strip().startswith("from __future__")]
-    final_imports = future_lines + other_lines
 
-    OUT.write_text("\n".join(final_imports) + "\n\n" + "\n".join(bodies) + "\n")
-    print(f"wrote {OUT} ({OUT.stat().st_size} bytes)")
+def main() -> None:
+    build_app()
+    build_ui()
 
 
 if __name__ == "__main__":

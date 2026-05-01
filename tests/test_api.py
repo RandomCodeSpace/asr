@@ -1,4 +1,5 @@
 import pytest
+from contextlib import asynccontextmanager
 from httpx import AsyncClient, ASGITransport
 from orchestrator.api import build_app
 from orchestrator.config import AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths
@@ -26,11 +27,26 @@ def cfg(tmp_path):
     )
 
 
+@asynccontextmanager
+async def _client_with_lifespan(app):
+    """Wrap an httpx client around an ASGI app, triggering lifespan
+    startup/shutdown around the request scope.
+
+    Required because :class:`httpx.ASGITransport` does NOT auto-trigger
+    lifespan; ``app.state.orchestrator`` is set during the FastAPI
+    lifespan and would be missing without this wrapper.
+    """
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            yield client
+
+
 @pytest.mark.asyncio
 async def test_health_returns_200(cfg):
-    app = await build_app(cfg)
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
         res = await client.get("/health")
     assert res.status_code == 200
     assert res.json()["status"] == "ok"
@@ -38,9 +54,8 @@ async def test_health_returns_200(cfg):
 
 @pytest.mark.asyncio
 async def test_agents_endpoint_returns_4(cfg):
-    app = await build_app(cfg)
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
         res = await client.get("/agents")
     assert res.status_code == 200
     names = {a["name"] for a in res.json()}
@@ -49,10 +64,12 @@ async def test_agents_endpoint_returns_4(cfg):
 
 @pytest.mark.asyncio
 async def test_investigate_endpoint_creates_incident(cfg):
-    app = await build_app(cfg)
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.post("/investigate", json={"query": "api latency", "environment": "production"})
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        res = await client.post(
+            "/investigate",
+            json={"query": "api latency", "environment": "production"},
+        )
     assert res.status_code == 200
     body = res.json()
     assert body["incident_id"].startswith("INC-")
