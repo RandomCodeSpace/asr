@@ -251,14 +251,15 @@ def make_agent_node(
                         entry.result = getattr(msg, "content", None)
                         break
 
-        # Final summary text from the agent's last AIMessage. Cap exists
-        # solely to bound a runaway LLM emission — keep it generous so the
-        # markdown the model writes survives intact (a truncated mid-fence
-        # response renders **bold** as literal asterisks in the UI).
+        # Final summary text from the agent's last AIMessage. Persist it
+        # verbatim — concision is enforced via the skill prompts (each one
+        # instructs the agent to keep the final reply ≤150 words). Storing
+        # the full message preserves the audit trail; mid-fence truncation
+        # used to corrupt downstream markdown rendering.
         final_text = ""
         for msg in reversed(result.get("messages", [])):
             if msg.__class__.__name__ == "AIMessage" and msg.content:
-                final_text = str(msg.content)[:4000]
+                final_text = str(msg.content)
                 break
 
         # Sum token usage across every message that reports it. langchain-ollama
