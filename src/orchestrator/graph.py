@@ -1,8 +1,67 @@
 """LangGraph state, routing helpers, and node runner."""
 from __future__ import annotations
 import asyncio
+import logging
 from typing import TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+
+_CONFIDENCE_LABELS: dict[str, float] = {
+    "high": 0.9,
+    "medium": 0.6,
+    "low": 0.3,
+}
+
+
+def _coerce_confidence(raw) -> float | None:
+    """Coerce a raw confidence value emitted by an LLM to a clamped float in
+    [0.0, 1.0], or None when the value cannot be interpreted.
+
+    Order matters: bool **must** be rejected before float because Python treats
+    ``True``/``False`` as instances of ``int`` (and therefore acceptable to
+    ``float()``). Strings are matched against the canonical {high, medium, low}
+    labels case-insensitively; any other string emits a warning and yields
+    None. Floats outside [0.0, 1.0] are clamped (with a warning) rather than
+    dropped — clamping is more forgiving when an LLM is on the right track but
+    miscalibrated.
+    """
+    if isinstance(raw, bool):
+        logger.warning("confidence value is bool (%r); rejecting", raw)
+        return None
+    if isinstance(raw, str):
+        key = raw.strip().lower()
+        if key in _CONFIDENCE_LABELS:
+            mapped = _CONFIDENCE_LABELS[key]
+            logger.warning("coerced string confidence %r -> %s", raw, mapped)
+            return mapped
+        logger.warning("unknown confidence string %r; treating as None", raw)
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("uncoercible confidence value %r (%s); treating as None",
+                       raw, type(raw).__name__)
+        return None
+    clamped = max(0.0, min(1.0, val))
+    if clamped != val:
+        logger.warning("clamped out-of-range confidence %s -> %s", val, clamped)
+    return clamped
+
+
+def _coerce_rationale(raw) -> str | None:
+    """Coerce a confidence_rationale value to a stripped string, or None."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        logger.warning("confidence_rationale is bool (%r); rejecting", raw)
+        return None
+    try:
+        return str(raw)
+    except Exception:  # noqa: BLE001 — defensive; any object should be str-able
+        logger.warning("uncoercible confidence_rationale %r; dropping", raw)
+        return None
 
 from langchain_core.messages import HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -180,12 +239,9 @@ def make_agent_node(
                 if tc_name == "update_incident":
                     patch = tc_args.get("patch") or {}
                     if "confidence" in patch:
-                        try:
-                            agent_confidence = float(patch["confidence"])
-                        except (TypeError, ValueError):
-                            pass
+                        agent_confidence = _coerce_confidence(patch["confidence"])
                     if "confidence_rationale" in patch:
-                        agent_rationale = str(patch["confidence_rationale"])
+                        agent_rationale = _coerce_rationale(patch["confidence_rationale"])
 
         # Pair tool responses with their tool calls.
         for msg in result.get("messages", []):
