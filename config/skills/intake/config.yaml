@@ -1,0 +1,10 @@
+name: intake
+description: First-line agent — enriches the just-created INC and checks for known prior resolutions
+temperature: 0.0
+tools:
+  - lookup_similar_incidents
+  - get_user_context
+  - update_incident
+routes:
+  - when: default
+    next: triage

@@ -37,7 +37,7 @@ class Orchestrator:
         try:
             store = IncidentStore(cfg.paths.incidents_dir)
             _set_inc_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
-            skills = load_all_skills(cfg.paths.skills_file)
+            skills = load_all_skills(cfg.paths.skills_dir)
             registry = await load_tools(cfg.mcp, stack)
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry)

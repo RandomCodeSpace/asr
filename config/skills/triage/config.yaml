@@ -1,0 +1,10 @@
+name: triage
+description: Categorize, prioritize, and assess the impact of the incident
+temperature: 0.0
+tools:
+  - update_incident
+  - get_service_health
+  - check_deployment_history
+routes:
+  - when: default
+    next: deep_investigator

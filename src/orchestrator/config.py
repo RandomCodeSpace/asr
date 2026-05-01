@@ -51,7 +51,7 @@ class IncidentConfig(BaseModel):
 
 
 class Paths(BaseModel):
-    skills_file: str = "config/skills.yaml"
+    skills_dir: str = "config/skills"
     incidents_dir: str = "incidents"
 
 

@@ -21,7 +21,7 @@ def cfg(tmp_path):
                             module="orchestrator.mcp_servers.user_context",
                             category="user_context"),
         ]),
-        paths=Paths(skills_file="config/skills.yaml", incidents_dir=str(tmp_path)),
+        paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
     )
 
 

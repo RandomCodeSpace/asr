@@ -1,0 +1,11 @@
+name: resolution
+description: Propose and (mock-)apply a fix; close the INC or escalate
+temperature: 0.0
+tools:
+  - propose_fix
+  - apply_fix
+  - notify_oncall
+  - update_incident
+routes:
+  - when: default
+    next: __end__
