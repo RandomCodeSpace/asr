@@ -1396,6 +1396,17 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
     Implemented as a plain async coroutine (not via ``make_agent_node``) so
     it does not invoke an LLM — but it IS a real graph node, so streamed
     events surface ``enter gate`` / ``exit gate``.
+
+    .. note::
+       The gate's *structural* placement is config-driven (see
+       :func:`_collect_gated_edges`), but its *semantic* check is still
+       pinned to ``deep_investigator``'s confidence via
+       :func:`_latest_di_confidence`. Moving the gate marker to a
+       different agent pair via ``gate: confidence`` on another route
+       will compile, but the gate will silently evaluate the wrong (or
+       absent) confidence value. Generalising this is tracked as
+       follow-up work — pass the upstream agent name as a parameter so
+       the lookup is config-driven.
     """
     threshold = cfg.intervention.confidence_threshold
     teams = list(cfg.intervention.escalation_teams)
