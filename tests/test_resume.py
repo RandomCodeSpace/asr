@@ -135,6 +135,54 @@ async def test_resume_rejects_when_not_awaiting_input(cfg):
 
 
 @pytest.mark.asyncio
+async def test_resume_handles_subgraph_exception(cfg, monkeypatch):
+    """If the resume sub-graph raises, the INC must be restored to
+    awaiting_input with its original pending_intervention payload — not left
+    stuck at in_progress with a cleared intervention.
+
+    The orchestrator should yield a ``resume_failed`` event and NOT re-raise.
+    """
+    orch = await Orchestrator.create(cfg)
+    try:
+        inc_id = _seed_paused_incident(orch, di_confidence=0.42)
+        before = orch.store.load(inc_id)
+        original_pi = dict(before.pending_intervention)
+
+        # Force the sub-graph to blow up partway through.
+        async def _boom(*_args, **_kwargs):
+            # Make it look like an async iterator that raises before yielding.
+            raise RuntimeError("apply_fix exploded mid-stream")
+            yield  # pragma: no cover — make this an async generator
+
+        monkeypatch.setattr(orch.resume_graph, "astream_events", _boom)
+
+        events = []
+        async for ev in orch.resume_investigation(
+            inc_id,
+            {"action": "resume_with_input", "input": "operator note"},
+        ):
+            events.append(ev)
+
+        # Restored state.
+        inc = orch.store.load(inc_id)
+        assert inc.status == "awaiting_input", (
+            f"INC must be restored to awaiting_input, got {inc.status}"
+        )
+        assert inc.pending_intervention == original_pi, (
+            "pending_intervention must be restored to its pre-resume value"
+        )
+
+        # Events.
+        failed = [e for e in events if e["event"] == "resume_failed"]
+        assert failed, f"expected resume_failed event, got {events}"
+        assert "apply_fix exploded" in str(failed[-1].get("error", ""))
+        # No resume_completed must have been emitted (failure short-circuits).
+        assert not any(e["event"] == "resume_completed" for e in events)
+    finally:
+        await orch.aclose()
+
+
+@pytest.mark.asyncio
 async def test_resume_with_input_reruns_di_and_resolution(cfg):
     orch = await Orchestrator.create(cfg)
     try:

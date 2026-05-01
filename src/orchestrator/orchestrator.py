@@ -179,17 +179,38 @@ class Orchestrator:
             user_text = (decision.get("input") or "").strip()
             if not user_text:
                 raise ValueError("resume_with_input requires a non-empty 'input'")
+            # Snapshot the intervention payload BEFORE we mutate the INC, so
+            # we can restore it if the sub-graph blows up. Without this an
+            # apply_fix exception leaves the INC stuck at in_progress with a
+            # cleared pending_intervention — the user can no longer resolve it
+            # via the UI.
+            saved_pi = inc.pending_intervention
             inc.user_inputs.append(user_text)
             inc.pending_intervention = None
             inc.status = "in_progress"
             self.store.save(inc)
             inc = self.store.load(incident_id)  # reload as canonical state
-            async for ev in self.resume_graph.astream_events(
-                GraphState(incident=inc, next_route=None, last_agent=None,
-                           error=None),
-                version="v2",
-            ):
-                yield self._to_ui_event(ev, incident_id)
+            try:
+                async for ev in self.resume_graph.astream_events(
+                    GraphState(incident=inc, next_route=None, last_agent=None,
+                               error=None),
+                    version="v2",
+                ):
+                    yield self._to_ui_event(ev, incident_id)
+            except Exception as exc:  # noqa: BLE001 — restore on any failure
+                # Reload from disk to absorb any partial writes from tools
+                # that ran before the failure, then restore intervention
+                # state so the UI can reprompt the user.
+                try:
+                    inc = self.store.load(incident_id)
+                except FileNotFoundError:
+                    pass
+                inc.pending_intervention = saved_pi
+                inc.status = "awaiting_input"
+                self.store.save(inc)
+                yield {"event": "resume_failed", "incident_id": incident_id,
+                       "error": str(exc), "ts": _now()}
+                return
             final = self.store.load(incident_id)
             yield {"event": "resume_completed", "incident_id": incident_id,
                    "status": final.status, "ts": _now()}
