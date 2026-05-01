@@ -37,8 +37,23 @@ async def test_update_incident_appends_finding(setup_store, monkeypatch):
     inc = await create_incident(query="x", environment="dev", reporter_id="u", reporter_team="t")
     await update_incident(incident_id=inc["id"], patch={"severity": "sev3", "category": "latency"})
     loaded = setup_store.load(inc["id"])
-    assert loaded.severity == "sev3"
+    # severity is normalized to the canonical {low, medium, high} vocabulary
+    assert loaded.severity == "medium"
     assert loaded.category == "latency"
+
+
+@pytest.mark.asyncio
+async def test_update_incident_normalizes_severity(setup_store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso", lambda: "2026-04-30T10:00:00Z")
+    inc = await create_incident(query="y", environment="dev", reporter_id="u", reporter_team="t")
+    for raw, want in [
+        ("sev1", "high"), ("SEV2", "high"), ("p1", "high"), ("critical", "high"),
+        ("sev3", "medium"), ("moderate", "medium"), ("Medium", "medium"),
+        ("sev4", "low"), ("info", "low"), ("LOW", "low"),
+    ]:
+        await update_incident(incident_id=inc["id"], patch={"severity": raw})
+        assert setup_store.load(inc["id"]).severity == want, raw
 
 
 @pytest.mark.asyncio

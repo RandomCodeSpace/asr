@@ -22,6 +22,27 @@ from orchestrator.incident import IncidentStore
 from orchestrator.similarity import KeywordSimilarity, find_similar
 
 
+_SEVERITY_MAP = {
+    "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
+    "critical": "high", "urgent": "high", "high": "high",
+    "sev3": "medium", "p3": "medium", "moderate": "medium", "medium": "medium",
+    "sev4": "low", "p4": "low", "info": "low", "informational": "low",
+    "low": "low",
+}
+
+
+def normalize_severity(value: str | None) -> str | None:
+    """Coerce assorted severity inputs (sev1/p2/critical/etc.) to low/medium/high.
+
+    Unknown inputs pass through untouched so callers can flag them; the
+    normalized vocabulary surfaced to the UI and stored on disk is restricted
+    to {low, medium, high}.
+    """
+    if value is None:
+        return None
+    return _SEVERITY_MAP.get(value.strip().lower(), value)
+
+
 @dataclass
 class IncidentMCPServer:
     """Per-instance container holding a FastMCP server and its scoped state.
@@ -98,7 +119,7 @@ class IncidentMCPServer:
         if "status" in patch:
             inc.status = patch["status"]
         if "severity" in patch:
-            inc.severity = patch["severity"]
+            inc.severity = normalize_severity(patch["severity"])
         if "category" in patch:
             inc.category = patch["category"]
         if "summary" in patch:

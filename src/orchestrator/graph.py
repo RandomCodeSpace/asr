@@ -321,7 +321,7 @@ _DECIDERS: dict[str, Callable[[Incident], str]] = {
 
 _STUB_CANNED = {
     "intake": "Created INC, no prior matches. Routing to triage.",
-    "triage": "Severity sev3, category latency. No recent deploys correlate.",
+    "triage": "Severity medium, category latency. No recent deploys correlate.",
     "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
     "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
 }
