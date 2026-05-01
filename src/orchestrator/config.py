@@ -99,6 +99,8 @@ def _interpolate(value):
 
 
 def load_config(path: str | Path) -> AppConfig:
+    from dotenv import load_dotenv
+    load_dotenv()
     raw = yaml.safe_load(Path(path).read_text())
     resolved = _interpolate(raw)
     return AppConfig(**resolved)

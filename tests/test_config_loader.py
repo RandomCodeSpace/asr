@@ -21,5 +21,6 @@ def test_unset_env_var_raises(monkeypatch):
     monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
     monkeypatch.delenv("EXTERNAL_MCP_URL", raising=False)
     monkeypatch.delenv("EXT_TOKEN", raising=False)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **kw: False)
     with pytest.raises(KeyError, match="OLLAMA_API_KEY"):
         load_config(FIXTURE)
