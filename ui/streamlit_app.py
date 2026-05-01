@@ -150,6 +150,32 @@ def render_sidebar(store: IncidentStore) -> None:
                     st.session_state["selected_incident"] = inc["id"]
 
 
+def _render_kv_dict_value(key: str, v: dict) -> None:
+    """Render a dict value inside _render_kv_block as a nested bordered card."""
+    st.markdown(f"**{key}:**")
+    with st.container(border=True):
+        _render_kv_block(v)
+
+
+def _render_kv_list_value(key: str, v: list) -> None:
+    """Render a list value inside _render_kv_block as bullets or nested cards."""
+    st.markdown(f"**{key}:**")
+    for item in v:
+        if isinstance(item, dict):
+            with st.container(border=True):
+                _render_kv_block(item)
+        else:
+            st.markdown(f"- {item}")
+
+
+def _render_kv_scalar_value(key: str, v) -> None:
+    """Render a bool or plain scalar value inside _render_kv_block."""
+    if isinstance(v, bool):
+        st.markdown(f"**{key}:** `{str(v).lower()}`")
+    else:
+        st.markdown(f"**{key}:** {v}")
+
+
 def _render_kv_block(d: dict) -> None:
     """Render a dict as labeled markdown lines, recursing into nested
     dicts and lists.
@@ -166,21 +192,22 @@ def _render_kv_block(d: dict) -> None:
             continue
         key = k.replace("_", " ").capitalize()
         if isinstance(v, dict):
-            st.markdown(f"**{key}:**")
-            with st.container(border=True):
-                _render_kv_block(v)
+            _render_kv_dict_value(key, v)
         elif isinstance(v, list):
-            st.markdown(f"**{key}:**")
-            for item in v:
-                if isinstance(item, dict):
-                    with st.container(border=True):
-                        _render_kv_block(item)
-                else:
-                    st.markdown(f"- {item}")
-        elif isinstance(v, bool):
-            st.markdown(f"**{key}:** `{str(v).lower()}`")
+            _render_kv_list_value(key, v)
         else:
-            st.markdown(f"**{key}:** {v}")
+            _render_kv_scalar_value(key, v)
+
+
+def _render_value_list(v: list) -> None:
+    """Render a non-empty list value inside _render_value."""
+    for i, item in enumerate(v):
+        if isinstance(item, dict):
+            if i > 0:
+                st.markdown("---")
+            _render_kv_block(item)
+        else:
+            st.markdown(f"- {item}")
 
 
 def _render_value(v) -> None:
@@ -199,13 +226,7 @@ def _render_value(v) -> None:
         if not v:
             st.caption("_(empty)_")
             return
-        for i, item in enumerate(v):
-            if isinstance(item, dict):
-                if i > 0:
-                    st.markdown("---")
-                _render_kv_block(item)
-            else:
-                st.markdown(f"- {item}")
+        _render_value_list(v)
     else:
         st.write(v)
 
@@ -248,30 +269,38 @@ def _fmt_confidence_badge(conf: float | None) -> str:
     return f"{glyph} confidence {conf:.2f}"
 
 
+def _render_one_hypothesis(h, label: str, idx: int) -> None:
+    """Render a single hypothesis item inside a pre-existing bordered card.
+
+    Dict entries are expanded to cause / evidence / next_steps / extra keys.
+    Scalars fall back to a simple bullet line.
+    """
+    if isinstance(h, dict):
+        st.markdown(f"**{label} {idx}:** {h.get('cause', '—')}")
+        ev = h.get("evidence")
+        if ev:
+            st.markdown("**Evidence:**")
+            for e in (ev if isinstance(ev, list) else [ev]):
+                st.markdown(f"- {e}")
+        ns = h.get("next_steps") or h.get("next_step") or h.get("probe")
+        if ns:
+            st.markdown(f"**Next steps:** {ns}")
+        extra = {k: v for k, v in h.items()
+                 if k not in {"cause", "evidence", "next_steps",
+                              "next_step", "probe"}}
+        if extra:
+            _render_kv_block(extra)
+    else:
+        st.markdown(f"**{label} {idx}:** {h}")
+
+
 def _render_hypothesis_list(items: list, label: str) -> None:
     """Render a list of hypothesis-shaped dicts (cause/evidence/next_steps)
     as bordered cards. Strings or scalar entries fall back to bullets.
     """
     for i, h in enumerate(items, 1):
         with st.container(border=True):
-            if isinstance(h, dict):
-                st.markdown(f"**{label} {i}:** {h.get('cause', '—')}")
-                ev = h.get("evidence")
-                if ev:
-                    st.markdown("**Evidence:**")
-                    for e in (ev if isinstance(ev, list) else [ev]):
-                        st.markdown(f"- {e}")
-                ns = h.get("next_steps") or h.get("next_step") or h.get("probe")
-                if ns:
-                    st.markdown(f"**Next steps:** {ns}")
-                # Anything else in the dict that we haven't surfaced.
-                extra = {k: v for k, v in h.items()
-                         if k not in {"cause", "evidence", "next_steps",
-                                      "next_step", "probe"}}
-                if extra:
-                    _render_kv_block(extra)
-            else:
-                st.markdown(f"**{label} {i}:** {h}")
+            _render_one_hypothesis(h, label, i)
 
 
 def _render_findings_section(value, label: str) -> None:
@@ -288,127 +317,150 @@ def _render_findings_section(value, label: str) -> None:
         _render_value(value)
 
 
+def _render_incident_top_badges(inc: dict) -> None:
+    """Render status / severity / category badge columns and the awaiting-input warning."""
+    b1, b2, b3 = st.columns([1, 1, 1])
+    with b1:
+        st.caption("Status")
+        _status_badge(inc.get("status"))
+    with b2:
+        st.caption("Severity")
+        _severity_badge(inc.get("severity"))
+    with b3:
+        st.caption("Category")
+        _category_badge(inc.get("category"))
+    if inc.get("status") == "awaiting_input":
+        st.warning(
+            "**Human intervention required.** The intervention gate "
+            "paused this INC because deep-investigator confidence was "
+            "below the configured threshold. Use the controls below to "
+            "resume with input, escalate, or stop."
+        )
+
+
+def _render_incident_metrics(inc: dict) -> None:
+    """Render the total-tokens and duration metric columns."""
+    token_total = (inc.get("token_usage") or {}).get("total_tokens", 0)
+    duration_s = _duration_seconds(inc.get("created_at", ""),
+                                   inc.get("updated_at", ""))
+    m1, m2 = st.columns(2)
+    m1.metric("Total tokens", _fmt_tokens(token_total))
+    m2.metric("Duration", f"{duration_s}s")
+
+
+def _render_incident_prior_match(inc: dict) -> None:
+    """Render the prior-incident callout when matched_prior_inc is set."""
+    tags = inc.get("tags") or []
+    if "hypothesis:prior_match_supported" in tags:
+        stance = "supported by current evidence"
+        callout = st.success
+    elif "hypothesis:prior_match_rejected" in tags:
+        stance = "rejected — fresh evidence diverges from prior cause"
+        callout = st.warning
+    else:
+        stance = "not yet validated"
+        callout = st.info
+    callout(
+        f"**Prior similar incident (hypothesis):** "
+        f"`{inc['matched_prior_inc']}` — {stance}.  \n"
+        f"_Same symptom can have different root causes "
+        f"(code bug vs. network vs. resource overload), so the prior "
+        f"cause is one ranked hypothesis for the deep investigator — "
+        f"not the answer._"
+    )
+
+
+def _render_incident_summary_meta(inc: dict) -> None:
+    """Render the query, environment, tags, summary, and prior-match callout."""
+    st.markdown(f"**Query:** {inc['query']}")
+    st.markdown(f"**Environment:** `{inc['environment']}`")
+    if inc.get("tags"):
+        st.markdown("**Tags:** " + " ".join(f"`{t}`" for t in inc["tags"]))
+    if inc.get("summary"):
+        st.markdown(f"**Summary:** {inc['summary']}")
+    if inc.get("matched_prior_inc"):
+        _render_incident_prior_match(inc)
+
+
+def _render_agents_run_block(inc: dict) -> None:
+    """Render the ### Agents run section if agents_run is non-empty."""
+    agents_run = inc.get("agents_run", [])
+    if not agents_run:
+        return
+    st.markdown("### Agents run")
+    for ar in agents_run:
+        a_dur = _duration_seconds(ar.get("started_at", ""),
+                                  ar.get("ended_at", ""))
+        a_tok = (ar.get("token_usage") or {}).get("total_tokens", 0)
+        conf = ar.get("confidence")
+        badge = _fmt_confidence_badge(conf)
+        with st.container(border=True):
+            st.markdown(
+                f"**{ar['agent']}** — {a_dur}s — "
+                f"{_fmt_tokens(a_tok)} tokens — {badge}"
+            )
+            rationale = ar.get("confidence_rationale")
+            if rationale:
+                st.caption(f"Why: {rationale}")
+            st.write(ar.get("summary") or "_(no summary)_")
+
+
+def _render_findings_block(inc: dict) -> None:
+    """Render the ### Findings section (triage + deep-investigator panels)."""
+    findings = inc.get("findings") or {}
+    f_triage = findings.get("triage")
+    f_di = findings.get("deep_investigator")
+    if f_triage is None and f_di is None:
+        return
+    st.markdown("### Findings")
+    if f_triage is not None:
+        with st.container(border=True):
+            st.markdown("**Triage**")
+            _render_findings_section(f_triage, label="Finding")
+    if f_di is not None:
+        with st.container(border=True):
+            st.markdown("**Deep investigator**")
+            _render_findings_section(f_di, label="Hypothesis")
+
+
+def _render_resolution_block(inc: dict) -> None:
+    """Render the ### Resolution section if resolution is present."""
+    if inc.get("resolution") is None:
+        return
+    st.markdown("### Resolution")
+    with st.container(border=True):
+        _render_value(inc["resolution"])
+
+
+def _render_tool_calls_block(inc: dict) -> None:
+    """Render the ### Tool calls section if tool_calls is non-empty."""
+    tool_calls = inc.get("tool_calls", [])
+    if not tool_calls:
+        return
+    st.markdown("### Tool calls")
+    for tc in tool_calls:
+        with st.expander(f"`{tc['agent']}` → `{tc['tool']}`"):
+            st.markdown("**Args:**")
+            st.json(tc.get("args") or {})
+            st.markdown("**Result:**")
+            _render_value(tc.get("result"))
+
+
 def render_incident_detail(store: IncidentStore) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
         return
     with st.expander(f"INC detail: {inc_id}", expanded=True):
         inc = store.load(inc_id).model_dump()
-
-        # --- Top status / severity / category badges ----------------------
-        b1, b2, b3 = st.columns([1, 1, 1])
-        with b1:
-            st.caption("Status")
-            _status_badge(inc.get("status"))
-        with b2:
-            st.caption("Severity")
-            _severity_badge(inc.get("severity"))
-        with b3:
-            st.caption("Category")
-            _category_badge(inc.get("category"))
-
-        # Prominent action-required call-out when the gate has paused the
-        # graph. Sits above the (separate) intervention prompt block so the
-        # user can't miss it on a long page.
-        if inc.get("status") == "awaiting_input":
-            st.warning(
-                "**Human intervention required.** The intervention gate "
-                "paused this INC because deep-investigator confidence was "
-                "below the configured threshold. Use the controls below to "
-                "resume with input, escalate, or stop."
-            )
-
-        # --- Numeric metrics ----------------------------------------------
-        token_total = (inc.get("token_usage") or {}).get("total_tokens", 0)
-        duration_s = _duration_seconds(inc.get("created_at", ""),
-                                       inc.get("updated_at", ""))
-        m1, m2 = st.columns(2)
-        m1.metric("Total tokens", _fmt_tokens(token_total))
-        m2.metric("Duration", f"{duration_s}s")
-
-        # --- Header block -------------------------------------------------
-        st.markdown(f"**Query:** {inc['query']}")
-        st.markdown(f"**Environment:** `{inc['environment']}`")
-        if inc.get("tags"):
-            st.markdown("**Tags:** " + " ".join(f"`{t}`" for t in inc["tags"]))
-        if inc.get("summary"):
-            st.markdown(f"**Summary:** {inc['summary']}")
-        if inc.get("matched_prior_inc"):
-            tags = inc.get("tags") or []
-            if "hypothesis:prior_match_supported" in tags:
-                stance = "supported by current evidence"
-                callout = st.success
-            elif "hypothesis:prior_match_rejected" in tags:
-                stance = "rejected — fresh evidence diverges from prior cause"
-                callout = st.warning
-            else:
-                stance = "not yet validated"
-                callout = st.info
-            callout(
-                f"**Prior similar incident (hypothesis):** "
-                f"`{inc['matched_prior_inc']}` — {stance}.  \n"
-                f"_Same symptom can have different root causes "
-                f"(code bug vs. network vs. resource overload), so the prior "
-                f"cause is one ranked hypothesis for the deep investigator — "
-                f"not the answer._"
-            )
-
-        # --- Intervention prompt (only when paused on low confidence) -----
+        _render_incident_top_badges(inc)
+        _render_incident_metrics(inc)
+        _render_incident_summary_meta(inc)
         if inc.get("status") == "awaiting_input" and inc.get("pending_intervention"):
             _render_intervention_block(inc, inc_id)
-
-        # --- Agents run ---------------------------------------------------
-        agents_run = inc.get("agents_run", [])
-        if agents_run:
-            st.markdown("### Agents run")
-            for ar in agents_run:
-                a_dur = _duration_seconds(ar.get("started_at", ""),
-                                          ar.get("ended_at", ""))
-                a_tok = (ar.get("token_usage") or {}).get("total_tokens", 0)
-                conf = ar.get("confidence")
-                badge = _fmt_confidence_badge(conf)
-                with st.container(border=True):
-                    st.markdown(
-                        f"**{ar['agent']}** — {a_dur}s — "
-                        f"{_fmt_tokens(a_tok)} tokens — {badge}"
-                    )
-                    rationale = ar.get("confidence_rationale")
-                    if rationale:
-                        st.caption(f"Why: {rationale}")
-                    st.write(ar.get("summary") or "_(no summary)_")
-
-        # --- Findings -----------------------------------------------------
-        findings = inc.get("findings") or {}
-        f_triage = findings.get("triage")
-        f_di = findings.get("deep_investigator")
-        if f_triage is not None or f_di is not None:
-            st.markdown("### Findings")
-        if f_triage is not None:
-            with st.container(border=True):
-                st.markdown("**Triage**")
-                _render_findings_section(f_triage, label="Finding")
-        if f_di is not None:
-            with st.container(border=True):
-                st.markdown("**Deep investigator**")
-                _render_findings_section(f_di, label="Hypothesis")
-
-        # --- Resolution ---------------------------------------------------
-        if inc.get("resolution") is not None:
-            st.markdown("### Resolution")
-            with st.container(border=True):
-                _render_value(inc["resolution"])
-
-        # --- Tool calls ---------------------------------------------------
-        tool_calls = inc.get("tool_calls", [])
-        if tool_calls:
-            st.markdown("### Tool calls")
-            for idx, tc in enumerate(tool_calls):
-                with st.expander(f"`{tc['agent']}` → `{tc['tool']}`"):
-                    st.markdown("**Args:**")
-                    st.json(tc.get("args") or {})
-                    st.markdown("**Result:**")
-                    _render_value(tc.get("result"))
-
+        _render_agents_run_block(inc)
+        _render_findings_block(inc)
+        _render_resolution_block(inc)
+        _render_tool_calls_block(inc)
         with st.expander("Raw JSON"):
             st.json(inc)
 
