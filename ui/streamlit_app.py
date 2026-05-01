@@ -198,7 +198,24 @@ def render_incident_detail(store: IncidentStore) -> None:
         if inc.get("summary"):
             st.markdown(f"**Summary:** {inc['summary']}")
         if inc.get("matched_prior_inc"):
-            st.markdown(f"**Matched prior INC:** `{inc['matched_prior_inc']}`")
+            tags = inc.get("tags") or []
+            if "hypothesis:prior_match_supported" in tags:
+                stance = "supported by current evidence"
+                callout = st.success
+            elif "hypothesis:prior_match_rejected" in tags:
+                stance = "rejected — fresh evidence diverges from prior cause"
+                callout = st.warning
+            else:
+                stance = "not yet validated"
+                callout = st.info
+            callout(
+                f"**Prior similar incident (hypothesis):** "
+                f"`{inc['matched_prior_inc']}` — {stance}.  \n"
+                f"_Same symptom can have different root causes "
+                f"(code bug vs. network vs. resource overload), so the prior "
+                f"cause is one ranked hypothesis for the deep investigator — "
+                f"not the answer._"
+            )
 
         # --- Intervention prompt (only when paused on low confidence) -----
         if inc.get("status") == "awaiting_input" and inc.get("pending_intervention"):
