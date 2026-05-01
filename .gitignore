@@ -48,3 +48,7 @@ Thumbs.db
 
 # --- Claude tooling artifacts ----------------------------------------
 AGENTS.md
+
+# Coverage / CI artefacts
+coverage.xml
+junit.xml
