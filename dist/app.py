@@ -1310,15 +1310,18 @@ def _handle_agent_failure(
     exc: Exception,
     inc_id: str,
     store: "IncidentStore",
-    incident: "Incident",
+    fallback: "Incident",
 ) -> dict:
     """Reload incident (absorbing partial tool writes), stamp a failure AgentRun,
     persist, and return the error state dict for the LangGraph node.
+
+    ``fallback`` is the in-memory incident from the caller; we use it only
+    when the on-disk state has gone missing (FileNotFoundError on reload).
     """
     try:
         incident = store.load(inc_id)
     except FileNotFoundError:
-        pass
+        incident = fallback
     ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
     incident.agents_run.append(AgentRun(
         agent=skill_name, started_at=started_at, ended_at=ended_at,
@@ -1354,7 +1357,7 @@ def make_agent_node(
         except Exception as exc:  # noqa: BLE001
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, incident=incident,
+                inc_id=inc_id, store=store, fallback=incident,
             )
 
         # Tools (e.g. update_incident) write straight to disk. Reload so the
