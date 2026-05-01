@@ -64,6 +64,10 @@ class InterventionConfig(BaseModel):
     )
 
 
+class OrchestratorConfig(BaseModel):
+    entry_agent: str = "intake"
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
@@ -73,6 +77,7 @@ class AppConfig(BaseModel):
     )
     paths: Paths = Field(default_factory=Paths)
     intervention: InterventionConfig = Field(default_factory=InterventionConfig)
+    orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
 
 
 import os

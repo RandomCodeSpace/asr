@@ -54,6 +54,7 @@ def _validate_agent_name(name: str, *, source: str) -> None:
 class RouteRule(BaseModel):
     when: str
     next: str
+    gate: str | None = None
 
 
 class Skill(BaseModel):

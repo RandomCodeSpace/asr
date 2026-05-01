@@ -50,3 +50,22 @@ def test_mcp_server_http_requires_url():
     )
     assert server.url == "https://example.com/mcp"
     assert server.enabled is False
+
+
+def test_orchestrator_default_entry_agent():
+    from orchestrator.config import AppConfig, LLMConfig, MCPConfig
+    cfg = AppConfig(llm=LLMConfig(provider="stub", default_model="stub-1"),
+                    mcp=MCPConfig())
+    assert cfg.orchestrator.entry_agent == "intake"
+
+
+def test_orchestrator_explicit_entry_agent():
+    from orchestrator.config import (
+        AppConfig, LLMConfig, MCPConfig, OrchestratorConfig,
+    )
+    cfg = AppConfig(
+        llm=LLMConfig(provider="stub", default_model="stub-1"),
+        mcp=MCPConfig(),
+        orchestrator=OrchestratorConfig(entry_agent="diagnostic"),
+    )
+    assert cfg.orchestrator.entry_agent == "diagnostic"

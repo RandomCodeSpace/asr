@@ -148,3 +148,15 @@ def test_load_skill_rejects_invalid_directory_name(tmp_path, bad_name):
     (d / "system.md").write_text("body")
     with pytest.raises(ValueError, match="invalid agent name"):
         load_skill(d)
+
+
+def test_route_rule_gate_defaults_to_none():
+    from orchestrator.skill import RouteRule
+    r = RouteRule(when="default", next="triage")
+    assert r.gate is None
+
+
+def test_route_rule_gate_explicit_value():
+    from orchestrator.skill import RouteRule
+    r = RouteRule(when="success", next="resolution", gate="confidence")
+    assert r.gate == "confidence"
