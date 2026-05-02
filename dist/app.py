@@ -72,22 +72,97 @@ from pydantic import Field, SecretStr
 
 
 
+# ----- imports for storage/types.py -----
+"""Custom SQLAlchemy column types that bridge SQLite and Postgres.
+
+- ``VectorColumn(dim)`` — ``pgvector.sqlalchemy.Vector(dim)`` on Postgres,
+  ``LargeBinary`` (numpy float32 bytes) on SQLite. Python value is always
+  ``list[float] | None`` regardless of dialect.
+- ``JSONColumn`` — thin alias over SQLAlchemy ``JSON``; auto-routes to
+  ``JSONB`` on Postgres, ``TEXT`` on SQLite. Centralized so we can adjust
+  serialization (e.g. datetime support) in one place later.
+"""
+
+import numpy as np
+from sqlalchemy import JSON, LargeBinary
+from sqlalchemy.types import TypeDecorator
+
+
+# ----- imports for storage/models.py -----
+"""SQLAlchemy declarative model for the ``incidents`` table.
+
+Hybrid schema: scalar/queryable fields as columns, nested Pydantic
+structures as JSON columns (JSONB on Postgres, TEXT on SQLite), and a
+native vector column for embeddings.
+"""
+
+from datetime import datetime
+from sqlalchemy import DateTime, Index, Integer, String, Text, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+
+# ----- imports for storage/engine.py -----
+"""SQLAlchemy engine factory + sqlite-vec extension loader.
+
+Behaviour
+---------
+- ``sqlite://``     → engine with ``NullPool``, ``check_same_thread=False``,
+                      and a ``connect`` event hook that loads sqlite-vec into
+                      every new dbapi connection.
+- ``postgresql://`` → engine with the configured pool size, plus a
+                      one-time ``CREATE EXTENSION IF NOT EXISTS vector``.
+"""
+
+import ctypes
+import ctypes.util
+from sqlalchemy import event, text
+from sqlalchemy.engine import Engine, create_engine
+from sqlalchemy.pool import NullPool
+
+
+# Python 3.14 on many distros is compiled without SQLITE_ENABLE_LOAD_EXTENSION,
+# so conn.enable_load_extension / conn.load_extension don't exist as Python
+# methods.  We call the underlying C functions directly via ctypes instead.
+# ----- imports for storage/embeddings.py -----
+"""LangChain ``Embeddings`` facade + deterministic stub for tests.
+
+Construction is config-driven via :func:`build_embedder`. Provider kind
+dispatches to ``OllamaEmbeddings`` / ``AzureOpenAIEmbeddings`` / a local
+stub. Stubs are deterministic so tests can assert similarity ordering
+without external services.
+"""
+
+import hashlib
+
+
+
+# ----- imports for storage/repository.py -----
+"""SQLAlchemy-backed Incident store.
+
+Public methods mirror the previous JSON ``IncidentStore`` 1:1 so call
+sites in the MCP server and orchestrator change minimally. The repository
+also owns the embedder; ``find_similar`` (Task G) does the dialect dispatch.
+"""
+
+from typing import Optional
+
+from sqlalchemy import and_, desc, func, literal, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
+
+
+
 # ----- imports for mcp_servers/incident.py -----
-"""FastMCP server: incident_management mock tools.
+"""FastMCP server: incident_management tools, backed by IncidentRepository.
 
 State scoping
 -------------
-Earlier revisions used a module-level ``_state`` dict, which made the FastMCP
-instance and its store reference process-global. Two concurrent
-:class:`Orchestrator` instances (or two pytest workers) would clobber each
-other's stores. Now state is held on a per-instance :class:`IncidentMCPServer`,
-and a fresh ``mcp`` (FastMCP) instance is built for every server.
-
-The module-level ``mcp`` symbol (imported by the MCP loader) is constructed
-lazily — the first call to :func:`get_or_create_default_server` (or the
-back-compat :func:`set_state`) builds it. ``set_state`` remains as a thin shim
-that mutates the default server's state, so existing call-sites and tests keep
-working without churn.
+Each Orchestrator constructs its own :class:`IncidentMCPServer`, so two
+orchestrators in the same process do not share repository state. The
+module-level ``mcp`` and ``set_state`` symbols are kept as a back-compat
+surface for the MCP loader (``getattr(mod, "mcp")``) and for tests that
+import these names directly.
 """
 
 from dataclasses import dataclass, field
@@ -95,11 +170,9 @@ from fastmcp import FastMCP
 
 
 
-
 # ----- imports for mcp_servers/observability.py -----
 """FastMCP server: observability mock tools."""
 
-import hashlib
 from datetime import datetime, timezone, timedelta
 
 # ----- imports for mcp_servers/remediation.py -----
@@ -164,6 +237,10 @@ from typing import AsyncIterator
 
 
 
+
+
+
+
 # ----- imports for api.py -----
 """FastAPI app — health, listings, and incident endpoints.
 
@@ -222,6 +299,7 @@ class EmbeddingConfig(BaseModel):
     provider: str
     model: str
     deployment: str | None = None  # azure_openai
+    dim: int = 1024
 
 
 class LLMConfig(BaseModel):
@@ -289,6 +367,13 @@ class IncidentConfig(BaseModel):
     similarity_method: Literal["keyword", "embedding"] = "keyword"
 
 
+class StorageConfig(BaseModel):
+    """Database backend. SQLite (with sqlite-vec) for dev, Postgres (with pgvector) for prod."""
+    url: str = "sqlite:///incidents.db"
+    pool_size: int = 5      # postgres only; sqlite uses NullPool
+    echo: bool = False
+
+
 class Paths(BaseModel):
     skills_dir: str = "config/skills"
     incidents_dir: str = "incidents"
@@ -330,6 +415,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
     incidents: IncidentConfig = Field(default_factory=IncidentConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     environments: list[str] = Field(
         default_factory=lambda: ["production", "staging", "dev", "local"]
     )
@@ -819,6 +905,535 @@ def get_embedding(cfg: LLMConfig) -> Embeddings:
         f"Embedding not supported for provider kind {provider.kind!r}"
     )
 
+# ====== module: orchestrator/storage/types.py ======
+
+JSONColumn = JSON  # SQLAlchemy auto-dialects: JSONB on pg, TEXT on sqlite.
+
+
+class VectorColumn(TypeDecorator):
+    """Vector column backed by pgvector on Postgres, BLOB on SQLite.
+
+    Python value: ``list[float] | None``.
+    """
+    impl = LargeBinary
+    cache_ok = True
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "postgresql":
+            from pgvector.sqlalchemy import Vector
+            return dialect.type_descriptor(Vector(self.dim))
+        return dialect.type_descriptor(LargeBinary())
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if dialect.name == "postgresql":
+            return list(value)
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.shape != (self.dim,):
+            raise ValueError(
+                f"vector dim {arr.shape[0]} != column dim {self.dim}"
+            )
+        return arr.tobytes()
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if dialect.name == "postgresql":
+            return list(value)
+        return np.frombuffer(value, dtype=np.float32).tolist()
+
+# ====== module: orchestrator/storage/models.py ======
+
+EMBEDDING_DIM = 1024  # bge-m3; if you change embed model, re-embed corpus.
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class IncidentRow(Base):
+    __tablename__ = "incidents"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    environment: Mapped[str] = mapped_column(String, nullable=False)
+    reporter_id: Mapped[str] = mapped_column(String, nullable=False)
+    reporter_team: Mapped[str] = mapped_column(String, nullable=False)
+
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    severity: Mapped[str | None] = mapped_column(String, nullable=True)
+    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    matched_prior_inc: Mapped[str | None] = mapped_column(String, nullable=True)
+    resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    tags: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
+    agents_run: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
+    tool_calls: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
+    findings: Mapped[dict] = mapped_column(JSONColumn, nullable=False, default=dict)
+    pending_intervention: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
+    user_inputs: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
+
+    embedding: Mapped[list[float] | None] = mapped_column(
+        VectorColumn(EMBEDDING_DIM), nullable=True
+    )
+
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("ix_incidents_status_env_active", "status", "environment",
+              postgresql_where=text("deleted_at IS NULL"),
+              sqlite_where=text("deleted_at IS NULL")),
+        Index("ix_incidents_created_at_active", "created_at",
+              postgresql_where=text("deleted_at IS NULL"),
+              sqlite_where=text("deleted_at IS NULL")),
+    )
+
+# ====== module: orchestrator/storage/engine.py ======
+
+_libsqlite = ctypes.CDLL(ctypes.util.find_library("sqlite3"))
+_libsqlite.sqlite3_enable_load_extension.restype = ctypes.c_int
+_libsqlite.sqlite3_enable_load_extension.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_libsqlite.sqlite3_load_extension.restype = ctypes.c_int
+_libsqlite.sqlite3_load_extension.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p),
+]
+# The CPython sqlite3.Connection C struct begins with PyObject header
+# (ob_refcnt + ob_type = 2 pointers), followed immediately by sqlite3 *db.
+_DB_PTR_OFFSET = 2 * ctypes.sizeof(ctypes.c_void_p)
+
+
+def _ctypes_load_vec(dbapi_conn) -> None:  # type: ignore[misc]
+    """Load sqlite-vec into *dbapi_conn* using the C-level SQLite API.
+
+    Required because CPython may be built without SQLITE_ENABLE_LOAD_EXTENSION,
+    which removes the Python-level enable_load_extension / load_extension methods
+    but leaves the underlying C functions available in libsqlite3.
+    """
+    import sqlite_vec
+    db_ptr = ctypes.c_void_p.from_address(id(dbapi_conn) + _DB_PTR_OFFSET).value
+    _libsqlite.sqlite3_enable_load_extension(db_ptr, 1)
+    errmsg = ctypes.c_char_p()
+    path = sqlite_vec.loadable_path().encode()
+    rc = _libsqlite.sqlite3_load_extension(db_ptr, path, None, ctypes.byref(errmsg))
+    _libsqlite.sqlite3_enable_load_extension(db_ptr, 0)
+    if rc != 0:
+        raise RuntimeError(f"sqlite3_load_extension failed: {errmsg.value!r}")
+
+
+def _attach_sqlite_vec(engine: Engine) -> None:
+    """Register the sqlite-vec loader on every new SQLite dbapi connection."""
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_conn, _):  # type: ignore[misc]
+        _ctypes_load_vec(dbapi_conn)
+
+
+def _ensure_pgvector(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+
+
+def build_engine(cfg: StorageConfig) -> Engine:
+    if cfg.url.startswith("sqlite"):
+        engine = create_engine(
+            cfg.url,
+            poolclass=NullPool,
+            echo=cfg.echo,
+            connect_args={"check_same_thread": False},
+        )
+        _attach_sqlite_vec(engine)
+        return engine
+    engine = create_engine(cfg.url, pool_size=cfg.pool_size, echo=cfg.echo)
+    _ensure_pgvector(engine)
+    return engine
+
+# ====== module: orchestrator/storage/embeddings.py ======
+
+class _StubEmbeddings(Embeddings):
+    """Deterministic dummy embedder.
+
+    Same text → same vector; different texts → different vectors. Useful
+    for CI and unit tests without a network or model server.
+    """
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def _vec(self, text: str) -> list[float]:
+        seed = int.from_bytes(
+            hashlib.sha256(text.encode("utf-8")).digest()[:8], "little"
+        )
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(self.dim).astype(np.float32).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._vec(text)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._vec(t) for t in texts]
+
+
+def build_embedder(
+    cfg: EmbeddingConfig | None,
+    providers: dict[str, ProviderConfig],
+) -> Embeddings | None:
+    """Build a LangChain ``Embeddings`` from config; ``None`` if not configured."""
+    if cfg is None:
+        return None
+    p = providers[cfg.provider]
+    if p.kind == "ollama":
+        from langchain_ollama import OllamaEmbeddings
+        return OllamaEmbeddings(
+            model=cfg.model,
+            base_url=p.base_url or "http://localhost:11434",
+        )
+    if p.kind == "azure_openai":
+        from langchain_openai import AzureOpenAIEmbeddings
+        return AzureOpenAIEmbeddings(
+            azure_deployment=cfg.deployment,
+            model=cfg.model,
+            azure_endpoint=p.endpoint,
+            api_version=p.api_version,
+            api_key=p.api_key,
+        )
+    if p.kind == "stub":
+        return _StubEmbeddings(dim=cfg.dim)
+    raise ValueError(f"unknown provider kind: {p.kind!r}")
+
+# ====== module: orchestrator/storage/repository.py ======
+
+_INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _today_str() -> str:
+    return _now().strftime("%Y%m%d")
+
+
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    """DB datetime -> Incident model ISO string (UTC, 'Z' suffix)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    """Incident ISO string -> DB datetime (UTC-aware)."""
+    if s is None:
+        return None
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+class IncidentRepository:
+    """SQLAlchemy-backed Incident store. Drop-in for the old ``IncidentStore``.
+
+    Threading note: methods open short-lived sessions; safe for the
+    orchestrator's coarse-grained concurrency model.
+    """
+
+    def __init__(
+        self,
+        *,
+        engine: Engine,
+        embedder: Optional[Embeddings] = None,
+        similarity_threshold: float = 0.85,
+        severity_aliases: Optional[dict[str, str]] = None,
+    ) -> None:
+        self.engine = engine
+        self.embedder = embedder
+        self.similarity_threshold = similarity_threshold
+        self.severity_aliases = severity_aliases or {}
+
+    # ---------- ID minting ----------
+    def _next_id(self, session: Session) -> str:
+        prefix = f"INC-{_today_str()}-"
+        like = f"{prefix}%"
+        rows = session.execute(
+            select(IncidentRow.id).where(IncidentRow.id.like(like))
+        ).scalars().all()
+        max_seq = 0
+        for r in rows:
+            try:
+                max_seq = max(max_seq, int(r.rsplit("-", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+        return f"{prefix}{max_seq + 1:03d}"
+
+    # ---------- public API ----------
+    def create(self, *, query: str, environment: str,
+               reporter_id: str = "user-mock",
+               reporter_team: str = "platform") -> Incident:
+        with Session(self.engine) as session:
+            now = _now()
+            inc_id = self._next_id(session)
+            row = IncidentRow(
+                id=inc_id,
+                status="new",
+                created_at=now,
+                updated_at=now,
+                query=query,
+                environment=environment,
+                reporter_id=reporter_id,
+                reporter_team=reporter_team,
+                summary="",
+                tags=[],
+                agents_run=[],
+                tool_calls=[],
+                findings={},
+                user_inputs=[],
+                embedding=self._maybe_embed(query),
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return self._row_to_incident(row)
+
+    def load(self, incident_id: str) -> Incident:
+        if not _INC_ID_RE.match(incident_id):
+            raise ValueError(
+                f"Invalid incident id {incident_id!r}; expected INC-YYYYMMDD-NNN"
+            )
+        with Session(self.engine) as session:
+            row = session.get(IncidentRow, incident_id)
+            if row is None:
+                raise FileNotFoundError(incident_id)
+            return self._row_to_incident(row)
+
+    def save(self, incident: Incident) -> None:
+        if not _INC_ID_RE.match(incident.id):
+            raise ValueError(
+                f"Invalid incident id {incident.id!r}; expected INC-YYYYMMDD-NNN"
+            )
+        incident.updated_at = _iso(_now())
+        with Session(self.engine) as session:
+            existing = session.get(IncidentRow, incident.id)
+            new_embedding = self._compute_save_embedding(existing, incident)
+            data = self._incident_to_row_dict(incident, embedding=new_embedding)
+            if existing is None:
+                session.add(IncidentRow(**data))
+            else:
+                for k, v in data.items():
+                    setattr(existing, k, v)
+            session.commit()
+
+    def delete(self, incident_id: str) -> Incident:
+        with Session(self.engine) as session:
+            row = session.get(IncidentRow, incident_id)
+            if row is None:
+                raise FileNotFoundError(incident_id)
+            if row.status != "deleted":
+                row.status = "deleted"
+                row.deleted_at = _now()
+                row.pending_intervention = None
+            session.commit()
+            session.refresh(row)
+            return self._row_to_incident(row)
+
+    def list_all(self, *, include_deleted: bool = False) -> list[Incident]:
+        with Session(self.engine) as session:
+            stmt = select(IncidentRow)
+            if not include_deleted:
+                stmt = stmt.where(IncidentRow.deleted_at.is_(None))
+            rows = session.execute(stmt).scalars().all()
+            return [self._row_to_incident(r) for r in rows]
+
+    def list_recent(self, limit: int = 20, *,
+                    include_deleted: bool = False) -> list[Incident]:
+        with Session(self.engine) as session:
+            stmt = select(IncidentRow)
+            if not include_deleted:
+                stmt = stmt.where(IncidentRow.deleted_at.is_(None))
+            stmt = stmt.order_by(
+                desc(IncidentRow.created_at), desc(IncidentRow.id)
+            ).limit(limit)
+            rows = session.execute(stmt).scalars().all()
+            return [self._row_to_incident(r) for r in rows]
+
+    # ---------- similarity search ----------
+    def find_similar(
+        self, *, query: str, environment: str,
+        status_filter: str = "resolved",
+        threshold: Optional[float] = None,
+        limit: int = 5,
+    ) -> list[tuple[Incident, float]]:
+        """Return up to ``limit`` similar resolved incidents for the same env.
+
+        Embedding path uses native vector ops (pgvector ``cosine_distance`` /
+        sqlite-vec ``vec_distance_cosine``). Keyword path falls back to
+        the existing ``KeywordSimilarity`` scorer to preserve behaviour
+        when no embedder is configured.
+        """
+        if self.embedder is None:
+            return self._keyword_similar(
+                query=query, environment=environment,
+                status_filter=status_filter,
+                threshold=threshold, limit=limit,
+            )
+        return self._vector_similar(
+            query=query, environment=environment,
+            status_filter=status_filter,
+            threshold=threshold, limit=limit,
+        )
+
+    def _vector_similar(self, *, query, environment, status_filter, threshold, limit):
+        import numpy as np
+        vec = self.embedder.embed_query(query)
+        threshold = self.similarity_threshold if threshold is None else threshold
+        with Session(self.engine) as session:
+            if self.engine.dialect.name == "postgresql":
+                score = (literal(1.0) - IncidentRow.embedding.cosine_distance(vec)).label("score")
+            else:
+                blob = np.asarray(vec, dtype=np.float32).tobytes()
+                score = (literal(1.0) - func.vec_distance_cosine(IncidentRow.embedding, blob)).label("score")
+            stmt = (
+                select(IncidentRow, score)
+                .where(and_(
+                    IncidentRow.deleted_at.is_(None),
+                    IncidentRow.status == status_filter,
+                    IncidentRow.environment == environment,
+                    IncidentRow.embedding.is_not(None),
+                ))
+                .order_by(desc("score"))
+                .limit(limit)
+            )
+            rows = session.execute(stmt).all()
+        out: list[tuple[Incident, float]] = []
+        for row, s in rows:
+            s = float(s)
+            if s < threshold:
+                continue
+            out.append((self._row_to_incident(row), s))
+        return out
+
+    def _keyword_similar(self, *, query, environment, status_filter, threshold, limit):
+
+        candidates_inc = [
+            i for i in self.list_all()
+            if i.environment == environment
+            and i.status == status_filter
+            and i.deleted_at is None
+        ]
+        candidates = [
+            {"id": i.id, "text": f"{i.query} {i.summary} {' '.join(i.tags)}",
+             "incident": i}
+            for i in candidates_inc
+        ]
+        results = find_similar(
+            query=query, candidates=candidates, text_field="text",
+            scorer=KeywordSimilarity(),
+            threshold=self.similarity_threshold if threshold is None else threshold,
+            limit=limit,
+        )
+        return [(c["incident"], float(s)) for c, s in results]
+
+    # ---------- mapping helpers ----------
+    def _row_to_incident(self, row: IncidentRow) -> Incident:
+        agents_run = [AgentRun.model_validate(a) for a in (row.agents_run or [])]
+        tool_calls = [ToolCall.model_validate(t) for t in (row.tool_calls or [])]
+        token_usage = TokenUsage(
+            input_tokens=row.input_tokens,
+            output_tokens=row.output_tokens,
+            total_tokens=row.total_tokens,
+        )
+        return Incident(
+            id=row.id,
+            status=row.status,
+            created_at=_iso(row.created_at),
+            updated_at=_iso(row.updated_at),
+            deleted_at=_iso(row.deleted_at) if row.deleted_at else None,
+            query=row.query,
+            environment=row.environment,
+            reporter=Reporter(id=row.reporter_id, team=row.reporter_team),
+            summary=row.summary or "",
+            tags=list(row.tags or []),
+            severity=row.severity,
+            category=row.category,
+            matched_prior_inc=row.matched_prior_inc,
+            embedding=row.embedding,
+            agents_run=agents_run,
+            tool_calls=tool_calls,
+            findings=dict(row.findings or {}),
+            resolution=row.resolution,
+            token_usage=token_usage,
+            pending_intervention=row.pending_intervention,
+            user_inputs=list(row.user_inputs or []),
+        )
+
+    def _incident_to_row_dict(
+        self, inc: Incident, *, embedding: Optional[list[float]],
+    ) -> dict:
+        return {
+            "id": inc.id,
+            "status": inc.status,
+            "created_at": _parse_iso(inc.created_at),
+            "updated_at": _parse_iso(inc.updated_at),
+            "deleted_at": _parse_iso(inc.deleted_at) if inc.deleted_at else None,
+            "query": inc.query,
+            "environment": inc.environment,
+            "reporter_id": inc.reporter.id,
+            "reporter_team": inc.reporter.team,
+            "summary": inc.summary or "",
+            "severity": inc.severity,
+            "category": inc.category,
+            "matched_prior_inc": inc.matched_prior_inc,
+            "resolution": inc.resolution,
+            "tags": list(inc.tags),
+            "agents_run": [a.model_dump(mode="json") for a in inc.agents_run],
+            "tool_calls": [t.model_dump(mode="json") for t in inc.tool_calls],
+            "findings": dict(inc.findings),
+            "pending_intervention": inc.pending_intervention,
+            "user_inputs": list(inc.user_inputs),
+            "embedding": embedding,
+            "input_tokens": inc.token_usage.input_tokens,
+            "output_tokens": inc.token_usage.output_tokens,
+            "total_tokens": inc.token_usage.total_tokens,
+        }
+
+    # ---------- embedding lifecycle ----------
+    def _maybe_embed(self, text: str) -> Optional[list[float]]:
+        if self.embedder is None or not text:
+            return None
+        return self.embedder.embed_query(text)
+
+    def _compute_save_embedding(
+        self, existing: Optional[IncidentRow], inc: Incident,
+    ) -> Optional[list[float]]:
+        """Re-embed only when the source text materially changed."""
+        if self.embedder is None:
+            return existing.embedding if existing is not None else None
+        text = _embed_source(inc)
+        if existing is not None:
+            prior = _embed_source_from_row(existing)
+            if prior == text and existing.embedding is not None:
+                return existing.embedding
+        return self.embedder.embed_query(text) if text else None
+
+
+def _embed_source(inc: Incident) -> str:
+    return (inc.query or "").strip()
+
+
+def _embed_source_from_row(row: IncidentRow) -> str:
+    return (row.query or "").strip()
+
 # ====== module: orchestrator/mcp_servers/incident.py ======
 
 _DEFAULT_SEVERITY_ALIASES: dict[str, str] = {
@@ -834,12 +1449,6 @@ def normalize_severity(
     value: str | None,
     aliases: dict[str, str] | None = None,
 ) -> str | None:
-    """Coerce assorted severity inputs (sev1/p2/critical/etc.) to a canonical label.
-
-    ``aliases`` maps lower-cased input tokens to canonical values. When ``None``
-    no normalization occurs — the lowercased input is returned as-is. Unknown
-    inputs pass through untouched so callers can flag them.
-    """
     if value is None:
         return None
     lowered = value.strip().lower()
@@ -850,14 +1459,8 @@ def normalize_severity(
 
 @dataclass
 class IncidentMCPServer:
-    """Per-instance container holding a FastMCP server and its scoped state.
-
-    Each Orchestrator constructs its own :class:`IncidentMCPServer`, so two
-    orchestrators in the same process (e.g. two test fixtures, two web users
-    behind one Streamlit deployment) no longer share a store reference.
-    """
-    store: IncidentStore | None = None
-    similarity_threshold: float = 0.85
+    """FastMCP server bound to a single :class:`IncidentRepository`."""
+    repository: IncidentRepository | None = None
     severity_aliases: dict[str, str] = field(
         default_factory=lambda: dict(_DEFAULT_SEVERITY_ALIASES)
     )
@@ -865,66 +1468,44 @@ class IncidentMCPServer:
 
     def __post_init__(self) -> None:
         self.mcp = FastMCP("incident_management")
-        # Bind the tool implementations to *this* server's state. We pass an
-        # explicit ``name=`` because FastMCP defaults to the function's
-        # ``__name__`` (which would expose the leading underscore). The names
-        # below match the original module-level tool functions, so the MCP
-        # tool surface (and the LangChain registry that consumes it) is
-        # unchanged.
         self.mcp.tool(name="lookup_similar_incidents")(self._tool_lookup_similar_incidents)
         self.mcp.tool(name="create_incident")(self._tool_create_incident)
         self.mcp.tool(name="update_incident")(self._tool_update_incident)
 
     def configure(
-        self,
-        *,
-        store: IncidentStore,
-        similarity_threshold: float,
+        self, *,
+        repository: IncidentRepository,
         severity_aliases: dict[str, str] | None = None,
     ) -> None:
-        self.store = store
-        self.similarity_threshold = similarity_threshold
+        self.repository = repository
         if severity_aliases is not None:
             self.severity_aliases = severity_aliases
 
-    def _require_store(self) -> IncidentStore:
-        if self.store is None:
+    def _require_repo(self) -> IncidentRepository:
+        if self.repository is None:
             raise RuntimeError(
                 "incident_management server not initialized — "
                 "call configure() (or the module-level set_state) first"
             )
-        return self.store
-
-    # FastMCP introspects parameter type hints to build tool schemas, so the
-    # bound methods below take the same signatures as the previous module-level
-    # functions (no `self` from the LLM's POV — `self` is captured by the bound
-    # method when we pass it to ``mcp.tool()``).
+        return self.repository
 
     async def _tool_lookup_similar_incidents(self, query: str, environment: str) -> dict:
         """Search past resolved INCs for similar issues. Returns top 5 by similarity score."""
-        store = self._require_store()
-        resolved = [i for i in store.list_all() if i.status == "resolved"]
-        candidates = [
-            {"id": i.id, "text": f"{i.query} {i.summary} {' '.join(i.tags)}",
-             "summary": i.summary, "resolution": i.resolution, "environment": i.environment}
-            for i in resolved if i.environment == environment
-        ]
-        results = find_similar(
-            query=query, candidates=candidates, text_field="text",
-            scorer=KeywordSimilarity(), threshold=self.similarity_threshold, limit=5,
-        )
+        repo = self._require_repo()
+        hits = repo.find_similar(query=query, environment=environment, limit=5)
         return {"matches": [
-            {"id": r["id"], "summary": r["summary"], "resolution": r["resolution"], "score": round(s, 3)}
-            for r, s in results
+            {"id": i.id, "summary": i.summary, "resolution": i.resolution,
+             "score": round(s, 3)}
+            for i, s in hits
         ]}
 
     async def _tool_create_incident(self, query: str, environment: str,
                                     reporter_id: str = "user-mock",
                                     reporter_team: str = "platform") -> dict:
         """Create a new INC ticket and persist it."""
-        inc = self._require_store().create(query=query, environment=environment,
-                                           reporter_id=reporter_id,
-                                           reporter_team=reporter_team)
+        inc = self._require_repo().create(query=query, environment=environment,
+                                          reporter_id=reporter_id,
+                                          reporter_team=reporter_team)
         return inc.model_dump()
 
     async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
@@ -932,12 +1513,10 @@ class IncidentMCPServer:
 
         Allowed keys:
           - status, severity, category, summary, tags, matched_prior_inc, resolution
-          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``
-            (e.g. ``findings_triage``, ``findings_deep_investigator``,
-            or any agent name a YAML-defined skill may use).
+          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``.
         """
-        store = self._require_store()
-        inc = store.load(incident_id)
+        repo = self._require_repo()
+        inc = repo.load(incident_id)
         if "status" in patch:
             inc.status = patch["status"]
         if "severity" in patch:
@@ -952,59 +1531,33 @@ class IncidentMCPServer:
             inc.matched_prior_inc = patch["matched_prior_inc"]
         if "resolution" in patch:
             inc.resolution = patch["resolution"]
-        # findings_<agent> → inc.findings[<agent>] for any agent name.
         for key, value in patch.items():
             if key.startswith("findings_"):
                 inc.findings[key[len("findings_"):]] = value
-        store.save(inc)
+        repo.save(inc)
         return inc.model_dump()
 
 
 # ---------------------------------------------------------------------------
-# Module-level default server (back-compat for the existing MCP loader path).
-#
-# The MCP loader imports ``mcp`` from this module by name (it doesn't know
-# about IncidentMCPServer). To preserve that contract, we expose:
-#
-#   - ``mcp``   : a FastMCP instance owned by ``_default_server``
-#   - ``set_state(...)`` : configure ``_default_server``'s store/threshold
-#   - ``lookup_similar_incidents`` / ``create_incident`` / ``update_incident``
-#     : thin shims so direct callers in tests still work
-#
-# Per-Orchestrator scoping is achieved by constructing a fresh
-# :class:`IncidentMCPServer` (planned in a follow-up that wires it through
-# ``mcp_loader.load_tools``). This commit removes the *module-global dict* —
-# state now lives on the instance — without breaking the existing import path.
+# Module-level default server (back-compat for the MCP loader path).
+# The MCP loader imports ``mcp`` from this module by name; this keeps that
+# contract working unchanged.
 # ---------------------------------------------------------------------------
 
 _default_server = IncidentMCPServer()
 mcp = _default_server.mcp
 
 
-def set_state(
-    *,
-    store: IncidentStore,
-    similarity_threshold: float,
-    severity_aliases: dict[str, str] | None = None,
-) -> None:
-    """Configure the default IncidentMCPServer instance.
-
-    Kept for backwards compatibility with callers that import this function
-    directly (the orchestrator and several tests). New code should construct an
-    :class:`IncidentMCPServer` and call ``configure`` on it.
-
-    ``severity_aliases`` is optional; when omitted the server retains the
-    default map so existing callers see no behaviour change.
-    """
+def set_state(*, repository: IncidentRepository,
+              severity_aliases: dict[str, str] | None = None) -> None:
+    """Configure the default IncidentMCPServer instance."""
     _default_server.configure(
-        store=store,
-        similarity_threshold=similarity_threshold,
+        repository=repository,
         severity_aliases=severity_aliases,
     )
 
 
-# Public function aliases so test modules importing these names directly keep
-# working. They forward to the bound methods on ``_default_server``.
+# Direct-call shims kept for tests that import these names.
 async def lookup_similar_incidents(query: str, environment: str) -> dict:
     return await _default_server._tool_lookup_similar_incidents(query, environment)
 
@@ -2067,6 +2620,20 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
 _INCIDENT_MCP_MODULE = "orchestrator.mcp_servers.incident"
 
 
+def _storage_url(cfg: AppConfig) -> str:
+    """Derive the SQLite URL for the current config.
+
+    When ``cfg.storage.url`` is still the default sentinel (``sqlite:///incidents.db``),
+    use ``cfg.paths.incidents_dir`` so that per-test ``tmp_path`` isolation is
+    respected. Production deployments that set an explicit ``storage.url``
+    (e.g. a Postgres DSN or a non-default SQLite path) are left untouched.
+    """
+    default_url = StorageConfig().url
+    if cfg.storage.url != default_url:
+        return cfg.storage.url
+    return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
+
+
 class Orchestrator:
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -2074,7 +2641,7 @@ class Orchestrator:
     tool registry. Always call :meth:`aclose` (or use ``async with``) when done.
     """
 
-    def __init__(self, cfg: AppConfig, store: IncidentStore,
+    def __init__(self, cfg: AppConfig, store: IncidentRepository,
                  skills: dict[str, Skill], registry: ToolRegistry, graph,
                  resume_graph, exit_stack: AsyncExitStack):
         self.cfg = cfg
@@ -2090,7 +2657,17 @@ class Orchestrator:
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
-            store = IncidentStore(cfg.paths.incidents_dir)
+            engine = build_engine(StorageConfig(url=_storage_url(cfg),
+                                                pool_size=cfg.storage.pool_size,
+                                                echo=cfg.storage.echo))
+            Base.metadata.create_all(engine)
+            embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
+            store = IncidentRepository(
+                engine=engine,
+                embedder=embedder,
+                similarity_threshold=cfg.incidents.similarity_threshold,
+                severity_aliases=cfg.orchestrator.severity_aliases,
+            )
             # Configure incident_management state via importlib so we hit the
             # *same* module instance the MCP loader will import. In the
             # single-file dist bundle a direct ``set_state`` call would
@@ -2101,8 +2678,7 @@ class Orchestrator:
                 if (srv.transport == "in_process" and srv.enabled
                         and srv.module == _INCIDENT_MCP_MODULE):
                     importlib.import_module(_INCIDENT_MCP_MODULE).set_state(
-                        store=store,
-                        similarity_threshold=cfg.incidents.similarity_threshold,
+                        repository=store,
                         severity_aliases=cfg.orchestrator.severity_aliases,
                     )
                     break

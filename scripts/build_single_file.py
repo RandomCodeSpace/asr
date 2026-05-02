@@ -22,6 +22,11 @@ CORE_MODULE_ORDER = [
     "similarity.py",
     "skill.py",
     "llm.py",
+    "storage/types.py",
+    "storage/models.py",
+    "storage/engine.py",
+    "storage/embeddings.py",
+    "storage/repository.py",
     "mcp_servers/incident.py",
     "mcp_servers/observability.py",
     "mcp_servers/remediation.py",
@@ -32,13 +37,18 @@ CORE_MODULE_ORDER = [
     "api.py",
 ]
 
+# Matches both single-line and parenthesized multi-line intra-package imports.
 INTRA_IMPORT_RE = re.compile(
-    r"^\s*from\s+orchestrator(\.[\w.]+)?\s+import\s+.*$", re.MULTILINE
+    r"^\s*from\s+orchestrator(\.[\w.]+)?\s+import\s+"
+    r"(?:\([^)]*\)|.*?)$",
+    re.MULTILINE | re.DOTALL,
 )
 PACKAGE_INIT_RE = re.compile(r"^\s*from\s+__future__\s+import\s+.*$", re.MULTILINE)
+# For UI rewriting: capture the symbols, handling parenthesized form.
 _FROM_ORCH_RE = re.compile(
-    r"^\s*from\s+orchestrator(?:\.[\w.]+)?\s+import\s+(.*?)\s*$",
-    re.MULTILINE,
+    r"^\s*from\s+orchestrator(?:\.[\w.]+)?\s+import\s+"
+    r"(?:\(([^)]*)\)|(.*?))\s*$",
+    re.MULTILINE | re.DOTALL,
 )
 
 
@@ -60,7 +70,8 @@ def _rewrite_intra_imports_for_ui(src: str) -> str:
     symbols: set[str] = set()
 
     def _collect(m: re.Match) -> str:
-        for s in m.group(1).split(","):
+        raw = m.group(1) if m.group(1) is not None else (m.group(2) or "")
+        for s in raw.split(","):
             s = s.strip()
             if s:
                 symbols.add(s)
