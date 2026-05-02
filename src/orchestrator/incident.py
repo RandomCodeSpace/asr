@@ -46,11 +46,6 @@ class AgentRun(BaseModel):
     signal: str | None = None
 
 
-class Findings(BaseModel):
-    triage: Any = None
-    deep_investigator: Any = None
-
-
 class Incident(BaseModel):
     id: str
     status: IncidentStatus
@@ -67,7 +62,10 @@ class Incident(BaseModel):
     embedding: list[float] | None = None
     agents_run: list[AgentRun] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
-    findings: Findings = Field(default_factory=Findings)
+    # Findings is an open mapping keyed by agent name (or any agent-declared
+    # output key). Old saves with {"triage": ..., "deep_investigator": ...}
+    # load transparently because Pydantic accepts those as dict entries.
+    findings: dict[str, Any] = Field(default_factory=dict)
     resolution: Any = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None

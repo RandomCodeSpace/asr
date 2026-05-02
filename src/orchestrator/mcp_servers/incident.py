@@ -112,8 +112,14 @@ class IncidentMCPServer:
         return inc.model_dump()
 
     async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
-        """Apply a flat patch to an INC. Allowed keys: status, severity, category, summary, tags,
-        matched_prior_inc, resolution, findings_triage, findings_deep_investigator."""
+        """Apply a flat patch to an INC.
+
+        Allowed keys:
+          - status, severity, category, summary, tags, matched_prior_inc, resolution
+          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``
+            (e.g. ``findings_triage``, ``findings_deep_investigator``,
+            or any agent name a YAML-defined skill may use).
+        """
         store = self._require_store()
         inc = store.load(incident_id)
         if "status" in patch:
@@ -130,10 +136,10 @@ class IncidentMCPServer:
             inc.matched_prior_inc = patch["matched_prior_inc"]
         if "resolution" in patch:
             inc.resolution = patch["resolution"]
-        if "findings_triage" in patch:
-            inc.findings.triage = patch["findings_triage"]
-        if "findings_deep_investigator" in patch:
-            inc.findings.deep_investigator = patch["findings_deep_investigator"]
+        # findings_<agent> → inc.findings[<agent>] for any agent name.
+        for key, value in patch.items():
+            if key.startswith("findings_"):
+                inc.findings[key[len("findings_"):]] = value
         store.save(inc)
         return inc.model_dump()
 

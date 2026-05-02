@@ -120,6 +120,13 @@ class InterventionConfig(BaseModel):
 
 class OrchestratorConfig(BaseModel):
     entry_agent: str = "intake"
+    # Signals an agent may emit (via ``update_incident.patch.signal``) that
+    # the router will accept and look up against the skill's ``routes`` table.
+    # Anything outside this set falls through to ``when: default``. Override
+    # in YAML to extend the vocabulary; the default keeps current behaviour.
+    signals: list[str] = Field(
+        default_factory=lambda: ["success", "failed", "needs_input"],
+    )
 
 
 class AppConfig(BaseModel):

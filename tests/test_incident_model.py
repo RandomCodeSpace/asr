@@ -16,7 +16,7 @@ def test_incident_minimal_construction():
     )
     assert inc.id == "INC-20260430-001"
     assert inc.tool_calls == []
-    assert inc.findings.triage is None
+    assert inc.findings == {}
     assert inc.matched_prior_inc is None
     # New intervention fields default cleanly.
     assert inc.pending_intervention is None

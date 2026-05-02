@@ -307,6 +307,13 @@ class InterventionConfig(BaseModel):
 
 class OrchestratorConfig(BaseModel):
     entry_agent: str = "intake"
+    # Signals an agent may emit (via ``update_incident.patch.signal``) that
+    # the router will accept and look up against the skill's ``routes`` table.
+    # Anything outside this set falls through to ``when: default``. Override
+    # in YAML to extend the vocabulary; the default keeps current behaviour.
+    signals: list[str] = Field(
+        default_factory=lambda: ["success", "failed", "needs_input"],
+    )
 
 
 class AppConfig(BaseModel):
@@ -388,11 +395,6 @@ class AgentRun(BaseModel):
     signal: str | None = None
 
 
-class Findings(BaseModel):
-    triage: Any = None
-    deep_investigator: Any = None
-
-
 class Incident(BaseModel):
     id: str
     status: IncidentStatus
@@ -409,7 +411,10 @@ class Incident(BaseModel):
     embedding: list[float] | None = None
     agents_run: list[AgentRun] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
-    findings: Findings = Field(default_factory=Findings)
+    # Findings is an open mapping keyed by agent name (or any agent-declared
+    # output key). Old saves with {"triage": ..., "deep_investigator": ...}
+    # load transparently because Pydantic accepts those as dict entries.
+    findings: dict[str, Any] = Field(default_factory=dict)
     resolution: Any = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
@@ -892,8 +897,14 @@ class IncidentMCPServer:
         return inc.model_dump()
 
     async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
-        """Apply a flat patch to an INC. Allowed keys: status, severity, category, summary, tags,
-        matched_prior_inc, resolution, findings_triage, findings_deep_investigator."""
+        """Apply a flat patch to an INC.
+
+        Allowed keys:
+          - status, severity, category, summary, tags, matched_prior_inc, resolution
+          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``
+            (e.g. ``findings_triage``, ``findings_deep_investigator``,
+            or any agent name a YAML-defined skill may use).
+        """
         store = self._require_store()
         inc = store.load(incident_id)
         if "status" in patch:
@@ -910,10 +921,10 @@ class IncidentMCPServer:
             inc.matched_prior_inc = patch["matched_prior_inc"]
         if "resolution" in patch:
             inc.resolution = patch["resolution"]
-        if "findings_triage" in patch:
-            inc.findings.triage = patch["findings_triage"]
-        if "findings_deep_investigator" in patch:
-            inc.findings.deep_investigator = patch["findings_deep_investigator"]
+        # findings_<agent> → inc.findings[<agent>] for any agent name.
+        for key, value in patch.items():
+            if key.startswith("findings_"):
+                inc.findings[key[len("findings_"):]] = value
         store.save(inc)
         return inc.model_dump()
 
@@ -1323,18 +1334,24 @@ def _coerce_rationale(raw) -> str | None:
         return None
 
 
-_VALID_SIGNALS: frozenset[str] = frozenset({"success", "failed", "needs_input"})
+# Fallback signal vocabulary used by tests and any caller that doesn't
+# thread ``cfg.orchestrator.signals`` through. Production code passes the
+# configured set down via ``make_agent_node``.
+_DEFAULT_SIGNALS: frozenset[str] = frozenset({"success", "failed", "needs_input"})
 
 
-def _coerce_signal(raw) -> str | None:
+def _coerce_signal(raw, valid_signals: frozenset[str] | None = None) -> str | None:
     """Coerce a raw signal value emitted by an LLM to a canonical lowercase
     string, or None when the value cannot be interpreted.
 
-    Recognised signals are ``success``, ``failed``, and ``needs_input``. Any
-    other string emits a warning and yields None — the route lookup then
-    falls back to ``when: default``. ``bool`` is rejected explicitly because
+    The accepted vocabulary comes from ``cfg.orchestrator.signals`` (passed
+    in as ``valid_signals``); when the caller omits it, the historical
+    ``{success, failed, needs_input}`` default is used. Any value outside
+    the set emits a warning and yields None — the route lookup then falls
+    back to ``when: default``. ``bool`` is rejected explicitly because
     Python treats it as ``int`` and string-coerces to ``"True"``/``"False"``.
     """
+    allowed = valid_signals if valid_signals is not None else _DEFAULT_SIGNALS
     if isinstance(raw, bool):
         logger.warning("signal value is bool (%r); rejecting", raw)
         return None
@@ -1345,7 +1362,7 @@ def _coerce_signal(raw) -> str | None:
                        raw, type(raw).__name__)
         return None
     key = raw.strip().lower()
-    if key in _VALID_SIGNALS:
+    if key in allowed:
         return key
     logger.warning("unknown signal %r; treating as None (will fall through to default)", raw)
     return None
@@ -1432,14 +1449,20 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
 
 
 def _format_agent_input(incident: Incident) -> str:
+    """Build the human-message preamble each agent receives.
+
+    Findings are now a free-form mapping (one entry per upstream agent),
+    so emit one ``Findings (<agent>): <value>`` line per recorded finding
+    instead of pinning the prompt to two specific agent identities.
+    """
     base = (
         f"Incident {incident.id}\n"
         f"Environment: {incident.environment}\n"
         f"Query: {incident.query}\n"
         f"Status: {incident.status}\n"
-        f"Findings (triage): {incident.findings.triage}\n"
-        f"Findings (deep_investigator): {incident.findings.deep_investigator}\n"
     )
+    for agent_key, finding in incident.findings.items():
+        base += f"Findings ({agent_key}): {finding}\n"
     if incident.user_inputs:
         bullets = "\n".join(f"- {ui}" for ui in incident.user_inputs)
         base += (
@@ -1454,6 +1477,7 @@ def _merge_patch_metadata(
     confidence: float | None,
     rationale: str | None,
     signal: str | None,
+    valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Update the (confidence, rationale, signal) trio with whatever the
     patch carries; preserve the prior value when the patch is silent on a
@@ -1465,7 +1489,10 @@ def _merge_patch_metadata(
         _coerce_rationale(patch["confidence_rationale"])
         if "confidence_rationale" in patch else rationale
     )
-    new_signal = _coerce_signal(patch["signal"]) if "signal" in patch else signal
+    new_signal = (
+        _coerce_signal(patch["signal"], valid_signals)
+        if "signal" in patch else signal
+    )
     return new_conf, new_rationale, new_signal
 
 
@@ -1474,6 +1501,7 @@ def _harvest_tool_calls_and_patches(
     skill_name: str,
     incident: Incident,
     ts: str,
+    valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Iterate agent messages, record ToolCall entries on the incident, and
     harvest any confidence / confidence_rationale / signal from update_incident
@@ -1504,6 +1532,7 @@ def _harvest_tool_calls_and_patches(
                 patch = tc_args.get("patch") or {}
                 agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
                     patch, agent_confidence, agent_rationale, agent_signal,
+                    valid_signals,
                 )
     return agent_confidence, agent_rationale, agent_signal
 
@@ -1606,8 +1635,15 @@ def make_agent_node(
     tools: list[BaseTool],
     decide_route: Callable[[Incident], str],
     store: IncidentStore,
+    valid_signals: frozenset[str] | None = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
-    """Factory: build a LangGraph node that runs a ReAct agent and decides a route."""
+    """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
+
+    ``valid_signals`` is the orchestrator-wide accepted signal vocabulary
+    (``cfg.orchestrator.signals``). When omitted, the legacy
+    ``{success, failed, needs_input}`` default is used so older callers and
+    tests keep working.
+    """
     agent_executor = create_react_agent(llm, tools, prompt=skill.system_prompt)
 
     async def node(state: GraphState) -> dict:
@@ -1637,7 +1673,7 @@ def make_agent_node(
 
         # Record tool calls and harvest confidence/signal from update_incident patches.
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
-            messages, skill.name, incident, ts,
+            messages, skill.name, incident, ts, valid_signals,
         )
 
         # Pair tool responses with their tool calls.
@@ -1763,6 +1799,7 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
 def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
                        registry: ToolRegistry) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs."""
+    valid_signals = frozenset(cfg.orchestrator.signals)
     nodes: dict = {}
     for agent_name, skill in skills.items():
         llm = get_llm(
@@ -1776,6 +1813,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         nodes[agent_name] = make_agent_node(
             skill=skill, llm=llm, tools=tools,
             decide_route=decide, store=store,
+            valid_signals=valid_signals,
         )
     return nodes
 

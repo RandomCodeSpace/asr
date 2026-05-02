@@ -76,18 +76,24 @@ def _coerce_rationale(raw) -> str | None:
         return None
 
 
-_VALID_SIGNALS: frozenset[str] = frozenset({"success", "failed", "needs_input"})
+# Fallback signal vocabulary used by tests and any caller that doesn't
+# thread ``cfg.orchestrator.signals`` through. Production code passes the
+# configured set down via ``make_agent_node``.
+_DEFAULT_SIGNALS: frozenset[str] = frozenset({"success", "failed", "needs_input"})
 
 
-def _coerce_signal(raw) -> str | None:
+def _coerce_signal(raw, valid_signals: frozenset[str] | None = None) -> str | None:
     """Coerce a raw signal value emitted by an LLM to a canonical lowercase
     string, or None when the value cannot be interpreted.
 
-    Recognised signals are ``success``, ``failed``, and ``needs_input``. Any
-    other string emits a warning and yields None — the route lookup then
-    falls back to ``when: default``. ``bool`` is rejected explicitly because
+    The accepted vocabulary comes from ``cfg.orchestrator.signals`` (passed
+    in as ``valid_signals``); when the caller omits it, the historical
+    ``{success, failed, needs_input}`` default is used. Any value outside
+    the set emits a warning and yields None — the route lookup then falls
+    back to ``when: default``. ``bool`` is rejected explicitly because
     Python treats it as ``int`` and string-coerces to ``"True"``/``"False"``.
     """
+    allowed = valid_signals if valid_signals is not None else _DEFAULT_SIGNALS
     if isinstance(raw, bool):
         logger.warning("signal value is bool (%r); rejecting", raw)
         return None
@@ -98,7 +104,7 @@ def _coerce_signal(raw) -> str | None:
                        raw, type(raw).__name__)
         return None
     key = raw.strip().lower()
-    if key in _VALID_SIGNALS:
+    if key in allowed:
         return key
     logger.warning("unknown signal %r; treating as None (will fall through to default)", raw)
     return None
@@ -185,14 +191,20 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
 
 
 def _format_agent_input(incident: Incident) -> str:
+    """Build the human-message preamble each agent receives.
+
+    Findings are now a free-form mapping (one entry per upstream agent),
+    so emit one ``Findings (<agent>): <value>`` line per recorded finding
+    instead of pinning the prompt to two specific agent identities.
+    """
     base = (
         f"Incident {incident.id}\n"
         f"Environment: {incident.environment}\n"
         f"Query: {incident.query}\n"
         f"Status: {incident.status}\n"
-        f"Findings (triage): {incident.findings.triage}\n"
-        f"Findings (deep_investigator): {incident.findings.deep_investigator}\n"
     )
+    for agent_key, finding in incident.findings.items():
+        base += f"Findings ({agent_key}): {finding}\n"
     if incident.user_inputs:
         bullets = "\n".join(f"- {ui}" for ui in incident.user_inputs)
         base += (
@@ -207,6 +219,7 @@ def _merge_patch_metadata(
     confidence: float | None,
     rationale: str | None,
     signal: str | None,
+    valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Update the (confidence, rationale, signal) trio with whatever the
     patch carries; preserve the prior value when the patch is silent on a
@@ -218,7 +231,10 @@ def _merge_patch_metadata(
         _coerce_rationale(patch["confidence_rationale"])
         if "confidence_rationale" in patch else rationale
     )
-    new_signal = _coerce_signal(patch["signal"]) if "signal" in patch else signal
+    new_signal = (
+        _coerce_signal(patch["signal"], valid_signals)
+        if "signal" in patch else signal
+    )
     return new_conf, new_rationale, new_signal
 
 
@@ -227,6 +243,7 @@ def _harvest_tool_calls_and_patches(
     skill_name: str,
     incident: Incident,
     ts: str,
+    valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Iterate agent messages, record ToolCall entries on the incident, and
     harvest any confidence / confidence_rationale / signal from update_incident
@@ -257,6 +274,7 @@ def _harvest_tool_calls_and_patches(
                 patch = tc_args.get("patch") or {}
                 agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
                     patch, agent_confidence, agent_rationale, agent_signal,
+                    valid_signals,
                 )
     return agent_confidence, agent_rationale, agent_signal
 
@@ -359,8 +377,15 @@ def make_agent_node(
     tools: list[BaseTool],
     decide_route: Callable[[Incident], str],
     store: IncidentStore,
+    valid_signals: frozenset[str] | None = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
-    """Factory: build a LangGraph node that runs a ReAct agent and decides a route."""
+    """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
+
+    ``valid_signals`` is the orchestrator-wide accepted signal vocabulary
+    (``cfg.orchestrator.signals``). When omitted, the legacy
+    ``{success, failed, needs_input}`` default is used so older callers and
+    tests keep working.
+    """
     agent_executor = create_react_agent(llm, tools, prompt=skill.system_prompt)
 
     async def node(state: GraphState) -> dict:
@@ -390,7 +415,7 @@ def make_agent_node(
 
         # Record tool calls and harvest confidence/signal from update_incident patches.
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
-            messages, skill.name, incident, ts,
+            messages, skill.name, incident, ts, valid_signals,
         )
 
         # Pair tool responses with their tool calls.
@@ -437,66 +462,64 @@ _STUB_CANNED = {
 }
 
 
-def _latest_di_run(incident: Incident):
-    """Return the most recent deep_investigator AgentRun, or None."""
+def _latest_run_for(incident: Incident, agent_name: str | None):
+    """Return the most recent ``AgentRun`` for ``agent_name``, or None.
+
+    ``agent_name`` is whichever agent ran immediately before the gate,
+    derived at runtime from ``state["last_agent"]`` — so the gate is
+    config-driven and works for any YAML-defined upstream, not just
+    ``deep_investigator``.
+    """
+    if not agent_name:
+        return None
     for run in reversed(incident.agents_run):
-        if run.agent == "deep_investigator":
+        if run.agent == agent_name:
             return run
     return None
 
 
-def _latest_di_confidence(incident: Incident) -> float | None:
-    """Return the most recent deep_investigator AgentRun confidence, or None."""
-    run = _latest_di_run(incident)
-    return run.confidence if run else None
-
-
 def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
-    """Build the intervention gate node placed between DI and resolution.
+    """Build the intervention gate node placed before a gated downstream.
 
-    If the latest deep_investigator confidence is below the configured
-    threshold (or absent), the gate marks the incident as `awaiting_input`,
-    populates `pending_intervention`, and routes to END. Otherwise it routes
-    to `resolution`.
+    The gate evaluates the confidence of whichever agent ran immediately
+    before it (``state["last_agent"]``). If that confidence is below the
+    configured threshold (or absent), the gate marks the incident
+    ``awaiting_input``, populates ``pending_intervention``, and routes
+    to END. Otherwise it routes to the gated target.
 
-    Implemented as a plain async coroutine (not via ``make_agent_node``) so
-    it does not invoke an LLM — but it IS a real graph node, so streamed
-    events surface ``enter gate`` / ``exit gate``.
+    Implemented as a plain async coroutine (not via ``make_agent_node``)
+    so it does not invoke an LLM — but it IS a real graph node, so
+    streamed events surface ``enter gate`` / ``exit gate``.
 
-    .. note::
-       The gate's *structural* placement is config-driven (see
-       :func:`_collect_gated_edges`), but its *semantic* check is still
-       pinned to ``deep_investigator``'s confidence via
-       :func:`_latest_di_confidence`. Moving the gate marker to a
-       different agent pair via ``gate: confidence`` on another route
-       will compile, but the gate will silently evaluate the wrong (or
-       absent) confidence value. Generalising this is tracked as
-       follow-up work — pass the upstream agent name as a parameter so
-       the lookup is config-driven.
+    The gate is fully agent-agnostic: any YAML route carrying
+    ``gate: confidence`` causes the gate to evaluate the upstream agent
+    named on that route, regardless of agent identity.
     """
     threshold = cfg.intervention.confidence_threshold
     teams = list(cfg.intervention.escalation_teams)
 
     async def gate(state: GraphState) -> dict:
         incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
+        upstream = state.get("last_agent")
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
             incident = store.load(incident.id)
         except FileNotFoundError:
             pass
-        di_run = _latest_di_run(incident)
-        di_conf = di_run.confidence if di_run else None
-        if di_conf is None or di_conf < threshold:
+        upstream_run = _latest_run_for(incident, upstream)
+        upstream_conf = upstream_run.confidence if upstream_run else None
+        if upstream_conf is None or upstream_conf < threshold:
             incident.status = "awaiting_input"
             # Surface the upstream agent's own summary + rationale so the
             # human reviewer can decide what input to give without scrolling
             # through every step of the agents-run log.
             incident.pending_intervention = {
                 "reason": "low_confidence",
-                "confidence": di_conf,
+                "confidence": upstream_conf,
                 "threshold": threshold,
-                "summary": di_run.summary if di_run else "",
-                "rationale": di_run.confidence_rationale if di_run else "",
+                "upstream_agent": upstream,
+                "summary": upstream_run.summary if upstream_run else "",
+                "rationale": upstream_run.confidence_rationale if upstream_run else "",
                 "options": ["resume_with_input", "escalate", "stop"],
                 "escalation_teams": teams,
             }
@@ -516,6 +539,7 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
 def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
                        registry: ToolRegistry) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs."""
+    valid_signals = frozenset(cfg.orchestrator.signals)
     nodes: dict = {}
     for agent_name, skill in skills.items():
         llm = get_llm(
@@ -529,6 +553,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         nodes[agent_name] = make_agent_node(
             skill=skill, llm=llm, tools=tools,
             decide_route=decide, store=store,
+            valid_signals=valid_signals,
         )
     return nodes
 
