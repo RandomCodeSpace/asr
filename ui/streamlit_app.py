@@ -23,6 +23,7 @@ from orchestrator.storage.engine import build_engine
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.models import Base
 from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.vector import build_vector_store
 
 
 CONFIG_PATH = Path("config/config.yaml")
@@ -39,9 +40,15 @@ def _make_repository(cfg: AppConfig) -> IncidentRepository:
     engine = build_engine(MetadataConfig(url=url, pool_size=cfg.storage.metadata.pool_size, echo=cfg.storage.metadata.echo))
     Base.metadata.create_all(engine)
     embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
+    vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
     return IncidentRepository(
         engine=engine,
         embedder=embedder,
+        vector_store=vector_store,
+        vector_path=(cfg.storage.vector.path
+                     if cfg.storage.vector.backend == "faiss" else None),
+        vector_index_name=cfg.storage.vector.collection_name,
+        distance_strategy=cfg.storage.vector.distance_strategy,
         similarity_threshold=cfg.incidents.similarity_threshold,
     )
 

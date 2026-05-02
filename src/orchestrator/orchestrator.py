@@ -15,6 +15,7 @@ from orchestrator.storage.engine import build_engine
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.models import Base
 from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.vector import build_vector_store
 
 _INCIDENT_MCP_MODULE = "orchestrator.mcp_servers.incident"
 
@@ -63,9 +64,15 @@ class Orchestrator:
             ))
             Base.metadata.create_all(engine)
             embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
+            vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
             store = IncidentRepository(
                 engine=engine,
                 embedder=embedder,
+                vector_store=vector_store,
+                vector_path=(cfg.storage.vector.path
+                             if cfg.storage.vector.backend == "faiss" else None),
+                vector_index_name=cfg.storage.vector.collection_name,
+                distance_strategy=cfg.storage.vector.distance_strategy,
                 similarity_threshold=cfg.incidents.similarity_threshold,
                 severity_aliases=cfg.orchestrator.severity_aliases,
             )

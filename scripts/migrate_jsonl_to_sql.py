@@ -14,6 +14,7 @@ from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
 from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.vector import build_vector_store
 
 
 def migrate(cfg: AppConfig, *, with_embeddings: bool, dry_run: bool) -> dict[str, int]:
@@ -29,7 +30,19 @@ def migrate(cfg: AppConfig, *, with_embeddings: bool, dry_run: bool) -> dict[str
         build_embedder(cfg.llm.embedding, cfg.llm.providers)
         if with_embeddings else None
     )
-    repo = IncidentRepository(engine=engine, embedder=embedder)
+    vector_store = (
+        build_vector_store(cfg.storage.vector, embedder, engine)
+        if with_embeddings else None
+    )
+    repo = IncidentRepository(
+        engine=engine,
+        embedder=embedder,
+        vector_store=vector_store,
+        vector_path=(cfg.storage.vector.path
+                     if cfg.storage.vector.backend == "faiss" else None),
+        vector_index_name=cfg.storage.vector.collection_name,
+        distance_strategy=cfg.storage.vector.distance_strategy,
+    )
     counts = {"inserted": 0, "skipped": 0, "failed": 0}
     for path in sorted(src.glob("INC-*.json")):
         try:
