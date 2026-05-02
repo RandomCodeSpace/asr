@@ -92,6 +92,8 @@ class Orchestrator:
         for skill in self.skills.values():
             for t in self.registry.resolve(skill.tools, self.cfg.mcp):
                 bindings.setdefault(t.name, []).append(skill.name)
+        # Map server name -> transport so callers can tell local from remote.
+        transport_by_server = {s.name: s.transport for s in self.cfg.mcp.servers}
         return [
             {
                 "name": e.tool.name,          # prefixed: "<server>:<original>"
@@ -99,6 +101,7 @@ class Orchestrator:
                 "description": e.description,
                 "category": e.category,
                 "server": e.server,
+                "transport": transport_by_server.get(e.server, "unknown"),
                 "bound_agents": bindings.get(e.tool.name, []),
             }
             for e in self.registry.entries.values()

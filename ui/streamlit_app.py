@@ -12,7 +12,7 @@
 # needs no MCP clients.
 from __future__ import annotations
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import streamlit as st
 
@@ -108,22 +108,137 @@ def _category_badge(category: str | None) -> None:
     _badge(category, _CATEGORY_COLOR.get(category, "gray"))
 
 
+def _age(ts: str) -> str:
+    """Compact relative-time label: ``2m`` / ``5h`` / ``3d`` / ``2w``."""
+    started = _parse_iso(ts)
+    if not started:
+        return ""
+    delta = datetime.now(timezone.utc).replace(tzinfo=None) - started
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"{max(seconds, 0)}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    if seconds < 604800:
+        return f"{seconds // 86400}d"
+    return f"{seconds // 604800}w"
+
+
+def _badge_md(label: str | None, palette: dict[str, str]) -> str:
+    """Inline markdown badge using Streamlit's ``:color-badge[]`` syntax."""
+    if not label:
+        return ""
+    color = palette.get(label, "gray")
+    return f":{color}-badge[{label}]"
+
+
+def _fmt_tokens_short(n: int) -> str:
+    """Compact form for the sidebar: ``12.3k`` / ``842``."""
+    return f"{n / 1000:.1f}k" if n >= 1000 else f"{n}"
+
+
+def _render_inc_row(inc: dict, store: IncidentStore) -> None:
+    """One INC row as an expander.
+
+    Header shows INC id + env badge + status badge. The body holds
+    severity/category badges, age + tokens, an excerpt of the summary,
+    and Open + delete actions. The currently-selected INC is expanded
+    by default so its details are visible without an extra click.
+    """
+    inc_id = inc["id"]
+    status = inc.get("status") or ""
+    env = inc.get("environment", "")
+    age = _age(inc.get("created_at", ""))
+    sev = (inc.get("severity") or "")
+    cat = (inc.get("category") or "")
+    summary = (inc.get("summary") or inc.get("query") or "").strip()
+    toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
+    is_deleted = status == "deleted"
+    is_selected = st.session_state.get("selected_incident") == inc_id
+
+    header = (
+        f"`{inc_id}` "
+        f"{_badge_md(env or None, _ENV_COLOR)} "
+        f"{_badge_md(status, _STATUS_COLOR)} "
+        f"`{_fmt_tokens_short(toks)}`"
+    ).strip()
+
+    # The delete button sits OUTSIDE the expander but on the same row,
+    # which is the closest Streamlit gets to "delete in the header" —
+    # ``st.expander`` labels can only be markdown text, not widgets.
+    exp_col, del_col = st.columns([10, 1], gap="small")
+    with del_col:
+        if not is_deleted:
+            if st.button("×", key=f"del_{inc_id}",
+                         help="Soft-delete",
+                         type="tertiary",
+                         use_container_width=True):
+                store.delete(inc_id)
+                if st.session_state.get("selected_incident") == inc_id:
+                    st.session_state.pop("selected_incident", None)
+                st.rerun()
+
+    with exp_col, st.expander(header, expanded=is_selected):
+        # Line 1: severity + category + age + updated-time. The time
+        # carries a hover tooltip with the full timestamp and reporter
+        # attribution, so the inline row stays compact.
+        updated = inc.get("updated_at") or ""
+        reporter = inc.get("reporter") or {}
+        rep_id = reporter.get("id") or ""
+        rep_team = reporter.get("team") or ""
+        meta_bits = [b for b in (
+            _badge_md(sev.lower() if sev else None, _SEVERITY_COLOR),
+            _badge_md(cat or None, _CATEGORY_COLOR),
+        ) if b]
+        if age:
+            meta_bits.append(f"`{age}`")
+        if updated and len(updated) >= 16:
+            time_str = updated[11:16]  # "HH:MM" out of "YYYY-MM-DDTHH:MM:SSZ"
+            tooltip_parts = [f"updated {updated}"]
+            if rep_id:
+                attrib = f"by {rep_id}" + (f" ({rep_team})" if rep_team else "")
+                tooltip_parts.append(attrib)
+            tooltip = " · ".join(tooltip_parts)
+            meta_bits.append(
+                f'<span title="{tooltip}">`{time_str}`</span>'
+            )
+        if meta_bits:
+            st.markdown(
+                " · ".join(meta_bits),
+                unsafe_allow_html=True,
+            )
+
+        if summary:
+            short = summary if len(summary) <= 160 else summary[:157] + "…"
+            st.markdown(f"> {short}")
+
+        if st.button("Open", key=f"inc_{inc_id}",
+                     type="primary",
+                     use_container_width=True):
+            st.session_state["selected_incident"] = inc_id
+
+
 def render_sidebar(store: IncidentStore) -> None:
     with st.sidebar:
-        st.markdown("### Recent INCs")
-        col_l, col_r = st.columns([3, 1])
-        with col_l:
-            show_deleted = st.checkbox("Show deleted", value=False,
-                                       key="show_deleted")
-            statuses = ["all", "new", "in_progress", "matched", "resolved",
-                        "escalated", "awaiting_input", "stopped"]
-            if show_deleted:
-                statuses.append("deleted")
-            status_filter = st.selectbox("Filter", statuses, key="status_filter",
-                                         label_visibility="collapsed")
-        with col_r:
-            if st.button("↻", help="Refresh"):
+        head_l, head_r = st.columns([4, 1])
+        with head_l:
+            st.markdown("### Recent INCs")
+        with head_r:
+            if st.button("↻", help="Refresh", type="tertiary",
+                         use_container_width=True):
                 st.rerun()
+        show_deleted = st.checkbox("Show deleted", value=False,
+                                   key="show_deleted")
+        statuses = ["all", "new", "in_progress", "matched", "resolved",
+                    "escalated", "awaiting_input", "stopped"]
+        if show_deleted:
+            statuses.append("deleted")
+        status_filter = st.selectbox(
+            "Filter", statuses, key="status_filter",
+            label_visibility="collapsed",
+        )
 
         recent = [i.model_dump()
                   for i in store.list_recent(50, include_deleted=show_deleted)]
@@ -134,39 +249,7 @@ def render_sidebar(store: IncidentStore) -> None:
             st.caption("No incidents.")
             return
         for inc in recent[:20]:
-            with st.container(border=True):
-                top_l, top_r = st.columns([3, 2])
-                with top_l:
-                    st.markdown(
-                        f"**`{inc['id']}`** · _{inc['environment']}_"
-                    )
-                with top_r:
-                    _status_badge(inc.get("status"))
-                meta_l, meta_r = st.columns(2)
-                with meta_l:
-                    _severity_badge(inc.get("severity"))
-                with meta_r:
-                    _category_badge(inc.get("category"))
-                toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
-                tok_str = (f"{toks/1000:.1f}k tok" if toks >= 1000
-                           else f"{toks} tok")
-                is_deleted = inc.get("status") == "deleted"
-                view_col, del_col = st.columns([4, 1])
-                with view_col:
-                    if st.button(f"View · {tok_str}",
-                                 key=f"inc_{inc['id']}",
-                                 use_container_width=True):
-                        st.session_state["selected_incident"] = inc["id"]
-                with del_col:
-                    if is_deleted:
-                        st.caption("—")
-                    elif st.button("🗑", key=f"del_{inc['id']}",
-                                   help="Soft-delete (toggle 'Show deleted' to view)",
-                                   use_container_width=True):
-                        store.delete(inc["id"])
-                        if st.session_state.get("selected_incident") == inc["id"]:
-                            st.session_state.pop("selected_incident", None)
-                        st.rerun()
+            _render_inc_row(inc, store)
 
 
 def _render_kv_dict_value(key: str, v: dict) -> None:
@@ -271,6 +354,22 @@ def _fmt_tokens(n: int) -> str:
     return f"{n:,}"
 
 
+def _fmt_duration(seconds: int) -> str:
+    """Compact duration: ``42s``, ``3m 5s``, ``1h 12m``, ``2d 4h``.
+
+    Sub-minute values stay as raw seconds; everything longer rolls up
+    into the largest two units so the metric stays readable for any
+    INC, from a 12s investigation to a multi-day awaiting-input pause.
+    """
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
 def _fmt_confidence_badge(conf: float | None) -> str:
     """Inline coloured badge for an agent confidence value.
 
@@ -358,13 +457,27 @@ def _render_incident_top_badges(inc: dict) -> None:
 
 
 def _render_incident_metrics(inc: dict) -> None:
-    """Render the total-tokens and duration metric columns."""
+    """Render tokens / active duration / total time metric columns.
+
+    - **Active duration** is the sum of each agent run's wall-clock —
+      reflects time the orchestrator was actually working.
+    - **Total time** is ``created_at → updated_at`` — wall-clock from
+      first report to the last write (covers awaiting-input pauses).
+    """
     token_total = (inc.get("token_usage") or {}).get("total_tokens", 0)
-    duration_s = _duration_seconds(inc.get("created_at", ""),
-                                   inc.get("updated_at", ""))
-    m1, m2 = st.columns(2)
+    runs = inc.get("agents_run") or []
+    active_s = sum(
+        _duration_seconds(r.get("started_at", ""), r.get("ended_at", ""))
+        for r in runs
+    )
+    total_s = _duration_seconds(inc.get("created_at", ""),
+                                inc.get("updated_at", ""))
+    if active_s == 0:
+        active_s = total_s
+    m1, m2, m3 = st.columns(3)
     m1.metric("Total tokens", _fmt_tokens(token_total))
-    m2.metric("Duration", f"{duration_s}s")
+    m2.metric("Active duration", _fmt_duration(active_s))
+    m3.metric("Total time", _fmt_duration(total_s))
 
 
 def _render_incident_prior_match(inc: dict) -> None:
@@ -415,7 +528,7 @@ def _render_agents_run_block(inc: dict) -> None:
         badge = _fmt_confidence_badge(conf)
         with st.container(border=True):
             st.markdown(
-                f"**{ar['agent']}** — {a_dur}s — "
+                f"**{ar['agent']}** — {_fmt_duration(a_dur)} — "
                 f"{_fmt_tokens(a_tok)} tokens — {badge}"
             )
             rationale = ar.get("confidence_rationale")
@@ -469,8 +582,20 @@ def render_incident_detail(store: IncidentStore) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
         return
-    with st.expander(f"INC detail: {inc_id}", expanded=True):
+    try:
         inc = store.load(inc_id).model_dump()
+    except FileNotFoundError:
+        return
+    status = inc.get("status") or ""
+    env = inc.get("environment") or ""
+    toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
+    header = (
+        f"`{inc_id}` "
+        f"{_badge_md(env or None, _ENV_COLOR)} "
+        f"{_badge_md(status, _STATUS_COLOR)} "
+        f"`{_fmt_tokens_short(toks)}`"
+    ).strip()
+    with st.expander(header, expanded=True):
         _render_incident_top_badges(inc)
         _render_incident_metrics(inc)
         _render_incident_summary_meta(inc)
@@ -568,15 +693,22 @@ def _render_intervention_block(inc: dict, inc_id: str) -> None:
     teams = pi.get("escalation_teams") or list(cfg.intervention.escalation_teams)
 
     conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
+    summary = (pi.get("summary") or "").strip()
+    rationale = (pi.get("rationale") or "").strip()
     with st.container(border=True):
         st.markdown(
             f"#### 🟠 Intervention required — confidence {conf_str} "
             f"< threshold {threshold:.2f}"
         )
-        st.caption(
-            "The deep investigator's confidence is below the configured "
-            "threshold. Choose how to proceed."
-        )
+        if summary:
+            st.markdown(f"**Investigator summary** — {summary}")
+        if rationale:
+            st.markdown(f"**Why confidence is low** — {rationale}")
+        if not summary and not rationale:
+            st.caption(
+                "The deep investigator's confidence is below the configured "
+                "threshold. Choose how to proceed."
+            )
         action = st.selectbox(
             "Action", ["resume_with_input", "escalate", "stop"],
             key=f"intervention_action_{inc_id}",
@@ -614,8 +746,116 @@ def _render_intervention_block(inc: dict, inc_id: str) -> None:
             st.rerun()
 
 
+def _render_agents_accordion(agents: list[dict], per_row: int = 2) -> None:
+    """Each agent as an expander, laid out in a ``per_row``-wide grid.
+
+    ``st.columns`` collapses to a single stacked column on narrow
+    viewports, so wide screens see a 2-up grid of expanders and mobile
+    sees them stacked vertically — responsive without extra CSS.
+    """
+    for i in range(0, len(agents), per_row):
+        cols = st.columns(per_row, gap="small")
+        for j in range(per_row):
+            with cols[j]:
+                if i + j >= len(agents):
+                    continue
+                a = agents[i + j]
+                label = f"{a['name']} :blue-badge[{a['model']}]"
+                with st.expander(label, expanded=(i + j == 0)):
+                    st.caption(a["description"])
+                    if a["tools"]:
+                        st.markdown(
+                            "**Tools** · "
+                            + " · ".join(f"`{t}`" for t in a["tools"])
+                        )
+                    if a["routes"]:
+                        st.caption(
+                            "Routes · " + ", ".join(
+                                f"`{r['when']}→{r['next']}`"
+                                for r in a["routes"]
+                            )
+                        )
+
+
+_LOCALITY_COLOR = {"local": "green", "remote": "orange", "mixed": "violet"}
+_ENV_COLOR = {
+    "production": "red",
+    "prod": "red",
+    "staging": "orange",
+    "stage": "orange",
+    "dev": "blue",
+    "local": "gray",
+}
+
+
+def _render_tools_by_category(tools: list[dict], per_row: int = 2) -> None:
+    """Render each ``category`` as an inner expander, laid out in a
+    ``per_row``-wide grid so categories sit side-by-side on wide screens
+    and stack vertically on narrow ones.
+
+    Designed to live inside the outer "Tools" expander on the registry
+    tab. Streamlit 1.42+ permits one level of expander nesting.
+    """
+    by_cat: dict[str, list[dict]] = {}
+    for t in tools:
+        by_cat.setdefault(t["category"], []).append(t)
+    cats = sorted(by_cat)
+    for i in range(0, len(cats), per_row):
+        cols = st.columns(per_row, gap="small")
+        for j in range(per_row):
+            with cols[j]:
+                if i + j >= len(cats):
+                    continue
+                cat = cats[i + j]
+                items = by_cat[cat]
+                tag = _category_locality_tag(items)
+                color = _LOCALITY_COLOR.get(tag, "gray")
+                label = f"{cat} ({len(items)}) :{color}-badge[{tag}]"
+                with st.expander(label, expanded=(i + j == 0)):
+                    for t in items:
+                        name = t.get("original_name", t["name"])
+                        st.markdown(f"- **{name}** — {t['description'][:80]}")
+
+
+def _category_locality_tag(items: list[dict]) -> str:
+    """Classify a tool category by transport: local / remote / mixed.
+
+    ``in_process`` is local; anything else (``http`` / ``sse`` / ``stdio``)
+    is remote. Mixed categories flag both kinds being co-located.
+    """
+    transports = {t.get("transport", "unknown") for t in items}
+    if transports == {"in_process"}:
+        return "local"
+    if "in_process" not in transports:
+        return "remote"
+    return "mixed"
+
+
+_SIDEBAR_MIN_WIDTH_PX = 500
+
+
+def _inject_global_css() -> None:
+    """Pin the sidebar to a minimum width when expanded.
+
+    Without the ``[aria-expanded="true"]`` predicate the min-width sticks
+    around after the user collapses the sidebar, leaving a blank gap on
+    the left of the main content area.
+    """
+    st.markdown(
+        f"""
+        <style>
+        section[data-testid="stSidebar"][aria-expanded="true"] {{
+            min-width: {_SIDEBAR_MIN_WIDTH_PX}px !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="ASR — Agent Orchestrator", layout="wide")
+    _inject_global_css()
     cfg = load_config(CONFIG_PATH)
     store = IncidentStore(cfg.paths.incidents_dir)
 
@@ -636,6 +876,11 @@ def main() -> None:
             submitted = st.form_submit_button("Start investigation", type="primary")
 
         if submitted and query.strip():
+            # Hide any previously-selected INC immediately — the detail
+            # panel below won't be reached this script-run, so during the
+            # blocking asyncio.run the user sees only the live timeline.
+            st.session_state.pop("selected_incident", None)
+
             timeline_box = st.container()
             timeline_box.markdown("### Live timeline")
             log_area = timeline_box.empty()
@@ -649,38 +894,17 @@ def main() -> None:
                 st.session_state["selected_incident"] = recent[0]["id"]
                 st.success(f"Investigation complete — {recent[0]['id']} ({recent[0]['status']})")
                 st.rerun()
+        else:
+            render_incident_detail(store)
 
     with tab_registry:
         st.header("Agents & Tools registry")
 
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            st.subheader("Agents")
-            for a in agents:
-                with st.container(border=True):
-                    st.markdown(f"**{a['name']}** — `{a['model']}`")
-                    st.caption(a["description"])
-                    st.markdown("Tools: " + ", ".join(f"`{t}`" for t in a["tools"]))
-                    if a["routes"]:
-                        st.caption("Routes: " + ", ".join(
-                            f"`{r['when']}→{r['next']}`" for r in a["routes"]))
+        with st.expander("Tools", expanded=True):
+            _render_tools_by_category(tools)
 
-        with col_b:
-            st.subheader("Tools by category")
-            by_cat: dict[str, list[dict]] = {}
-            for t in tools:
-                by_cat.setdefault(t["category"], []).append(t)
-            for cat in sorted(by_cat):
-                st.markdown(f"**{cat}**")
-                for t in by_cat[cat]:
-                    bound = ", ".join(f"`{a}`" for a in t["bound_agents"]) or "_(unbound)_"
-                    label = t.get("original_name", t["name"])
-                    st.markdown(
-                        f"- **{label}** — {t['description'][:80]}  \n"
-                        f"  `{t['name']}` · bound to: {bound}"
-                    )
-
-    render_incident_detail(store)
+        st.subheader("Agents")
+        _render_agents_accordion(agents)
 
 
 if __name__ == "__main__":

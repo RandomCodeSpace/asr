@@ -1,0 +1,19 @@
+[theme]
+# No hard ``base`` pin — Streamlit's Settings menu (hamburger →
+# Settings → Appearance) then offers Light / Dark / Use system
+# setting, honouring ``prefers-color-scheme`` when "Use system
+# setting" is selected.
+baseRadius = "none"
+buttonRadius = "none"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+port = 37776
+
+[client]
+# Show the full toolbar so the Settings menu (with the Theme picker —
+# Light / Dark / Use system setting) is visible to all viewers.
+toolbarMode = "auto"

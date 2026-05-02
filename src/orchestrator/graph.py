@@ -242,6 +242,10 @@ def _harvest_tool_calls_and_patches(
         for tc in tool_calls:
             tc_name = tc.get("name", "unknown")
             tc_args = tc.get("args", {}) or {}
+            # Tool names are now namespaced as ``<server>:<original>``;
+            # match on the un-prefixed suffix so the bare and prefixed
+            # forms both harvest confidence/signal patches.
+            tc_original = tc_name.rsplit(":", 1)[-1]
             incident.tool_calls.append(ToolCall(
                 agent=skill_name,
                 tool=tc_name,
@@ -249,7 +253,7 @@ def _harvest_tool_calls_and_patches(
                 result=None,
                 ts=ts,
             ))
-            if tc_name == "update_incident":
+            if tc_original == "update_incident":
                 patch = tc_args.get("patch") or {}
                 agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
                     patch, agent_confidence, agent_rationale, agent_signal,
@@ -433,12 +437,18 @@ _STUB_CANNED = {
 }
 
 
-def _latest_di_confidence(incident: Incident) -> float | None:
-    """Return the most recent deep_investigator AgentRun confidence, or None."""
+def _latest_di_run(incident: Incident):
+    """Return the most recent deep_investigator AgentRun, or None."""
     for run in reversed(incident.agents_run):
         if run.agent == "deep_investigator":
-            return run.confidence
+            return run
     return None
+
+
+def _latest_di_confidence(incident: Incident) -> float | None:
+    """Return the most recent deep_investigator AgentRun confidence, or None."""
+    run = _latest_di_run(incident)
+    return run.confidence if run else None
 
 
 def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
@@ -474,13 +484,19 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
             incident = store.load(incident.id)
         except FileNotFoundError:
             pass
-        di_conf = _latest_di_confidence(incident)
+        di_run = _latest_di_run(incident)
+        di_conf = di_run.confidence if di_run else None
         if di_conf is None or di_conf < threshold:
             incident.status = "awaiting_input"
+            # Surface the upstream agent's own summary + rationale so the
+            # human reviewer can decide what input to give without scrolling
+            # through every step of the agents-run log.
             incident.pending_intervention = {
                 "reason": "low_confidence",
                 "confidence": di_conf,
                 "threshold": threshold,
+                "summary": di_run.summary if di_run else "",
+                "rationale": di_run.confidence_rationale if di_run else "",
                 "options": ["resume_with_input", "escalate", "stop"],
                 "escalation_teams": teams,
             }
