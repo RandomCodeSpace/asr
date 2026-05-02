@@ -195,13 +195,13 @@ class Orchestrator:
         inc = self.store.create(query=query, environment=environment,
                                 reporter_id=reporter_id, reporter_team=reporter_team)
         yield {"event": "investigation_started", "incident_id": inc.id,
-               "ts": _now()}
+               "ts": _event_ts()}
         async for ev in self.graph.astream_events(
             GraphState(incident=inc, next_route=None, last_agent=None, error=None),
             version="v2",
         ):
             yield self._to_ui_event(ev, inc.id)
-        yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _now()}
+        yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _event_ts()}
 
     async def resume_investigation(self, incident_id: str,
                                    decision: dict) -> AsyncIterator[dict]:
@@ -217,7 +217,7 @@ class Orchestrator:
         """
         action = decision.get("action")
         yield {"event": "resume_started", "incident_id": incident_id,
-               "action": action, "ts": _now()}
+               "action": action, "ts": _event_ts()}
 
         inc = self.store.load(incident_id)
 
@@ -227,7 +227,7 @@ class Orchestrator:
         if inc.status != "awaiting_input":
             yield {"event": "resume_rejected", "incident_id": incident_id,
                    "reason": f"not_awaiting_input (status={inc.status})",
-                   "ts": _now()}
+                   "ts": _event_ts()}
             return
 
         if action == "stop":
@@ -235,7 +235,7 @@ class Orchestrator:
             inc.pending_intervention = None
             self.store.save(inc)
             yield {"event": "resume_completed", "incident_id": incident_id,
-                   "status": "stopped", "ts": _now()}
+                   "status": "stopped", "ts": _event_ts()}
             return
 
         if action == "escalate":
@@ -250,7 +250,7 @@ class Orchestrator:
                            f"team '{team}' not in allowed escalation_teams "
                            f"({allowed})"
                        ),
-                       "ts": _now()}
+                       "ts": _event_ts()}
                 return
             message = (
                 f"INC {incident_id} escalated by user — team {team}. "
@@ -264,13 +264,13 @@ class Orchestrator:
                 tool="notify_oncall",
                 args=tool_args,
                 result=tool_result,
-                ts=_now(),
+                ts=_event_ts(),
             ))
             inc.status = "escalated"
             inc.pending_intervention = None
             self.store.save(inc)
             yield {"event": "resume_completed", "incident_id": incident_id,
-                   "status": "escalated", "team": team, "ts": _now()}
+                   "status": "escalated", "team": team, "ts": _event_ts()}
             return
 
         if action == "resume_with_input":
@@ -292,7 +292,7 @@ class Orchestrator:
         if self.resume_graph is None:
             yield {"event": "resume_rejected", "incident_id": incident_id,
                    "reason": "resume_with_input not available: no gated route configured",
-                   "ts": _now()}
+                   "ts": _event_ts()}
             return
         # Snapshot the intervention payload BEFORE we mutate the INC, so
         # we can restore it if the sub-graph blows up. Without this an
@@ -324,11 +324,11 @@ class Orchestrator:
             inc.status = "awaiting_input"
             self.store.save(inc)
             yield {"event": "resume_failed", "incident_id": incident_id,
-                   "error": str(exc), "ts": _now()}
+                   "error": str(exc), "ts": _event_ts()}
             return
         final = self.store.load(incident_id)
         yield {"event": "resume_completed", "incident_id": incident_id,
-               "status": final.status, "ts": _now()}
+               "status": final.status, "ts": _event_ts()}
 
     async def _invoke_tool(self, name: str, args: dict):
         """Call an MCP tool by original name, going through the LangChain wrapper.
@@ -353,10 +353,10 @@ class Orchestrator:
             "event": kind,
             "node": node,
             "incident_id": incident_id,
-            "ts": _now(),
+            "ts": _event_ts(),
             "data": raw.get("data"),
         }
 
 
-def _now() -> str:
+def _event_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

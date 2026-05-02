@@ -13,6 +13,9 @@ llm:
       kind: ollama
       base_url: https://ollama.com
       api_key: ${OLLAMA_API_KEY}
+    ollama_local:
+      kind: ollama
+      base_url: http://localhost:11434
     azure:
       kind: azure_openai
       endpoint: ${AZURE_ENDPOINT}
@@ -33,8 +36,9 @@ llm:
       deployment: gpt-4o
       temperature: 0.0
   embedding:
-    provider: ollama_cloud
-    model: nomic-embed-text
+    provider: ollama_local
+    model: bge-m3
+    dim: 1024
 mcp:
   servers:
   - name: local_inc
