@@ -105,11 +105,28 @@ class IncidentConfig(BaseModel):
     similarity_method: Literal["keyword", "embedding"] = "keyword"
 
 
-class StorageConfig(BaseModel):
-    """Database backend. SQLite (with sqlite-vec) for dev, Postgres (with pgvector) for prod."""
-    url: str = "sqlite:///incidents.db"
+class MetadataConfig(BaseModel):
+    """Relational store for incident metadata. SQLite (dev) or Postgres (prod)."""
+    url: str = "sqlite:///incidents/incidents.db"
     pool_size: int = 5      # postgres only; sqlite uses NullPool
     echo: bool = False
+
+
+VectorBackend = Literal["faiss", "pgvector", "none"]
+DistanceStrategy = Literal["cosine", "euclidean", "inner_product"]
+
+
+class VectorConfig(BaseModel):
+    """Vector store backing. FAISS (dev) or PGVector (prod) or none (keyword-only)."""
+    backend: VectorBackend = "faiss"
+    path: str = "incidents/faiss"
+    collection_name: str = "incidents"
+    distance_strategy: DistanceStrategy = "cosine"
+
+
+class StorageConfig(BaseModel):
+    metadata: MetadataConfig = Field(default_factory=MetadataConfig)
+    vector: VectorConfig = Field(default_factory=VectorConfig)
 
 
 class Paths(BaseModel):

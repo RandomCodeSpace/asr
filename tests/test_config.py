@@ -123,22 +123,43 @@ def test_orchestrator_explicit_entry_agent():
     assert cfg.orchestrator.entry_agent == "diagnostic"
 
 
-def test_storage_config_default():
-    from orchestrator.config import AppConfig, LLMConfig, MCPConfig
-    cfg = AppConfig(llm=LLMConfig.stub(), mcp=MCPConfig())
-    assert cfg.storage.url == "sqlite:///incidents.db"
-    assert cfg.storage.pool_size == 5
-    assert cfg.storage.echo is False
-
-
 def test_embedding_config_dim_default():
     from orchestrator.config import EmbeddingConfig
     e = EmbeddingConfig(provider="p", model="m")
     assert e.dim == 1024
 
 
-def test_storage_config_postgres_url():
-    from orchestrator.config import StorageConfig
-    s = StorageConfig(url="postgresql+psycopg://u:p@h/db", pool_size=10)
-    assert s.url.startswith("postgresql+psycopg://")
-    assert s.pool_size == 10
+def test_storage_metadata_default():
+    from orchestrator.config import AppConfig, LLMConfig, MCPConfig
+    cfg = AppConfig(llm=LLMConfig.stub(), mcp=MCPConfig())
+    assert cfg.storage.metadata.url == "sqlite:///incidents/incidents.db"
+    assert cfg.storage.metadata.pool_size == 5
+    assert cfg.storage.metadata.echo is False
+
+
+def test_storage_vector_default():
+    from orchestrator.config import AppConfig, LLMConfig, MCPConfig
+    cfg = AppConfig(llm=LLMConfig.stub(), mcp=MCPConfig())
+    assert cfg.storage.vector.backend == "faiss"
+    assert cfg.storage.vector.path == "incidents/faiss"
+    assert cfg.storage.vector.collection_name == "incidents"
+    assert cfg.storage.vector.distance_strategy == "cosine"
+
+
+def test_vector_backend_pgvector():
+    from orchestrator.config import VectorConfig
+    v = VectorConfig(backend="pgvector", collection_name="incidents")
+    assert v.backend == "pgvector"
+
+
+def test_vector_backend_none():
+    from orchestrator.config import VectorConfig
+    v = VectorConfig(backend="none")
+    assert v.backend == "none"
+
+
+def test_vector_backend_invalid_rejected():
+    from orchestrator.config import VectorConfig
+    import pytest
+    with pytest.raises(Exception):
+        VectorConfig(backend="qdrant")
