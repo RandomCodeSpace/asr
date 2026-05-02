@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 from orchestrator.config import (
-    AppConfig, IncidentConfig, LLMConfig, MCPConfig, Paths, StorageConfig,
+    AppConfig, IncidentConfig, LLMConfig, MCPConfig, MetadataConfig, Paths,
+    StorageConfig,
 )
 
 
@@ -28,7 +29,7 @@ def test_migration_script_idempotent(tmp_path: Path):
         llm=LLMConfig.stub(),
         mcp=MCPConfig(),
         incidents=IncidentConfig(store_path=str(src)),
-        storage=StorageConfig(url=f"sqlite:///{db_path}"),
+        storage=StorageConfig(metadata=MetadataConfig(url=f"sqlite:///{db_path}")),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(src)),
     )
     out1 = migrate(cfg, with_embeddings=False, dry_run=False)

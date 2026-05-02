@@ -1,5 +1,5 @@
 import pytest
-from orchestrator.config import StorageConfig
+from orchestrator.config import MetadataConfig
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
 from orchestrator.storage.repository import IncidentRepository
@@ -11,7 +11,7 @@ from orchestrator.mcp_servers.incident import (
 
 def _make_repo(tmp_path, *, similarity_threshold: float = 0.3):
     """Create a keyword-based repo (no embedder) for fast unit tests."""
-    eng = build_engine(StorageConfig(url=f"sqlite:///{tmp_path}/test.db"))
+    eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
     Base.metadata.create_all(eng)
     return IncidentRepository(engine=eng, embedder=None,
                               similarity_threshold=similarity_threshold)

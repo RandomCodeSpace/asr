@@ -23,7 +23,7 @@ def migrate(cfg: AppConfig, *, with_embeddings: bool, dry_run: bool) -> dict[str
     Returns counters: ``{"inserted": N, "skipped": M, "failed": K}``.
     """
     src = Path(cfg.paths.incidents_dir)
-    engine = build_engine(cfg.storage)
+    engine = build_engine(cfg.storage.metadata)
     Base.metadata.create_all(engine)
     embedder = (
         build_embedder(cfg.llm.embedding, cfg.llm.providers)

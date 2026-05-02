@@ -30,14 +30,13 @@ CONFIG_PATH = Path("config/config.yaml")
 
 def _make_repository(cfg: AppConfig) -> IncidentRepository:
     """Build an IncidentRepository from config — mirrors Orchestrator.create logic."""
-    from orchestrator.config import StorageConfig
-    default_url = StorageConfig().url
+    from orchestrator.config import MetadataConfig
+    default_url = MetadataConfig().url
     url = (
-        cfg.storage.url if cfg.storage.url != default_url
+        cfg.storage.metadata.url if cfg.storage.metadata.url != default_url
         else f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
     )
-    from orchestrator.config import StorageConfig as SC
-    engine = build_engine(SC(url=url, pool_size=cfg.storage.pool_size, echo=cfg.storage.echo))
+    engine = build_engine(MetadataConfig(url=url, pool_size=cfg.storage.metadata.pool_size, echo=cfg.storage.metadata.echo))
     Base.metadata.create_all(engine)
     embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
     return IncidentRepository(

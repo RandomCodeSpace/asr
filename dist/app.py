@@ -71,58 +71,32 @@ from pydantic import Field, SecretStr
 
 
 
-# ----- imports for storage/types.py -----
-"""Custom SQLAlchemy column types that bridge SQLite and Postgres.
-
-- ``VectorColumn(dim)`` — ``pgvector.sqlalchemy.Vector(dim)`` on Postgres,
-  ``LargeBinary`` (numpy float32 bytes) on SQLite. Python value is always
-  ``list[float] | None`` regardless of dialect.
-- ``JSONColumn`` — thin alias over SQLAlchemy ``JSON``; auto-routes to
-  ``JSONB`` on Postgres, ``TEXT`` on SQLite. Centralized so we can adjust
-  serialization (e.g. datetime support) in one place later.
-"""
-
-import numpy as np
-from sqlalchemy import JSON, LargeBinary
-from sqlalchemy.types import TypeDecorator
-
-
 # ----- imports for storage/models.py -----
 """SQLAlchemy declarative model for the ``incidents`` table.
 
 Hybrid schema: scalar/queryable fields as columns, nested Pydantic
-structures as JSON columns (JSONB on Postgres, TEXT on SQLite), and a
-native vector column for embeddings.
+structures as JSON columns (JSONB on Postgres, TEXT on SQLite).
+Vector similarity lives in a separate LangChain VectorStore (landed in M3).
 """
 
 from datetime import datetime
-from sqlalchemy import DateTime, Index, Integer, String, Text, text
+from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-
 # ----- imports for storage/engine.py -----
-"""SQLAlchemy engine factory + sqlite-vec extension loader.
+"""SQLAlchemy engine factory.
 
-Behaviour
----------
-- ``sqlite://``     → engine with ``NullPool``, ``check_same_thread=False``,
-                      and a ``connect`` event hook that loads sqlite-vec into
-                      every new dbapi connection.
-- ``postgresql://`` → engine with the configured pool size, plus a
-                      one-time ``CREATE EXTENSION IF NOT EXISTS vector``.
+Sync engine for SQLite (dev) or Postgres (prod). No vector-extension
+loading — vectors live in a separate LangChain VectorStore (see
+:mod:`orchestrator.storage.vector`, landed in M3).
 """
 
-import ctypes
-import ctypes.util
-from sqlalchemy import event, text
 from sqlalchemy.engine import Engine, create_engine
 from sqlalchemy.pool import NullPool
 
 
-# Python 3.14 on many distros is compiled without SQLITE_ENABLE_LOAD_EXTENSION,
-# so conn.enable_load_extension / conn.load_extension don't exist as Python
-# methods.  We call the underlying C functions directly via ctypes instead.
+
 # ----- imports for storage/embeddings.py -----
 """LangChain ``Embeddings`` facade + deterministic stub for tests.
 
@@ -133,6 +107,7 @@ without external services.
 """
 
 import hashlib
+import numpy as np
 
 
 
@@ -148,7 +123,7 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import and_, desc, func, literal, select
+from sqlalchemy import desc, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -368,11 +343,28 @@ class IncidentConfig(BaseModel):
     similarity_method: Literal["keyword", "embedding"] = "keyword"
 
 
-class StorageConfig(BaseModel):
-    """Database backend. SQLite (with sqlite-vec) for dev, Postgres (with pgvector) for prod."""
-    url: str = "sqlite:///incidents.db"
+class MetadataConfig(BaseModel):
+    """Relational store for incident metadata. SQLite (dev) or Postgres (prod)."""
+    url: str = "sqlite:///incidents/incidents.db"
     pool_size: int = 5      # postgres only; sqlite uses NullPool
     echo: bool = False
+
+
+VectorBackend = Literal["faiss", "pgvector", "none"]
+DistanceStrategy = Literal["cosine", "euclidean", "inner_product"]
+
+
+class VectorConfig(BaseModel):
+    """Vector store backing. FAISS (dev) or PGVector (prod) or none (keyword-only)."""
+    backend: VectorBackend = "faiss"
+    path: str = "incidents/faiss"
+    collection_name: str = "incidents"
+    distance_strategy: DistanceStrategy = "cosine"
+
+
+class StorageConfig(BaseModel):
+    metadata: MetadataConfig = Field(default_factory=MetadataConfig)
+    vector: VectorConfig = Field(default_factory=VectorConfig)
 
 
 class Paths(BaseModel):
@@ -816,52 +808,7 @@ def get_embedding(cfg: LLMConfig) -> Embeddings:
         f"Embedding not supported for provider kind {provider.kind!r}"
     )
 
-# ====== module: orchestrator/storage/types.py ======
-
-JSONColumn = JSON  # SQLAlchemy auto-dialects: JSONB on pg, TEXT on sqlite.
-
-
-class VectorColumn(TypeDecorator):
-    """Vector column backed by pgvector on Postgres, BLOB on SQLite.
-
-    Python value: ``list[float] | None``.
-    """
-    impl = LargeBinary
-    cache_ok = True
-
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.dim = dim
-
-    def load_dialect_impl(self, dialect):
-        if dialect.name == "postgresql":
-            from pgvector.sqlalchemy import Vector
-            return dialect.type_descriptor(Vector(self.dim))
-        return dialect.type_descriptor(LargeBinary())
-
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        if dialect.name == "postgresql":
-            return list(value)
-        arr = np.asarray(value, dtype=np.float32)
-        if arr.shape != (self.dim,):
-            raise ValueError(
-                f"vector dim {arr.shape[0]} != column dim {self.dim}"
-            )
-        return arr.tobytes()
-
-    def process_result_value(self, value, dialect):
-        if value is None:
-            return None
-        if dialect.name == "postgresql":
-            return list(value)
-        return np.frombuffer(value, dtype=np.float32).tolist()
-
 # ====== module: orchestrator/storage/models.py ======
-
-EMBEDDING_DIM = 1024  # bge-m3; if you change embed model, re-embed corpus.
-
 
 class Base(DeclarativeBase):
     pass
@@ -888,16 +835,12 @@ class IncidentRow(Base):
     matched_prior_inc: Mapped[str | None] = mapped_column(String, nullable=True)
     resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    tags: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-    agents_run: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-    tool_calls: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-    findings: Mapped[dict] = mapped_column(JSONColumn, nullable=False, default=dict)
-    pending_intervention: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
-    user_inputs: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-
-    embedding: Mapped[list[float] | None] = mapped_column(
-        VectorColumn(EMBEDDING_DIM), nullable=True
-    )
+    tags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    agents_run: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    tool_calls: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    findings: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    pending_intervention: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    user_inputs: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -914,62 +857,15 @@ class IncidentRow(Base):
 
 # ====== module: orchestrator/storage/engine.py ======
 
-_libsqlite = ctypes.CDLL(ctypes.util.find_library("sqlite3"))
-_libsqlite.sqlite3_enable_load_extension.restype = ctypes.c_int
-_libsqlite.sqlite3_enable_load_extension.argtypes = [ctypes.c_void_p, ctypes.c_int]
-_libsqlite.sqlite3_load_extension.restype = ctypes.c_int
-_libsqlite.sqlite3_load_extension.argtypes = [
-    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
-    ctypes.POINTER(ctypes.c_char_p),
-]
-# The CPython sqlite3.Connection C struct begins with PyObject header
-# (ob_refcnt + ob_type = 2 pointers), followed immediately by sqlite3 *db.
-_DB_PTR_OFFSET = 2 * ctypes.sizeof(ctypes.c_void_p)
-
-
-def _ctypes_load_vec(dbapi_conn) -> None:  # type: ignore[misc]
-    """Load sqlite-vec into *dbapi_conn* using the C-level SQLite API.
-
-    Required because CPython may be built without SQLITE_ENABLE_LOAD_EXTENSION,
-    which removes the Python-level enable_load_extension / load_extension methods
-    but leaves the underlying C functions available in libsqlite3.
-    """
-    import sqlite_vec
-    db_ptr = ctypes.c_void_p.from_address(id(dbapi_conn) + _DB_PTR_OFFSET).value
-    _libsqlite.sqlite3_enable_load_extension(db_ptr, 1)
-    errmsg = ctypes.c_char_p()
-    path = sqlite_vec.loadable_path().encode()
-    rc = _libsqlite.sqlite3_load_extension(db_ptr, path, None, ctypes.byref(errmsg))
-    _libsqlite.sqlite3_enable_load_extension(db_ptr, 0)
-    if rc != 0:
-        raise RuntimeError(f"sqlite3_load_extension failed: {errmsg.value!r}")
-
-
-def _attach_sqlite_vec(engine: Engine) -> None:
-    """Register the sqlite-vec loader on every new SQLite dbapi connection."""
-    @event.listens_for(engine, "connect")
-    def _on_connect(dbapi_conn, _):  # type: ignore[misc]
-        _ctypes_load_vec(dbapi_conn)
-
-
-def _ensure_pgvector(engine: Engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-
-
-def build_engine(cfg: StorageConfig) -> Engine:
+def build_engine(cfg: MetadataConfig) -> Engine:
     if cfg.url.startswith("sqlite"):
-        engine = create_engine(
+        return create_engine(
             cfg.url,
             poolclass=NullPool,
             echo=cfg.echo,
             connect_args={"check_same_thread": False},
         )
-        _attach_sqlite_vec(engine)
-        return engine
-    engine = create_engine(cfg.url, pool_size=cfg.pool_size, echo=cfg.echo)
-    _ensure_pgvector(engine)
-    return engine
+    return create_engine(cfg.url, pool_size=cfg.pool_size, echo=cfg.echo)
 
 # ====== module: orchestrator/storage/embeddings.py ======
 
@@ -1120,7 +1016,6 @@ class IncidentRepository:
                 tool_calls=[],
                 findings={},
                 user_inputs=[],
-                embedding=self._maybe_embed(query),
             )
             session.add(row)
             session.commit()
@@ -1146,8 +1041,7 @@ class IncidentRepository:
         incident.updated_at = _iso(_now())
         with Session(self.engine) as session:
             existing = session.get(IncidentRow, incident.id)
-            new_embedding = self._compute_save_embedding(existing, incident)
-            data = self._incident_to_row_dict(incident, embedding=new_embedding)
+            data = self._incident_to_row_dict(incident)
             if existing is None:
                 session.add(IncidentRow(**data))
             else:
@@ -1202,47 +1096,11 @@ class IncidentRepository:
         the existing ``KeywordSimilarity`` scorer to preserve behaviour
         when no embedder is configured.
         """
-        if self.embedder is None:
-            return self._keyword_similar(
-                query=query, environment=environment,
-                status_filter=status_filter,
-                threshold=threshold, limit=limit,
-            )
-        return self._vector_similar(
+        return self._keyword_similar(
             query=query, environment=environment,
             status_filter=status_filter,
             threshold=threshold, limit=limit,
         )
-
-    def _vector_similar(self, *, query, environment, status_filter, threshold, limit):
-        import numpy as np
-        vec = self.embedder.embed_query(query)
-        threshold = self.similarity_threshold if threshold is None else threshold
-        with Session(self.engine) as session:
-            if self.engine.dialect.name == "postgresql":
-                score = (literal(1.0) - IncidentRow.embedding.cosine_distance(vec)).label("score")
-            else:
-                blob = np.asarray(vec, dtype=np.float32).tobytes()
-                score = (literal(1.0) - func.vec_distance_cosine(IncidentRow.embedding, blob)).label("score")
-            stmt = (
-                select(IncidentRow, score)
-                .where(and_(
-                    IncidentRow.deleted_at.is_(None),
-                    IncidentRow.status == status_filter,
-                    IncidentRow.environment == environment,
-                    IncidentRow.embedding.is_not(None),
-                ))
-                .order_by(desc("score"))
-                .limit(limit)
-            )
-            rows = session.execute(stmt).all()
-        out: list[tuple[Incident, float]] = []
-        for row, s in rows:
-            s = float(s)
-            if s < threshold:
-                continue
-            out.append((self._row_to_incident(row), s))
-        return out
 
     def _keyword_similar(self, *, query, environment, status_filter, threshold, limit):
 
@@ -1288,7 +1146,6 @@ class IncidentRepository:
             severity=row.severity,
             category=row.category,
             matched_prior_inc=row.matched_prior_inc,
-            embedding=row.embedding,
             agents_run=agents_run,
             tool_calls=tool_calls,
             findings=dict(row.findings or {}),
@@ -1298,9 +1155,7 @@ class IncidentRepository:
             user_inputs=list(row.user_inputs or []),
         )
 
-    def _incident_to_row_dict(
-        self, inc: Incident, *, embedding: Optional[list[float]],
-    ) -> dict:
+    def _incident_to_row_dict(self, inc: Incident) -> dict:
         return {
             "id": inc.id,
             "status": inc.status,
@@ -1325,38 +1180,11 @@ class IncidentRepository:
             "findings": dict(inc.findings),
             "pending_intervention": inc.pending_intervention,
             "user_inputs": list(inc.user_inputs),
-            "embedding": embedding,
             "input_tokens": inc.token_usage.input_tokens,
             "output_tokens": inc.token_usage.output_tokens,
             "total_tokens": inc.token_usage.total_tokens,
         }
 
-    # ---------- embedding lifecycle ----------
-    def _maybe_embed(self, text: str) -> Optional[list[float]]:
-        if self.embedder is None or not text:
-            return None
-        return self.embedder.embed_query(text)
-
-    def _compute_save_embedding(
-        self, existing: Optional[IncidentRow], inc: Incident,
-    ) -> Optional[list[float]]:
-        """Re-embed only when the source text materially changed."""
-        if self.embedder is None:
-            return existing.embedding if existing is not None else None
-        text = _embed_source(inc)
-        if existing is not None:
-            prior = _embed_source_from_row(existing)
-            if prior == text and existing.embedding is not None:
-                return existing.embedding
-        return self.embedder.embed_query(text) if text else None
-
-
-def _embed_source(inc: Incident) -> str:
-    return (inc.query or "").strip()
-
-
-def _embed_source_from_row(row: IncidentRow) -> str:
-    return (row.query or "").strip()
 
 # ====== module: orchestrator/mcp_servers/incident.py ======
 
@@ -2544,17 +2372,17 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
 _INCIDENT_MCP_MODULE = "orchestrator.mcp_servers.incident"
 
 
-def _storage_url(cfg: AppConfig) -> str:
-    """Derive the SQLite URL for the current config.
+def _metadata_url(cfg: AppConfig) -> str:
+    """Derive the metadata DB URL for the current config.
 
-    When ``cfg.storage.url`` is still the default sentinel (``sqlite:///incidents.db``),
-    use ``cfg.paths.incidents_dir`` so that per-test ``tmp_path`` isolation is
-    respected. Production deployments that set an explicit ``storage.url``
-    (e.g. a Postgres DSN or a non-default SQLite path) are left untouched.
+    When ``cfg.storage.metadata.url`` is still the default sentinel, use
+    ``cfg.paths.incidents_dir`` so that per-test ``tmp_path`` isolation is
+    respected. Production deployments that set an explicit URL are left
+    untouched.
     """
-    default_url = StorageConfig().url
-    if cfg.storage.url != default_url:
-        return cfg.storage.url
+    default_url = MetadataConfig().url
+    if cfg.storage.metadata.url != default_url:
+        return cfg.storage.metadata.url
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
@@ -2581,9 +2409,11 @@ class Orchestrator:
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
-            engine = build_engine(StorageConfig(url=_storage_url(cfg),
-                                                pool_size=cfg.storage.pool_size,
-                                                echo=cfg.storage.echo))
+            engine = build_engine(MetadataConfig(
+                url=_metadata_url(cfg),
+                pool_size=cfg.storage.metadata.pool_size,
+                echo=cfg.storage.metadata.echo,
+            ))
             Base.metadata.create_all(engine)
             embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
             store = IncidentRepository(

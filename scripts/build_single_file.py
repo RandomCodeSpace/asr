@@ -22,7 +22,6 @@ CORE_MODULE_ORDER = [
     "similarity.py",
     "skill.py",
     "llm.py",
-    "storage/types.py",
     "storage/models.py",
     "storage/engine.py",
     "storage/embeddings.py",

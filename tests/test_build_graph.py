@@ -1,6 +1,6 @@
 from contextlib import AsyncExitStack
 import pytest
-from orchestrator.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MCPServerConfig, ProviderConfig, StorageConfig
+from orchestrator.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
 from orchestrator.mcp_loader import load_tools
 from orchestrator.mcp_servers.incident import set_state as set_inc_state
 from orchestrator.storage.embeddings import build_embedder
@@ -12,7 +12,7 @@ from orchestrator.skill import load_all_skills
 
 
 def _make_repo(tmp_path):
-    eng = build_engine(StorageConfig(url=f"sqlite:///{tmp_path}/test.db"))
+    eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
     Base.metadata.create_all(eng)
     embedder = build_embedder(
         EmbeddingConfig(provider="s", model="x", dim=1024),

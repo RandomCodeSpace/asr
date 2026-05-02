@@ -2,7 +2,7 @@
 import pytest
 from pytest import approx
 
-from orchestrator.config import AppConfig, EmbeddingConfig, InterventionConfig, LLMConfig, MCPConfig, ProviderConfig, StorageConfig
+from orchestrator.config import AppConfig, EmbeddingConfig, InterventionConfig, LLMConfig, MCPConfig, MetadataConfig, ProviderConfig
 from orchestrator.graph import (
     GraphState, make_agent_node, make_gate_node, _coerce_confidence,
 )
@@ -16,7 +16,7 @@ from orchestrator.storage.repository import IncidentRepository
 
 
 def _make_repo(tmp_path):
-    eng = build_engine(StorageConfig(url=f"sqlite:///{tmp_path}/test.db"))
+    eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
     Base.metadata.create_all(eng)
     embedder = build_embedder(
         EmbeddingConfig(provider="s", model="x", dim=1024),

@@ -1,6 +1,6 @@
 """Behavioural tests for IncidentRepository (replaces the old JSON IncidentStore tests)."""
 import pytest
-from orchestrator.config import EmbeddingConfig, ProviderConfig, StorageConfig
+from orchestrator.config import EmbeddingConfig, MetadataConfig, ProviderConfig
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
@@ -8,7 +8,7 @@ from orchestrator.storage.repository import IncidentRepository
 
 
 def _make_repo(tmp_path) -> IncidentRepository:
-    eng = build_engine(StorageConfig(url=f"sqlite:///{tmp_path}/test.db"))
+    eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
     Base.metadata.create_all(eng)
     embedder = build_embedder(
         EmbeddingConfig(provider="s", model="x", dim=1024),

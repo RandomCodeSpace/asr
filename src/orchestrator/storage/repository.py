@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from langchain_core.embeddings import Embeddings
-from sqlalchemy import and_, desc, func, literal, select
+from sqlalchemy import desc, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -114,7 +114,6 @@ class IncidentRepository:
                 tool_calls=[],
                 findings={},
                 user_inputs=[],
-                embedding=self._maybe_embed(query),
             )
             session.add(row)
             session.commit()
@@ -140,8 +139,7 @@ class IncidentRepository:
         incident.updated_at = _iso(_now())
         with Session(self.engine) as session:
             existing = session.get(IncidentRow, incident.id)
-            new_embedding = self._compute_save_embedding(existing, incident)
-            data = self._incident_to_row_dict(incident, embedding=new_embedding)
+            data = self._incident_to_row_dict(incident)
             if existing is None:
                 session.add(IncidentRow(**data))
             else:
@@ -196,47 +194,11 @@ class IncidentRepository:
         the existing ``KeywordSimilarity`` scorer to preserve behaviour
         when no embedder is configured.
         """
-        if self.embedder is None:
-            return self._keyword_similar(
-                query=query, environment=environment,
-                status_filter=status_filter,
-                threshold=threshold, limit=limit,
-            )
-        return self._vector_similar(
+        return self._keyword_similar(
             query=query, environment=environment,
             status_filter=status_filter,
             threshold=threshold, limit=limit,
         )
-
-    def _vector_similar(self, *, query, environment, status_filter, threshold, limit):
-        import numpy as np
-        vec = self.embedder.embed_query(query)
-        threshold = self.similarity_threshold if threshold is None else threshold
-        with Session(self.engine) as session:
-            if self.engine.dialect.name == "postgresql":
-                score = (literal(1.0) - IncidentRow.embedding.cosine_distance(vec)).label("score")
-            else:
-                blob = np.asarray(vec, dtype=np.float32).tobytes()
-                score = (literal(1.0) - func.vec_distance_cosine(IncidentRow.embedding, blob)).label("score")
-            stmt = (
-                select(IncidentRow, score)
-                .where(and_(
-                    IncidentRow.deleted_at.is_(None),
-                    IncidentRow.status == status_filter,
-                    IncidentRow.environment == environment,
-                    IncidentRow.embedding.is_not(None),
-                ))
-                .order_by(desc("score"))
-                .limit(limit)
-            )
-            rows = session.execute(stmt).all()
-        out: list[tuple[Incident, float]] = []
-        for row, s in rows:
-            s = float(s)
-            if s < threshold:
-                continue
-            out.append((self._row_to_incident(row), s))
-        return out
 
     def _keyword_similar(self, *, query, environment, status_filter, threshold, limit):
         from orchestrator.similarity import KeywordSimilarity, find_similar
@@ -282,7 +244,6 @@ class IncidentRepository:
             severity=row.severity,
             category=row.category,
             matched_prior_inc=row.matched_prior_inc,
-            embedding=row.embedding,
             agents_run=agents_run,
             tool_calls=tool_calls,
             findings=dict(row.findings or {}),
@@ -292,9 +253,7 @@ class IncidentRepository:
             user_inputs=list(row.user_inputs or []),
         )
 
-    def _incident_to_row_dict(
-        self, inc: Incident, *, embedding: Optional[list[float]],
-    ) -> dict:
+    def _incident_to_row_dict(self, inc: Incident) -> dict:
         return {
             "id": inc.id,
             "status": inc.status,
@@ -319,35 +278,8 @@ class IncidentRepository:
             "findings": dict(inc.findings),
             "pending_intervention": inc.pending_intervention,
             "user_inputs": list(inc.user_inputs),
-            "embedding": embedding,
             "input_tokens": inc.token_usage.input_tokens,
             "output_tokens": inc.token_usage.output_tokens,
             "total_tokens": inc.token_usage.total_tokens,
         }
 
-    # ---------- embedding lifecycle ----------
-    def _maybe_embed(self, text: str) -> Optional[list[float]]:
-        if self.embedder is None or not text:
-            return None
-        return self.embedder.embed_query(text)
-
-    def _compute_save_embedding(
-        self, existing: Optional[IncidentRow], inc: Incident,
-    ) -> Optional[list[float]]:
-        """Re-embed only when the source text materially changed."""
-        if self.embedder is None:
-            return existing.embedding if existing is not None else None
-        text = _embed_source(inc)
-        if existing is not None:
-            prior = _embed_source_from_row(existing)
-            if prior == text and existing.embedding is not None:
-                return existing.embedding
-        return self.embedder.embed_query(text) if text else None
-
-
-def _embed_source(inc: Incident) -> str:
-    return (inc.query or "").strip()
-
-
-def _embed_source_from_row(row: IncidentRow) -> str:
-    return (row.query or "").strip()

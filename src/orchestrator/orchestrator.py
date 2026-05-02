@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import AsyncIterator
 from datetime import datetime, timezone
 
-from orchestrator.config import AppConfig, StorageConfig
+from orchestrator.config import AppConfig, MetadataConfig
 from orchestrator.incident import ToolCall
 from orchestrator.skill import load_all_skills, Skill
 from orchestrator.mcp_loader import load_tools, ToolRegistry
@@ -19,17 +19,17 @@ from orchestrator.storage.repository import IncidentRepository
 _INCIDENT_MCP_MODULE = "orchestrator.mcp_servers.incident"
 
 
-def _storage_url(cfg: AppConfig) -> str:
-    """Derive the SQLite URL for the current config.
+def _metadata_url(cfg: AppConfig) -> str:
+    """Derive the metadata DB URL for the current config.
 
-    When ``cfg.storage.url`` is still the default sentinel (``sqlite:///incidents.db``),
-    use ``cfg.paths.incidents_dir`` so that per-test ``tmp_path`` isolation is
-    respected. Production deployments that set an explicit ``storage.url``
-    (e.g. a Postgres DSN or a non-default SQLite path) are left untouched.
+    When ``cfg.storage.metadata.url`` is still the default sentinel, use
+    ``cfg.paths.incidents_dir`` so that per-test ``tmp_path`` isolation is
+    respected. Production deployments that set an explicit URL are left
+    untouched.
     """
-    default_url = StorageConfig().url
-    if cfg.storage.url != default_url:
-        return cfg.storage.url
+    default_url = MetadataConfig().url
+    if cfg.storage.metadata.url != default_url:
+        return cfg.storage.metadata.url
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
@@ -56,9 +56,11 @@ class Orchestrator:
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
-            engine = build_engine(StorageConfig(url=_storage_url(cfg),
-                                                pool_size=cfg.storage.pool_size,
-                                                echo=cfg.storage.echo))
+            engine = build_engine(MetadataConfig(
+                url=_metadata_url(cfg),
+                pool_size=cfg.storage.metadata.pool_size,
+                echo=cfg.storage.metadata.echo,
+            ))
             Base.metadata.create_all(engine)
             embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
             store = IncidentRepository(

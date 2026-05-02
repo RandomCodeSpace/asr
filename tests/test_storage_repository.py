@@ -2,7 +2,7 @@
 from __future__ import annotations
 import pytest
 
-from orchestrator.config import StorageConfig
+from orchestrator.config import MetadataConfig
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
 
@@ -11,7 +11,7 @@ from orchestrator.storage.models import Base
 def repo(tmp_path):
     from orchestrator.storage.repository import IncidentRepository
     db = tmp_path / "test.db"
-    eng = build_engine(StorageConfig(url=f"sqlite:///{db}"))
+    eng = build_engine(MetadataConfig(url=f"sqlite:///{db}"))
     Base.metadata.create_all(eng)
     return IncidentRepository(engine=eng)
 

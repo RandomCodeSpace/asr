@@ -1,18 +1,13 @@
 """SQLAlchemy declarative model for the ``incidents`` table.
 
 Hybrid schema: scalar/queryable fields as columns, nested Pydantic
-structures as JSON columns (JSONB on Postgres, TEXT on SQLite), and a
-native vector column for embeddings.
+structures as JSON columns (JSONB on Postgres, TEXT on SQLite).
+Vector similarity lives in a separate LangChain VectorStore (landed in M3).
 """
 from __future__ import annotations
 from datetime import datetime
-from sqlalchemy import DateTime, Index, Integer, String, Text, text
+from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-from orchestrator.storage.types import JSONColumn, VectorColumn
-
-
-EMBEDDING_DIM = 1024  # bge-m3; if you change embed model, re-embed corpus.
 
 
 class Base(DeclarativeBase):
@@ -40,16 +35,12 @@ class IncidentRow(Base):
     matched_prior_inc: Mapped[str | None] = mapped_column(String, nullable=True)
     resolution: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    tags: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-    agents_run: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-    tool_calls: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-    findings: Mapped[dict] = mapped_column(JSONColumn, nullable=False, default=dict)
-    pending_intervention: Mapped[dict | None] = mapped_column(JSONColumn, nullable=True)
-    user_inputs: Mapped[list] = mapped_column(JSONColumn, nullable=False, default=list)
-
-    embedding: Mapped[list[float] | None] = mapped_column(
-        VectorColumn(EMBEDDING_DIM), nullable=True
-    )
+    tags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    agents_run: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    tool_calls: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    findings: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    pending_intervention: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    user_inputs: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
