@@ -14,11 +14,12 @@ from __future__ import annotations
 # that need no MCP clients. It builds the repo from the same config the
 # Orchestrator uses so both share the same SQLite DB.
 
-from app import AppConfig, Base, IncidentRepository, MetadataConfig, Orchestrator, build_embedder, build_engine, load_config
+from app import AppConfig, Base, IncidentRepository, MetadataConfig, Orchestrator, build_embedder, build_engine, build_vector_store, load_config
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import streamlit as st
+
 
 
 
@@ -43,9 +44,15 @@ def _make_repository(cfg: AppConfig) -> IncidentRepository:
     engine = build_engine(MetadataConfig(url=url, pool_size=cfg.storage.metadata.pool_size, echo=cfg.storage.metadata.echo))
     Base.metadata.create_all(engine)
     embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
+    vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
     return IncidentRepository(
         engine=engine,
         embedder=embedder,
+        vector_store=vector_store,
+        vector_path=(cfg.storage.vector.path
+                     if cfg.storage.vector.backend == "faiss" else None),
+        vector_index_name=cfg.storage.vector.collection_name,
+        distance_strategy=cfg.storage.vector.distance_strategy,
         similarity_threshold=cfg.incidents.similarity_threshold,
     )
 

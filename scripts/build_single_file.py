@@ -25,6 +25,7 @@ CORE_MODULE_ORDER = [
     "storage/models.py",
     "storage/engine.py",
     "storage/embeddings.py",
+    "storage/vector.py",
     "storage/repository.py",
     "mcp_servers/incident.py",
     "mcp_servers/observability.py",

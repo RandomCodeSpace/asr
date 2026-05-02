@@ -111,17 +111,40 @@ import numpy as np
 
 
 
+# ----- imports for storage/vector.py -----
+"""LangChain ``VectorStore`` factory.
+
+Backends
+--------
+- ``faiss``    -> ``langchain_community.vectorstores.FAISS`` (file-backed, dev).
+- ``pgvector`` -> ``langchain_postgres.PGVector`` (DB-backed, prod).
+- ``none``     -> ``None``; caller falls back to keyword similarity.
+
+FAISS persistence: callers invoke :meth:`vector_store.save_local` after
+each mutation. The factory loads from disk if a saved index exists at
+the configured ``path``; otherwise it constructs an empty index by
+seeding with a placeholder doc and immediately deleting it (LangChain's
+FAISS constructor doesn't accept an empty docstore).
+"""
+
+from typing import Optional
+
+from langchain_core.documents import Document
+from langchain_core.vectorstores import VectorStore
+
+
+
 # ----- imports for storage/repository.py -----
 """SQLAlchemy-backed Incident store.
 
 Public methods mirror the previous JSON ``IncidentStore`` 1:1 so call
 sites in the MCP server and orchestrator change minimally. The repository
-also owns the embedder; ``find_similar`` (Task G) does the dialect dispatch.
+also owns the embedder and vector_store; ``find_similar`` dispatches to
+the vector path when both are present, else falls back to keyword similarity.
 """
 
 import json
 from datetime import datetime, timezone
-from typing import Optional
 
 from sqlalchemy import desc, select
 from sqlalchemy.engine import Engine
@@ -208,6 +231,7 @@ from langgraph.graph import StateGraph, END
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 
 from typing import AsyncIterator
+
 
 
 
@@ -884,7 +908,12 @@ class _StubEmbeddings(Embeddings):
             hashlib.sha256(text.encode("utf-8")).digest()[:8], "little"
         )
         rng = np.random.default_rng(seed)
-        return rng.standard_normal(self.dim).astype(np.float32).tolist()
+        v = rng.standard_normal(self.dim).astype(np.float32)
+        # Normalize to unit length so cosine similarity = dot product in [−1, 1].
+        norm = np.linalg.norm(v)
+        if norm > 0:
+            v = v / norm
+        return v.tolist()
 
     def embed_query(self, text: str) -> list[float]:
         return self._vec(text)
@@ -920,9 +949,117 @@ def build_embedder(
         return _StubEmbeddings(dim=cfg.dim)
     raise ValueError(f"unknown provider kind: {p.kind!r}")
 
+# ====== module: orchestrator/storage/vector.py ======
+
+_PLACEHOLDER_ID = "__seed__"
+
+
+def _faiss_distance_strategy(name: str):
+    from langchain_community.vectorstores.utils import DistanceStrategy
+    return {
+        "cosine": DistanceStrategy.COSINE,
+        "euclidean": DistanceStrategy.EUCLIDEAN_DISTANCE,
+        "inner_product": DistanceStrategy.MAX_INNER_PRODUCT,
+    }[name]
+
+
+def _pgvector_distance_strategy(name: str):
+    from langchain_postgres.vectorstores import DistanceStrategy
+    return {
+        "cosine": DistanceStrategy.COSINE,
+        "euclidean": DistanceStrategy.EUCLIDEAN,
+        "inner_product": DistanceStrategy.INNER_PRODUCT,
+    }[name]
+
+
+def _build_faiss(cfg: VectorConfig, embedder: Embeddings) -> VectorStore:
+    from langchain_community.vectorstores import FAISS
+
+    folder = Path(cfg.path)
+    index_file = folder / f"{cfg.collection_name}.faiss"
+    if index_file.exists():
+        return FAISS.load_local(
+            folder_path=str(folder),
+            index_name=cfg.collection_name,
+            embeddings=embedder,
+            allow_dangerous_deserialization=True,
+            distance_strategy=_faiss_distance_strategy(cfg.distance_strategy),
+        )
+    folder.mkdir(parents=True, exist_ok=True)
+    vs = FAISS.from_documents(
+        [Document(page_content=_PLACEHOLDER_ID, metadata={"id": _PLACEHOLDER_ID})],
+        embedding=embedder,
+        ids=[_PLACEHOLDER_ID],
+        distance_strategy=_faiss_distance_strategy(cfg.distance_strategy),
+    )
+    vs.delete(ids=[_PLACEHOLDER_ID])
+    return vs
+
+
+def _build_pgvector(cfg: VectorConfig, embedder: Embeddings,
+                    engine) -> VectorStore:
+    from langchain_postgres import PGVector
+    return PGVector(
+        embeddings=embedder,
+        collection_name=cfg.collection_name,
+        connection=engine,
+        distance_strategy=_pgvector_distance_strategy(cfg.distance_strategy),
+        use_jsonb=True,
+    )
+
+
+def build_vector_store(
+    cfg: VectorConfig,
+    embedder: Optional[Embeddings],
+    metadata_engine=None,
+) -> Optional[VectorStore]:
+    if cfg.backend == "none" or embedder is None:
+        return None
+    if cfg.backend == "faiss":
+        return _build_faiss(cfg, embedder)
+    if cfg.backend == "pgvector":
+        if metadata_engine is None:
+            raise ValueError(
+                "pgvector backend requires metadata_engine (the SQLAlchemy "
+                "engine, used as the connection)"
+            )
+        return _build_pgvector(cfg, embedder, metadata_engine)
+    raise ValueError(f"unknown vector backend: {cfg.backend!r}")
+
+
+def distance_to_similarity(distance: float, strategy: str) -> float:
+    """Normalize a backend-native distance to a similarity in roughly [0, 1].
+
+    - cosine: ``1 - distance`` (LangChain's cosine-distance in [0, 2]).
+    - inner_product: returns ``distance`` unchanged (already a similarity).
+    - euclidean: ``1 / (1 + distance)`` -- monotonic, compressed to (0, 1].
+    """
+    if strategy == "cosine":
+        return 1.0 - distance
+    if strategy == "inner_product":
+        return distance
+    if strategy == "euclidean":
+        return 1.0 / (1.0 + distance)
+    raise ValueError(f"unknown distance strategy: {strategy!r}")
+
 # ====== module: orchestrator/storage/repository.py ======
 
 _INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
+
+
+def _embed_source(inc: "Incident") -> str:
+    """Produce the text that represents an incident in the vector store.
+
+    Uses query only so that ``find_similar(query=inc.query)`` retrieves the
+    same vector (enabling self-match and cross-incident similarity by query
+    semantics, regardless of how the summary evolves).
+    """
+    return (inc.query or "").strip()
+
+
+def _embed_source_from_row(row: "IncidentRow") -> str:
+    """Same as ``_embed_source`` but from a raw ORM row (used in save)."""
+    return (row.query or "").strip()
 
 
 def _now() -> datetime:
@@ -971,11 +1108,19 @@ class IncidentRepository:
         *,
         engine: Engine,
         embedder: Optional[Embeddings] = None,
+        vector_store: Optional[VectorStore] = None,
+        vector_path: Optional[str] = None,
+        vector_index_name: str = "incidents",
+        distance_strategy: str = "cosine",
         similarity_threshold: float = 0.85,
         severity_aliases: Optional[dict[str, str]] = None,
     ) -> None:
         self.engine = engine
         self.embedder = embedder
+        self.vector_store = vector_store
+        self.vector_path = vector_path
+        self.vector_index_name = vector_index_name
+        self.distance_strategy = distance_strategy
         self.similarity_threshold = similarity_threshold
         self.severity_aliases = severity_aliases or {}
 
@@ -1020,7 +1165,9 @@ class IncidentRepository:
             session.add(row)
             session.commit()
             session.refresh(row)
-            return self._row_to_incident(row)
+            inc = self._row_to_incident(row)
+        self._add_vector(inc)
+        return inc
 
     def load(self, incident_id: str) -> Incident:
         if not _INC_ID_RE.match(incident_id):
@@ -1041,6 +1188,7 @@ class IncidentRepository:
         incident.updated_at = _iso(_now())
         with Session(self.engine) as session:
             existing = session.get(IncidentRow, incident.id)
+            prior_text = _embed_source_from_row(existing) if existing is not None else ""
             data = self._incident_to_row_dict(incident)
             if existing is None:
                 session.add(IncidentRow(**data))
@@ -1048,6 +1196,7 @@ class IncidentRepository:
                 for k, v in data.items():
                     setattr(existing, k, v)
             session.commit()
+        self._refresh_vector(incident, prior_text=prior_text)
 
     def delete(self, incident_id: str) -> Incident:
         with Session(self.engine) as session:
@@ -1082,6 +1231,52 @@ class IncidentRepository:
             rows = session.execute(stmt).scalars().all()
             return [self._row_to_incident(r) for r in rows]
 
+    # ---------- vector helpers ----------
+    def _persist_vector(self) -> None:
+        """If FAISS-backed (has save_local) and a path is configured, persist to disk."""
+        if self.vector_store is None:
+            return
+        if not hasattr(self.vector_store, "save_local"):
+            return
+        if not self.vector_path:
+            return
+        from pathlib import Path
+        folder = Path(self.vector_path)
+        folder.mkdir(parents=True, exist_ok=True)
+        self.vector_store.save_local(
+            folder_path=str(folder),
+            index_name=self.vector_index_name,
+        )
+
+    def _add_vector(self, inc: "Incident") -> None:
+        if self.vector_store is None or self.embedder is None:
+            return
+        text = _embed_source(inc)
+        if not text:
+            return
+        from langchain_core.documents import Document
+        self.vector_store.add_documents(
+            [Document(page_content=text, metadata={"id": inc.id})],
+            ids=[inc.id],
+        )
+        self._persist_vector()
+
+    def _refresh_vector(self, inc: "Incident", *, prior_text: str) -> None:
+        if self.vector_store is None or self.embedder is None:
+            return
+        text = _embed_source(inc)
+        if not text:
+            return
+        if prior_text == text:
+            return
+        self.vector_store.delete(ids=[inc.id])
+        from langchain_core.documents import Document
+        self.vector_store.add_documents(
+            [Document(page_content=text, metadata={"id": inc.id})],
+            ids=[inc.id],
+        )
+        self._persist_vector()
+
     # ---------- similarity search ----------
     def find_similar(
         self, *, query: str, environment: str,
@@ -1091,16 +1286,39 @@ class IncidentRepository:
     ) -> list[tuple[Incident, float]]:
         """Return up to ``limit`` similar resolved incidents for the same env.
 
-        Embedding path uses native vector ops (pgvector ``cosine_distance`` /
-        sqlite-vec ``vec_distance_cosine``). Keyword path falls back to
-        the existing ``KeywordSimilarity`` scorer to preserve behaviour
-        when no embedder is configured.
+        Vector path: uses the configured VectorStore when both vector_store
+        and embedder are present. Falls back to keyword similarity otherwise.
         """
-        return self._keyword_similar(
-            query=query, environment=environment,
-            status_filter=status_filter,
-            threshold=threshold, limit=limit,
-        )
+        if self.vector_store is None or self.embedder is None:
+            return self._keyword_similar(
+                query=query, environment=environment,
+                status_filter=status_filter,
+                threshold=threshold, limit=limit,
+            )
+        threshold = self.similarity_threshold if threshold is None else threshold
+
+        vec = self.embedder.embed_query(query)
+        raw = self.vector_store.similarity_search_with_score_by_vector(vec, k=limit * 4)
+        out: list[tuple[Incident, float]] = []
+        for doc, distance in raw:
+            score = distance_to_similarity(float(distance), self.distance_strategy)
+            if score < threshold:
+                continue
+            inc_id = doc.metadata.get("id")
+            if inc_id is None:
+                continue
+            try:
+                inc = self.load(inc_id)
+            except (FileNotFoundError, ValueError):
+                continue
+            if (inc.environment != environment
+                    or inc.status != status_filter
+                    or inc.deleted_at is not None):
+                continue
+            out.append((inc, score))
+            if len(out) >= limit:
+                break
+        return out
 
     def _keyword_similar(self, *, query, environment, status_filter, threshold, limit):
 
@@ -2416,9 +2634,15 @@ class Orchestrator:
             ))
             Base.metadata.create_all(engine)
             embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
+            vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
             store = IncidentRepository(
                 engine=engine,
                 embedder=embedder,
+                vector_store=vector_store,
+                vector_path=(cfg.storage.vector.path
+                             if cfg.storage.vector.backend == "faiss" else None),
+                vector_index_name=cfg.storage.vector.collection_name,
+                distance_strategy=cfg.storage.vector.distance_strategy,
                 similarity_threshold=cfg.incidents.similarity_threshold,
                 severity_aliases=cfg.orchestrator.severity_aliases,
             )
