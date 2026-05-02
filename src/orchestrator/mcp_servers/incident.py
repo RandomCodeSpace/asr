@@ -22,7 +22,7 @@ from orchestrator.incident import IncidentStore
 from orchestrator.similarity import KeywordSimilarity, find_similar
 
 
-_SEVERITY_MAP = {
+_DEFAULT_SEVERITY_ALIASES: dict[str, str] = {
     "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
     "critical": "high", "urgent": "high", "high": "high",
     "sev3": "medium", "p3": "medium", "moderate": "medium", "medium": "medium",
@@ -31,16 +31,22 @@ _SEVERITY_MAP = {
 }
 
 
-def normalize_severity(value: str | None) -> str | None:
-    """Coerce assorted severity inputs (sev1/p2/critical/etc.) to low/medium/high.
+def normalize_severity(
+    value: str | None,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    """Coerce assorted severity inputs (sev1/p2/critical/etc.) to a canonical label.
 
-    Unknown inputs pass through untouched so callers can flag them; the
-    normalized vocabulary surfaced to the UI and stored on disk is restricted
-    to {low, medium, high}.
+    ``aliases`` maps lower-cased input tokens to canonical values. When ``None``
+    no normalization occurs — the lowercased input is returned as-is. Unknown
+    inputs pass through untouched so callers can flag them.
     """
     if value is None:
         return None
-    return _SEVERITY_MAP.get(value.strip().lower(), value)
+    lowered = value.strip().lower()
+    if aliases is None:
+        return lowered
+    return aliases.get(lowered, value)
 
 
 @dataclass
@@ -53,6 +59,9 @@ class IncidentMCPServer:
     """
     store: IncidentStore | None = None
     similarity_threshold: float = 0.85
+    severity_aliases: dict[str, str] = field(
+        default_factory=lambda: dict(_DEFAULT_SEVERITY_ALIASES)
+    )
     mcp: FastMCP = field(init=False)
 
     def __post_init__(self) -> None:
@@ -67,9 +76,17 @@ class IncidentMCPServer:
         self.mcp.tool(name="create_incident")(self._tool_create_incident)
         self.mcp.tool(name="update_incident")(self._tool_update_incident)
 
-    def configure(self, *, store: IncidentStore, similarity_threshold: float) -> None:
+    def configure(
+        self,
+        *,
+        store: IncidentStore,
+        similarity_threshold: float,
+        severity_aliases: dict[str, str] | None = None,
+    ) -> None:
         self.store = store
         self.similarity_threshold = similarity_threshold
+        if severity_aliases is not None:
+            self.severity_aliases = severity_aliases
 
     def _require_store(self) -> IncidentStore:
         if self.store is None:
@@ -125,7 +142,7 @@ class IncidentMCPServer:
         if "status" in patch:
             inc.status = patch["status"]
         if "severity" in patch:
-            inc.severity = normalize_severity(patch["severity"])
+            inc.severity = normalize_severity(patch["severity"], self.severity_aliases)
         if "category" in patch:
             inc.category = patch["category"]
         if "summary" in patch:
@@ -165,14 +182,26 @@ _default_server = IncidentMCPServer()
 mcp = _default_server.mcp
 
 
-def set_state(*, store: IncidentStore, similarity_threshold: float) -> None:
+def set_state(
+    *,
+    store: IncidentStore,
+    similarity_threshold: float,
+    severity_aliases: dict[str, str] | None = None,
+) -> None:
     """Configure the default IncidentMCPServer instance.
 
     Kept for backwards compatibility with callers that import this function
     directly (the orchestrator and several tests). New code should construct an
     :class:`IncidentMCPServer` and call ``configure`` on it.
+
+    ``severity_aliases`` is optional; when omitted the server retains the
+    default map so existing callers see no behaviour change.
     """
-    _default_server.configure(store=store, similarity_threshold=similarity_threshold)
+    _default_server.configure(
+        store=store,
+        similarity_threshold=similarity_threshold,
+        severity_aliases=severity_aliases,
+    )
 
 
 # Public function aliases so test modules importing these names directly keep

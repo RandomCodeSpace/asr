@@ -56,6 +56,7 @@ _STATUS_COLOR = {
 }
 
 # Human-readable labels — awaiting_input is highlighted as the action-required state.
+# Unknown statuses fall back to ``status.upper()`` via the .get() in _status_badge.
 _STATUS_LABEL = {
     "new": "NEW",
     "in_progress": "IN PROGRESS",
@@ -72,6 +73,7 @@ _SEVERITY_COLOR = {
     "high": "red",
 }
 
+# Unknown categories fall back to "gray" via the .get() in _category_badge.
 _CATEGORY_COLOR = {
     "latency": "orange",
     "availability": "red",
@@ -425,20 +427,6 @@ def _render_hypothesis_list(items: list, label: str) -> None:
             _render_one_hypothesis(h, label, i)
 
 
-def _render_findings_section(value, label: str) -> None:
-    """Findings can be a list of hypothesis dicts, a single dict, or free
-    prose. Pick the right renderer; never silently truncate.
-    """
-    if isinstance(value, list):
-        _render_hypothesis_list(value, label=label)
-    elif isinstance(value, dict):
-        _render_kv_block(value)
-    elif isinstance(value, str):
-        st.write(value)
-    else:
-        _render_value(value)
-
-
 def _render_incident_top_badges(inc: dict) -> None:
     """Render status / severity / category badge columns and the awaiting-input warning."""
     b1, b2, b3 = st.columns([1, 1, 1])
@@ -452,11 +440,13 @@ def _render_incident_top_badges(inc: dict) -> None:
         st.caption("Category")
         _category_badge(inc.get("category"))
     if inc.get("status") == "awaiting_input":
+        _pi = inc.get("pending_intervention") or {}
+        _upstream = _pi.get("upstream_agent") or "the upstream agent"
         st.warning(
-            "**Human intervention required.** The intervention gate "
-            "paused this INC because deep-investigator confidence was "
-            "below the configured threshold. Use the controls below to "
-            "resume with input, escalate, or stop."
+            f"**Human intervention required.** The intervention gate "
+            f"paused this INC because {_upstream} confidence was "
+            f"below the configured threshold. Use the controls below to "
+            f"resume with input, escalate, or stop."
         )
 
 
@@ -541,22 +531,37 @@ def _render_agents_run_block(inc: dict) -> None:
             st.write(ar.get("summary") or "_(no summary)_")
 
 
+def _is_hypothesis_list(value) -> bool:
+    """Return True when value is a non-empty list of dicts with a 'cause' key."""
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and isinstance(value[0], dict)
+        and "cause" in value[0]
+    )
+
+
 def _render_findings_block(inc: dict) -> None:
-    """Render the ### Findings section (triage + deep-investigator panels)."""
+    """Render the ### Findings section for every agent that produced findings.
+
+    Iterates over all entries in ``findings`` so custom YAML-defined agents
+    are shown alongside built-in ones. Values that look like hypothesis lists
+    (list of dicts with a ``cause`` key) are passed to ``_render_hypothesis_list``;
+    everything else goes to ``_render_value``.
+    """
     findings = inc.get("findings") or {}
-    f_triage = findings.get("triage")
-    f_di = findings.get("deep_investigator")
-    if f_triage is None and f_di is None:
+    if not findings:
         return
     st.markdown("### Findings")
-    if f_triage is not None:
+    for agent_name, value in findings.items():
+        if value is None:
+            continue
         with st.container(border=True):
-            st.markdown("**Triage**")
-            _render_findings_section(f_triage, label="Finding")
-    if f_di is not None:
-        with st.container(border=True):
-            st.markdown("**Deep investigator**")
-            _render_findings_section(f_di, label="Hypothesis")
+            st.markdown(f"**{agent_name}**")
+            if _is_hypothesis_list(value):
+                _render_hypothesis_list(value, label="Hypothesis")
+            else:
+                _render_value(value)
 
 
 def _render_resolution_block(inc: dict) -> None:
@@ -582,7 +587,8 @@ def _render_tool_calls_block(inc: dict) -> None:
             _render_value(tc.get("result"))
 
 
-def render_incident_detail(store: IncidentStore) -> None:
+def render_incident_detail(store: IncidentStore,
+                           agent_names: frozenset[str] = frozenset()) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
         return
@@ -604,7 +610,7 @@ def render_incident_detail(store: IncidentStore) -> None:
         _render_incident_metrics(inc)
         _render_incident_summary_meta(inc)
         if inc.get("status") == "awaiting_input" and inc.get("pending_intervention"):
-            _render_intervention_block(inc, inc_id)
+            _render_intervention_block(inc, inc_id, agent_names)
         _render_agents_run_block(inc)
         _render_findings_block(inc)
         _render_resolution_block(inc)
@@ -613,7 +619,15 @@ def render_incident_detail(store: IncidentStore) -> None:
             st.json(inc)
 
 
-def _format_event(ev: dict) -> str | None:
+def _format_event(ev: dict, agent_names: frozenset[str] = frozenset()) -> str | None:
+    """Format a streaming orchestrator event for display in the live timeline.
+
+    ``agent_names`` is the set of all configured agent names (derived from the
+    loaded YAML at runtime). When non-empty it replaces the former hardcoded
+    whitelist so custom agents appear in the log. When empty every
+    on_chain_start/end node is shown (safe fallback for callers that don't have
+    the agent list handy).
+    """
     kind = ev.get("event")
     node = ev.get("node") or ""
     ts = ev.get("ts", "")
@@ -621,9 +635,10 @@ def _format_event(ev: dict) -> str | None:
         return f"[{ts}] start  inc={ev.get('incident_id')}"
     if kind == "investigation_completed":
         return f"[{ts}] done   inc={ev.get('incident_id')}"
-    if kind == "on_chain_start" and node in {"intake", "triage", "deep_investigator", "resolution"}:
+    _node_visible = (not agent_names) or (node in agent_names)
+    if kind == "on_chain_start" and _node_visible:
         return f"[{ts}] enter  {node}"
-    if kind == "on_chain_end" and node in {"intake", "triage", "deep_investigator", "resolution"}:
+    if kind == "on_chain_end" and _node_visible:
         return f"[{ts}] exit   {node}"
     if kind == "on_tool_start":
         return f"[{ts}] tool   {node}"
@@ -635,12 +650,13 @@ def _format_event(ev: dict) -> str | None:
 
 
 async def _run_investigation_async(cfg: AppConfig, query: str, environment: str,
-                                   log_area, lines: list[str]) -> None:
+                                   log_area, lines: list[str],
+                                   agent_names: frozenset[str] = frozenset()) -> None:
     """Build a fresh Orchestrator, stream events, aclose. One asyncio.run frame."""
     orch = await Orchestrator.create(cfg)
     try:
         async for ev in orch.stream_investigation(query=query, environment=environment):
-            line = _format_event(ev)
+            line = _format_event(ev, agent_names)
             if line:
                 lines.append(line)
                 log_area.code("\n".join(lines), language="text")
@@ -649,7 +665,8 @@ async def _run_investigation_async(cfg: AppConfig, query: str, environment: str,
 
 
 async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
-                        log_area, lines: list[str]) -> dict:
+                        log_area, lines: list[str],
+                        agent_names: frozenset[str] = frozenset()) -> dict:
     """Build a fresh Orchestrator, stream resume events, aclose.
 
     Returns a small summary dict describing the outcome so the caller can show
@@ -674,7 +691,7 @@ async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
                 lines.append(f"[{ts}] failed {ev.get('error')}")
                 outcome["rejected"] = ev.get("error")
             else:
-                line = _format_event(ev)
+                line = _format_event(ev, agent_names)
                 if line:
                     lines.append(line)
             log_area.code("\n".join(lines), language="text")
@@ -683,7 +700,8 @@ async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
     return outcome
 
 
-def _render_intervention_block(inc: dict, inc_id: str) -> None:
+def _render_intervention_block(inc: dict, inc_id: str,
+                               agent_names: frozenset[str] = frozenset()) -> None:
     """Render the intervention prompt above the agents_run section.
 
     Shows the confidence vs. threshold and a single form with an action
@@ -738,7 +756,7 @@ def _render_intervention_block(inc: dict, inc_id: str) -> None:
                 return
             log_area = st.empty()
             lines: list[str] = []
-            outcome = asyncio.run(_resume_async(cfg, inc_id, decision, log_area, lines))
+            outcome = asyncio.run(_resume_async(cfg, inc_id, decision, log_area, lines, agent_names))
             if outcome.get("rejected"):
                 # Don't auto-rerun — let the user read the warning before the
                 # form goes away. Common causes: INC already closed, invalid
@@ -866,6 +884,7 @@ def main() -> None:
     # One-shot snapshot of agent/tool metadata + environments. ~100-200ms per
     # rerun; acceptable, and keeps async resources strictly scoped.
     agents, tools, environments = _load_metadata_dicts(cfg)
+    agent_names: frozenset[str] = frozenset(a["name"] for a in agents)
 
     render_sidebar(store)
 
@@ -890,7 +909,7 @@ def main() -> None:
             log_area = timeline_box.empty()
             lines: list[str] = []
 
-            asyncio.run(_run_investigation_async(cfg, query, environment, log_area, lines))
+            asyncio.run(_run_investigation_async(cfg, query, environment, log_area, lines, agent_names))
 
             # Surface the resulting INC for one-click drill-in
             recent = [i.model_dump() for i in store.list_recent(1)]
@@ -899,7 +918,7 @@ def main() -> None:
                 st.success(f"Investigation complete — {recent[0]['id']} ({recent[0]['status']})")
                 st.rerun()
         else:
-            render_incident_detail(store)
+            render_incident_detail(store, agent_names)
 
     with tab_registry:
         st.header("Agents & Tools registry")

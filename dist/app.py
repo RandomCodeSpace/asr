@@ -314,6 +314,18 @@ class OrchestratorConfig(BaseModel):
     signals: list[str] = Field(
         default_factory=lambda: ["success", "failed", "needs_input"],
     )
+    # Mapping from raw severity inputs to canonical severity labels.
+    # Override in YAML to adapt to domain-specific taxonomies.
+    # Default reproduces the original hardcoded _SEVERITY_MAP in incident.py.
+    severity_aliases: dict[str, str] = Field(
+        default_factory=lambda: {
+            "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
+            "critical": "high", "urgent": "high", "high": "high",
+            "sev3": "medium", "p3": "medium", "moderate": "medium", "medium": "medium",
+            "sev4": "low", "p4": "low", "info": "low", "informational": "low",
+            "low": "low",
+        }
+    )
 
 
 class AppConfig(BaseModel):
@@ -811,7 +823,7 @@ def get_embedding(cfg: LLMConfig) -> Embeddings:
 
 # ====== module: orchestrator/mcp_servers/incident.py ======
 
-_SEVERITY_MAP = {
+_DEFAULT_SEVERITY_ALIASES: dict[str, str] = {
     "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
     "critical": "high", "urgent": "high", "high": "high",
     "sev3": "medium", "p3": "medium", "moderate": "medium", "medium": "medium",
@@ -820,16 +832,22 @@ _SEVERITY_MAP = {
 }
 
 
-def normalize_severity(value: str | None) -> str | None:
-    """Coerce assorted severity inputs (sev1/p2/critical/etc.) to low/medium/high.
+def normalize_severity(
+    value: str | None,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    """Coerce assorted severity inputs (sev1/p2/critical/etc.) to a canonical label.
 
-    Unknown inputs pass through untouched so callers can flag them; the
-    normalized vocabulary surfaced to the UI and stored on disk is restricted
-    to {low, medium, high}.
+    ``aliases`` maps lower-cased input tokens to canonical values. When ``None``
+    no normalization occurs — the lowercased input is returned as-is. Unknown
+    inputs pass through untouched so callers can flag them.
     """
     if value is None:
         return None
-    return _SEVERITY_MAP.get(value.strip().lower(), value)
+    lowered = value.strip().lower()
+    if aliases is None:
+        return lowered
+    return aliases.get(lowered, value)
 
 
 @dataclass
@@ -842,6 +860,9 @@ class IncidentMCPServer:
     """
     store: IncidentStore | None = None
     similarity_threshold: float = 0.85
+    severity_aliases: dict[str, str] = field(
+        default_factory=lambda: dict(_DEFAULT_SEVERITY_ALIASES)
+    )
     mcp: FastMCP = field(init=False)
 
     def __post_init__(self) -> None:
@@ -856,9 +877,17 @@ class IncidentMCPServer:
         self.mcp.tool(name="create_incident")(self._tool_create_incident)
         self.mcp.tool(name="update_incident")(self._tool_update_incident)
 
-    def configure(self, *, store: IncidentStore, similarity_threshold: float) -> None:
+    def configure(
+        self,
+        *,
+        store: IncidentStore,
+        similarity_threshold: float,
+        severity_aliases: dict[str, str] | None = None,
+    ) -> None:
         self.store = store
         self.similarity_threshold = similarity_threshold
+        if severity_aliases is not None:
+            self.severity_aliases = severity_aliases
 
     def _require_store(self) -> IncidentStore:
         if self.store is None:
@@ -914,7 +943,7 @@ class IncidentMCPServer:
         if "status" in patch:
             inc.status = patch["status"]
         if "severity" in patch:
-            inc.severity = normalize_severity(patch["severity"])
+            inc.severity = normalize_severity(patch["severity"], self.severity_aliases)
         if "category" in patch:
             inc.category = patch["category"]
         if "summary" in patch:
@@ -954,14 +983,26 @@ _default_server = IncidentMCPServer()
 mcp = _default_server.mcp
 
 
-def set_state(*, store: IncidentStore, similarity_threshold: float) -> None:
+def set_state(
+    *,
+    store: IncidentStore,
+    similarity_threshold: float,
+    severity_aliases: dict[str, str] | None = None,
+) -> None:
     """Configure the default IncidentMCPServer instance.
 
     Kept for backwards compatibility with callers that import this function
     directly (the orchestrator and several tests). New code should construct an
     :class:`IncidentMCPServer` and call ``configure`` on it.
+
+    ``severity_aliases`` is optional; when omitted the server retains the
+    default map so existing callers see no behaviour change.
     """
-    _default_server.configure(store=store, similarity_threshold=similarity_threshold)
+    _default_server.configure(
+        store=store,
+        similarity_threshold=similarity_threshold,
+        severity_aliases=severity_aliases,
+    )
 
 
 # Public function aliases so test modules importing these names directly keep
@@ -1376,6 +1417,7 @@ class GraphState(TypedDict, total=False):
     incident: Incident
     next_route: str | None
     last_agent: str | None
+    gated_target: str | None  # set by gate node; the downstream target if gate passes
     error: str | None
 
 
@@ -1766,6 +1808,10 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
     async def gate(state: GraphState) -> dict:
         incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         upstream = state.get("last_agent")
+        # Capture the intended downstream target before we overwrite next_route.
+        # The upstream agent set next_route to the gated target; we stash it in
+        # gated_target so _make_gate_to can route correctly for multi-target graphs.
+        intended_target = state.get("next_route")
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
             incident = store.load(incident.id)
@@ -1790,13 +1836,13 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
             }
             store.save(incident)
             return {"incident": incident, "next_route": "__end__",
-                    "last_agent": "gate", "error": None}
+                    "gated_target": intended_target, "last_agent": "gate", "error": None}
         # Confidence met threshold — clear any stale intervention payload.
         if incident.pending_intervention is not None:
             incident.pending_intervention = None
             store.save(incident)
         return {"incident": incident, "next_route": "default",
-                "last_agent": "gate", "error": None}
+                "gated_target": intended_target, "last_agent": "gate", "error": None}
 
     return gate
 
@@ -1846,15 +1892,24 @@ def _make_router(gated_edges: dict[tuple[str, str], str]):
     return _router
 
 
-def _make_gate_to(gate_target: str):
-    """Build the gate's outbound router. On a "default" pass, the gate
-    forwards to its single downstream target; on "__end__", it terminates.
+def _make_gate_to(gate_targets: set[str]):
+    """Build the gate's outbound router.
+
+    On a low-confidence fail the gate sets ``next_route="__end__"`` and
+    we terminate. On a pass the gate sets ``next_route="default"`` and also
+    stamps ``gated_target`` with the intended downstream node (captured from
+    the incoming ``next_route`` before the gate ran). We read ``gated_target``
+    here so this router handles any number of gated targets without needing
+    a hardcoded closure over a single target name.
     """
     def _gate_to(state: GraphState):
         nr = state.get("next_route")
         if nr in (None, "__end__"):
             return END
-        return gate_target
+        gt = state.get("gated_target")
+        if gt in gate_targets:
+            return gt
+        return END
     return _gate_to
 
 
@@ -1918,24 +1973,16 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         target_map[END] = END
         sg.add_conditional_edges(agent_name, _router, target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
 
-    # Determine where the gate forwards on a "default" pass — there is at
-    # most one downstream agent per gated edge; with one gate type today
-    # we collapse to a single target. If the user defines multiple gated
-    # edges with different downstream agents in the future, the closure
-    # below will need a state-aware lookup; for now we assert "exactly one"
-    # and error loudly otherwise.
+    # Build the gate's outbound target map from all distinct gated downstream
+    # nodes. _make_gate_to reads next_route from state (set by the upstream
+    # agent) so it routes to the correct target regardless of how many gated
+    # edges exist — the multi-target restriction is no longer needed.
     gate_targets = {to for (_from, to) in gated_edges.keys()}
-    if len(gate_targets) > 1:
-        raise ValueError(
-            f"multiple gated downstream targets {sorted(gate_targets)} not "
-            f"yet supported; only one gated edge per graph"
-        )
-    gate_target = next(iter(gate_targets), None)
-    if gate_target is not None:
-        _gate_to = _make_gate_to(gate_target)
-        sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
-            gate_target: gate_target, END: END,
-        })
+    if gate_targets:
+        _gate_to = _make_gate_to(gate_targets)
+        gate_target_map: dict = {t: t for t in gate_targets}
+        gate_target_map[END] = END
+        sg.add_conditional_edges("gate", _gate_to, gate_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
     else:
         sg.add_edge("gate", END)
 
@@ -1944,13 +1991,18 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
 async def build_resume_graph(*, cfg: AppConfig, skills: dict,
                              store: IncidentStore, registry: ToolRegistry):
-    """Compile a sub-graph that re-runs from the *upstream* end of the
-    (single) gated edge through to the gate's downstream target.
+    """Compile a sub-graph that re-runs from the upstream end of whichever
+    gated edge the INC was awaiting input from.
+
+    Supports any number of gated edges. The correct upstream agent is
+    determined at runtime from ``incident.pending_intervention["upstream_agent"]``
+    (stamped by the gate node). A lightweight dispatcher node is used as the
+    fixed entry point; it reads the upstream agent from state and sets
+    ``next_route`` so the shared router forwards execution to it.
 
     Used by ``Orchestrator.resume_investigation`` after the user supplies
-    new context: agents before the gated edge already ran, so we resume
-    from the gated agent with the updated incident. Same gate semantics —
-    if the new run is still low-confidence, we'll pause again.
+    new context. Same gate semantics — if the new run is still low-confidence
+    the gate will pause again.
     """
     gated_edges = _collect_gated_edges(skills)
     if not gated_edges:
@@ -1960,35 +2012,56 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
             "'gate: confidence' to the relevant agent's route in "
             "config/skills/<agent>/config.yaml"
         )
-    if len(gated_edges) > 1:
-        raise ValueError(
-            f"multiple gated edges {sorted(gated_edges.keys())} not yet "
-            f"supported; resume entry is ambiguous"
-        )
-    resume_from, gate_target = next(iter(gated_edges.keys()))
+
+    upstream_agents = {frm for (frm, _to) in gated_edges.keys()}
+    gate_targets = {to for (_frm, to) in gated_edges.keys()}
+
+    async def _resume_dispatcher(state: GraphState) -> dict:
+        """Route to whichever upstream agent the INC was awaiting input from.
+
+        Reads ``pending_intervention["upstream_agent"]`` from the incident
+        so the resume graph works for any gated topology without being
+        rebuilt per call.
+        """
+        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        pi = getattr(incident, "pending_intervention", None)
+        upstream = (pi or {}).get("upstream_agent") if pi else None
+        if upstream not in upstream_agents:
+            # Fallback: pick the lexically first upstream to avoid a hard crash;
+            # callers should only resume incidents that are awaiting_input.
+            upstream = next(iter(sorted(upstream_agents)))
+            logger.warning(
+                "resume_dispatcher: upstream_agent %r not in gated upstreams %r; "
+                "falling back to %r",
+                upstream, sorted(upstream_agents), upstream,
+            )
+        return {"next_route": upstream, "last_agent": None, "error": None}
 
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
-    for agent_name in (resume_from, gate_target):
+    sg.add_node("__resume_dispatcher__", _resume_dispatcher)
+    for agent_name in upstream_agents | gate_targets:
         if agent_name in nodes:
             sg.add_node(agent_name, nodes[agent_name])
     sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
-    sg.set_entry_point(resume_from)
+    sg.set_entry_point("__resume_dispatcher__")
 
     _router = _make_router(gated_edges)
 
-    for _resume_agent in (resume_from, gate_target):
-        sg.add_conditional_edges(_resume_agent, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
-            resume_from: resume_from,
-            gate_target: gate_target,
-            "gate": "gate",
-            END: END,
-        })
+    all_resume_nodes = upstream_agents | gate_targets
+    shared_target_map: dict = {name: name for name in all_resume_nodes | {"gate"}}
+    shared_target_map[END] = END
 
-    _gate_to = _make_gate_to(gate_target)
-    sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
-        gate_target: gate_target, END: END,
-    })
+    # Dispatcher routes to an upstream agent via next_route.
+    sg.add_conditional_edges("__resume_dispatcher__", _router, shared_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+
+    for agent_name in all_resume_nodes:
+        sg.add_conditional_edges(agent_name, _router, shared_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+
+    _gate_to = _make_gate_to(gate_targets)
+    gate_target_map: dict = {t: t for t in gate_targets}
+    gate_target_map[END] = END
+    sg.add_conditional_edges("gate", _gate_to, gate_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
     return sg.compile()
 
 # ====== module: orchestrator/orchestrator.py ======
@@ -2017,7 +2090,11 @@ class Orchestrator:
         await stack.__aenter__()
         try:
             store = IncidentStore(cfg.paths.incidents_dir)
-            set_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
+            set_state(
+                store=store,
+                similarity_threshold=cfg.incidents.similarity_threshold,
+                severity_aliases=cfg.orchestrator.severity_aliases,
+            )
             skills = load_all_skills(cfg.paths.skills_dir)
             for s in skills.values():
                 if s.model is not None and s.model not in cfg.llm.models:

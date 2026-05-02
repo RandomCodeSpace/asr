@@ -127,6 +127,18 @@ class OrchestratorConfig(BaseModel):
     signals: list[str] = Field(
         default_factory=lambda: ["success", "failed", "needs_input"],
     )
+    # Mapping from raw severity inputs to canonical severity labels.
+    # Override in YAML to adapt to domain-specific taxonomies.
+    # Default reproduces the original hardcoded _SEVERITY_MAP in incident.py.
+    severity_aliases: dict[str, str] = Field(
+        default_factory=lambda: {
+            "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
+            "critical": "high", "urgent": "high", "high": "high",
+            "sev3": "medium", "p3": "medium", "moderate": "medium", "medium": "medium",
+            "sev4": "low", "p4": "low", "info": "low", "informational": "low",
+            "low": "low",
+        }
+    )
 
 
 class AppConfig(BaseModel):

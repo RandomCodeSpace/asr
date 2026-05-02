@@ -36,7 +36,11 @@ class Orchestrator:
         await stack.__aenter__()
         try:
             store = IncidentStore(cfg.paths.incidents_dir)
-            set_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
+            set_state(
+                store=store,
+                similarity_threshold=cfg.incidents.similarity_threshold,
+                severity_aliases=cfg.orchestrator.severity_aliases,
+            )
             skills = load_all_skills(cfg.paths.skills_dir)
             for s in skills.values():
                 if s.model is not None and s.model not in cfg.llm.models:

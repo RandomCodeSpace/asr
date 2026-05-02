@@ -114,6 +114,7 @@ class GraphState(TypedDict, total=False):
     incident: Incident
     next_route: str | None
     last_agent: str | None
+    gated_target: str | None  # set by gate node; the downstream target if gate passes
     error: str | None
 
 
@@ -504,6 +505,10 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
     async def gate(state: GraphState) -> dict:
         incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
         upstream = state.get("last_agent")
+        # Capture the intended downstream target before we overwrite next_route.
+        # The upstream agent set next_route to the gated target; we stash it in
+        # gated_target so _make_gate_to can route correctly for multi-target graphs.
+        intended_target = state.get("next_route")
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
             incident = store.load(incident.id)
@@ -528,13 +533,13 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
             }
             store.save(incident)
             return {"incident": incident, "next_route": "__end__",
-                    "last_agent": "gate", "error": None}
+                    "gated_target": intended_target, "last_agent": "gate", "error": None}
         # Confidence met threshold — clear any stale intervention payload.
         if incident.pending_intervention is not None:
             incident.pending_intervention = None
             store.save(incident)
         return {"incident": incident, "next_route": "default",
-                "last_agent": "gate", "error": None}
+                "gated_target": intended_target, "last_agent": "gate", "error": None}
 
     return gate
 
@@ -584,15 +589,24 @@ def _make_router(gated_edges: dict[tuple[str, str], str]):
     return _router
 
 
-def _make_gate_to(gate_target: str):
-    """Build the gate's outbound router. On a "default" pass, the gate
-    forwards to its single downstream target; on "__end__", it terminates.
+def _make_gate_to(gate_targets: set[str]):
+    """Build the gate's outbound router.
+
+    On a low-confidence fail the gate sets ``next_route="__end__"`` and
+    we terminate. On a pass the gate sets ``next_route="default"`` and also
+    stamps ``gated_target`` with the intended downstream node (captured from
+    the incoming ``next_route`` before the gate ran). We read ``gated_target``
+    here so this router handles any number of gated targets without needing
+    a hardcoded closure over a single target name.
     """
     def _gate_to(state: GraphState):
         nr = state.get("next_route")
         if nr in (None, "__end__"):
             return END
-        return gate_target
+        gt = state.get("gated_target")
+        if gt in gate_targets:
+            return gt
+        return END
     return _gate_to
 
 
@@ -656,24 +670,16 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
         target_map[END] = END
         sg.add_conditional_edges(agent_name, _router, target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
 
-    # Determine where the gate forwards on a "default" pass — there is at
-    # most one downstream agent per gated edge; with one gate type today
-    # we collapse to a single target. If the user defines multiple gated
-    # edges with different downstream agents in the future, the closure
-    # below will need a state-aware lookup; for now we assert "exactly one"
-    # and error loudly otherwise.
+    # Build the gate's outbound target map from all distinct gated downstream
+    # nodes. _make_gate_to reads next_route from state (set by the upstream
+    # agent) so it routes to the correct target regardless of how many gated
+    # edges exist — the multi-target restriction is no longer needed.
     gate_targets = {to for (_from, to) in gated_edges.keys()}
-    if len(gate_targets) > 1:
-        raise ValueError(
-            f"multiple gated downstream targets {sorted(gate_targets)} not "
-            f"yet supported; only one gated edge per graph"
-        )
-    gate_target = next(iter(gate_targets), None)
-    if gate_target is not None:
-        _gate_to = _make_gate_to(gate_target)
-        sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
-            gate_target: gate_target, END: END,
-        })
+    if gate_targets:
+        _gate_to = _make_gate_to(gate_targets)
+        gate_target_map: dict = {t: t for t in gate_targets}
+        gate_target_map[END] = END
+        sg.add_conditional_edges("gate", _gate_to, gate_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
     else:
         sg.add_edge("gate", END)
 
@@ -682,13 +688,18 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
 async def build_resume_graph(*, cfg: AppConfig, skills: dict,
                              store: IncidentStore, registry: ToolRegistry):
-    """Compile a sub-graph that re-runs from the *upstream* end of the
-    (single) gated edge through to the gate's downstream target.
+    """Compile a sub-graph that re-runs from the upstream end of whichever
+    gated edge the INC was awaiting input from.
+
+    Supports any number of gated edges. The correct upstream agent is
+    determined at runtime from ``incident.pending_intervention["upstream_agent"]``
+    (stamped by the gate node). A lightweight dispatcher node is used as the
+    fixed entry point; it reads the upstream agent from state and sets
+    ``next_route`` so the shared router forwards execution to it.
 
     Used by ``Orchestrator.resume_investigation`` after the user supplies
-    new context: agents before the gated edge already ran, so we resume
-    from the gated agent with the updated incident. Same gate semantics —
-    if the new run is still low-confidence, we'll pause again.
+    new context. Same gate semantics — if the new run is still low-confidence
+    the gate will pause again.
     """
     gated_edges = _collect_gated_edges(skills)
     if not gated_edges:
@@ -698,33 +709,54 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
             "'gate: confidence' to the relevant agent's route in "
             "config/skills/<agent>/config.yaml"
         )
-    if len(gated_edges) > 1:
-        raise ValueError(
-            f"multiple gated edges {sorted(gated_edges.keys())} not yet "
-            f"supported; resume entry is ambiguous"
-        )
-    resume_from, gate_target = next(iter(gated_edges.keys()))
+
+    upstream_agents = {frm for (frm, _to) in gated_edges.keys()}
+    gate_targets = {to for (_frm, to) in gated_edges.keys()}
+
+    async def _resume_dispatcher(state: GraphState) -> dict:
+        """Route to whichever upstream agent the INC was awaiting input from.
+
+        Reads ``pending_intervention["upstream_agent"]`` from the incident
+        so the resume graph works for any gated topology without being
+        rebuilt per call.
+        """
+        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        pi = getattr(incident, "pending_intervention", None)
+        upstream = (pi or {}).get("upstream_agent") if pi else None
+        if upstream not in upstream_agents:
+            # Fallback: pick the lexically first upstream to avoid a hard crash;
+            # callers should only resume incidents that are awaiting_input.
+            upstream = next(iter(sorted(upstream_agents)))
+            logger.warning(
+                "resume_dispatcher: upstream_agent %r not in gated upstreams %r; "
+                "falling back to %r",
+                upstream, sorted(upstream_agents), upstream,
+            )
+        return {"next_route": upstream, "last_agent": None, "error": None}
 
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
-    for agent_name in (resume_from, gate_target):
+    sg.add_node("__resume_dispatcher__", _resume_dispatcher)
+    for agent_name in upstream_agents | gate_targets:
         if agent_name in nodes:
             sg.add_node(agent_name, nodes[agent_name])
     sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
-    sg.set_entry_point(resume_from)
+    sg.set_entry_point("__resume_dispatcher__")
 
     _router = _make_router(gated_edges)
 
-    for _resume_agent in (resume_from, gate_target):
-        sg.add_conditional_edges(_resume_agent, _router, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
-            resume_from: resume_from,
-            gate_target: gate_target,
-            "gate": "gate",
-            END: END,
-        })
+    all_resume_nodes = upstream_agents | gate_targets
+    shared_target_map: dict = {name: name for name in all_resume_nodes | {"gate"}}
+    shared_target_map[END] = END
 
-    _gate_to = _make_gate_to(gate_target)
-    sg.add_conditional_edges("gate", _gate_to, {  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
-        gate_target: gate_target, END: END,
-    })
+    # Dispatcher routes to an upstream agent via next_route.
+    sg.add_conditional_edges("__resume_dispatcher__", _router, shared_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+
+    for agent_name in all_resume_nodes:
+        sg.add_conditional_edges(agent_name, _router, shared_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+
+    _gate_to = _make_gate_to(gate_targets)
+    gate_target_map: dict = {t: t for t in gate_targets}
+    gate_target_map[END] = END
+    sg.add_conditional_edges("gate", _gate_to, gate_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
     return sg.compile()
