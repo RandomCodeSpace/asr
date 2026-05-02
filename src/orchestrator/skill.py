@@ -64,6 +64,10 @@ class Skill(BaseModel):
     tools: dict[str, list[str]] = Field(default_factory=dict)
     routes: list[RouteRule] = Field(default_factory=list)
     system_prompt: str
+    stub_response: str | None = None
+    """Per-skill canned response used by ``StubChatModel`` when
+    ``provider.kind == "stub"``.  Takes precedence over any entry in
+    ``_DEFAULT_STUB_CANNED`` for the same agent name."""
 
     @field_validator("tools")
     @classmethod

@@ -454,7 +454,10 @@ def _decide_from_signal(inc: Incident) -> str:
     return inc.agents_run[-1].signal or "default"
 
 
-_STUB_CANNED = {
+_DEFAULT_STUB_CANNED: dict[str, str] = {
+    # Back-compat defaults for the four canonical agents.  Any YAML-defined
+    # agent can override or extend this via ``skill.stub_response``; new agents
+    # without an entry here fall through to StubChatModel's generic placeholder.
     "intake": "Created INC, no prior matches. Routing to triage.",
     "triage": "Severity medium, category latency. No recent deploys correlate.",
     "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
@@ -542,11 +545,17 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     valid_signals = frozenset(cfg.orchestrator.signals)
     nodes: dict = {}
     for agent_name, skill in skills.items():
+        if skill.stub_response is not None:
+            stub_canned: dict[str, str] | None = {skill.name: skill.stub_response}
+        elif agent_name in _DEFAULT_STUB_CANNED:
+            stub_canned = {agent_name: _DEFAULT_STUB_CANNED[agent_name]}
+        else:
+            stub_canned = None
         llm = get_llm(
             cfg.llm,
             skill.model,
             role=agent_name,
-            stub_canned=_STUB_CANNED,
+            stub_canned=stub_canned,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal

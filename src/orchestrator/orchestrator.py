@@ -48,8 +48,18 @@ class Orchestrator:
             registry = await load_tools(cfg.mcp, stack)
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry)
-            resume_graph = await build_resume_graph(
-                cfg=cfg, skills=skills, store=store, registry=registry,
+            # Build the resume graph only when at least one skill declares
+            # a gated route. Without gates an INC can never enter the
+            # ``awaiting_input`` state, so the resume path is dead code —
+            # and ``build_resume_graph`` raises by design when gated_edges
+            # is empty. This unblocks intake-only YAML configurations.
+            has_gates = any(
+                r.gate for s in skills.values() for r in s.routes
+            )
+            resume_graph = (
+                await build_resume_graph(
+                    cfg=cfg, skills=skills, store=store, registry=registry,
+                ) if has_gates else None
             )
             return cls(cfg, store, skills, registry, graph, resume_graph, stack)
         except BaseException:
@@ -223,6 +233,14 @@ class Orchestrator:
         user_text = (decision.get("input") or "").strip()
         if not user_text:
             raise ValueError("resume_with_input requires a non-empty 'input'")
+        # The resume sub-graph only exists when the YAML declares at least
+        # one gated route. An intake-only configuration has nothing to
+        # resume into — bail with a rejection event rather than crashing.
+        if self.resume_graph is None:
+            yield {"event": "resume_rejected", "incident_id": incident_id,
+                   "reason": "resume_with_input not available: no gated route configured",
+                   "ts": _now()}
+            return
         # Snapshot the intervention payload BEFORE we mutate the INC, so
         # we can restore it if the sub-graph blows up. Without this an
         # apply_fix exception leaves the INC stuck at in_progress with a

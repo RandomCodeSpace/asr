@@ -578,6 +578,10 @@ class Skill(BaseModel):
     tools: dict[str, list[str]] = Field(default_factory=dict)
     routes: list[RouteRule] = Field(default_factory=list)
     system_prompt: str
+    stub_response: str | None = None
+    """Per-skill canned response used by ``StubChatModel`` when
+    ``provider.kind == "stub"``.  Takes precedence over any entry in
+    ``_DEFAULT_STUB_CANNED`` for the same agent name."""
 
     @field_validator("tools")
     @classmethod
@@ -1712,7 +1716,10 @@ def _decide_from_signal(inc: Incident) -> str:
     return inc.agents_run[-1].signal or "default"
 
 
-_STUB_CANNED = {
+_DEFAULT_STUB_CANNED: dict[str, str] = {
+    # Back-compat defaults for the four canonical agents.  Any YAML-defined
+    # agent can override or extend this via ``skill.stub_response``; new agents
+    # without an entry here fall through to StubChatModel's generic placeholder.
     "intake": "Created INC, no prior matches. Routing to triage.",
     "triage": "Severity medium, category latency. No recent deploys correlate.",
     "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
@@ -1720,66 +1727,64 @@ _STUB_CANNED = {
 }
 
 
-def _latest_di_run(incident: Incident):
-    """Return the most recent deep_investigator AgentRun, or None."""
+def _latest_run_for(incident: Incident, agent_name: str | None):
+    """Return the most recent ``AgentRun`` for ``agent_name``, or None.
+
+    ``agent_name`` is whichever agent ran immediately before the gate,
+    derived at runtime from ``state["last_agent"]`` — so the gate is
+    config-driven and works for any YAML-defined upstream, not just
+    ``deep_investigator``.
+    """
+    if not agent_name:
+        return None
     for run in reversed(incident.agents_run):
-        if run.agent == "deep_investigator":
+        if run.agent == agent_name:
             return run
     return None
 
 
-def _latest_di_confidence(incident: Incident) -> float | None:
-    """Return the most recent deep_investigator AgentRun confidence, or None."""
-    run = _latest_di_run(incident)
-    return run.confidence if run else None
-
-
 def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
-    """Build the intervention gate node placed between DI and resolution.
+    """Build the intervention gate node placed before a gated downstream.
 
-    If the latest deep_investigator confidence is below the configured
-    threshold (or absent), the gate marks the incident as `awaiting_input`,
-    populates `pending_intervention`, and routes to END. Otherwise it routes
-    to `resolution`.
+    The gate evaluates the confidence of whichever agent ran immediately
+    before it (``state["last_agent"]``). If that confidence is below the
+    configured threshold (or absent), the gate marks the incident
+    ``awaiting_input``, populates ``pending_intervention``, and routes
+    to END. Otherwise it routes to the gated target.
 
-    Implemented as a plain async coroutine (not via ``make_agent_node``) so
-    it does not invoke an LLM — but it IS a real graph node, so streamed
-    events surface ``enter gate`` / ``exit gate``.
+    Implemented as a plain async coroutine (not via ``make_agent_node``)
+    so it does not invoke an LLM — but it IS a real graph node, so
+    streamed events surface ``enter gate`` / ``exit gate``.
 
-    .. note::
-       The gate's *structural* placement is config-driven (see
-       :func:`_collect_gated_edges`), but its *semantic* check is still
-       pinned to ``deep_investigator``'s confidence via
-       :func:`_latest_di_confidence`. Moving the gate marker to a
-       different agent pair via ``gate: confidence`` on another route
-       will compile, but the gate will silently evaluate the wrong (or
-       absent) confidence value. Generalising this is tracked as
-       follow-up work — pass the upstream agent name as a parameter so
-       the lookup is config-driven.
+    The gate is fully agent-agnostic: any YAML route carrying
+    ``gate: confidence`` causes the gate to evaluate the upstream agent
+    named on that route, regardless of agent identity.
     """
     threshold = cfg.intervention.confidence_threshold
     teams = list(cfg.intervention.escalation_teams)
 
     async def gate(state: GraphState) -> dict:
         incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
+        upstream = state.get("last_agent")
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
             incident = store.load(incident.id)
         except FileNotFoundError:
             pass
-        di_run = _latest_di_run(incident)
-        di_conf = di_run.confidence if di_run else None
-        if di_conf is None or di_conf < threshold:
+        upstream_run = _latest_run_for(incident, upstream)
+        upstream_conf = upstream_run.confidence if upstream_run else None
+        if upstream_conf is None or upstream_conf < threshold:
             incident.status = "awaiting_input"
             # Surface the upstream agent's own summary + rationale so the
             # human reviewer can decide what input to give without scrolling
             # through every step of the agents-run log.
             incident.pending_intervention = {
                 "reason": "low_confidence",
-                "confidence": di_conf,
+                "confidence": upstream_conf,
                 "threshold": threshold,
-                "summary": di_run.summary if di_run else "",
-                "rationale": di_run.confidence_rationale if di_run else "",
+                "upstream_agent": upstream,
+                "summary": upstream_run.summary if upstream_run else "",
+                "rationale": upstream_run.confidence_rationale if upstream_run else "",
                 "options": ["resume_with_input", "escalate", "stop"],
                 "escalation_teams": teams,
             }
@@ -1802,11 +1807,17 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     valid_signals = frozenset(cfg.orchestrator.signals)
     nodes: dict = {}
     for agent_name, skill in skills.items():
+        if skill.stub_response is not None:
+            stub_canned: dict[str, str] | None = {skill.name: skill.stub_response}
+        elif agent_name in _DEFAULT_STUB_CANNED:
+            stub_canned = {agent_name: _DEFAULT_STUB_CANNED[agent_name]}
+        else:
+            stub_canned = None
         llm = get_llm(
             cfg.llm,
             skill.model,
             role=agent_name,
-            stub_canned=_STUB_CANNED,
+            stub_canned=stub_canned,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal
@@ -2018,8 +2029,18 @@ class Orchestrator:
             registry = await load_tools(cfg.mcp, stack)
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry)
-            resume_graph = await build_resume_graph(
-                cfg=cfg, skills=skills, store=store, registry=registry,
+            # Build the resume graph only when at least one skill declares
+            # a gated route. Without gates an INC can never enter the
+            # ``awaiting_input`` state, so the resume path is dead code —
+            # and ``build_resume_graph`` raises by design when gated_edges
+            # is empty. This unblocks intake-only YAML configurations.
+            has_gates = any(
+                r.gate for s in skills.values() for r in s.routes
+            )
+            resume_graph = (
+                await build_resume_graph(
+                    cfg=cfg, skills=skills, store=store, registry=registry,
+                ) if has_gates else None
             )
             return cls(cfg, store, skills, registry, graph, resume_graph, stack)
         except BaseException:
@@ -2193,6 +2214,14 @@ class Orchestrator:
         user_text = (decision.get("input") or "").strip()
         if not user_text:
             raise ValueError("resume_with_input requires a non-empty 'input'")
+        # The resume sub-graph only exists when the YAML declares at least
+        # one gated route. An intake-only configuration has nothing to
+        # resume into — bail with a rejection event rather than crashing.
+        if self.resume_graph is None:
+            yield {"event": "resume_rejected", "incident_id": incident_id,
+                   "reason": "resume_with_input not available: no gated route configured",
+                   "ts": _now()}
+            return
         # Snapshot the intervention payload BEFORE we mutate the INC, so
         # we can restore it if the sub-graph blows up. Without this an
         # apply_fix exception leaves the INC stuck at in_progress with a
