@@ -37,6 +37,7 @@ class EmbeddingConfig(BaseModel):
     provider: str
     model: str
     deployment: str | None = None  # azure_openai
+    dim: int = 1024
 
 
 class LLMConfig(BaseModel):
@@ -104,6 +105,13 @@ class IncidentConfig(BaseModel):
     similarity_method: Literal["keyword", "embedding"] = "keyword"
 
 
+class StorageConfig(BaseModel):
+    """Database backend. SQLite (with sqlite-vec) for dev, Postgres (with pgvector) for prod."""
+    url: str = "sqlite:///incidents.db"
+    pool_size: int = 5      # postgres only; sqlite uses NullPool
+    echo: bool = False
+
+
 class Paths(BaseModel):
     skills_dir: str = "config/skills"
     incidents_dir: str = "incidents"
@@ -145,6 +153,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
     incidents: IncidentConfig = Field(default_factory=IncidentConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     environments: list[str] = Field(
         default_factory=lambda: ["production", "staging", "dev", "local"]
     )

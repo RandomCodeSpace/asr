@@ -121,3 +121,24 @@ def test_orchestrator_explicit_entry_agent():
         orchestrator=OrchestratorConfig(entry_agent="diagnostic"),
     )
     assert cfg.orchestrator.entry_agent == "diagnostic"
+
+
+def test_storage_config_default():
+    from orchestrator.config import AppConfig, LLMConfig, MCPConfig
+    cfg = AppConfig(llm=LLMConfig.stub(), mcp=MCPConfig())
+    assert cfg.storage.url == "sqlite:///incidents.db"
+    assert cfg.storage.pool_size == 5
+    assert cfg.storage.echo is False
+
+
+def test_embedding_config_dim_default():
+    from orchestrator.config import EmbeddingConfig
+    e = EmbeddingConfig(provider="p", model="m")
+    assert e.dim == 1024
+
+
+def test_storage_config_postgres_url():
+    from orchestrator.config import StorageConfig
+    s = StorageConfig(url="postgresql+psycopg://u:p@h/db", pool_size=10)
+    assert s.url.startswith("postgresql+psycopg://")
+    assert s.pool_size == 10
