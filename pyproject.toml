@@ -21,6 +21,10 @@ dependencies = [
     "streamlit>=1.40",
     "sqlalchemy>=2.0",
     "uvicorn[standard]>=0.32",
+    "sqlite-vec>=0.1.6",
+    "pgvector>=0.3",
+    "psycopg[binary]>=3.2",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
