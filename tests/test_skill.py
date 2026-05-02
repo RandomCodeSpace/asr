@@ -1,5 +1,6 @@
 import pytest
 import yaml
+from pydantic import ValidationError
 from orchestrator.skill import Skill, RouteRule, load_skill, load_all_skills
 
 
@@ -8,7 +9,7 @@ _BASE_CONFIG = {
     "description": "First-line agent",
     "model": "llama3.1:70b",
     "temperature": 0.2,
-    "tools": ["lookup_similar_incidents", "create_incident", "get_user_context"],
+    "tools": {"local": ["lookup_similar_incidents", "create_incident", "get_user_context"]},
     "routes": [
         {"when": "matched_known_issue", "next": "resolution"},
         {"when": "default", "next": "triage"},
@@ -32,9 +33,9 @@ def test_load_skill_uses_directory_name(tmp_path):
     assert isinstance(skill, Skill)
     assert skill.name == "intake"
     assert skill.model == "llama3.1:70b"
-    assert skill.tools == [
-        "lookup_similar_incidents", "create_incident", "get_user_context",
-    ]
+    assert skill.tools == {
+        "local": ["lookup_similar_incidents", "create_incident", "get_user_context"],
+    }
     assert skill.routes == [
         RouteRule(when="matched_known_issue", next="resolution"),
         RouteRule(when="default", next="triage"),
@@ -148,6 +149,34 @@ def test_load_skill_rejects_invalid_directory_name(tmp_path, bad_name):
     (d / "system.md").write_text("body")
     with pytest.raises(ValueError, match="invalid agent name"):
         load_skill(d)
+
+
+def test_skill_tools_map_shape_accepted():
+    """Map-form tools (dict[str, list[str]]) parses without error."""
+    s = Skill(
+        name="agent", description="d",
+        tools={"local": ["tool_a", "tool_b"], "ext": ["tool_c"]},
+        system_prompt="p",
+    )
+    assert s.tools == {"local": ["tool_a", "tool_b"], "ext": ["tool_c"]}
+
+
+def test_skill_tools_wildcard_sole_entry_accepted():
+    s = Skill(name="agent", description="d",
+               tools={"local": ["*"]}, system_prompt="p")
+    assert s.tools == {"local": ["*"]}
+
+
+def test_skill_tools_wildcard_mixed_rejected():
+    with pytest.raises(ValidationError, match="must be the sole entry"):
+        Skill(name="agent", description="d",
+              tools={"local": ["*", "extra"]}, system_prompt="p")
+
+
+def test_skill_tools_empty_list_rejected():
+    with pytest.raises(ValidationError, match="empty tool list"):
+        Skill(name="agent", description="d",
+              tools={"local": []}, system_prompt="p")
 
 
 def test_route_rule_gate_defaults_to_none():

@@ -103,7 +103,17 @@ from datetime import datetime, timezone, timedelta
 
 
 # ----- imports for mcp_loader.py -----
-"""Load MCP servers (in_process / stdio / http / sse) and build a tool registry."""
+"""Load MCP servers (in_process / stdio / http / sse) and build a tool registry.
+
+Each tool is registered by ``(server_name, original_tool_name)`` and its
+LangChain ``.name`` is rewritten to ``<server_name>:<original_tool_name>`` so
+the LLM sees disambiguated names when two MCP servers both expose a tool with
+the same base name.
+
+The caller resolves a skill's ``tools`` map (``dict[str, list[str]]``) into a
+flat list of :class:`~langchain_core.tools.BaseTool` via
+:meth:`ToolRegistry.resolve`.
+"""
 # The FastMCP Client instances loaded here MUST stay open for the entire
 # lifetime of the returned ToolRegistry, otherwise the LangChain tool wrappers
 # hold references to a closed transport and the FIRST tool invocation raises:
@@ -483,9 +493,25 @@ class Skill(BaseModel):
     description: str
     model: str | None = None
     temperature: float | None = None
-    tools: list[str] = Field(default_factory=list)
+    tools: dict[str, list[str]] = Field(default_factory=dict)
     routes: list[RouteRule] = Field(default_factory=list)
     system_prompt: str
+
+    @field_validator("tools")
+    @classmethod
+    def _validate_tools(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        for server, names in v.items():
+            if not names:
+                raise ValueError(
+                    f"empty tool list for server {server!r}; "
+                    f"remove the key or use ['*']"
+                )
+            if "*" in names and len(names) != 1:
+                raise ValueError(
+                    f"'*' must be the sole entry for server "
+                    f"{server!r}; got {names!r}"
+                )
+        return v
 
     @field_validator("system_prompt")
     @classmethod
@@ -953,28 +979,86 @@ async def get_user_context(user_id: str) -> dict:
 
 @dataclass
 class ToolEntry:
-    name: str
+    name: str          # original tool name as exposed by the server
     description: str
-    server: str
+    server: str        # server name as declared in cfg.mcp.servers
     category: str
-    tool: BaseTool
+    tool: BaseTool     # LangChain tool with .name = "<server>:<name>"
 
 
 @dataclass
 class ToolRegistry:
-    entries: dict[str, ToolEntry] = field(default_factory=dict)
+    entries: dict[tuple[str, str], ToolEntry] = field(default_factory=dict)
 
     def add(self, entry: ToolEntry) -> None:
-        if entry.name in self.entries:
-            raise ValueError(f"Duplicate tool name in registry: {entry.name}")
-        self.entries[entry.name] = entry
+        key = (entry.server, entry.name)
+        if key in self.entries:
+            raise ValueError(
+                f"Duplicate tool {entry.name!r} on server {entry.server!r}"
+            )
+        self.entries[key] = entry
 
-    def get(self, names: list[str]) -> list[BaseTool]:
+    def tools_for_server(self, server: str) -> list[ToolEntry]:
+        """Return all entries belonging to ``server``."""
+        return [e for e in self.entries.values() if e.server == server]
+
+    def tools_in_process(self, in_process_server_names: set[str]) -> list[ToolEntry]:
+        """Return all entries whose server is in ``in_process_server_names``."""
+        return [e for e in self.entries.values()
+                if e.server in in_process_server_names]
+
+    def resolve(self, spec: dict[str, list[str]], cfg: "MCPConfig") -> list[BaseTool]:
+        """Resolve a skill's ``tools`` map to a flat, deduplicated list of
+        LangChain tools.
+
+        Keys are server names declared in ``cfg.mcp.servers`` or the special
+        key ``"local"`` which aggregates every server with
+        ``transport=in_process``. Values are explicit tool-name lists or
+        ``["*"]`` for "all tools from this server".
+
+        Raises :class:`ValueError` on unknown server key or unknown tool name.
+        """
+        in_process_servers = {
+            s.name for s in cfg.servers if s.transport == "in_process"
+        }
+        declared_servers = {s.name for s in cfg.servers}
         out: list[BaseTool] = []
-        for n in names:
-            if n not in self.entries:
-                raise KeyError(f"Tool not in registry: {n}")
-            out.append(self.entries[n].tool)
+        seen: set[tuple[str, str]] = set()
+
+        def _add(entry: ToolEntry) -> None:
+            key = (entry.server, entry.name)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(entry.tool)
+
+        for key, names in spec.items():
+            if key == "local":
+                available = [e for e in self.entries.values()
+                             if e.server in in_process_servers]
+            elif key in declared_servers:
+                available = [e for e in self.entries.values()
+                             if e.server == key]
+            else:
+                raise ValueError(
+                    f"unknown server {key!r} in skill tools; known: "
+                    f"{sorted(declared_servers | {'local'})}"
+                )
+
+            if names == ["*"]:
+                for e in available:
+                    _add(e)
+            else:
+                for n in names:
+                    matched = [e for e in available if e.name == n]
+                    if not matched:
+                        raise ValueError(
+                            f"tool {n!r} not found in server {key!r} "
+                            f"(available: {sorted(e.name for e in available)})"
+                        )
+                    for e in matched:
+                        _add(e)
+
         return out
 
     def by_category(self) -> dict[str, list[ToolEntry]]:
@@ -999,7 +1083,13 @@ async def _load_in_process(server_cfg: MCPServerConfig,
     from fastmcp import Client
     client = Client(fmcp)
     await stack.enter_async_context(client)
-    return await load_mcp_tools(client.session)
+    tools = await load_mcp_tools(client.session)
+    # Rewrite each tool's .name to "<server>:<original>" for LLM disambiguation.
+    for t in tools:
+        original_name = t.name
+        t.name = f"{server_cfg.name}:{original_name}"
+        t._original_mcp_name = original_name  # type: ignore[attr-defined]
+    return tools
 
 
 async def _load_remote(server_cfg: MCPServerConfig,
@@ -1016,7 +1106,13 @@ async def _load_remote(server_cfg: MCPServerConfig,
     else:
         raise ValueError(f"Unknown transport: {server_cfg.transport}")
     await stack.enter_async_context(client)
-    return await load_mcp_tools(client.session)
+    tools = await load_mcp_tools(client.session)
+    # Rewrite each tool's .name to "<server>:<original>" for LLM disambiguation.
+    for t in tools:
+        original_name = t.name
+        t.name = f"{server_cfg.name}:{original_name}"
+        t._original_mcp_name = original_name  # type: ignore[attr-defined]
+    return tools
 
 
 async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
@@ -1035,8 +1131,9 @@ async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
         else:
             tools = await _load_remote(server_cfg, stack)
         for t in tools:
+            original = getattr(t, "_original_mcp_name", t.name)
             registry.add(ToolEntry(
-                name=t.name, description=t.description or "",
+                name=original, description=t.description or "",
                 server=server_cfg.name, category=server_cfg.category, tool=t,
             ))
     return registry
@@ -1535,7 +1632,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
             temperature=skill.temperature,
             stub_canned=_STUB_CANNED,
         )
-        tools = registry.get(skill.tools)
+        tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal
         nodes[agent_name] = make_agent_node(
             skill=skill, llm=llm, tools=tools,
@@ -1761,24 +1858,32 @@ class Orchestrator:
                 "name": s.name,
                 "description": s.description,
                 "model": s.model or self.cfg.llm.default_model,
-                "tools": list(s.tools),
+                # Expose the flat list of prefixed tool names the LLM sees.
+                # resolve() returns list[BaseTool], so .name is on the tool directly.
+                "tools": [
+                    t.name
+                    for t in self.registry.resolve(s.tools, self.cfg.mcp)
+                ],
                 "routes": [r.model_dump() for r in s.routes],
             }
             for s in self.skills.values()
         ]
 
     def list_tools(self) -> list[dict]:
+        # Build reverse map: prefixed tool name -> list of skill names that bind it.
+        # resolve() returns list[BaseTool]; tool.name is the prefixed form.
         bindings: dict[str, list[str]] = {}
         for skill in self.skills.values():
-            for tool_name in skill.tools:
-                bindings.setdefault(tool_name, []).append(skill.name)
+            for t in self.registry.resolve(skill.tools, self.cfg.mcp):
+                bindings.setdefault(t.name, []).append(skill.name)
         return [
             {
-                "name": e.name,
+                "name": e.tool.name,          # prefixed: "<server>:<original>"
+                "original_name": e.name,      # original tool name as exposed by server
                 "description": e.description,
                 "category": e.category,
                 "server": e.server,
-                "bound_agents": bindings.get(e.name, []),
+                "bound_agents": bindings.get(e.tool.name, []),
             }
             for e in self.registry.entries.values()
         ]
@@ -1933,12 +2038,16 @@ class Orchestrator:
                "status": final.status, "ts": _now()}
 
     async def _invoke_tool(self, name: str, args: dict):
-        """Call an MCP tool by name, going through the LangChain wrapper.
+        """Call an MCP tool by original name, going through the LangChain wrapper.
 
+        Searches the registry for any entry whose original ``name`` matches.
         Used for orchestrator-driven tool calls (e.g. notify_oncall on
         escalate) that aren't initiated by an LLM.
         """
-        entry = self.registry.entries.get(name)
+        entry = next(
+            (e for e in self.registry.entries.values() if e.name == name),
+            None,
+        )
         if entry is None:
             raise KeyError(f"tool '{name}' not registered")
         return await entry.tool.ainvoke(args)

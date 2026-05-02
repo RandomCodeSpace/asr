@@ -659,7 +659,11 @@ def main() -> None:
                 st.markdown(f"**{cat}**")
                 for t in by_cat[cat]:
                     bound = ", ".join(f"`{a}`" for a in t["bound_agents"]) or "_(unbound)_"
-                    st.markdown(f"- `{t['name']}` — {t['description'][:80]}  \n  bound to: {bound}")
+                    label = t.get("original_name", t["name"])
+                    st.markdown(
+                        f"- **{label}** — {t['description'][:80]}  \n"
+                        f"  `{t['name']}` · bound to: {bound}"
+                    )
 
     render_incident_detail(store)
 

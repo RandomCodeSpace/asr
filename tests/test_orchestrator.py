@@ -33,7 +33,8 @@ async def test_list_agents_returns_4_with_metadata(cfg):
         names = {a["name"] for a in agents}
         assert names == {"intake", "triage", "deep_investigator", "resolution"}
         intake = next(a for a in agents if a["name"] == "intake")
-        assert "lookup_similar_incidents" in intake["tools"]
+        # Tools are now prefixed: "<server>:<original>"
+        assert "local_inc:lookup_similar_incidents" in intake["tools"]
     finally:
         await orch.aclose()
 
@@ -45,8 +46,9 @@ async def test_list_tools_returns_grouped_by_category(cfg):
         tools = orch.list_tools()
         cats = {t["category"] for t in tools}
         assert {"incident_management", "observability", "remediation", "user_context"} <= cats
-        # Each tool reports which agents use it
-        lookup = next(t for t in tools if t["name"] == "lookup_similar_incidents")
+        # Each tool reports which agents use it; name is now prefixed
+        lookup = next(t for t in tools
+                      if t["name"] == "local_inc:lookup_similar_incidents")
         assert "intake" in lookup["bound_agents"]
     finally:
         await orch.aclose()

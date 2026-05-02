@@ -62,9 +62,25 @@ class Skill(BaseModel):
     description: str
     model: str | None = None
     temperature: float | None = None
-    tools: list[str] = Field(default_factory=list)
+    tools: dict[str, list[str]] = Field(default_factory=dict)
     routes: list[RouteRule] = Field(default_factory=list)
     system_prompt: str
+
+    @field_validator("tools")
+    @classmethod
+    def _validate_tools(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        for server, names in v.items():
+            if not names:
+                raise ValueError(
+                    f"empty tool list for server {server!r}; "
+                    f"remove the key or use ['*']"
+                )
+            if "*" in names and len(names) != 1:
+                raise ValueError(
+                    f"'*' must be the sole entry for server "
+                    f"{server!r}; got {names!r}"
+                )
+        return v
 
     @field_validator("system_prompt")
     @classmethod

@@ -65,24 +65,32 @@ class Orchestrator:
                 "name": s.name,
                 "description": s.description,
                 "model": s.model or self.cfg.llm.default_model,
-                "tools": list(s.tools),
+                # Expose the flat list of prefixed tool names the LLM sees.
+                # resolve() returns list[BaseTool], so .name is on the tool directly.
+                "tools": [
+                    t.name
+                    for t in self.registry.resolve(s.tools, self.cfg.mcp)
+                ],
                 "routes": [r.model_dump() for r in s.routes],
             }
             for s in self.skills.values()
         ]
 
     def list_tools(self) -> list[dict]:
+        # Build reverse map: prefixed tool name -> list of skill names that bind it.
+        # resolve() returns list[BaseTool]; tool.name is the prefixed form.
         bindings: dict[str, list[str]] = {}
         for skill in self.skills.values():
-            for tool_name in skill.tools:
-                bindings.setdefault(tool_name, []).append(skill.name)
+            for t in self.registry.resolve(skill.tools, self.cfg.mcp):
+                bindings.setdefault(t.name, []).append(skill.name)
         return [
             {
-                "name": e.name,
+                "name": e.tool.name,          # prefixed: "<server>:<original>"
+                "original_name": e.name,      # original tool name as exposed by server
                 "description": e.description,
                 "category": e.category,
                 "server": e.server,
-                "bound_agents": bindings.get(e.name, []),
+                "bound_agents": bindings.get(e.tool.name, []),
             }
             for e in self.registry.entries.values()
         ]
@@ -237,12 +245,16 @@ class Orchestrator:
                "status": final.status, "ts": _now()}
 
     async def _invoke_tool(self, name: str, args: dict):
-        """Call an MCP tool by name, going through the LangChain wrapper.
+        """Call an MCP tool by original name, going through the LangChain wrapper.
 
+        Searches the registry for any entry whose original ``name`` matches.
         Used for orchestrator-driven tool calls (e.g. notify_oncall on
         escalate) that aren't initiated by an LLM.
         """
-        entry = self.registry.entries.get(name)
+        entry = next(
+            (e for e in self.registry.entries.values() if e.name == name),
+            None,
+        )
         if entry is None:
             raise KeyError(f"tool '{name}' not registered")
         return await entry.tool.ainvoke(args)

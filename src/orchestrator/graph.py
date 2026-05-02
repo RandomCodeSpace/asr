@@ -509,7 +509,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
             temperature=skill.temperature,
             stub_canned=_STUB_CANNED,
         )
-        tools = registry.get(skill.tools)
+        tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal
         nodes[agent_name] = make_agent_node(
             skill=skill, llm=llm, tools=tools,

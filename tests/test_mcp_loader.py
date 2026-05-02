@@ -44,27 +44,87 @@ async def test_loader_skips_disabled_servers(cfg):
 async def test_loader_builds_categorized_registry(cfg):
     async with AsyncExitStack() as stack:
         registry: ToolRegistry = await load_tools(cfg, stack)
-        assert "lookup_similar_incidents" in registry.entries
-        assert registry.entries["lookup_similar_incidents"].category == "incident_management"
-        assert registry.entries["get_logs"].category == "observability"
+        # Entries are now keyed by (server, original_name)
+        key = ("local_inc", "lookup_similar_incidents")
+        assert key in registry.entries
+        assert registry.entries[key].category == "incident_management"
+        obs_key = ("local_observability", "get_logs")
+        assert registry.entries[obs_key].category == "observability"
 
 
 @pytest.mark.asyncio
-async def test_registry_get_tools_for_subset(cfg):
+async def test_registry_tools_are_name_prefixed(cfg):
+    """Each tool's LangChain .name must be '<server>:<original>'."""
     async with AsyncExitStack() as stack:
         registry: ToolRegistry = await load_tools(cfg, stack)
-        tools = registry.get(["lookup_similar_incidents", "get_logs"])
+        entry = registry.entries[("local_inc", "lookup_similar_incidents")]
+        assert entry.tool.name == "local_inc:lookup_similar_incidents"
+        assert entry.name == "lookup_similar_incidents"
+
+
+@pytest.mark.asyncio
+async def test_registry_resolve_wildcard_local(cfg):
+    """resolve with local:['*'] returns all in-process tools."""
+    async with AsyncExitStack() as stack:
+        registry: ToolRegistry = await load_tools(cfg, stack)
+        tools = registry.resolve({"local": ["*"]}, cfg)
+        names = {t.name for t in tools}
+        assert "local_inc:lookup_similar_incidents" in names
+        assert "local_observability:get_logs" in names
+        assert "local_user:get_user_context" in names
+        # disabled server must not appear
+        assert not any("external_off" in n for n in names)
+
+
+@pytest.mark.asyncio
+async def test_registry_resolve_selective_local(cfg):
+    """resolve with specific local names returns only those tools."""
+    async with AsyncExitStack() as stack:
+        registry: ToolRegistry = await load_tools(cfg, stack)
+        tools = registry.resolve(
+            {"local": ["lookup_similar_incidents", "get_logs"]}, cfg
+        )
         assert len(tools) == 2
         names = {t.name for t in tools}
-        assert names == {"lookup_similar_incidents", "get_logs"}
+        assert names == {"local_inc:lookup_similar_incidents",
+                         "local_observability:get_logs"}
 
 
 @pytest.mark.asyncio
-async def test_registry_get_unknown_tool_raises(cfg):
+async def test_registry_resolve_wildcard_named_server(cfg):
+    """resolve with <server>:['*'] returns all tools from that server."""
     async with AsyncExitStack() as stack:
         registry: ToolRegistry = await load_tools(cfg, stack)
-        with pytest.raises(KeyError, match="does_not_exist"):
-            registry.get(["does_not_exist"])
+        tools = registry.resolve({"local_inc": ["*"]}, cfg)
+        names = {t.name for t in tools}
+        assert all(n.startswith("local_inc:") for n in names)
+        assert "local_inc:lookup_similar_incidents" in names
+
+
+@pytest.mark.asyncio
+async def test_registry_resolve_selective_named_server(cfg):
+    """resolve with specific named-server tool returns exactly that tool."""
+    async with AsyncExitStack() as stack:
+        registry: ToolRegistry = await load_tools(cfg, stack)
+        tools = registry.resolve({"local_observability": ["get_logs"]}, cfg)
+        assert len(tools) == 1
+        assert tools[0].name == "local_observability:get_logs"
+
+
+@pytest.mark.asyncio
+async def test_registry_resolve_unknown_server_raises(cfg):
+    async with AsyncExitStack() as stack:
+        registry: ToolRegistry = await load_tools(cfg, stack)
+        with pytest.raises(ValueError, match="unknown server"):
+            registry.resolve({"ghost_server": ["*"]}, cfg)
+
+
+@pytest.mark.asyncio
+async def test_registry_resolve_unknown_tool_raises(cfg):
+    async with AsyncExitStack() as stack:
+        registry: ToolRegistry = await load_tools(cfg, stack)
+        with pytest.raises(ValueError, match="does_not_exist"):
+            registry.resolve({"local": ["does_not_exist"]}, cfg)
 
 
 @pytest.mark.asyncio
@@ -80,7 +140,7 @@ async def test_loaded_tool_is_invocable_after_load_returns(cfg):
     """
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg, stack)
-        tool = registry.entries["get_user_context"].tool
+        entry = registry.entries[("local_user", "get_user_context")]
         # invoke the tool — must not raise "TCPTransport closed"
-        result = await tool.ainvoke({"user_id": "test-user"})
+        result = await entry.tool.ainvoke({"user_id": "test-user"})
         assert "team" in str(result) or "user_id" in str(result)

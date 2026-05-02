@@ -1,10 +1,7 @@
 description: Propose and (mock-)apply a fix; close the INC or escalate
 temperature: 0.0
 tools:
-  - propose_fix
-  - apply_fix
-  - notify_oncall
-  - update_incident
+  local: ["propose_fix", "apply_fix", "notify_oncall", "update_incident"]
 routes:
   - when: success
     next: __end__

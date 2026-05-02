@@ -1,9 +1,7 @@
 description: Perform diagnostic deep-dive — pull logs, metrics, propose hypotheses
 temperature: 0.0
 tools:
-  - get_logs
-  - get_metrics
-  - update_incident
+  local: ["get_logs", "get_metrics", "update_incident"]
 routes:
   - when: success
     next: resolution
