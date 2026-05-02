@@ -44,7 +44,7 @@ packages = ["src/orchestrator"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-v --cov=src/orchestrator --cov-report=term-missing --cov-report=xml"
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 
 [tool.ruff]
 line-length = 100
