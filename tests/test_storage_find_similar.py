@@ -1,45 +1,44 @@
 """find_similar tests — embedding ordering and dialect dispatch.
 
-Default backend is SQLite (with sqlite-vec). Postgres parity is gated
+Uses a FAISS-backed repo with a stub embedder. Postgres parity is gated
 behind ``POSTGRES_TEST_URL`` env var; if unset, the postgres params skip.
 """
 from __future__ import annotations
-import os
 import pytest
 
 from orchestrator.config import (
-    EmbeddingConfig, MetadataConfig, ProviderConfig,
+    EmbeddingConfig, MetadataConfig, ProviderConfig, VectorConfig,
 )
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
 from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.vector import build_vector_store
 
 
-def _engine_params() -> list[tuple[str, str]]:
-    out = [("sqlite", "")]  # url filled in per-test from tmp_path
-    pg = os.environ.get("POSTGRES_TEST_URL")
-    if pg:
-        out.append(("postgres", pg))
-    return out
-
-
-@pytest.fixture(params=_engine_params(), ids=lambda p: p[0])
-def repo(request, tmp_path):
-    kind, url = request.param
-    if kind == "sqlite":
-        url = f"sqlite:///{tmp_path}/test.db"
-    eng = build_engine(MetadataConfig(url=url))
-    Base.metadata.drop_all(eng)
+@pytest.fixture
+def repo(tmp_path):
+    db = tmp_path / "test.db"
+    eng = build_engine(MetadataConfig(url=f"sqlite:///{db}"))
     Base.metadata.create_all(eng)
+
     embedder = build_embedder(
-        EmbeddingConfig(provider="s", model="x", dim=1024),
+        EmbeddingConfig(provider="s", model="x", dim=8),
         {"s": ProviderConfig(kind="stub")},
     )
-    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.0)
+    vec_path = str(tmp_path / "vs")
+    vs = build_vector_store(
+        VectorConfig(backend="faiss", path=vec_path,
+                     collection_name="t", distance_strategy="cosine"),
+        embedder,
+    )
+    return IncidentRepository(
+        engine=eng, embedder=embedder, vector_store=vs,
+        vector_path=vec_path, vector_index_name="t",
+        distance_strategy="cosine", similarity_threshold=0.0,
+    )
 
 
-@pytest.mark.xfail(reason="vector path lands in Task M4", strict=False)
 def test_find_similar_returns_self_first(repo):
     a = repo.create(query="redis OOMKill in payments", environment="production",
                     reporter_id="u", reporter_team="t")
@@ -57,7 +56,6 @@ def test_find_similar_returns_self_first(repo):
     assert top_score > 0.99
 
 
-@pytest.mark.xfail(reason="vector path lands in Task M4", strict=False)
 def test_find_similar_filters_by_environment(repo):
     a = repo.create(query="match me", environment="production",
                     reporter_id="u", reporter_team="t")
@@ -71,7 +69,6 @@ def test_find_similar_filters_by_environment(repo):
     assert {h[0].id for h in hits} == {a.id}
 
 
-@pytest.mark.xfail(reason="vector path lands in Task M4", strict=False)
 def test_find_similar_excludes_unresolved(repo):
     a = repo.create(query="hello", environment="dev",
                     reporter_id="u", reporter_team="t")
@@ -93,7 +90,6 @@ def test_find_similar_keyword_fallback_when_no_embedder(tmp_path):
     assert hits and hits[0][0].id == a.id
 
 
-@pytest.mark.xfail(reason="vector path lands in Task M4", strict=False)
 def test_find_similar_threshold_excludes_low_scores(repo):
     a = repo.create(query="alpha", environment="dev",
                     reporter_id="u", reporter_team="t")

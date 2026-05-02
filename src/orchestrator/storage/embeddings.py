@@ -28,7 +28,12 @@ class _StubEmbeddings(Embeddings):
             hashlib.sha256(text.encode("utf-8")).digest()[:8], "little"
         )
         rng = np.random.default_rng(seed)
-        return rng.standard_normal(self.dim).astype(np.float32).tolist()
+        v = rng.standard_normal(self.dim).astype(np.float32)
+        # Normalize to unit length so cosine similarity = dot product in [−1, 1].
+        norm = np.linalg.norm(v)
+        if norm > 0:
+            v = v / norm
+        return v.tolist()
 
     def embed_query(self, text: str) -> list[float]:
         return self._vec(text)
