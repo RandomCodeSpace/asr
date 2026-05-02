@@ -9,7 +9,7 @@ from orchestrator.config import AppConfig, LLMConfig, MCPConfig, MCPServerConfig
 @pytest.fixture
 def cfg(tmp_path):
     return AppConfig(
-        llm=LLMConfig(provider="stub", default_model="stub-1"),
+        llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[
             MCPServerConfig(name="local_inc", transport="in_process",
                             module="orchestrator.mcp_servers.incident",
@@ -104,6 +104,28 @@ async def test_investigate_stream_emits_events(cfg):
                     events.append(json.loads(line[len("data:"):].strip()))
     assert events, "expected at least one SSE event"
     assert all(isinstance(e, dict) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_delete_endpoint_soft_deletes_incident(cfg):
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        created = await client.post(
+            "/investigate",
+            json={"query": "to be deleted", "environment": "production"},
+        )
+        inc_id = created.json()["incident_id"]
+        del_res = await client.delete(f"/incidents/{inc_id}")
+        assert del_res.status_code == 200
+        body = del_res.json()
+        assert body["status"] == "deleted"
+        assert body["deleted_at"] is not None
+        listing = await client.get("/incidents")
+        assert all(i["id"] != inc_id for i in listing.json()), \
+            "deleted incident must be hidden from /incidents"
+        single = await client.get(f"/incidents/{inc_id}")
+        assert single.status_code == 200
+        assert single.json()["status"] == "deleted"
 
 
 @pytest.mark.asyncio

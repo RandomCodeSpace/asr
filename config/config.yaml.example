@@ -2,17 +2,48 @@
 # Copy to config/config.yaml and edit. Env vars use ${VAR_NAME} syntax.
 
 llm:
-  provider: stub               # stub | ollama | azure_openai
-  default_model: stub-1
-  default_temperature: 0.0
-  ollama:
-    base_url: https://ollama.com
-    api_key: ${OLLAMA_API_KEY}
-  azure_openai:
-    endpoint: ${AZURE_ENDPOINT}
-    api_version: 2024-08-01-preview
-    api_key: ${AZURE_OPENAI_KEY}
-    deployment: gpt-4o
+  # Name of the default model (must exist in `models` below). Skills with
+  # `model: <name>` override this; skills that omit `model` use this default.
+  default: stub_default
+
+  # Connection settings per upstream provider. Multiple named models can
+  # share one provider entry.
+  providers:
+    stub:
+      kind: stub
+    ollama_cloud:
+      kind: ollama
+      base_url: https://ollama.com
+      api_key: ${OLLAMA_API_KEY}
+    azure:
+      kind: azure_openai
+      endpoint: ${AZURE_ENDPOINT}
+      api_version: 2024-08-01-preview
+      api_key: ${AZURE_OPENAI_KEY}
+
+  # Named chat models. Reference these from skill `config.yaml` (`model: <name>`).
+  models:
+    stub_default:
+      provider: stub
+      model: stub-1
+    workhorse:
+      provider: ollama_cloud
+      model: gpt-oss:120b
+      temperature: 0.0
+    cheap:
+      provider: ollama_cloud
+      model: gpt-oss:20b
+      temperature: 0.2
+    smart:
+      provider: azure
+      model: gpt-4o
+      deployment: gpt-4o
+      temperature: 0.0
+
+  # Single embedding model (for similarity / retrieval). Optional.
+  embedding:
+    provider: ollama_cloud
+    model: nomic-embed-text
 
 mcp:
   servers:

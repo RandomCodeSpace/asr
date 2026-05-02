@@ -52,6 +52,7 @@ _STATUS_COLOR = {
     "escalated": "red",
     "awaiting_input": "orange",
     "stopped": "gray",
+    "deleted": "gray",
 }
 
 # Human-readable labels — awaiting_input is highlighted as the action-required state.
@@ -116,15 +117,20 @@ def render_sidebar(store: IncidentStore) -> None:
         st.markdown("### Recent INCs")
         col_l, col_r = st.columns([3, 1])
         with col_l:
+            show_deleted = st.checkbox("Show deleted", value=False,
+                                       key="show_deleted")
             statuses = ["all", "new", "in_progress", "matched", "resolved",
                         "escalated", "awaiting_input", "stopped"]
+            if show_deleted:
+                statuses.append("deleted")
             status_filter = st.selectbox("Filter", statuses, key="status_filter",
                                          label_visibility="collapsed")
         with col_r:
             if st.button("↻", help="Refresh"):
                 st.rerun()
 
-        recent = [i.model_dump() for i in store.list_recent(50)]
+        recent = [i.model_dump()
+                  for i in store.list_recent(50, include_deleted=show_deleted)]
         if status_filter != "all":
             recent = [i for i in recent if i["status"] == status_filter]
 
@@ -148,10 +154,23 @@ def render_sidebar(store: IncidentStore) -> None:
                 toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
                 tok_str = (f"{toks/1000:.1f}k tok" if toks >= 1000
                            else f"{toks} tok")
-                if st.button(f"View · {tok_str}",
-                             key=f"inc_{inc['id']}",
-                             use_container_width=True):
-                    st.session_state["selected_incident"] = inc["id"]
+                is_deleted = inc.get("status") == "deleted"
+                view_col, del_col = st.columns([4, 1])
+                with view_col:
+                    if st.button(f"View · {tok_str}",
+                                 key=f"inc_{inc['id']}",
+                                 use_container_width=True):
+                        st.session_state["selected_incident"] = inc["id"]
+                with del_col:
+                    if is_deleted:
+                        st.caption("—")
+                    elif st.button("🗑", key=f"del_{inc['id']}",
+                                   help="Soft-delete (toggle 'Show deleted' to view)",
+                                   use_container_width=True):
+                        store.delete(inc["id"])
+                        if st.session_state.get("selected_incident") == inc["id"]:
+                            st.session_state.pop("selected_incident", None)
+                        st.rerun()
 
 
 def _render_kv_dict_value(key: str, v: dict) -> None:

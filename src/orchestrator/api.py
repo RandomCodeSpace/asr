@@ -91,6 +91,10 @@ def build_app(cfg: AppConfig) -> FastAPI:
     async def incident(incident_id: str):
         return fastapi_app.state.orchestrator.get_incident(incident_id)
 
+    @fastapi_app.delete("/incidents/{incident_id}")
+    async def delete_incident(incident_id: str):
+        return fastapi_app.state.orchestrator.delete_incident(incident_id)
+
     @fastapi_app.post("/investigate")
     async def investigate(req: InvestigateRequest) -> InvestigateResponse:
         inc_id = await fastapi_app.state.orchestrator.start_investigation(

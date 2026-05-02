@@ -11,8 +11,10 @@ def test_loads_yaml_and_resolves_env_vars(monkeypatch):
     monkeypatch.setenv("EXTERNAL_MCP_URL", "https://x.example/mcp")
     monkeypatch.setenv("EXT_TOKEN", "ext-tok")
     cfg = load_config(FIXTURE)
-    assert cfg.llm.provider == "ollama"
-    assert cfg.llm.ollama.api_key == "secret-ollama"
+    assert cfg.llm.default == "workhorse"
+    assert cfg.llm.providers["ollama_cloud"].kind == "ollama"
+    assert cfg.llm.providers["ollama_cloud"].api_key == "secret-ollama"
+    assert cfg.llm.models["workhorse"].model == "llama3.1:70b"
     assert cfg.mcp.servers[1].url == "https://x.example/mcp"
     assert cfg.mcp.servers[1].headers["Authorization"] == "Bearer ext-tok"
     assert cfg.incidents.similarity_threshold == approx(0.9)

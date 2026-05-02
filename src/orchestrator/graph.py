@@ -504,9 +504,8 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     for agent_name, skill in skills.items():
         llm = get_llm(
             cfg.llm,
+            skill.model,
             role=agent_name,
-            model=skill.model,
-            temperature=skill.temperature,
             stub_canned=_STUB_CANNED,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)

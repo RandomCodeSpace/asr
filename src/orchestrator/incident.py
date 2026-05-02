@@ -12,7 +12,7 @@ _UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 IncidentStatus = Literal[
     "new", "in_progress", "matched", "resolved",
-    "escalated", "awaiting_input", "stopped",
+    "escalated", "awaiting_input", "stopped", "deleted",
 ]
 
 
@@ -72,6 +72,7 @@ class Incident(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
+    deleted_at: str | None = None
 
 
 def _utc_now_iso() -> str:
@@ -139,7 +140,26 @@ class IncidentStore:
     def list_all(self) -> list[Incident]:
         return [self.load(p.stem) for p in self.base_dir.glob("INC-*.json")]
 
-    def list_recent(self, limit: int = 20) -> list[Incident]:
+    def list_recent(self, limit: int = 20,
+                    include_deleted: bool = False) -> list[Incident]:
         all_inc = self.list_all()
+        if not include_deleted:
+            all_inc = [i for i in all_inc if i.status != "deleted"]
         all_inc.sort(key=lambda i: (i.created_at, i.id), reverse=True)
         return all_inc[:limit]
+
+    def delete(self, incident_id: str) -> Incident:
+        """Soft-delete: mark status='deleted' + set deleted_at timestamp.
+
+        Idempotent — re-deleting a deleted INC returns it unchanged. The
+        JSON file is preserved for audit; ``list_recent`` hides it by
+        default.
+        """
+        inc = self.load(incident_id)
+        if inc.status == "deleted":
+            return inc
+        inc.status = "deleted"
+        inc.deleted_at = _utc_now_iso()
+        inc.pending_intervention = None
+        self.save(inc)
+        return inc

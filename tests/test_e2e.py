@@ -1,6 +1,6 @@
 import pytest
 
-from orchestrator.config import load_config
+from orchestrator.config import LLMConfig, load_config
 from orchestrator.orchestrator import Orchestrator
 
 
@@ -14,7 +14,7 @@ async def test_full_flow_no_prior_match(tmp_path, monkeypatch):
 
     cfg = load_config("config/config.yaml.example")
     cfg.paths.incidents_dir = str(tmp_path)
-    cfg.llm.provider = "stub"
+    cfg.llm = LLMConfig.stub()
 
     orch = await Orchestrator.create(cfg)
     try:
@@ -39,7 +39,7 @@ async def test_full_flow_short_circuits_on_known_match(tmp_path, monkeypatch):
 
     cfg = load_config("config/config.yaml.example")
     cfg.paths.incidents_dir = str(tmp_path)
-    cfg.llm.provider = "stub"
+    cfg.llm = LLMConfig.stub()
     cfg.incidents.similarity_threshold = 0.2
 
     orch = await Orchestrator.create(cfg)

@@ -1,14 +1,21 @@
-"""LLM provider abstraction with stub/ollama/azure_openai backends."""
+"""LLM provider abstraction with stub/ollama/azure_openai backends.
+
+Models are resolved by name from ``LLMConfig``. Each named entry binds a
+provider (kind + connection) to a model id and optional temperature/deployment.
+``get_llm(cfg, "smart")`` looks up ``cfg.models["smart"]`` and uses its
+referenced ``cfg.providers[<name>]`` to build a langchain ``BaseChatModel``.
+"""
 from __future__ import annotations
 import os
 from typing import Any
 from uuid import uuid4
+from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field, SecretStr
 
-from orchestrator.config import LLMConfig
+from orchestrator.config import LLMConfig, ModelConfig, ProviderConfig
 
 
 class StubChatModel(BaseChatModel):
@@ -45,50 +52,97 @@ class StubChatModel(BaseChatModel):
         return self
 
 
-def _build_ollama_llm(cfg: "LLMConfig", actual_model: str, actual_temp: float) -> BaseChatModel:
+def _build_ollama_chat(provider: ProviderConfig, model_id: str,
+                       temperature: float) -> BaseChatModel:
     from langchain_ollama import ChatOllama
-    if cfg.ollama is None:
-        raise ValueError("ollama provider requires llm.ollama config")
     kwargs: dict[str, Any] = {
-        "base_url": cfg.ollama.base_url,
-        "model": actual_model,
-        "temperature": actual_temp,
+        "base_url": provider.base_url or "https://ollama.com",
+        "model": model_id,
+        "temperature": temperature,
     }
-    api_key = cfg.ollama.api_key or os.environ.get("OLLAMA_API_KEY")
+    api_key = provider.api_key or os.environ.get("OLLAMA_API_KEY")
     if api_key:
         kwargs["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
     return ChatOllama(**kwargs)
 
 
-def _build_azure_llm(cfg: "LLMConfig", actual_temp: float) -> BaseChatModel:
+def _build_azure_chat(provider: ProviderConfig, model: ModelConfig) -> BaseChatModel:
     from langchain_openai import AzureChatOpenAI
-    if cfg.azure_openai is None:
-        raise ValueError("azure_openai provider requires llm.azure_openai config")
-    _ak = cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY")
+    if provider.endpoint is None:
+        raise ValueError("azure_openai provider requires 'endpoint'")
+    if model.deployment is None:
+        raise ValueError(
+            f"azure_openai model {model.model!r} requires 'deployment'"
+        )
+    _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
     return AzureChatOpenAI(
-        azure_endpoint=cfg.azure_openai.endpoint,
-        api_version=cfg.azure_openai.api_version,
-        azure_deployment=cfg.azure_openai.deployment,
+        azure_endpoint=provider.endpoint,
+        api_version=provider.api_version or "2024-08-01-preview",
+        azure_deployment=model.deployment,
         api_key=SecretStr(_ak) if _ak else None,
-        temperature=actual_temp,
+        temperature=model.temperature,
     )
 
 
-def get_llm(cfg: LLMConfig, *, role: str = "default", model: str | None = None,
-            temperature: float | None = None,
+def get_llm(cfg: LLMConfig, model_name: str | None = None, *,
+            role: str = "default",
             stub_canned: dict[str, str] | None = None,
             stub_tool_plan: list[dict] | None = None) -> BaseChatModel:
-    actual_model = model or cfg.default_model
-    actual_temp = temperature if temperature is not None else cfg.default_temperature
+    """Build a chat model by named entry from ``cfg.models``.
 
-    if cfg.provider == "stub":
+    ``model_name`` defaults to ``cfg.default``. Validation that the name
+    exists is enforced by ``LLMConfig`` itself (model_validator), so a
+    missing name here means caller passed a typo — raise loudly.
+    """
+    name = model_name or cfg.default
+    model = cfg.models.get(name)
+    if model is None:
+        raise KeyError(
+            f"llm model {name!r} not found in llm.models "
+            f"(known: {sorted(cfg.models)})"
+        )
+    provider = cfg.providers[model.provider]  # validated at config load
+
+    if provider.kind == "stub":
         return StubChatModel(
             role=role,
             canned_responses=stub_canned or {},
             tool_call_plan=stub_tool_plan,
         )
-    if cfg.provider == "ollama":
-        return _build_ollama_llm(cfg, actual_model, actual_temp)
-    if cfg.provider == "azure_openai":
-        return _build_azure_llm(cfg, actual_temp)
-    raise ValueError(f"Unknown provider: {cfg.provider}")
+    if provider.kind == "ollama":
+        return _build_ollama_chat(provider, model.model, model.temperature)
+    if provider.kind == "azure_openai":
+        return _build_azure_chat(provider, model)
+    raise ValueError(f"Unknown provider kind: {provider.kind!r}")
+
+
+def get_embedding(cfg: LLMConfig) -> Embeddings:
+    """Build the configured embedding model. Raises if ``cfg.embedding`` is None."""
+    if cfg.embedding is None:
+        raise ValueError("llm.embedding is not configured")
+    provider = cfg.providers[cfg.embedding.provider]
+    if provider.kind == "ollama":
+        from langchain_ollama import OllamaEmbeddings
+        kwargs: dict[str, Any] = {
+            "base_url": provider.base_url or "https://ollama.com",
+            "model": cfg.embedding.model,
+        }
+        api_key = provider.api_key or os.environ.get("OLLAMA_API_KEY")
+        if api_key:
+            kwargs["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
+        return OllamaEmbeddings(**kwargs)
+    if provider.kind == "azure_openai":
+        from langchain_openai import AzureOpenAIEmbeddings
+        if provider.endpoint is None:
+            raise ValueError("azure_openai provider requires 'endpoint'")
+        deployment = cfg.embedding.deployment or cfg.embedding.model
+        _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
+        return AzureOpenAIEmbeddings(
+            azure_endpoint=provider.endpoint,
+            api_version=provider.api_version or "2024-08-01-preview",
+            azure_deployment=deployment,
+            api_key=SecretStr(_ak) if _ak else None,
+        )
+    raise ValueError(
+        f"Embedding not supported for provider kind {provider.kind!r}"
+    )

@@ -1,9 +1,15 @@
 llm:
-  provider: ollama
-  default_model: llama3.1:70b
-  ollama:
-    base_url: https://ollama.com
-    api_key: ${OLLAMA_API_KEY}
+  default: workhorse
+  providers:
+    ollama_cloud:
+      kind: ollama
+      base_url: https://ollama.com
+      api_key: ${OLLAMA_API_KEY}
+  models:
+    workhorse:
+      provider: ollama_cloud
+      model: llama3.1:70b
+      temperature: 0.0
 
 mcp:
   servers:

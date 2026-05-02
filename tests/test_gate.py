@@ -13,7 +13,7 @@ from orchestrator.skill import RouteRule, Skill
 
 def _cfg(threshold: float = 0.75) -> AppConfig:
     return AppConfig(
-        llm=LLMConfig(provider="stub", default_model="stub-1"),
+        llm=LLMConfig.stub(),
         mcp=MCPConfig(),
         intervention=InterventionConfig(confidence_threshold=threshold),
     )

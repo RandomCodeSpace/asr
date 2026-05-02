@@ -1,15 +1,32 @@
 llm:
-  provider: ollama
-  default_model: gpt-oss:120b
-  default_temperature: 0.0
-  ollama:
-    base_url: https://ollama.com
-    api_key: ${OLLAMA_API_KEY}
-  azure_openai:
-    endpoint: ${AZURE_ENDPOINT}
-    api_version: 2024-08-01-preview
-    api_key: ${AZURE_OPENAI_KEY}
-    deployment: gpt-4o
+  default: workhorse
+  providers:
+    ollama_cloud:
+      kind: ollama
+      base_url: https://ollama.com
+      api_key: ${OLLAMA_API_KEY}
+    azure:
+      kind: azure_openai
+      endpoint: ${AZURE_ENDPOINT}
+      api_version: 2024-08-01-preview
+      api_key: ${AZURE_OPENAI_KEY}
+  models:
+    workhorse:
+      provider: ollama_cloud
+      model: gpt-oss:120b
+      temperature: 0.0
+    cheap:
+      provider: ollama_cloud
+      model: gpt-oss:20b
+      temperature: 0.2
+    smart:
+      provider: azure
+      model: gpt-4o
+      deployment: gpt-4o
+      temperature: 0.0
+  embedding:
+    provider: ollama_cloud
+    model: nomic-embed-text
 mcp:
   servers:
   - name: local_inc

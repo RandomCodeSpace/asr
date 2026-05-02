@@ -1,5 +1,4 @@
 description: Categorize, prioritize, and assess the impact of the incident
-temperature: 0.0
 tools:
   local: ["update_incident", "get_service_health", "check_deployment_history"]
 routes:

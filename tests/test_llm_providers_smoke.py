@@ -1,7 +1,7 @@
 import os
 import pytest
 from langchain_core.messages import HumanMessage
-from orchestrator.config import LLMConfig, OllamaConfig, AzureOpenAIConfig
+from orchestrator.config import LLMConfig, ProviderConfig, ModelConfig
 from orchestrator.llm import get_llm
 
 
@@ -9,9 +9,20 @@ from orchestrator.llm import get_llm
 @pytest.mark.skipif(not os.environ.get("OLLAMA_API_KEY"), reason="no OLLAMA_API_KEY")
 async def test_ollama_smoke():
     cfg = LLMConfig(
-        provider="ollama",
-        default_model=os.environ.get("OLLAMA_TEST_MODEL", "llama3.1:8b"),
-        ollama=OllamaConfig(base_url="https://ollama.com", api_key=os.environ["OLLAMA_API_KEY"]),
+        default="workhorse",
+        providers={
+            "ollama_cloud": ProviderConfig(
+                kind="ollama",
+                base_url="https://ollama.com",
+                api_key=os.environ["OLLAMA_API_KEY"],
+            ),
+        },
+        models={
+            "workhorse": ModelConfig(
+                provider="ollama_cloud",
+                model=os.environ.get("OLLAMA_TEST_MODEL", "llama3.1:8b"),
+            ),
+        },
     )
     llm = get_llm(cfg)
     res = await llm.ainvoke([HumanMessage(content="Say only the word: pong")])
@@ -25,13 +36,21 @@ async def test_ollama_smoke():
 )
 async def test_azure_openai_smoke():
     cfg = LLMConfig(
-        provider="azure_openai",
-        default_model="ignored",
-        azure_openai=AzureOpenAIConfig(
-            endpoint=os.environ["AZURE_ENDPOINT"],
-            api_key=os.environ["AZURE_OPENAI_KEY"],
-            deployment=os.environ["AZURE_DEPLOYMENT"],
-        ),
+        default="smart",
+        providers={
+            "azure": ProviderConfig(
+                kind="azure_openai",
+                endpoint=os.environ["AZURE_ENDPOINT"],
+                api_key=os.environ["AZURE_OPENAI_KEY"],
+            ),
+        },
+        models={
+            "smart": ModelConfig(
+                provider="azure",
+                model="gpt-4o",
+                deployment=os.environ["AZURE_DEPLOYMENT"],
+            ),
+        },
     )
     llm = get_llm(cfg)
     res = await llm.ainvoke([HumanMessage(content="Say only the word: pong")])

@@ -12,7 +12,7 @@ from orchestrator.skill import load_all_skills
 def cfg(tmp_path):
     set_inc_state(store=IncidentStore(tmp_path), similarity_threshold=0.5)
     return AppConfig(
-        llm=LLMConfig(provider="stub", default_model="stub-1"),
+        llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[
             MCPServerConfig(name="local_inc", transport="in_process",
                             module="orchestrator.mcp_servers.incident",

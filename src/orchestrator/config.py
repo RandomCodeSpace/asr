@@ -4,33 +4,83 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import yaml
 
 
-class OllamaConfig(BaseModel):
-    base_url: str = "https://ollama.com"
-    api_key: str | None = None
+ProviderKind = Literal["ollama", "azure_openai", "stub"]
 
 
-class AzureOpenAIConfig(BaseModel):
-    endpoint: str
-    api_version: str = "2024-08-01-preview"
-    api_key: str | None = None
-    deployment: str
+class ProviderConfig(BaseModel):
+    """Connection settings for one upstream LLM provider.
+
+    Multiple named ``ModelConfig`` entries can reference the same provider
+    so that, e.g., two Ollama models share a single base_url + api_key.
+    """
+    kind: ProviderKind
+    base_url: str | None = None       # ollama
+    api_key: str | None = None        # ollama, azure_openai
+    endpoint: str | None = None       # azure_openai
+    api_version: str | None = None    # azure_openai
 
 
-class StubConfig(BaseModel):
-    pass
+class ModelConfig(BaseModel):
+    """Named chat model entry. ``provider`` references a key in ``LLMConfig.providers``."""
+    provider: str
+    model: str = ""           # raw upstream model id (ignored for stub kind)
+    temperature: float = 0.0
+    deployment: str | None = None  # azure_openai
+
+
+class EmbeddingConfig(BaseModel):
+    """Single embedding model. ``provider`` references a key in ``LLMConfig.providers``."""
+    provider: str
+    model: str
+    deployment: str | None = None  # azure_openai
 
 
 class LLMConfig(BaseModel):
-    provider: Literal["ollama", "azure_openai", "stub"] = "stub"
-    default_model: str = "stub-1"
-    default_temperature: float = 0.0
-    ollama: OllamaConfig | None = None
-    azure_openai: AzureOpenAIConfig | None = None
-    stub: StubConfig = Field(default_factory=StubConfig)
+    """Named-model registry. Skills reference chat models by name; the orchestrator
+    resolves name → model entry → provider entry at LLM build time.
+
+    ``default`` is used when a skill's ``model`` field is ``None``.
+    ``embedding`` is the single embedding model (for similarity / retrieval).
+    """
+    default: str = "stub_default"
+    providers: dict[str, ProviderConfig] = Field(
+        default_factory=lambda: {"stub": ProviderConfig(kind="stub")}
+    )
+    models: dict[str, ModelConfig] = Field(
+        default_factory=lambda: {
+            "stub_default": ModelConfig(provider="stub", model="stub-1"),
+        }
+    )
+    embedding: EmbeddingConfig | None = None
+
+    @model_validator(mode="after")
+    def _validate_refs(self) -> "LLMConfig":
+        if self.default not in self.models:
+            raise ValueError(
+                f"llm.default={self.default!r} not found in llm.models "
+                f"(known: {sorted(self.models)})"
+            )
+        for name, m in self.models.items():
+            if m.provider not in self.providers:
+                raise ValueError(
+                    f"llm.models[{name!r}].provider={m.provider!r} not found "
+                    f"in llm.providers (known: {sorted(self.providers)})"
+                )
+        if self.embedding and self.embedding.provider not in self.providers:
+            raise ValueError(
+                f"llm.embedding.provider={self.embedding.provider!r} not found "
+                f"in llm.providers (known: {sorted(self.providers)})"
+            )
+        return self
+
+    @classmethod
+    def stub(cls) -> "LLMConfig":
+        """Convenience factory for tests/CI — single stub model."""
+        return cls()
 
 
 class MCPServerConfig(BaseModel):

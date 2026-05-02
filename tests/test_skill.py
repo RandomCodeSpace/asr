@@ -8,7 +8,6 @@ _BASE_CONFIG = {
     # NOTE: no "name" — agent identity is the directory name (single source of truth).
     "description": "First-line agent",
     "model": "llama3.1:70b",
-    "temperature": 0.2,
     "tools": {"local": ["lookup_similar_incidents", "create_incident", "get_user_context"]},
     "routes": [
         {"when": "matched_known_issue", "next": "resolution"},

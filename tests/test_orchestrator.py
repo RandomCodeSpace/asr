@@ -6,7 +6,7 @@ from orchestrator.orchestrator import Orchestrator
 @pytest.fixture
 def cfg(tmp_path):
     return AppConfig(
-        llm=LLMConfig(provider="stub", default_model="stub-1"),
+        llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[
             MCPServerConfig(name="local_inc", transport="in_process",
                             module="orchestrator.mcp_servers.incident",

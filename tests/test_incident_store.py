@@ -75,3 +75,66 @@ def test_valid_id_loads_correctly(store, monkeypatch):
     inc = store.create(query="valid", environment="dev", reporter_id="u", reporter_team="t")
     loaded = store.load(inc.id)
     assert loaded.id == inc.id
+
+
+def test_delete_marks_status_and_timestamp(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso",
+                        lambda: "2026-04-30T10:00:00Z")
+    inc = store.create(query="A", environment="dev", reporter_id="u", reporter_team="t")
+    deleted = store.delete(inc.id)
+    assert deleted.status == "deleted"
+    assert deleted.deleted_at == "2026-04-30T10:00:00Z"
+    reloaded = store.load(inc.id)
+    assert reloaded.status == "deleted"
+    assert reloaded.deleted_at == "2026-04-30T10:00:00Z"
+
+
+def test_delete_is_idempotent(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso",
+                        lambda: "2026-04-30T10:00:00Z")
+    inc = store.create(query="A", environment="dev", reporter_id="u", reporter_team="t")
+    first = store.delete(inc.id)
+    second = store.delete(inc.id)
+    assert first.deleted_at == second.deleted_at
+    assert second.status == "deleted"
+
+
+def test_delete_clears_pending_intervention(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso",
+                        lambda: "2026-04-30T10:00:00Z")
+    inc = store.create(query="A", environment="dev", reporter_id="u", reporter_team="t")
+    inc.status = "awaiting_input"
+    inc.pending_intervention = {"reason": "low_confidence"}
+    store.save(inc)
+    deleted = store.delete(inc.id)
+    assert deleted.pending_intervention is None
+
+
+def test_list_recent_excludes_deleted_by_default(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso",
+                        lambda: "2026-04-30T10:00:00Z")
+    a = store.create(query="A", environment="dev", reporter_id="u", reporter_team="t")
+    b = store.create(query="B", environment="dev", reporter_id="u", reporter_team="t")
+    store.delete(a.id)
+    items = store.list_recent(limit=10)
+    assert [i.id for i in items] == [b.id]
+
+
+def test_list_recent_include_deleted_returns_all(store, monkeypatch):
+    monkeypatch.setattr("orchestrator.incident._utc_today", lambda: "20260430")
+    monkeypatch.setattr("orchestrator.incident._utc_now_iso",
+                        lambda: "2026-04-30T10:00:00Z")
+    a = store.create(query="A", environment="dev", reporter_id="u", reporter_team="t")
+    b = store.create(query="B", environment="dev", reporter_id="u", reporter_team="t")
+    store.delete(a.id)
+    items = store.list_recent(limit=10, include_deleted=True)
+    assert {i.id for i in items} == {a.id, b.id}
+
+
+def test_delete_invalid_id_raises(store):
+    with pytest.raises(ValueError, match="Invalid incident id"):
+        store.delete("../../etc/passwd")

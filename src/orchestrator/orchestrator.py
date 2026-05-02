@@ -38,6 +38,13 @@ class Orchestrator:
             store = IncidentStore(cfg.paths.incidents_dir)
             set_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
             skills = load_all_skills(cfg.paths.skills_dir)
+            for s in skills.values():
+                if s.model is not None and s.model not in cfg.llm.models:
+                    raise ValueError(
+                        f"skill {s.name!r} references llm model {s.model!r} "
+                        f"which is not defined in llm.models "
+                        f"(known: {sorted(cfg.llm.models)})"
+                    )
             registry = await load_tools(cfg.mcp, stack)
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry)
@@ -64,7 +71,9 @@ class Orchestrator:
             {
                 "name": s.name,
                 "description": s.description,
-                "model": s.model or self.cfg.llm.default_model,
+                # The named model entry the agent will use (resolved against
+                # cfg.llm.default when the skill leaves model unset).
+                "model": s.model or self.cfg.llm.default,
                 # Expose the flat list of prefixed tool names the LLM sees.
                 # resolve() returns list[BaseTool], so .name is on the tool directly.
                 "tools": [
@@ -100,6 +109,9 @@ class Orchestrator:
 
     def list_recent_incidents(self, limit: int = 20) -> list[dict]:
         return [i.model_dump() for i in self.store.list_recent(limit)]
+
+    def delete_incident(self, incident_id: str) -> dict:
+        return self.store.delete(incident_id).model_dump()
 
     async def start_investigation(self, *, query: str, environment: str,
                                   reporter_id: str = "user-mock",

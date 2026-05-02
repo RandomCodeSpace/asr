@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import yaml
 
 
@@ -14,6 +14,7 @@ import yaml
 """Incident domain model."""
 
 from datetime import datetime, timezone
+from pydantic import BaseModel, Field
 
 # ----- imports for similarity.py -----
 """Similarity scoring for incident matching."""
@@ -30,7 +31,7 @@ Each agent lives in its own subdirectory under ``config/skills/``::
         confidence.md         # appended to every agent's system_prompt, in
         output.md             # alphabetical order, joined with blank lines
       intake/
-        config.yaml           # name, description, tools, routes, temperature, model
+        config.yaml           # description, tools, routes, model
         system.md             # the agent's specialty (markdown body — format is free)
         guidelines.md         # OPTIONAL extra fragments; every *.md in the
         ...                   # directory is concatenated in alphabetical order
@@ -53,10 +54,17 @@ from pydantic import BaseModel, Field, field_validator
 
 
 # ----- imports for llm.py -----
-"""LLM provider abstraction with stub/ollama/azure_openai backends."""
+"""LLM provider abstraction with stub/ollama/azure_openai backends.
+
+Models are resolved by name from ``LLMConfig``. Each named entry binds a
+provider (kind + connection) to a model id and optional temperature/deployment.
+``get_llm(cfg, "smart")`` looks up ``cfg.models["smart"]`` and uses its
+referenced ``cfg.providers[<name>]`` to build a langchain ``BaseChatModel``.
+"""
 
 from typing import Any
 from uuid import uuid4
+from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -187,29 +195,79 @@ from pydantic import BaseModel
 
 # ====== module: orchestrator/config.py ======
 
-class OllamaConfig(BaseModel):
-    base_url: str = "https://ollama.com"
-    api_key: str | None = None
+ProviderKind = Literal["ollama", "azure_openai", "stub"]
 
 
-class AzureOpenAIConfig(BaseModel):
-    endpoint: str
-    api_version: str = "2024-08-01-preview"
-    api_key: str | None = None
-    deployment: str
+class ProviderConfig(BaseModel):
+    """Connection settings for one upstream LLM provider.
+
+    Multiple named ``ModelConfig`` entries can reference the same provider
+    so that, e.g., two Ollama models share a single base_url + api_key.
+    """
+    kind: ProviderKind
+    base_url: str | None = None       # ollama
+    api_key: str | None = None        # ollama, azure_openai
+    endpoint: str | None = None       # azure_openai
+    api_version: str | None = None    # azure_openai
 
 
-class StubConfig(BaseModel):
-    pass
+class ModelConfig(BaseModel):
+    """Named chat model entry. ``provider`` references a key in ``LLMConfig.providers``."""
+    provider: str
+    model: str = ""           # raw upstream model id (ignored for stub kind)
+    temperature: float = 0.0
+    deployment: str | None = None  # azure_openai
+
+
+class EmbeddingConfig(BaseModel):
+    """Single embedding model. ``provider`` references a key in ``LLMConfig.providers``."""
+    provider: str
+    model: str
+    deployment: str | None = None  # azure_openai
 
 
 class LLMConfig(BaseModel):
-    provider: Literal["ollama", "azure_openai", "stub"] = "stub"
-    default_model: str = "stub-1"
-    default_temperature: float = 0.0
-    ollama: OllamaConfig | None = None
-    azure_openai: AzureOpenAIConfig | None = None
-    stub: StubConfig = Field(default_factory=StubConfig)
+    """Named-model registry. Skills reference chat models by name; the orchestrator
+    resolves name → model entry → provider entry at LLM build time.
+
+    ``default`` is used when a skill's ``model`` field is ``None``.
+    ``embedding`` is the single embedding model (for similarity / retrieval).
+    """
+    default: str = "stub_default"
+    providers: dict[str, ProviderConfig] = Field(
+        default_factory=lambda: {"stub": ProviderConfig(kind="stub")}
+    )
+    models: dict[str, ModelConfig] = Field(
+        default_factory=lambda: {
+            "stub_default": ModelConfig(provider="stub", model="stub-1"),
+        }
+    )
+    embedding: EmbeddingConfig | None = None
+
+    @model_validator(mode="after")
+    def _validate_refs(self) -> "LLMConfig":
+        if self.default not in self.models:
+            raise ValueError(
+                f"llm.default={self.default!r} not found in llm.models "
+                f"(known: {sorted(self.models)})"
+            )
+        for name, m in self.models.items():
+            if m.provider not in self.providers:
+                raise ValueError(
+                    f"llm.models[{name!r}].provider={m.provider!r} not found "
+                    f"in llm.providers (known: {sorted(self.providers)})"
+                )
+        if self.embedding and self.embedding.provider not in self.providers:
+            raise ValueError(
+                f"llm.embedding.provider={self.embedding.provider!r} not found "
+                f"in llm.providers (known: {sorted(self.providers)})"
+            )
+        return self
+
+    @classmethod
+    def stub(cls) -> "LLMConfig":
+        """Convenience factory for tests/CI — single stub model."""
+        return cls()
 
 
 class MCPServerConfig(BaseModel):
@@ -296,7 +354,7 @@ _UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 IncidentStatus = Literal[
     "new", "in_progress", "matched", "resolved",
-    "escalated", "awaiting_input", "stopped",
+    "escalated", "awaiting_input", "stopped", "deleted",
 ]
 
 
@@ -356,6 +414,7 @@ class Incident(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
+    deleted_at: str | None = None
 
 
 def _utc_now_iso() -> str:
@@ -423,10 +482,29 @@ class IncidentStore:
     def list_all(self) -> list[Incident]:
         return [self.load(p.stem) for p in self.base_dir.glob("INC-*.json")]
 
-    def list_recent(self, limit: int = 20) -> list[Incident]:
+    def list_recent(self, limit: int = 20,
+                    include_deleted: bool = False) -> list[Incident]:
         all_inc = self.list_all()
+        if not include_deleted:
+            all_inc = [i for i in all_inc if i.status != "deleted"]
         all_inc.sort(key=lambda i: (i.created_at, i.id), reverse=True)
         return all_inc[:limit]
+
+    def delete(self, incident_id: str) -> Incident:
+        """Soft-delete: mark status='deleted' + set deleted_at timestamp.
+
+        Idempotent — re-deleting a deleted INC returns it unchanged. The
+        JSON file is preserved for audit; ``list_recent`` hides it by
+        default.
+        """
+        inc = self.load(incident_id)
+        if inc.status == "deleted":
+            return inc
+        inc.status = "deleted"
+        inc.deleted_at = _utc_now_iso()
+        inc.pending_intervention = None
+        self.save(inc)
+        return inc
 
 # ====== module: orchestrator/similarity.py ======
 
@@ -492,7 +570,6 @@ class Skill(BaseModel):
     name: str
     description: str
     model: str | None = None
-    temperature: float | None = None
     tools: dict[str, list[str]] = Field(default_factory=dict)
     routes: list[RouteRule] = Field(default_factory=list)
     system_prompt: str
@@ -628,53 +705,100 @@ class StubChatModel(BaseChatModel):
         return self
 
 
-def _build_ollama_llm(cfg: "LLMConfig", actual_model: str, actual_temp: float) -> BaseChatModel:
+def _build_ollama_chat(provider: ProviderConfig, model_id: str,
+                       temperature: float) -> BaseChatModel:
     from langchain_ollama import ChatOllama
-    if cfg.ollama is None:
-        raise ValueError("ollama provider requires llm.ollama config")
     kwargs: dict[str, Any] = {
-        "base_url": cfg.ollama.base_url,
-        "model": actual_model,
-        "temperature": actual_temp,
+        "base_url": provider.base_url or "https://ollama.com",
+        "model": model_id,
+        "temperature": temperature,
     }
-    api_key = cfg.ollama.api_key or os.environ.get("OLLAMA_API_KEY")
+    api_key = provider.api_key or os.environ.get("OLLAMA_API_KEY")
     if api_key:
         kwargs["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
     return ChatOllama(**kwargs)
 
 
-def _build_azure_llm(cfg: "LLMConfig", actual_temp: float) -> BaseChatModel:
+def _build_azure_chat(provider: ProviderConfig, model: ModelConfig) -> BaseChatModel:
     from langchain_openai import AzureChatOpenAI
-    if cfg.azure_openai is None:
-        raise ValueError("azure_openai provider requires llm.azure_openai config")
-    _ak = cfg.azure_openai.api_key or os.environ.get("AZURE_OPENAI_KEY")
+    if provider.endpoint is None:
+        raise ValueError("azure_openai provider requires 'endpoint'")
+    if model.deployment is None:
+        raise ValueError(
+            f"azure_openai model {model.model!r} requires 'deployment'"
+        )
+    _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
     return AzureChatOpenAI(
-        azure_endpoint=cfg.azure_openai.endpoint,
-        api_version=cfg.azure_openai.api_version,
-        azure_deployment=cfg.azure_openai.deployment,
+        azure_endpoint=provider.endpoint,
+        api_version=provider.api_version or "2024-08-01-preview",
+        azure_deployment=model.deployment,
         api_key=SecretStr(_ak) if _ak else None,
-        temperature=actual_temp,
+        temperature=model.temperature,
     )
 
 
-def get_llm(cfg: LLMConfig, *, role: str = "default", model: str | None = None,
-            temperature: float | None = None,
+def get_llm(cfg: LLMConfig, model_name: str | None = None, *,
+            role: str = "default",
             stub_canned: dict[str, str] | None = None,
             stub_tool_plan: list[dict] | None = None) -> BaseChatModel:
-    actual_model = model or cfg.default_model
-    actual_temp = temperature if temperature is not None else cfg.default_temperature
+    """Build a chat model by named entry from ``cfg.models``.
 
-    if cfg.provider == "stub":
+    ``model_name`` defaults to ``cfg.default``. Validation that the name
+    exists is enforced by ``LLMConfig`` itself (model_validator), so a
+    missing name here means caller passed a typo — raise loudly.
+    """
+    name = model_name or cfg.default
+    model = cfg.models.get(name)
+    if model is None:
+        raise KeyError(
+            f"llm model {name!r} not found in llm.models "
+            f"(known: {sorted(cfg.models)})"
+        )
+    provider = cfg.providers[model.provider]  # validated at config load
+
+    if provider.kind == "stub":
         return StubChatModel(
             role=role,
             canned_responses=stub_canned or {},
             tool_call_plan=stub_tool_plan,
         )
-    if cfg.provider == "ollama":
-        return _build_ollama_llm(cfg, actual_model, actual_temp)
-    if cfg.provider == "azure_openai":
-        return _build_azure_llm(cfg, actual_temp)
-    raise ValueError(f"Unknown provider: {cfg.provider}")
+    if provider.kind == "ollama":
+        return _build_ollama_chat(provider, model.model, model.temperature)
+    if provider.kind == "azure_openai":
+        return _build_azure_chat(provider, model)
+    raise ValueError(f"Unknown provider kind: {provider.kind!r}")
+
+
+def get_embedding(cfg: LLMConfig) -> Embeddings:
+    """Build the configured embedding model. Raises if ``cfg.embedding`` is None."""
+    if cfg.embedding is None:
+        raise ValueError("llm.embedding is not configured")
+    provider = cfg.providers[cfg.embedding.provider]
+    if provider.kind == "ollama":
+        from langchain_ollama import OllamaEmbeddings
+        kwargs: dict[str, Any] = {
+            "base_url": provider.base_url or "https://ollama.com",
+            "model": cfg.embedding.model,
+        }
+        api_key = provider.api_key or os.environ.get("OLLAMA_API_KEY")
+        if api_key:
+            kwargs["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
+        return OllamaEmbeddings(**kwargs)
+    if provider.kind == "azure_openai":
+        from langchain_openai import AzureOpenAIEmbeddings
+        if provider.endpoint is None:
+            raise ValueError("azure_openai provider requires 'endpoint'")
+        deployment = cfg.embedding.deployment or cfg.embedding.model
+        _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
+        return AzureOpenAIEmbeddings(
+            azure_endpoint=provider.endpoint,
+            api_version=provider.api_version or "2024-08-01-preview",
+            azure_deployment=deployment,
+            api_key=SecretStr(_ak) if _ak else None,
+        )
+    raise ValueError(
+        f"Embedding not supported for provider kind {provider.kind!r}"
+    )
 
 # ====== module: orchestrator/mcp_servers/incident.py ======
 
@@ -1627,9 +1751,8 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
     for agent_name, skill in skills.items():
         llm = get_llm(
             cfg.llm,
+            skill.model,
             role=agent_name,
-            model=skill.model,
-            temperature=skill.temperature,
             stub_canned=_STUB_CANNED,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)
@@ -1831,6 +1954,13 @@ class Orchestrator:
             store = IncidentStore(cfg.paths.incidents_dir)
             set_state(store=store, similarity_threshold=cfg.incidents.similarity_threshold)
             skills = load_all_skills(cfg.paths.skills_dir)
+            for s in skills.values():
+                if s.model is not None and s.model not in cfg.llm.models:
+                    raise ValueError(
+                        f"skill {s.name!r} references llm model {s.model!r} "
+                        f"which is not defined in llm.models "
+                        f"(known: {sorted(cfg.llm.models)})"
+                    )
             registry = await load_tools(cfg.mcp, stack)
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry)
@@ -1857,7 +1987,9 @@ class Orchestrator:
             {
                 "name": s.name,
                 "description": s.description,
-                "model": s.model or self.cfg.llm.default_model,
+                # The named model entry the agent will use (resolved against
+                # cfg.llm.default when the skill leaves model unset).
+                "model": s.model or self.cfg.llm.default,
                 # Expose the flat list of prefixed tool names the LLM sees.
                 # resolve() returns list[BaseTool], so .name is on the tool directly.
                 "tools": [
@@ -1893,6 +2025,9 @@ class Orchestrator:
 
     def list_recent_incidents(self, limit: int = 20) -> list[dict]:
         return [i.model_dump() for i in self.store.list_recent(limit)]
+
+    def delete_incident(self, incident_id: str) -> dict:
+        return self.store.delete(incident_id).model_dump()
 
     async def start_investigation(self, *, query: str, environment: str,
                                   reporter_id: str = "user-mock",
@@ -2135,6 +2270,10 @@ def build_app(cfg: AppConfig) -> FastAPI:
     @fastapi_app.get("/incidents/{incident_id}")
     async def incident(incident_id: str):
         return fastapi_app.state.orchestrator.get_incident(incident_id)
+
+    @fastapi_app.delete("/incidents/{incident_id}")
+    async def delete_incident(incident_id: str):
+        return fastapi_app.state.orchestrator.delete_incident(incident_id)
 
     @fastapi_app.post("/investigate")
     async def investigate(req: InvestigateRequest) -> InvestigateResponse:

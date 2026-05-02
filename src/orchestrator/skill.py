@@ -7,7 +7,7 @@ Each agent lives in its own subdirectory under ``config/skills/``::
         confidence.md         # appended to every agent's system_prompt, in
         output.md             # alphabetical order, joined with blank lines
       intake/
-        config.yaml           # name, description, tools, routes, temperature, model
+        config.yaml           # description, tools, routes, model
         system.md             # the agent's specialty (markdown body — format is free)
         guidelines.md         # OPTIONAL extra fragments; every *.md in the
         ...                   # directory is concatenated in alphabetical order
@@ -61,7 +61,6 @@ class Skill(BaseModel):
     name: str
     description: str
     model: str | None = None
-    temperature: float | None = None
     tools: dict[str, list[str]] = Field(default_factory=dict)
     routes: list[RouteRule] = Field(default_factory=list)
     system_prompt: str
