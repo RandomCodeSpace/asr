@@ -24,6 +24,8 @@ htmlcov/
 
 # --- Runtime data (user-specific, not source) ------------------------
 incidents/*.json
+incidents/*.db
+incidents/*.db-journal
 !incidents/.gitkeep
 
 # --- Secrets ---------------------------------------------------------

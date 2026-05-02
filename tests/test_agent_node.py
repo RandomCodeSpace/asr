@@ -2,15 +2,30 @@ import logging
 
 import pytest
 from pytest import approx
+from orchestrator.config import EmbeddingConfig, ProviderConfig, StorageConfig
 from orchestrator.graph import GraphState, _decide_from_signal, make_agent_node
-from orchestrator.incident import IncidentStore, TokenUsage
+from orchestrator.incident import TokenUsage
 from orchestrator.skill import Skill, RouteRule
 from orchestrator.llm import StubChatModel
+from orchestrator.storage.embeddings import build_embedder
+from orchestrator.storage.engine import build_engine
+from orchestrator.storage.models import Base
+from orchestrator.storage.repository import IncidentRepository
+
+
+def _make_repo(tmp_path):
+    eng = build_engine(StorageConfig(url=f"sqlite:///{tmp_path}/test.db"))
+    Base.metadata.create_all(eng)
+    embedder = build_embedder(
+        EmbeddingConfig(provider="s", model="x", dim=1024),
+        {"s": ProviderConfig(kind="stub")},
+    )
+    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.5)
 
 
 @pytest.fixture
 def incident(tmp_path):
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     return store.create(query="api latency", environment="dev",
                         reporter_id="u", reporter_team="t"), store
 

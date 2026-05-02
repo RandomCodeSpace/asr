@@ -11,11 +11,12 @@ from langchain_core.tools import BaseTool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, END
 
-from orchestrator.incident import Incident, ToolCall, AgentRun, IncidentStore, TokenUsage, _UTC_TS_FMT
+from orchestrator.incident import Incident, ToolCall, AgentRun, TokenUsage, _UTC_TS_FMT
 from orchestrator.skill import Skill
 from orchestrator.config import AppConfig
 from orchestrator.llm import get_llm
 from orchestrator.mcp_loader import ToolRegistry
+from orchestrator.storage.repository import IncidentRepository
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +319,7 @@ def _handle_agent_failure(
     started_at: str,
     exc: Exception,
     inc_id: str,
-    store: "IncidentStore",
+    store: "IncidentRepository",
     fallback: "Incident",
 ) -> dict:
     """Reload incident (absorbing partial tool writes), stamp a failure AgentRun,
@@ -352,7 +353,7 @@ def _record_success_run(
     confidence: float | None,
     rationale: str | None,
     signal: str | None,
-    store: "IncidentStore",
+    store: "IncidentRepository",
 ) -> None:
     """Append the success-path AgentRun, update the incident's running token
     totals, and persist. Mutates ``incident`` in place."""
@@ -377,7 +378,7 @@ def make_agent_node(
     llm: BaseChatModel,
     tools: list[BaseTool],
     decide_route: Callable[[Incident], str],
-    store: IncidentStore,
+    store: IncidentRepository,
     valid_signals: frozenset[str] | None = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
@@ -482,7 +483,7 @@ def _latest_run_for(incident: Incident, agent_name: str | None):
     return None
 
 
-def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
+def make_gate_node(*, cfg: AppConfig, store: IncidentRepository):
     """Build the intervention gate node placed before a gated downstream.
 
     The gate evaluates the confidence of whichever agent ran immediately
@@ -544,7 +545,7 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
     return gate
 
 
-def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
+def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentRepository,
                        registry: ToolRegistry) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs."""
     valid_signals = frozenset(cfg.orchestrator.signals)
@@ -621,7 +622,7 @@ def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
     return edges
 
 
-async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
+async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentRepository,
                       registry: ToolRegistry):
     """Compile the main LangGraph from configured skills and routes.
 
@@ -687,7 +688,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
 
 async def build_resume_graph(*, cfg: AppConfig, skills: dict,
-                             store: IncidentStore, registry: ToolRegistry):
+                             store: IncidentRepository, registry: ToolRegistry):
     """Compile a sub-graph that re-runs from the upstream end of whichever
     gated edge the INC was awaiting input from.
 

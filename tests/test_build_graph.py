@@ -1,7 +1,6 @@
 from contextlib import AsyncExitStack
 import pytest
 from orchestrator.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MCPServerConfig, ProviderConfig, StorageConfig
-from orchestrator.incident import IncidentStore
 from orchestrator.mcp_loader import load_tools
 from orchestrator.mcp_servers.incident import set_state as set_inc_state
 from orchestrator.storage.embeddings import build_embedder
@@ -47,7 +46,7 @@ def cfg(tmp_path):
 @pytest.mark.asyncio
 async def test_build_graph_compiles_with_4_agents(cfg, tmp_path):
     skills = load_all_skills("config/skills")
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
         graph = await build_graph(cfg=cfg, skills=skills, store=store,
@@ -60,7 +59,7 @@ async def test_build_graph_compiles_with_4_agents(cfg, tmp_path):
 @pytest.mark.asyncio
 async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
     skills = load_all_skills("config/skills")
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
         graph = await build_graph(cfg=cfg, skills=skills, store=store,
@@ -83,7 +82,7 @@ async def test_build_graph_honours_entry_agent_from_config(cfg, tmp_path):
     """Entry node is whichever agent cfg.orchestrator.entry_agent names."""
     from orchestrator.config import OrchestratorConfig
     skills = load_all_skills("config/skills")
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     # Override entry to triage.
     cfg2 = cfg.model_copy(update={
         "orchestrator": OrchestratorConfig(entry_agent="triage"),
@@ -108,7 +107,7 @@ async def test_build_graph_inserts_gate_for_gated_route(cfg, tmp_path):
     direct edge from deep_investigator to resolution; the path must go
     through the gate."""
     skills = load_all_skills("config/skills")
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
         graph = await build_graph(cfg=cfg, skills=skills, store=store,
@@ -144,7 +143,7 @@ async def test_build_graph_raises_on_unknown_entry_agent(cfg, tmp_path):
     produce a broken graph."""
     from orchestrator.config import OrchestratorConfig
     skills = load_all_skills("config/skills")
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     cfg2 = cfg.model_copy(update={
         "orchestrator": OrchestratorConfig(entry_agent="nonexistent"),
     })

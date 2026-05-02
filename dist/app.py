@@ -13,7 +13,6 @@ import yaml
 # ----- imports for incident.py -----
 """Incident domain model."""
 
-from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 # ----- imports for similarity.py -----
@@ -145,6 +144,8 @@ sites in the MCP server and orchestrator change minimally. The repository
 also owns the embedder; ``find_similar`` (Task G) does the dialect dispatch.
 """
 
+import json
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import and_, desc, func, literal, select
@@ -227,6 +228,7 @@ from langgraph.graph import StateGraph, END
 
 
 
+
 # ----- imports for orchestrator.py -----
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 
@@ -255,7 +257,6 @@ The module-level ``get_app()`` is a no-arg factory suitable for
 ``config/config.yaml``) and returns a fresh app.
 """
 
-import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal
 
@@ -516,96 +517,6 @@ class Incident(BaseModel):
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
     deleted_at: str | None = None
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-
-
-def _utc_today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d")
-
-
-class IncidentStore:
-    """JSON-file-backed incident store. One file per INC."""
-
-    def __init__(self, base_dir: str | Path):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-
-    def _next_id(self) -> str:
-        today = _utc_today()
-        prefix = f"INC-{today}-"
-        existing = [p.stem for p in self.base_dir.glob(f"{prefix}*.json")]
-        max_seq = 0
-        for stem in existing:
-            try:
-                max_seq = max(max_seq, int(stem.rsplit("-", 1)[1]))
-            except (ValueError, IndexError):
-                continue
-        return f"{prefix}{max_seq + 1:03d}"
-
-    def create(self, *, query: str, environment: str,
-               reporter_id: str, reporter_team: str) -> Incident:
-        inc_id = self._next_id()
-        now = _utc_now_iso()
-        inc = Incident(
-            id=inc_id,
-            status="new",
-            created_at=now,
-            updated_at=now,
-            query=query,
-            environment=environment,
-            reporter=Reporter(id=reporter_id, team=reporter_team),
-        )
-        self.save(inc)
-        return inc
-
-    def save(self, incident: Incident) -> None:
-        if not _INC_ID_RE.match(incident.id):
-            raise ValueError(
-                f"Invalid incident id {incident.id!r}; expected INC-YYYYMMDD-NNN"
-            )
-        incident.updated_at = _utc_now_iso()
-        path = self.base_dir / f"{incident.id}.json"
-        path.write_text(incident.model_dump_json(indent=2))
-
-    def load(self, incident_id: str) -> Incident:
-        if not _INC_ID_RE.match(incident_id):
-            raise ValueError(
-                f"Invalid incident id {incident_id!r}; expected INC-YYYYMMDD-NNN"
-            )
-        path = self.base_dir / f"{incident_id}.json"
-        if not path.exists():
-            raise FileNotFoundError(incident_id)
-        return Incident.model_validate_json(path.read_text())
-
-    def list_all(self) -> list[Incident]:
-        return [self.load(p.stem) for p in self.base_dir.glob("INC-*.json")]
-
-    def list_recent(self, limit: int = 20,
-                    include_deleted: bool = False) -> list[Incident]:
-        all_inc = self.list_all()
-        if not include_deleted:
-            all_inc = [i for i in all_inc if i.status != "deleted"]
-        all_inc.sort(key=lambda i: (i.created_at, i.id), reverse=True)
-        return all_inc[:limit]
-
-    def delete(self, incident_id: str) -> Incident:
-        """Soft-delete: mark status='deleted' + set deleted_at timestamp.
-
-        Idempotent — re-deleting a deleted INC returns it unchanged. The
-        JSON file is preserved for audit; ``list_recent`` hides it by
-        default.
-        """
-        inc = self.load(incident_id)
-        if inc.status == "deleted":
-            return inc
-        inc.status = "deleted"
-        inc.deleted_at = _utc_now_iso()
-        inc.pending_intervention = None
-        self.save(inc)
-        return inc
 
 # ====== module: orchestrator/similarity.py ======
 
@@ -1142,6 +1053,16 @@ def _parse_iso(s: Optional[str]) -> Optional[datetime]:
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
+def _deserialize_resolution(raw: Optional[str]):
+    """Attempt JSON parse of stored resolution; return raw string on failure."""
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
+
+
 class IncidentRepository:
     """SQLAlchemy-backed Incident store. Drop-in for the old ``IncidentStore``.
 
@@ -1371,7 +1292,7 @@ class IncidentRepository:
             agents_run=agents_run,
             tool_calls=tool_calls,
             findings=dict(row.findings or {}),
-            resolution=row.resolution,
+            resolution=_deserialize_resolution(row.resolution),
             token_usage=token_usage,
             pending_intervention=row.pending_intervention,
             user_inputs=list(row.user_inputs or []),
@@ -1394,7 +1315,10 @@ class IncidentRepository:
             "severity": inc.severity,
             "category": inc.category,
             "matched_prior_inc": inc.matched_prior_inc,
-            "resolution": inc.resolution,
+            "resolution": (
+                inc.resolution if inc.resolution is None or isinstance(inc.resolution, str)
+                else json.dumps(inc.resolution)
+            ),
             "tags": list(inc.tags),
             "agents_run": [a.model_dump(mode="json") for a in inc.agents_run],
             "tool_calls": [t.model_dump(mode="json") for t in inc.tool_calls],
@@ -2172,7 +2096,7 @@ def _handle_agent_failure(
     started_at: str,
     exc: Exception,
     inc_id: str,
-    store: "IncidentStore",
+    store: "IncidentRepository",
     fallback: "Incident",
 ) -> dict:
     """Reload incident (absorbing partial tool writes), stamp a failure AgentRun,
@@ -2206,7 +2130,7 @@ def _record_success_run(
     confidence: float | None,
     rationale: str | None,
     signal: str | None,
-    store: "IncidentStore",
+    store: "IncidentRepository",
 ) -> None:
     """Append the success-path AgentRun, update the incident's running token
     totals, and persist. Mutates ``incident`` in place."""
@@ -2231,7 +2155,7 @@ def make_agent_node(
     llm: BaseChatModel,
     tools: list[BaseTool],
     decide_route: Callable[[Incident], str],
-    store: IncidentStore,
+    store: IncidentRepository,
     valid_signals: frozenset[str] | None = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
@@ -2336,7 +2260,7 @@ def _latest_run_for(incident: Incident, agent_name: str | None):
     return None
 
 
-def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
+def make_gate_node(*, cfg: AppConfig, store: IncidentRepository):
     """Build the intervention gate node placed before a gated downstream.
 
     The gate evaluates the confidence of whichever agent ran immediately
@@ -2398,7 +2322,7 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentStore):
     return gate
 
 
-def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentStore,
+def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentRepository,
                        registry: ToolRegistry) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs."""
     valid_signals = frozenset(cfg.orchestrator.signals)
@@ -2475,7 +2399,7 @@ def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
     return edges
 
 
-async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
+async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentRepository,
                       registry: ToolRegistry):
     """Compile the main LangGraph from configured skills and routes.
 
@@ -2541,7 +2465,7 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentStore,
 
 
 async def build_resume_graph(*, cfg: AppConfig, skills: dict,
-                             store: IncidentStore, registry: ToolRegistry):
+                             store: IncidentRepository, registry: ToolRegistry):
     """Compile a sub-graph that re-runs from the upstream end of whichever
     gated edge the INC was awaiting input from.
 

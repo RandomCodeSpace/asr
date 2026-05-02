@@ -2,13 +2,27 @@
 import pytest
 from pytest import approx
 
-from orchestrator.config import AppConfig, InterventionConfig, LLMConfig, MCPConfig
+from orchestrator.config import AppConfig, EmbeddingConfig, InterventionConfig, LLMConfig, MCPConfig, ProviderConfig, StorageConfig
 from orchestrator.graph import (
     GraphState, make_agent_node, make_gate_node, _coerce_confidence,
 )
-from orchestrator.incident import AgentRun, IncidentStore
+from orchestrator.incident import AgentRun
 from orchestrator.llm import StubChatModel
 from orchestrator.skill import RouteRule, Skill
+from orchestrator.storage.embeddings import build_embedder
+from orchestrator.storage.engine import build_engine
+from orchestrator.storage.models import Base
+from orchestrator.storage.repository import IncidentRepository
+
+
+def _make_repo(tmp_path):
+    eng = build_engine(StorageConfig(url=f"sqlite:///{tmp_path}/test.db"))
+    Base.metadata.create_all(eng)
+    embedder = build_embedder(
+        EmbeddingConfig(provider="s", model="x", dim=1024),
+        {"s": ProviderConfig(kind="stub")},
+    )
+    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.5)
 
 
 def _cfg(threshold: float = 0.75) -> AppConfig:
@@ -19,7 +33,7 @@ def _cfg(threshold: float = 0.75) -> AppConfig:
     )
 
 
-def _seed(store: IncidentStore, *, di_confidence: float | None):
+def _seed(store: IncidentRepository, *, di_confidence: float | None):
     inc = store.create(query="api latency", environment="production",
                        reporter_id="u", reporter_team="t")
     # Pretend deep_investigator already ran and stamped a confidence value.
@@ -36,7 +50,7 @@ def _seed(store: IncidentStore, *, di_confidence: float | None):
 
 @pytest.mark.asyncio
 async def test_gate_pauses_when_no_di_confidence(tmp_path):
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     inc = _seed(store, di_confidence=None)
     gate = make_gate_node(cfg=_cfg(), store=store)
     out = await gate(GraphState(incident=inc, next_route=None,
@@ -55,7 +69,7 @@ async def test_gate_pauses_when_no_di_confidence(tmp_path):
 
 @pytest.mark.asyncio
 async def test_gate_pauses_when_below_threshold(tmp_path):
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     inc = _seed(store, di_confidence=0.42)
     gate = make_gate_node(cfg=_cfg(threshold=0.75), store=store)
     out = await gate(GraphState(incident=inc, next_route=None,
@@ -68,7 +82,7 @@ async def test_gate_pauses_when_below_threshold(tmp_path):
 
 @pytest.mark.asyncio
 async def test_gate_passes_when_at_or_above_threshold(tmp_path):
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     inc = _seed(store, di_confidence=0.9)
     gate = make_gate_node(cfg=_cfg(threshold=0.75), store=store)
     out = await gate(GraphState(incident=inc, next_route=None,
@@ -87,7 +101,7 @@ async def test_gate_pauses_when_string_label_confidence_below_threshold(tmp_path
     0.3 because it's below 0.75. This pins that fix-1 plays nicely with the
     gate's threshold logic.
     """
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     inc = store.create(query="api latency", environment="production",
                        reporter_id="u", reporter_team="t")
     skill = Skill(
@@ -127,7 +141,7 @@ async def test_gate_pauses_when_string_label_confidence_below_threshold(tmp_path
 async def test_gate_clears_stale_intervention_on_pass(tmp_path):
     """If a prior run set pending_intervention but the new DI is confident,
     the gate should clear the old payload before forwarding to resolution."""
-    store = IncidentStore(tmp_path)
+    store = _make_repo(tmp_path)
     inc = _seed(store, di_confidence=0.92)
     inc.pending_intervention = {"reason": "low_confidence", "confidence": 0.3,
                                 "threshold": 0.75,

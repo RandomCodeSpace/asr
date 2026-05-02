@@ -10,10 +10,11 @@ from __future__ import annotations
 # So: build a fresh Orchestrator inside each `asyncio.run` and `aclose` it when
 # done. For pure metadata views (agents/tools) we use `_load_metadata_dicts` —
 # a one-shot fetch that captures plain dicts and disposes the orchestrator.
-# The sidebar uses IncidentStore directly, since incident JSON I/O is sync and
-# needs no MCP clients.
+# The sidebar uses IncidentRepository directly for sync list/load/delete calls
+# that need no MCP clients. It builds the repo from the same config the
+# Orchestrator uses so both share the same SQLite DB.
 
-from app import AppConfig, IncidentStore, Orchestrator, load_config
+from app import AppConfig, Base, IncidentRepository, Orchestrator, StorageConfig, StorageConfig as SC, build_embedder, build_engine, load_config
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,9 +24,31 @@ import streamlit as st
 
 
 
+
+
+
 # ====== module: ui/streamlit_app.py ======
 
 CONFIG_PATH = Path("config/config.yaml")
+
+
+def _make_repository(cfg: AppConfig) -> IncidentRepository:
+    """Build an IncidentRepository from config — mirrors Orchestrator.create logic."""
+
+    default_url = StorageConfig().url
+    url = (
+        cfg.storage.url if cfg.storage.url != default_url
+        else f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
+    )
+
+    engine = build_engine(SC(url=url, pool_size=cfg.storage.pool_size, echo=cfg.storage.echo))
+    Base.metadata.create_all(engine)
+    embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
+    return IncidentRepository(
+        engine=engine,
+        embedder=embedder,
+        similarity_threshold=cfg.incidents.similarity_threshold,
+    )
 
 
 def _load_metadata_dicts(cfg: AppConfig) -> tuple[list[dict], list[dict], list[str]]:
@@ -145,7 +168,7 @@ def _fmt_tokens_short(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else f"{n}"
 
 
-def _render_inc_row(inc: dict, store: IncidentStore) -> None:
+def _render_inc_row(inc: dict, store: IncidentRepository) -> None:
     """One INC row as an expander.
 
     Header shows INC id + env badge + status badge. The body holds
@@ -226,7 +249,7 @@ def _render_inc_row(inc: dict, store: IncidentStore) -> None:
             st.session_state["selected_incident"] = inc_id
 
 
-def render_sidebar(store: IncidentStore) -> None:
+def render_sidebar(store: IncidentRepository) -> None:
     with st.sidebar:
         head_l, head_r = st.columns([4, 1])
         with head_l:
@@ -587,7 +610,7 @@ def _render_tool_calls_block(inc: dict) -> None:
             _render_value(tc.get("result"))
 
 
-def render_incident_detail(store: IncidentStore,
+def render_incident_detail(store: IncidentRepository,
                            agent_names: frozenset[str] = frozenset()) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
@@ -879,7 +902,7 @@ def main() -> None:
     st.set_page_config(page_title="ASR — Agent Orchestrator", layout="wide")
     _inject_global_css()
     cfg = load_config(CONFIG_PATH)
-    store = IncidentStore(cfg.paths.incidents_dir)
+    store = _make_repository(cfg)
 
     # One-shot snapshot of agent/tool metadata + environments. ~100-200ms per
     # rerun; acceptable, and keeps async resources strictly scoped.

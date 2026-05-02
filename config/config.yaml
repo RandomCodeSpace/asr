@@ -1,3 +1,5 @@
+storage:
+  url: "sqlite:///incidents/incidents.db"
 llm:
   default: workhorse
   providers:

@@ -5,6 +5,7 @@ sites in the MCP server and orchestrator change minimally. The repository
 also owns the embedder; ``find_similar`` (Task G) does the dialect dispatch.
 """
 from __future__ import annotations
+import json
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -44,6 +45,16 @@ def _parse_iso(s: Optional[str]) -> Optional[datetime]:
     if s is None:
         return None
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _deserialize_resolution(raw: Optional[str]):
+    """Attempt JSON parse of stored resolution; return raw string on failure."""
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
 
 
 class IncidentRepository:
@@ -275,7 +286,7 @@ class IncidentRepository:
             agents_run=agents_run,
             tool_calls=tool_calls,
             findings=dict(row.findings or {}),
-            resolution=row.resolution,
+            resolution=_deserialize_resolution(row.resolution),
             token_usage=token_usage,
             pending_intervention=row.pending_intervention,
             user_inputs=list(row.user_inputs or []),
@@ -298,7 +309,10 @@ class IncidentRepository:
             "severity": inc.severity,
             "category": inc.category,
             "matched_prior_inc": inc.matched_prior_inc,
-            "resolution": inc.resolution,
+            "resolution": (
+                inc.resolution if inc.resolution is None or isinstance(inc.resolution, str)
+                else json.dumps(inc.resolution)
+            ),
             "tags": list(inc.tags),
             "agents_run": [a.model_dump(mode="json") for a in inc.agents_run],
             "tool_calls": [t.model_dump(mode="json") for t in inc.tool_calls],
