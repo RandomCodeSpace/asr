@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from langchain_core.embeddings import Embeddings
-from sqlalchemy import desc, select
+from sqlalchemy import and_, desc, func, literal, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -171,6 +171,83 @@ class IncidentRepository:
             rows = session.execute(stmt).scalars().all()
             return [self._row_to_incident(r) for r in rows]
 
+    # ---------- similarity search ----------
+    def find_similar(
+        self, *, query: str, environment: str,
+        status_filter: str = "resolved",
+        threshold: Optional[float] = None,
+        limit: int = 5,
+    ) -> list[tuple[Incident, float]]:
+        """Return up to ``limit`` similar resolved incidents for the same env.
+
+        Embedding path uses native vector ops (pgvector ``cosine_distance`` /
+        sqlite-vec ``vec_distance_cosine``). Keyword path falls back to
+        the existing ``KeywordSimilarity`` scorer to preserve behaviour
+        when no embedder is configured.
+        """
+        if self.embedder is None:
+            return self._keyword_similar(
+                query=query, environment=environment,
+                status_filter=status_filter,
+                threshold=threshold, limit=limit,
+            )
+        return self._vector_similar(
+            query=query, environment=environment,
+            status_filter=status_filter,
+            threshold=threshold, limit=limit,
+        )
+
+    def _vector_similar(self, *, query, environment, status_filter, threshold, limit):
+        import numpy as np
+        vec = self.embedder.embed_query(query)
+        threshold = self.similarity_threshold if threshold is None else threshold
+        with Session(self.engine) as session:
+            if self.engine.dialect.name == "postgresql":
+                score = (literal(1.0) - IncidentRow.embedding.cosine_distance(vec)).label("score")
+            else:
+                blob = np.asarray(vec, dtype=np.float32).tobytes()
+                score = (literal(1.0) - func.vec_distance_cosine(IncidentRow.embedding, blob)).label("score")
+            stmt = (
+                select(IncidentRow, score)
+                .where(and_(
+                    IncidentRow.deleted_at.is_(None),
+                    IncidentRow.status == status_filter,
+                    IncidentRow.environment == environment,
+                    IncidentRow.embedding.is_not(None),
+                ))
+                .order_by(desc("score"))
+                .limit(limit)
+            )
+            rows = session.execute(stmt).all()
+        out: list[tuple[Incident, float]] = []
+        for row, s in rows:
+            s = float(s)
+            if s < threshold:
+                continue
+            out.append((self._row_to_incident(row), s))
+        return out
+
+    def _keyword_similar(self, *, query, environment, status_filter, threshold, limit):
+        from orchestrator.similarity import KeywordSimilarity, find_similar
+        candidates_inc = [
+            i for i in self.list_all()
+            if i.environment == environment
+            and i.status == status_filter
+            and i.deleted_at is None
+        ]
+        candidates = [
+            {"id": i.id, "text": f"{i.query} {i.summary} {' '.join(i.tags)}",
+             "incident": i}
+            for i in candidates_inc
+        ]
+        results = find_similar(
+            query=query, candidates=candidates, text_field="text",
+            scorer=KeywordSimilarity(),
+            threshold=self.similarity_threshold if threshold is None else threshold,
+            limit=limit,
+        )
+        return [(c["incident"], float(s)) for c, s in results]
+
     # ---------- mapping helpers ----------
     def _row_to_incident(self, row: IncidentRow) -> Incident:
         agents_run = [AgentRun.model_validate(a) for a in (row.agents_run or [])]
@@ -255,10 +332,8 @@ class IncidentRepository:
 
 
 def _embed_source(inc: Incident) -> str:
-    parts = [inc.query or "", inc.summary or "", " ".join(inc.tags or [])]
-    return " ".join(p for p in parts if p).strip()
+    return (inc.query or "").strip()
 
 
 def _embed_source_from_row(row: IncidentRow) -> str:
-    parts = [row.query or "", row.summary or "", " ".join(row.tags or [])]
-    return " ".join(p for p in parts if p).strip()
+    return (row.query or "").strip()
