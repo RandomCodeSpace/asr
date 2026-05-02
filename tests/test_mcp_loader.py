@@ -1,14 +1,27 @@
 from contextlib import AsyncExitStack
 import pytest
-from orchestrator.config import MCPConfig, MCPServerConfig
-from orchestrator.incident import IncidentStore
+from orchestrator.config import EmbeddingConfig, MCPConfig, MCPServerConfig, ProviderConfig, StorageConfig
 from orchestrator.mcp_loader import load_tools, ToolRegistry
 from orchestrator.mcp_servers.incident import set_state as set_inc_state
+from orchestrator.storage.embeddings import build_embedder
+from orchestrator.storage.engine import build_engine
+from orchestrator.storage.models import Base
+from orchestrator.storage.repository import IncidentRepository
+
+
+def _make_repo(tmp_path):
+    eng = build_engine(StorageConfig(url=f"sqlite:///{tmp_path}/test.db"))
+    Base.metadata.create_all(eng)
+    embedder = build_embedder(
+        EmbeddingConfig(provider="s", model="x", dim=1024),
+        {"s": ProviderConfig(kind="stub")},
+    )
+    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.5)
 
 
 @pytest.fixture
 def cfg(tmp_path):
-    set_inc_state(store=IncidentStore(tmp_path), similarity_threshold=0.5)
+    set_inc_state(repository=_make_repo(tmp_path))
     return MCPConfig(servers=[
         MCPServerConfig(
             name="local_inc", transport="in_process",

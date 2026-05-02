@@ -2,16 +2,35 @@
 from __future__ import annotations
 import importlib
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import AsyncIterator
 from datetime import datetime, timezone
 
-from orchestrator.config import AppConfig
-from orchestrator.incident import IncidentStore, ToolCall
+from orchestrator.config import AppConfig, StorageConfig
+from orchestrator.incident import ToolCall
 from orchestrator.skill import load_all_skills, Skill
 from orchestrator.mcp_loader import load_tools, ToolRegistry
 from orchestrator.graph import build_graph, build_resume_graph, GraphState
+from orchestrator.storage.engine import build_engine
+from orchestrator.storage.embeddings import build_embedder
+from orchestrator.storage.models import Base
+from orchestrator.storage.repository import IncidentRepository
 
 _INCIDENT_MCP_MODULE = "orchestrator.mcp_servers.incident"
+
+
+def _storage_url(cfg: AppConfig) -> str:
+    """Derive the SQLite URL for the current config.
+
+    When ``cfg.storage.url`` is still the default sentinel (``sqlite:///incidents.db``),
+    use ``cfg.paths.incidents_dir`` so that per-test ``tmp_path`` isolation is
+    respected. Production deployments that set an explicit ``storage.url``
+    (e.g. a Postgres DSN or a non-default SQLite path) are left untouched.
+    """
+    default_url = StorageConfig().url
+    if cfg.storage.url != default_url:
+        return cfg.storage.url
+    return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
 class Orchestrator:
@@ -21,7 +40,7 @@ class Orchestrator:
     tool registry. Always call :meth:`aclose` (or use ``async with``) when done.
     """
 
-    def __init__(self, cfg: AppConfig, store: IncidentStore,
+    def __init__(self, cfg: AppConfig, store: IncidentRepository,
                  skills: dict[str, Skill], registry: ToolRegistry, graph,
                  resume_graph, exit_stack: AsyncExitStack):
         self.cfg = cfg
@@ -37,7 +56,17 @@ class Orchestrator:
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
-            store = IncidentStore(cfg.paths.incidents_dir)
+            engine = build_engine(StorageConfig(url=_storage_url(cfg),
+                                                pool_size=cfg.storage.pool_size,
+                                                echo=cfg.storage.echo))
+            Base.metadata.create_all(engine)
+            embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
+            store = IncidentRepository(
+                engine=engine,
+                embedder=embedder,
+                similarity_threshold=cfg.incidents.similarity_threshold,
+                severity_aliases=cfg.orchestrator.severity_aliases,
+            )
             # Configure incident_management state via importlib so we hit the
             # *same* module instance the MCP loader will import. In the
             # single-file dist bundle a direct ``set_state`` call would
@@ -48,8 +77,7 @@ class Orchestrator:
                 if (srv.transport == "in_process" and srv.enabled
                         and srv.module == _INCIDENT_MCP_MODULE):
                     importlib.import_module(_INCIDENT_MCP_MODULE).set_state(
-                        store=store,
-                        similarity_threshold=cfg.incidents.similarity_threshold,
+                        repository=store,
                         severity_aliases=cfg.orchestrator.severity_aliases,
                     )
                     break

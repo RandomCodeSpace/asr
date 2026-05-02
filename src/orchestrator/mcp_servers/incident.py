@@ -1,25 +1,18 @@
-"""FastMCP server: incident_management mock tools.
+"""FastMCP server: incident_management tools, backed by IncidentRepository.
 
 State scoping
 -------------
-Earlier revisions used a module-level ``_state`` dict, which made the FastMCP
-instance and its store reference process-global. Two concurrent
-:class:`Orchestrator` instances (or two pytest workers) would clobber each
-other's stores. Now state is held on a per-instance :class:`IncidentMCPServer`,
-and a fresh ``mcp`` (FastMCP) instance is built for every server.
-
-The module-level ``mcp`` symbol (imported by the MCP loader) is constructed
-lazily — the first call to :func:`get_or_create_default_server` (or the
-back-compat :func:`set_state`) builds it. ``set_state`` remains as a thin shim
-that mutates the default server's state, so existing call-sites and tests keep
-working without churn.
+Each Orchestrator constructs its own :class:`IncidentMCPServer`, so two
+orchestrators in the same process do not share repository state. The
+module-level ``mcp`` and ``set_state`` symbols are kept as a back-compat
+surface for the MCP loader (``getattr(mod, "mcp")``) and for tests that
+import these names directly.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
 from fastmcp import FastMCP
 
-from orchestrator.incident import IncidentStore
-from orchestrator.similarity import KeywordSimilarity, find_similar
+from orchestrator.storage.repository import IncidentRepository
 
 
 _DEFAULT_SEVERITY_ALIASES: dict[str, str] = {
@@ -35,12 +28,6 @@ def normalize_severity(
     value: str | None,
     aliases: dict[str, str] | None = None,
 ) -> str | None:
-    """Coerce assorted severity inputs (sev1/p2/critical/etc.) to a canonical label.
-
-    ``aliases`` maps lower-cased input tokens to canonical values. When ``None``
-    no normalization occurs — the lowercased input is returned as-is. Unknown
-    inputs pass through untouched so callers can flag them.
-    """
     if value is None:
         return None
     lowered = value.strip().lower()
@@ -51,14 +38,8 @@ def normalize_severity(
 
 @dataclass
 class IncidentMCPServer:
-    """Per-instance container holding a FastMCP server and its scoped state.
-
-    Each Orchestrator constructs its own :class:`IncidentMCPServer`, so two
-    orchestrators in the same process (e.g. two test fixtures, two web users
-    behind one Streamlit deployment) no longer share a store reference.
-    """
-    store: IncidentStore | None = None
-    similarity_threshold: float = 0.85
+    """FastMCP server bound to a single :class:`IncidentRepository`."""
+    repository: IncidentRepository | None = None
     severity_aliases: dict[str, str] = field(
         default_factory=lambda: dict(_DEFAULT_SEVERITY_ALIASES)
     )
@@ -66,66 +47,44 @@ class IncidentMCPServer:
 
     def __post_init__(self) -> None:
         self.mcp = FastMCP("incident_management")
-        # Bind the tool implementations to *this* server's state. We pass an
-        # explicit ``name=`` because FastMCP defaults to the function's
-        # ``__name__`` (which would expose the leading underscore). The names
-        # below match the original module-level tool functions, so the MCP
-        # tool surface (and the LangChain registry that consumes it) is
-        # unchanged.
         self.mcp.tool(name="lookup_similar_incidents")(self._tool_lookup_similar_incidents)
         self.mcp.tool(name="create_incident")(self._tool_create_incident)
         self.mcp.tool(name="update_incident")(self._tool_update_incident)
 
     def configure(
-        self,
-        *,
-        store: IncidentStore,
-        similarity_threshold: float,
+        self, *,
+        repository: IncidentRepository,
         severity_aliases: dict[str, str] | None = None,
     ) -> None:
-        self.store = store
-        self.similarity_threshold = similarity_threshold
+        self.repository = repository
         if severity_aliases is not None:
             self.severity_aliases = severity_aliases
 
-    def _require_store(self) -> IncidentStore:
-        if self.store is None:
+    def _require_repo(self) -> IncidentRepository:
+        if self.repository is None:
             raise RuntimeError(
                 "incident_management server not initialized — "
                 "call configure() (or the module-level set_state) first"
             )
-        return self.store
-
-    # FastMCP introspects parameter type hints to build tool schemas, so the
-    # bound methods below take the same signatures as the previous module-level
-    # functions (no `self` from the LLM's POV — `self` is captured by the bound
-    # method when we pass it to ``mcp.tool()``).
+        return self.repository
 
     async def _tool_lookup_similar_incidents(self, query: str, environment: str) -> dict:
         """Search past resolved INCs for similar issues. Returns top 5 by similarity score."""
-        store = self._require_store()
-        resolved = [i for i in store.list_all() if i.status == "resolved"]
-        candidates = [
-            {"id": i.id, "text": f"{i.query} {i.summary} {' '.join(i.tags)}",
-             "summary": i.summary, "resolution": i.resolution, "environment": i.environment}
-            for i in resolved if i.environment == environment
-        ]
-        results = find_similar(
-            query=query, candidates=candidates, text_field="text",
-            scorer=KeywordSimilarity(), threshold=self.similarity_threshold, limit=5,
-        )
+        repo = self._require_repo()
+        hits = repo.find_similar(query=query, environment=environment, limit=5)
         return {"matches": [
-            {"id": r["id"], "summary": r["summary"], "resolution": r["resolution"], "score": round(s, 3)}
-            for r, s in results
+            {"id": i.id, "summary": i.summary, "resolution": i.resolution,
+             "score": round(s, 3)}
+            for i, s in hits
         ]}
 
     async def _tool_create_incident(self, query: str, environment: str,
                                     reporter_id: str = "user-mock",
                                     reporter_team: str = "platform") -> dict:
         """Create a new INC ticket and persist it."""
-        inc = self._require_store().create(query=query, environment=environment,
-                                           reporter_id=reporter_id,
-                                           reporter_team=reporter_team)
+        inc = self._require_repo().create(query=query, environment=environment,
+                                          reporter_id=reporter_id,
+                                          reporter_team=reporter_team)
         return inc.model_dump()
 
     async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
@@ -133,12 +92,10 @@ class IncidentMCPServer:
 
         Allowed keys:
           - status, severity, category, summary, tags, matched_prior_inc, resolution
-          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``
-            (e.g. ``findings_triage``, ``findings_deep_investigator``,
-            or any agent name a YAML-defined skill may use).
+          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``.
         """
-        store = self._require_store()
-        inc = store.load(incident_id)
+        repo = self._require_repo()
+        inc = repo.load(incident_id)
         if "status" in patch:
             inc.status = patch["status"]
         if "severity" in patch:
@@ -153,59 +110,33 @@ class IncidentMCPServer:
             inc.matched_prior_inc = patch["matched_prior_inc"]
         if "resolution" in patch:
             inc.resolution = patch["resolution"]
-        # findings_<agent> → inc.findings[<agent>] for any agent name.
         for key, value in patch.items():
             if key.startswith("findings_"):
                 inc.findings[key[len("findings_"):]] = value
-        store.save(inc)
+        repo.save(inc)
         return inc.model_dump()
 
 
 # ---------------------------------------------------------------------------
-# Module-level default server (back-compat for the existing MCP loader path).
-#
-# The MCP loader imports ``mcp`` from this module by name (it doesn't know
-# about IncidentMCPServer). To preserve that contract, we expose:
-#
-#   - ``mcp``   : a FastMCP instance owned by ``_default_server``
-#   - ``set_state(...)`` : configure ``_default_server``'s store/threshold
-#   - ``lookup_similar_incidents`` / ``create_incident`` / ``update_incident``
-#     : thin shims so direct callers in tests still work
-#
-# Per-Orchestrator scoping is achieved by constructing a fresh
-# :class:`IncidentMCPServer` (planned in a follow-up that wires it through
-# ``mcp_loader.load_tools``). This commit removes the *module-global dict* —
-# state now lives on the instance — without breaking the existing import path.
+# Module-level default server (back-compat for the MCP loader path).
+# The MCP loader imports ``mcp`` from this module by name; this keeps that
+# contract working unchanged.
 # ---------------------------------------------------------------------------
 
 _default_server = IncidentMCPServer()
 mcp = _default_server.mcp
 
 
-def set_state(
-    *,
-    store: IncidentStore,
-    similarity_threshold: float,
-    severity_aliases: dict[str, str] | None = None,
-) -> None:
-    """Configure the default IncidentMCPServer instance.
-
-    Kept for backwards compatibility with callers that import this function
-    directly (the orchestrator and several tests). New code should construct an
-    :class:`IncidentMCPServer` and call ``configure`` on it.
-
-    ``severity_aliases`` is optional; when omitted the server retains the
-    default map so existing callers see no behaviour change.
-    """
+def set_state(*, repository: IncidentRepository,
+              severity_aliases: dict[str, str] | None = None) -> None:
+    """Configure the default IncidentMCPServer instance."""
     _default_server.configure(
-        store=store,
-        similarity_threshold=similarity_threshold,
+        repository=repository,
         severity_aliases=severity_aliases,
     )
 
 
-# Public function aliases so test modules importing these names directly keep
-# working. They forward to the bound methods on ``_default_server``.
+# Direct-call shims kept for tests that import these names.
 async def lookup_similar_incidents(query: str, environment: str) -> dict:
     return await _default_server._tool_lookup_similar_incidents(query, environment)
 
