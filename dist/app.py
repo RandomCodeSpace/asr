@@ -164,8 +164,6 @@ from typing import AsyncIterator
 
 
 
-
-
 # ----- imports for api.py -----
 """FastAPI app — health, listings, and incident endpoints.
 
@@ -2066,6 +2064,9 @@ async def build_resume_graph(*, cfg: AppConfig, skills: dict,
 
 # ====== module: orchestrator/orchestrator.py ======
 
+_INCIDENT_MCP_MODULE = "orchestrator.mcp_servers.incident"
+
+
 class Orchestrator:
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -2090,11 +2091,21 @@ class Orchestrator:
         await stack.__aenter__()
         try:
             store = IncidentStore(cfg.paths.incidents_dir)
-            set_state(
-                store=store,
-                similarity_threshold=cfg.incidents.similarity_threshold,
-                severity_aliases=cfg.orchestrator.severity_aliases,
-            )
+            # Configure incident_management state via importlib so we hit the
+            # *same* module instance the MCP loader will import. In the
+            # single-file dist bundle a direct ``set_state`` call would
+            # configure a bundled-local ``_default_server`` while the loader
+            # imports ``orchestrator.mcp_servers.incident`` from src and uses
+            # a *different* singleton — leaving FastMCP tools unconfigured.
+            for srv in cfg.mcp.servers:
+                if (srv.transport == "in_process" and srv.enabled
+                        and srv.module == _INCIDENT_MCP_MODULE):
+                    importlib.import_module(_INCIDENT_MCP_MODULE).set_state(
+                        store=store,
+                        similarity_threshold=cfg.incidents.similarity_threshold,
+                        severity_aliases=cfg.orchestrator.severity_aliases,
+                    )
+                    break
             skills = load_all_skills(cfg.paths.skills_dir)
             for s in skills.values():
                 if s.model is not None and s.model not in cfg.llm.models:
