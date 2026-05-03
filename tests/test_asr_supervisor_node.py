@@ -379,3 +379,90 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
     sess = out["session"]
     assert sess.status == "duplicate"
     assert sess.parent_session_id == "INC-OTHER"
+
+
+# ---------------------------------------------------------------------------
+# Task 7: composition — default_supervisor_runner = compose_runners(
+#          default_intake_runner, asr_memory_hydration)
+# ---------------------------------------------------------------------------
+
+
+def _make_incident() -> "IncidentState":
+    from examples.incident_management.state import IncidentState, Reporter
+    return IncidentState(
+        id="INC-20260503-007",
+        status="new",
+        created_at="2026-05-03T00:00:00Z",
+        updated_at="2026-05-03T00:00:00Z",
+        query="payments service p99 latency spike",
+        environment="prod",
+        reporter=Reporter(id="op-1", team="sre"),
+    )
+
+
+def test_default_supervisor_runner_calls_framework_default_first() -> None:
+    """ASR runner must call default_intake_runner before ASR hydration.
+
+    Verifies two things:
+    1. Framework default ran: ``findings['prior_similar']`` is present
+       (even as an empty list — HistoryStore returned no hits).
+    2. ASR hydration ran: ``session.memory`` is non-None / populated,
+       because the framework runner did NOT short-circuit.
+    """
+    from runtime.intake import IntakeContext
+    from examples.incident_management.asr.supervisor_node import (
+        default_supervisor_runner,
+    )
+
+    class _StubHist:
+        def find_similar(self, *, query: str, filter_kwargs=None, limit: int = 3, threshold: float = 0.7):
+            return []
+
+    incident = _make_incident()
+    state = {"session": incident}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=_StubHist(), dedup_pipeline=None,
+    )})()
+
+    default_supervisor_runner(state, app_cfg=app_cfg)
+
+    # Framework default: findings['prior_similar'] populated (empty list ok).
+    assert "prior_similar" in incident.findings
+    # ASR hydration: memory attribute is set (MemoryLayerState, even if empty).
+    assert incident.memory is not None
+
+
+def test_default_supervisor_runner_skips_hydration_on_short_circuit(monkeypatch) -> None:
+    """If framework runner returns next_route='__end__', ASR hydration must NOT run.
+
+    This pins the composition contract: compose_runners stops on first
+    next_route so a dedup/duplicate hit skips expensive KG lookups.
+    """
+    from runtime.intake import compose_runners, default_intake_runner
+    from examples.incident_management.asr import supervisor_node as sn
+
+    hydration_called = []
+
+    def _stub_hydrate_runner(state: object, *, app_cfg: object = None):  # type: ignore[return]
+        hydration_called.append(True)
+        return None
+
+    # Patch: framework default always short-circuits.
+    def _short_circuit(state: object, *, app_cfg: object = None):
+        sess = state.get("session") if hasattr(state, "get") else None  # type: ignore[union-attr]
+        if sess is not None:
+            sess.status = "duplicate"
+        return {"next_route": "__end__"}
+
+    patched = compose_runners(_short_circuit, _stub_hydrate_runner)
+    monkeypatch.setattr(sn, "_BUILT_DEFAULT_RUNNER", patched)
+
+    incident = _make_incident()
+    state = {"session": incident}
+
+    result = sn.default_supervisor_runner(state, app_cfg=None)
+
+    assert result is not None
+    assert result.get("next_route") == "__end__"
+    # ASR hydration must NOT have run.
+    assert hydration_called == [], "ASR hydration ran despite short-circuit — composition broken"

@@ -466,6 +466,45 @@ def make_hydrate_runner(
     return _runner
 
 
+from runtime.intake import compose_runners, default_intake_runner
+
+
+def make_default_supervisor_runner(
+    *,
+    kg_store: KGStore,
+    release_store: ReleaseStore,
+    playbook_store: PlaybookStore,
+    get_active_sessions: Callable[[], list[dict[str, Any]]] | None = None,
+    component_lookup: Callable[[str], list[str]] | None = None,
+) -> Callable[..., dict[str, Any] | None]:
+    """Compose framework default_intake_runner + ASR memory hydration.
+
+    Framework default runs first (similarity retrieval + dedup gate).
+    If it short-circuits via ``next_route='__end__'`` (duplicate), the
+    ASR hydration is skipped — the duplicate session ends without
+    paying for KG/playbook lookups.
+    """
+    asr_runner = make_hydrate_runner(
+        kg_store=kg_store,
+        release_store=release_store,
+        playbook_store=playbook_store,
+        get_active_sessions=get_active_sessions,
+        component_lookup=component_lookup,
+    )
+    return compose_runners(default_intake_runner, asr_runner)
+
+
+# Build the default runner exactly once at import time so per-call
+# overhead is just a closure invocation. Constructor stays cheap:
+# the stores read seed JSON lazily on first access.
+_BUILT_DEFAULT_RUNNER = make_default_supervisor_runner(
+    kg_store=KGStore(_DEFAULT_SEEDS / "kg"),
+    release_store=ReleaseStore(_DEFAULT_SEEDS / "releases"),
+    playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
+    get_active_sessions=lambda: [],
+)
+
+
 def default_supervisor_runner(
     state: Any, *, app_cfg: Any | None = None,
 ) -> dict[str, Any] | None:
@@ -474,19 +513,12 @@ def default_supervisor_runner(
     Anchored on the bundled seed directory (``seeds/kg``,
     ``seeds/releases``, ``seeds/playbooks``) so the asr_supervisor
     skill works out of the box. Real deployments should construct
-    their own runner via :func:`make_hydrate_runner` and register it
-    with their app's skill loader.
+    their own runner via :func:`make_default_supervisor_runner` and
+    register it with their app's skill loader.
+
+    Composition: framework ``default_intake_runner`` (similarity
+    retrieval + dedup gate) runs first; ASR memory hydration follows.
+    If the framework short-circuits (``next_route='__end__'``), the
+    hydration step is skipped.
     """
-    runner = _BUILT_DEFAULT_RUNNER
-    return runner(state, app_cfg=app_cfg)
-
-
-# Build the default runner exactly once at import time so per-call
-# overhead is just a closure invocation. Constructor stays cheap:
-# the stores read seed JSON lazily on first access.
-_BUILT_DEFAULT_RUNNER = make_hydrate_runner(
-    kg_store=KGStore(_DEFAULT_SEEDS / "kg"),
-    release_store=ReleaseStore(_DEFAULT_SEEDS / "releases"),
-    playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
-    get_active_sessions=lambda: [],
-)
+    return _BUILT_DEFAULT_RUNNER(state, app_cfg=app_cfg)
