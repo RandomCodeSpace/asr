@@ -120,7 +120,9 @@ class IncidentAppConfig(BaseModel):
         return self.framework.severity_aliases
 
 
-_DEFAULT_PATH = Path(__file__).parent / "config.yaml"
+_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "incident_management.yaml"
+)
 
 
 def load_incident_app_config(
@@ -155,6 +157,7 @@ def load_incident_app_config(
         "escalation_teams",
         "severity_aliases",
         "dedup_system_prompt",
+        "ui",
     ):
         if legacy_key in raw:
             fw_kwargs[legacy_key] = raw.pop(legacy_key)

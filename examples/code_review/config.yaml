@@ -1,6 +1,0 @@
-similarity_threshold: 0.3
-similarity_method: keyword
-severity_categories: [info, warning, error, critical]
-auto_request_changes_on: [critical, error]
-repos_in_scope: []
-review_max_diff_kb: 500

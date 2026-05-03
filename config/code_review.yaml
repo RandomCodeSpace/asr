@@ -1,0 +1,26 @@
+similarity_threshold: 0.3
+similarity_method: keyword
+severity_categories: [info, warning, error, critical]
+auto_request_changes_on: [critical, error]
+repos_in_scope: []
+review_max_diff_kb: 500
+
+# UI rendering knobs surfaced to the generic runtime/ui.py shell.
+# Severity badges follow the code-review vocabulary; detail fields
+# expose PR identity and review verdict in the right pane.
+ui:
+  badges:
+    severity:
+      info:     { label: INFO,     color: gray }
+      warning:  { label: WARNING,  color: yellow }
+      error:    { label: ERROR,    color: orange }
+      critical: { label: CRITICAL, color: red }
+    overall_recommendation:
+      approve:         { label: APPROVE,         color: green }
+      request_changes: { label: REQUEST CHANGES, color: red }
+      comment:         { label: COMMENT,         color: blue }
+  detail_fields:
+    - { key: pr.repo,   label: Repo,   section: summary }
+    - { key: pr.number, label: "PR #", section: summary }
+    - { key: pr.author, label: Author, section: summary }
+  tags: {}

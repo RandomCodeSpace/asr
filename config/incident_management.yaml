@@ -48,3 +48,24 @@ dedup:
   scope:
     same_environment: true
     only_closed: true
+
+# UI rendering knobs surfaced to the generic runtime/ui.py shell. Keys
+# under `badges` are field names on the session; values map field-value
+# -> {label, color}. `detail_fields` lists fields the detail pane
+# renders, in order. `tags` is an opaque key->tag-string map for
+# cross-skill signals.
+ui:
+  badges:
+    severity:
+      sev1: { label: SEV1, color: red }
+      sev2: { label: SEV2, color: orange }
+      sev3: { label: SEV3, color: yellow }
+      sev4: { label: SEV4, color: blue }
+      sev5: { label: SEV5, color: gray }
+  detail_fields:
+    - { key: reporter.id, label: Reporter, section: summary }
+    - { key: reporter.team, label: Team, section: summary }
+    - { key: component_id, label: Component, section: summary }
+  tags:
+    prior_match_supported: hypothesis:prior_match_supported
+    prior_match_rejected: hypothesis:prior_match_rejected

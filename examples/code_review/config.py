@@ -65,7 +65,9 @@ class CodeReviewAppConfig(BaseModel):
         return self.framework.similarity_threshold
 
 
-_DEFAULT_PATH = Path(__file__).parent / "config.yaml"
+_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "code_review.yaml"
+)
 
 
 def load_code_review_app_config(path: str | Path | None = None) -> CodeReviewAppConfig:
@@ -87,6 +89,7 @@ def load_code_review_app_config(path: str | Path | None = None) -> CodeReviewApp
         "escalation_teams",
         "severity_aliases",
         "dedup_system_prompt",
+        "ui",
     ):
         if legacy_key in raw:
             fw_kwargs[legacy_key] = raw.pop(legacy_key)
