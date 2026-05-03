@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from runtime.memory.knowledge_graph import KnowledgeGraphStore
-from examples.incident_management.asr.memory_state import L2KGContext
+from runtime.memory.session_state import L2KGContext
 
 
 # ---- Seed-fallback path -------------------------------------------------

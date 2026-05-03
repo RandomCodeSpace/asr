@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from examples.incident_management.asr.memory_state import L7PlaybookSuggestion
+from runtime.memory.session_state import L7PlaybookSuggestion
 from runtime.memory.playbook_store import PlaybookStore
 
 

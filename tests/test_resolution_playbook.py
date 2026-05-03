@@ -20,9 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 
 
-from examples.incident_management.asr.memory_state import L7PlaybookSuggestion
+from runtime.memory.session_state import L7PlaybookSuggestion
 from runtime.memory.playbook_store import PlaybookStore
-from examples.incident_management.asr.resolution_helpers import (
+from runtime.memory.resolution import (
     playbook_to_tool_calls,
     top_playbook,
 )

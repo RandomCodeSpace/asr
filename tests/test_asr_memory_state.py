@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from examples.incident_management.asr.memory_state import (
+from runtime.memory.session_state import (
     L2KGContext,
     L5ReleaseContext,
     L7PlaybookSuggestion,

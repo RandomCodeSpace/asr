@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from examples.incident_management.asr.memory_state import L2KGContext
+from runtime.memory.session_state import L2KGContext
 
 _VALID_EDGE_KINDS: frozenset[str] = frozenset(
     {"calls", "deploys", "reads", "writes"}

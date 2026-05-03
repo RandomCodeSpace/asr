@@ -37,7 +37,7 @@ class L5ReleaseContext(BaseModel):
     Each entry in ``recent_releases`` is a release record dict with at
     least ``service``, ``sha``, ``deployed_at``, ``author``.
     ``suspect_releases`` is the subset of release ids correlated to
-    the incident's start time within the configured window.
+    the session's anchor time within the configured window.
     """
 
     model_config = ConfigDict(extra="forbid")

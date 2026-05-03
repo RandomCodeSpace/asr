@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from examples.incident_management.asr.memory_state import L5ReleaseContext
+from runtime.memory.session_state import L5ReleaseContext
 from runtime.memory.release_context import ReleaseContextStore
 
 

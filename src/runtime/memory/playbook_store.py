@@ -36,7 +36,7 @@ from typing import Any
 
 import yaml
 
-from examples.incident_management.asr.memory_state import L7PlaybookSuggestion
+from runtime.memory.session_state import L7PlaybookSuggestion
 
 _SEED_ROOT = Path(__file__).parent / "seeds" / "playbooks"
 

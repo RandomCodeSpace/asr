@@ -14,8 +14,8 @@ from __future__ import annotations
 
 
 def test_ui_module_imports_cleanly() -> None:
-    """``import examples.incident_management.ui`` must succeed headlessly."""
-    import examples.incident_management.ui as ui  # noqa: F401
+    """``import runtime.ui`` must succeed headlessly."""
+    import runtime.ui as ui  # noqa: F401
     # The renderer for the new panel exists.
     assert hasattr(ui, "_render_hypothesis_trail_block")
     # The Approval Inbox renderer is still present after the
@@ -24,7 +24,7 @@ def test_ui_module_imports_cleanly() -> None:
 
 
 def test_is_hypothesis_trail_recognises_triage_trail_shape() -> None:
-    from examples.incident_management.ui import _is_hypothesis_trail
+    from runtime.ui import _is_hypothesis_trail
 
     trail = [
         {"iteration": 0, "hypothesis": "deploy caused it", "score": 0.4,
@@ -36,7 +36,7 @@ def test_is_hypothesis_trail_recognises_triage_trail_shape() -> None:
 
 
 def test_is_hypothesis_trail_rejects_other_shapes() -> None:
-    from examples.incident_management.ui import _is_hypothesis_trail
+    from runtime.ui import _is_hypothesis_trail
 
     # Empty / wrong type.
     assert _is_hypothesis_trail([]) is False

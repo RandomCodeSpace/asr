@@ -24,7 +24,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from examples.incident_management.asr.memory_state import L5ReleaseContext
+from runtime.memory.session_state import L5ReleaseContext
 
 _SEED_ROOT = Path(__file__).parent / "seeds" / "releases"
 

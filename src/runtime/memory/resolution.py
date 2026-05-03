@@ -1,6 +1,6 @@
 """Resolution agent helpers — playbook → tool-call translation.
 
-The resolution agent matches the L7 PlaybookStore for the incident's
+The resolution agent matches the L7 PlaybookStore for the session's
 signals and produces a list of suggested tool calls. The framework's
 risk-rated gateway (``runtime.tools.gateway``) decides whether each
 call runs auto / notify-soft / require-approval based on its policy
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
-from examples.incident_management.asr.memory_state import L7PlaybookSuggestion
+from runtime.memory.session_state import L7PlaybookSuggestion
 
 
 class ToolCallSpec(TypedDict):

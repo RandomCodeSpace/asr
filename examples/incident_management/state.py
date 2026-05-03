@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from examples.incident_management.asr.memory_state import MemoryLayerState
+from runtime.memory.session_state import MemoryLayerState
 from runtime.state import Session
 
 _INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from examples.incident_management.asr.hypothesis_loop import (
+from runtime.memory.hypothesis import (
     ACCEPT_THRESHOLD,
     MAX_ITERATIONS,
     score_hypothesis,

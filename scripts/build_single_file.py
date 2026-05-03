@@ -93,12 +93,14 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "intake.py"),
     # Generic memory layers (ASR L2/L5/L7). Lifted from
     # examples/incident_management/asr in Wave 1 of the strip-down.
-    # ``memory_state`` (L2/L5/L7 pydantic slots) is referenced by the
-    # three stores so it must come first; lifted in Wave 1.B as
-    # ``runtime.memory.session_state``.
+    # ``session_state`` (L2/L5/L7 pydantic slots) is referenced by the
+    # three stores so it must come first.
+    (RUNTIME_ROOT, "memory/session_state.py"),
     (RUNTIME_ROOT, "memory/knowledge_graph.py"),
     (RUNTIME_ROOT, "memory/release_context.py"),
     (RUNTIME_ROOT, "memory/playbook_store.py"),
+    (RUNTIME_ROOT, "memory/hypothesis.py"),
+    (RUNTIME_ROOT, "memory/resolution.py"),
     (RUNTIME_ROOT, "orchestrator.py"),
     (RUNTIME_ROOT, "api.py"),
     # Retraction routes are a side-car router so they don't bloat
@@ -111,17 +113,14 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 # incident-management app bundle. Order matters: config and state must
 # precede mcp_server / ui which import from them.
 #
-# ``asr/memory_state.py`` is imported by ``state.py`` so it must come
-# first. The three filesystem-backed stores (KG / Release / Playbook)
-# were lifted to ``runtime.memory`` in Wave 1.A and are now bundled in
-# RUNTIME_MODULE_ORDER above. supervisor_node + hypothesis_loop +
-# resolution_helpers are pure-Python helpers consumed by the
-# asr_supervisor / triage / resolution skills.
+# All memory-layer foundations (memory_state, KG/Release/Playbook
+# stores, hypothesis_loop, resolution_helpers) were lifted to
+# ``runtime.memory`` in Wave 1 of the strip-down and are bundled in
+# RUNTIME_MODULE_ORDER above. supervisor_node remains as the per-app
+# adapter that wires the framework helpers to incident_management's
+# stores and active-session lookup.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
-    (EXAMPLES_ROOT, "incident_management/asr/memory_state.py"),
     (EXAMPLES_ROOT, "incident_management/asr/supervisor_node.py"),
-    (EXAMPLES_ROOT, "incident_management/asr/hypothesis_loop.py"),
-    (EXAMPLES_ROOT, "incident_management/asr/resolution_helpers.py"),
     (EXAMPLES_ROOT, "incident_management/config.py"),
     (EXAMPLES_ROOT, "incident_management/state.py"),
     (EXAMPLES_ROOT, "incident_management/mcp_server.py"),
