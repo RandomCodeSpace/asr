@@ -358,6 +358,25 @@ class AppConfig(BaseModel):
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    # Cross-cutting framework knobs (confidence threshold, escalation
+    # roster, severity aliases, dedup prompt, intake tuning) read by
+    # the runtime directly off the loaded ``AppConfig`` — no
+    # app-specific provider callable required. Apps configure these
+    # under the ``framework:`` block of their YAML; tests build them
+    # in code via ``FrameworkAppConfig(...)``. Defaults are framework-
+    # neutral so unconfigured apps still validate cleanly.
+    framework: FrameworkAppConfig = Field(default_factory=FrameworkAppConfig)
+    # Two-stage dedup pipeline shape. Typed as ``Any`` because
+    # ``DedupConfig`` lives in ``runtime.dedup`` and importing it here
+    # would introduce a circular import (``runtime.dedup`` ->
+    # ``runtime.config``). The ``_coerce_dedup`` validator below
+    # promotes a raw dict (the YAML shape) to a real ``DedupConfig``;
+    # callers reading ``cfg.dedup`` get the typed object.
+    dedup: Any | None = None
+    # App-specific environments roster surfaced on the UI's
+    # ``GET /environments`` endpoint and the env selector. Empty list
+    # means "this app doesn't expose environments".
+    environments: list[str] = Field(default_factory=list)
     # Declarative trigger registry. Each entry is one transport-flavoured
     # ``TriggerConfig`` (api/webhook/schedule/plugin). Typed as
     # ``list[Any]`` because Pydantic v2's discriminated-union binding
@@ -365,6 +384,23 @@ class AppConfig(BaseModel):
     # a circular import. The ``_coerce_triggers`` validator below
     # promotes raw dicts to the proper TriggerConfig variants.
     triggers: list[Any] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _coerce_dedup(self) -> "AppConfig":
+        # Lazy import to avoid the circular dep with ``runtime.dedup``
+        # (which imports things that re-import ``runtime.config``).
+        from runtime.dedup import DedupConfig
+        if self.dedup is None:
+            return self
+        if isinstance(self.dedup, DedupConfig):
+            return self
+        if isinstance(self.dedup, dict):
+            self.__dict__["dedup"] = DedupConfig(**self.dedup)
+            return self
+        raise ValueError(
+            f"app.dedup must be a DedupConfig or dict; got "
+            f"{type(self.dedup).__name__}"
+        )
 
     @model_validator(mode="after")
     def _coerce_triggers(self) -> "AppConfig":

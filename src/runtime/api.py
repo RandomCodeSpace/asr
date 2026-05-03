@@ -167,11 +167,15 @@ def _make_lifespan(cfg: AppConfig):
         app.state.orchestrator = orch
         # Environments roster is app-specific (incident-management has
         # production/staging/dev/local; code-review doesn't expose one).
-        # Resolve via the generic provider hook so the runtime never
-        # imports an app config module.
-        app.state.environments = _resolve_environments(
-            getattr(cfg.runtime, "environments_provider_path", None),
-        )
+        # Read it from the YAML's top-level ``environments:`` block;
+        # fall back to the legacy ``environments_provider_path`` callable
+        # for deployments that still wire it.
+        if cfg.environments:
+            app.state.environments = list(cfg.environments)
+        else:
+            app.state.environments = _resolve_environments(
+                getattr(cfg.runtime, "environments_provider_path", None),
+            )
 
         # ------------------------------------------------------------
         # Build & start the trigger registry

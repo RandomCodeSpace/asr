@@ -72,14 +72,20 @@ def test_session_row_alias_exists():
 
 def test_runtime_config_no_incident_keys():
     """Incident-flavored keys live on
-    examples.incident_management.config.IncidentAppConfig, not on the
-    framework's generic ``AppConfig``."""
-    from runtime.config import AppConfig
+    ``AppConfig.framework`` (a generic ``FrameworkAppConfig``) rather
+    than as ad-hoc top-level fields. ``environments`` is a generic
+    list[str] surfaced on ``AppConfig`` directly — apps that don't
+    expose environments leave it empty."""
+    from runtime.config import AppConfig, FrameworkAppConfig
 
     fields = set(AppConfig.model_fields.keys())
     assert "incidents" not in fields
     assert "intervention" not in fields
-    assert "environments" not in fields
+    # ``environments`` is now a generic AppConfig field; verify it is
+    # the empty default when no YAML supplies it.
+    assert "environments" in fields
+    assert "framework" in fields
+    assert AppConfig.model_fields["framework"].annotation is FrameworkAppConfig
 
 
 def test_runtime_config_no_severity_aliases():

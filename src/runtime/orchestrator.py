@@ -251,14 +251,19 @@ class Orchestrator(Generic[StateT]):
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
-            # Cross-cutting framework knobs come from the dotted-path
-            # provider on RuntimeConfig.framework_app_config_path. When
-            # unset the runtime falls back to a bare FrameworkAppConfig()
-            # so unit tests that build an AppConfig without an app-side
-            # provider keep working.
-            framework_cfg = resolve_framework_app_config(
-                cfg.runtime.framework_app_config_path,
-            )
+            # Cross-cutting framework knobs read directly off
+            # ``AppConfig.framework`` — the YAML carries them under the
+            # ``framework:`` block, no app-specific provider callable.
+            # Falls back to the dotted-path provider for backward
+            # compatibility with deployments that still wire it (the
+            # provider, when set, wins over the YAML default since
+            # historical configs relied on it).
+            if cfg.runtime.framework_app_config_path is not None:
+                framework_cfg = resolve_framework_app_config(
+                    cfg.runtime.framework_app_config_path,
+                )
+            else:
+                framework_cfg = cfg.framework
             # Resolve the app state class once. ``None`` (default) keeps the
             # framework-default ``Session`` shape; apps point this at e.g.
             # ``examples.incident_management.state.IncidentState`` via YAML.
@@ -369,13 +374,18 @@ class Orchestrator(Generic[StateT]):
             # about it. Production deployments with a real registry hit
             # the strict validation path.
             #
-            # The DedupConfig comes through a generic provider hook
-            # (``RuntimeConfig.dedup_config_path``) — the runtime never
-            # imports an app-specific config to discover dedup settings.
+            # DedupConfig is now a first-class field on ``AppConfig``
+            # (read from the YAML's top-level ``dedup:`` block). The
+            # legacy provider-callable path is honoured when set so
+            # existing deployments don't break, but the YAML wins for
+            # bare apps.
             dedup_pipeline: DedupPipeline | None = None
-            dedup_cfg: DedupConfig | None = _resolve_dedup_config(
-                cfg.runtime.dedup_config_path,
-            )
+            if cfg.runtime.dedup_config_path is not None:
+                dedup_cfg: DedupConfig | None = _resolve_dedup_config(
+                    cfg.runtime.dedup_config_path,
+                )
+            else:
+                dedup_cfg = cfg.dedup
             if dedup_cfg is not None and dedup_cfg.enabled:
                 if dedup_cfg.stage2_model in cfg.llm.models:
                     _llm_cfg_capture = cfg.llm

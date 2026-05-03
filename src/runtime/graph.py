@@ -774,9 +774,15 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
             f"(known: {sorted(skills.keys())})"
         )
     if framework_cfg is None:
-        framework_cfg = resolve_framework_app_config(
-            getattr(cfg.runtime, "framework_app_config_path", None),
-        )
+        # Prefer the YAML-driven ``AppConfig.framework`` field; fall
+        # back to the legacy provider-callable path for backward
+        # compatibility with deployments that still wire it.
+        if getattr(cfg.runtime, "framework_app_config_path", None) is not None:
+            framework_cfg = resolve_framework_app_config(
+                cfg.runtime.framework_app_config_path,
+            )
+        else:
+            framework_cfg = getattr(cfg, "framework", None) or resolve_framework_app_config(None)
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)
