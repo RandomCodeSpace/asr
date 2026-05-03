@@ -32,7 +32,7 @@ def cfg(tmp_path):
         # Wire the incident-management provider so the resume_session
         # escalate action can validate against the incident roster.
         runtime=RuntimeConfig(
-            state_class="examples.incident_management.state.IncidentState",
+            state_class=None,
             framework_app_config_path=(
                 "examples.incident_management.config:framework_app_config_provider"
             ),
@@ -322,7 +322,7 @@ async def test_cold_restart_resume(tmp_path):
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
         runtime=RuntimeConfig(
-            state_class="examples.incident_management.state.IncidentState",
+            state_class=None,
         ),
     )
 

@@ -3,14 +3,14 @@
 Usage:
     python scripts/migrate_jsonl_to_sql.py [--config PATH] [--with-embeddings] [--dry-run]
 
-Uses ``SessionStore`` directly with the example app's ``IncidentState``.
+Uses ``SessionStore`` directly with the framework ``Session``.
 """
 from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
 
-from examples.incident_management.state import IncidentState
+from runtime.state import Session
 from runtime.config import AppConfig, load_config
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.engine import build_engine
@@ -38,7 +38,7 @@ def migrate(cfg: AppConfig, *, with_embeddings: bool, dry_run: bool) -> dict[str
     )
     store = SessionStore(
         engine=engine,
-        state_cls=IncidentState,
+        state_cls=Session,
         embedder=embedder,
         vector_store=vector_store,
         vector_path=(cfg.storage.vector.path
@@ -49,7 +49,7 @@ def migrate(cfg: AppConfig, *, with_embeddings: bool, dry_run: bool) -> dict[str
     counts = {"inserted": 0, "skipped": 0, "failed": 0}
     for path in sorted(src.glob("INC-*.json")):
         try:
-            inc = IncidentState.model_validate(json.loads(path.read_text()))
+            inc = Session.model_validate(json.loads(path.read_text()))
         except Exception:
             counts["failed"] += 1
             continue

@@ -92,7 +92,7 @@ def cfg_full(tmp_path):
             incidents_dir=str(tmp_path),
         ),
         runtime=RuntimeConfig(
-            state_class="examples.incident_management.state.IncidentState",
+            state_class=None,
         ),
     )
 
@@ -455,8 +455,8 @@ def test_start_session_creates_persisted_row(service_full):
 
     inc = service_full.submit_and_wait(_load(), timeout=5)
     assert inc.id == sid
-    assert inc.query == "db slow"
-    assert inc.environment == "prod"
+    assert inc.extra_fields.get("query") == "db slow"
+    assert inc.extra_fields.get("environment") == "prod"
 
 
 def test_concurrent_start_sessions(service_full):

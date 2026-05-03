@@ -36,10 +36,10 @@ def test_code_review_bundle_parses_cleanly():
                     reason="code-review bundle not built; run scripts/build_single_file.py")
 def test_code_review_bundle_contains_app_symbols():
     src = _BUNDLE.read_text()
-    # The CodeReviewState class body and the MCP server module-name
-    # must both land in the bundle — proves the example app's source
-    # was actually concatenated in.
-    assert "class CodeReviewState" in src
+    # The MCP server class body and module-name must land in the
+    # bundle — proves the example app's source was actually
+    # concatenated in.
+    assert "class CodeReviewMCPServer" in src
     assert "FastMCP(\"code_review\")" in src
     # And critically: no incident-management *example app* bodies
     # leaked in. We probe via the module-marker comment the bundler

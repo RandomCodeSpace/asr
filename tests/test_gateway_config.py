@@ -117,6 +117,6 @@ def test_app_config_can_load_gateway_from_dict_shape():
 
 def test_runtime_config_back_compat_legacy_callers():
     """Code constructing ``RuntimeConfig`` without ``gateway`` still works."""
-    rc = RuntimeConfig(state_class="examples.incident_management.state.IncidentState")
+    rc = RuntimeConfig(state_class=None)
     assert rc.gateway is None
     assert rc.max_concurrent_sessions == 8

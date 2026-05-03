@@ -16,7 +16,7 @@ async def test_full_flow_no_prior_match(tmp_path, monkeypatch):
     cfg.paths.incidents_dir = str(tmp_path)
     cfg.llm = LLMConfig.stub()
     cfg.runtime = RuntimeConfig(
-        state_class="examples.incident_management.state.IncidentState",
+        state_class=None,
     )
 
     orch = await Orchestrator.create(cfg)
@@ -44,7 +44,7 @@ async def test_full_flow_short_circuits_on_known_match(tmp_path, monkeypatch):
     cfg.paths.incidents_dir = str(tmp_path)
     cfg.llm = LLMConfig.stub()
     cfg.runtime = RuntimeConfig(
-        state_class="examples.incident_management.state.IncidentState",
+        state_class=None,
     )
     # incidents.similarity_threshold lives on IncidentAppConfig. The
     # bundled config/incident_management.yaml already pins it to 0.2,

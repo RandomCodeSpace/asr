@@ -693,6 +693,176 @@ via :func:`compose_runners`.
 from typing import Any, Callable
 
 
+# ----- imports for runtime/memory/session_state.py -----
+"""ASR memory-layer slots that ride on ``IncidentState.memory``.
+
+Each layer in the ASR.md §3 7-layer model that the MVP slice exercises
+(L2 / L5 / L7) gets a small pydantic model here so an investigation
+can attach the context it fetched from that layer to the session
+state. The whole bundle round-trips losslessly through the framework's
+``extra_fields`` mechanism — no row schema changes are needed.
+
+Read-only by construction: agents *consume* these slots; mutation via
+MCP tools is not exposed.
+"""
+
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+# ----- imports for runtime/memory/knowledge_graph.py -----
+"""L2 Knowledge Graph — filesystem backend.
+
+Read-only thin class over two JSON files on disk:
+
+- ``components.json`` — list of ``{id, name, owner, criticality, environment}``.
+- ``edges.json``      — list of ``{from, to, kind}`` where
+  ``kind in {"calls", "deploys", "reads", "writes"}``.
+
+The store accepts a ``root: Path`` (the layer directory, conventionally
+``incidents/kg/``) for testability. If that directory is missing or
+empty, the store falls back to the seed bundle at
+``examples/incident_management/asr/seeds/kg/`` so a freshly cloned
+checkout has a working graph for tests and demos. Air-gapped friendly:
+no network, no Neo4j.
+
+Mutation is out of scope for this batch (post-MVP); the surface here
+is ``get_component`` / ``find_by_name`` / ``neighbors`` / ``subgraph``.
+``subgraph`` returns the assembled :class:`L2KGContext` ready to drop
+onto ``IncidentState.memory.l2_kg``.
+"""
+
+
+from typing import Iterable
+
+
+# ----- imports for runtime/memory/release_context.py -----
+"""L5 Release Context — filesystem backend.
+
+Read-only thin class over a single JSON file:
+
+- ``recent.json`` — list of release records ``{id, service, sha,
+  deployed_at, author, summary}`` sorted descending by ``deployed_at``.
+
+Accepts ``root: Path`` (the layer directory, conventionally
+``incidents/releases/``) for testability. Falls back to the seed
+bundle at ``examples/incident_management/asr/seeds/releases/`` when
+the configured directory is missing or empty. No Postgres/pgvector
+dependency in this batch.
+
+Surface:
+
+- ``recent_for_service(service, *, hours=24)``
+- ``suspect_at(*, services, at, window_minutes=60)``
+- ``context(services, incident_at)`` -> :class:`L5ReleaseContext` ready
+  to attach to ``IncidentState.memory.l5_release``.
+"""
+
+
+from datetime import datetime, timedelta, timezone
+
+
+# ----- imports for runtime/memory/playbook_store.py -----
+"""L7 Playbook Store — filesystem backend.
+
+Read-only thin class over a directory of YAML playbooks. Each file
+follows the schema:
+
+.. code-block:: yaml
+
+    id: pb-payments-latency
+    title: "Payments service latency spike"
+    match_signals:
+      service: payments
+      metric: p99_latency
+      threshold_breach: true
+    hypothesis_steps:
+      - "Check recent payments deploys (L5)"
+      - "Check downstream dependencies (L2)"
+    remediation:
+      - tool: restart_service
+        args: { service: payments }
+    required_approval: true
+
+Accepts ``root: Path`` (the layer directory, conventionally
+``incidents/playbooks/``) for testability. Falls back to the seed
+bundle at ``examples/incident_management/asr/seeds/playbooks/`` when
+the configured directory is missing or empty. No FAISS / pgvector
+dependency in this batch — semantic match comes in 9d-vector later.
+
+Surface: ``get`` / ``list_all`` / ``match``. ``match`` produces a list
+of :class:`L7PlaybookSuggestion` ranked by signal-overlap score, ready
+to drop onto ``IncidentState.memory.l7_playbooks``.
+"""
+
+
+
+
+
+# ----- imports for runtime/memory/hypothesis.py -----
+"""ASR triage hypothesis-refinement loop helpers.
+
+The triage agent runs an iterative pattern: generate a hypothesis →
+gather evidence (L1 current findings, L3-equivalent past similar
+incidents, L5 recent releases) → score → refine OR accept. The loop
+is bounded so a stuck hypothesis doesn't spin forever.
+
+This module ships the *deterministic* primitives that gate the loop:
+
+* :func:`score_hypothesis` — token-overlap heuristic. Pure, no LLM.
+  Returns a normalised score in ``[0.0, 1.0]`` plus a one-sentence
+  rationale. Tests can assert exact behaviour.
+
+* :func:`should_refine` — boolean decision based on the current score
+  and the iteration counter. Refines while score < 0.7 AND
+  iterations < 3.
+
+The agent's LLM-driven generation step (the *hypothesis* itself) lives
+in the system prompt at ``skills/triage/system.md``; only the scoring
+and continue/stop predicates are deterministic Python so the loop's
+boundary conditions are exercised in unit tests without spinning the
+LLM.
+
+Design note: tokenisation mirrors :mod:`runtime.similarity` — same
+regex, same stopword list — so a hypothesis containing service names
+and timing words ranks consistent with the dedup pipeline's notion of
+"similar".
+"""
+
+
+from typing import TypedDict
+
+
+# Loop bounds.
+# ----- imports for runtime/memory/resolution.py -----
+"""Resolution agent helpers — playbook → tool-call translation.
+
+The resolution agent matches the L7 PlaybookStore for the session's
+signals and produces a list of suggested tool calls. The framework's
+risk-rated gateway (``runtime.tools.gateway``) decides whether each
+call runs auto / notify-soft / require-approval based on its policy
+and the prod-environment override.
+
+This module is a thin, deterministic translator. The agent's prompt
+(``skills/resolution/system.md``) describes the reasoning; the helpers
+here are pure functions exercised by unit tests.
+
+Surface:
+
+* :class:`ToolCallSpec` — typed dict for a single suggested tool call.
+* :func:`playbook_to_tool_calls` — given a playbook dict (the YAML
+  shape :class:`PlaybookStore` already validates), return the list of
+  :class:`ToolCallSpec` entries the agent should issue.
+* :func:`top_playbook` — given the full
+  ``IncidentState.memory.l7_playbooks`` suggestion list, return the
+  highest-scoring playbook id (None if empty).
+"""
+
+
+from typing import Any, TypedDict
+
+
+
 # ----- imports for runtime/orchestrator.py -----
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 
@@ -761,112 +931,6 @@ status flip via :meth:`SessionStore.un_duplicate`.
 from fastapi import FastAPI, HTTPException
 
 
-# ----- imports for examples/incident_management/asr/memory_state.py -----
-"""ASR memory-layer slots that ride on ``IncidentState.memory``.
-
-Each layer in the ASR.md §3 7-layer model that the MVP slice exercises
-(L2 / L5 / L7) gets a small pydantic model here so an investigation
-can attach the context it fetched from that layer to the session
-state. The whole bundle round-trips losslessly through the framework's
-``extra_fields`` mechanism — no row schema changes are needed.
-
-Read-only by construction: agents *consume* these slots; mutation via
-MCP tools is not exposed.
-"""
-
-
-from pydantic import BaseModel, ConfigDict, Field
-
-
-# ----- imports for examples/incident_management/asr/kg_store.py -----
-"""L2 Knowledge Graph — filesystem backend.
-
-Read-only thin class over two JSON files on disk:
-
-- ``components.json`` — list of ``{id, name, owner, criticality, environment}``.
-- ``edges.json``      — list of ``{from, to, kind}`` where
-  ``kind in {"calls", "deploys", "reads", "writes"}``.
-
-The store accepts a ``root: Path`` (the layer directory, conventionally
-``incidents/kg/``) for testability. If that directory is missing or
-empty, the store falls back to the seed bundle at
-``examples/incident_management/asr/seeds/kg/`` so a freshly cloned
-checkout has a working graph for tests and demos. Air-gapped friendly:
-no network, no Neo4j.
-
-Mutation is out of scope for this batch (post-MVP); the surface here
-is ``get_component`` / ``find_by_name`` / ``neighbors`` / ``subgraph``.
-``subgraph`` returns the assembled :class:`L2KGContext` ready to drop
-onto ``IncidentState.memory.l2_kg``.
-"""
-
-
-from typing import Iterable
-
-
-# ----- imports for examples/incident_management/asr/release_store.py -----
-"""L5 Release Context — filesystem backend.
-
-Read-only thin class over a single JSON file:
-
-- ``recent.json`` — list of release records ``{id, service, sha,
-  deployed_at, author, summary}`` sorted descending by ``deployed_at``.
-
-Accepts ``root: Path`` (the layer directory, conventionally
-``incidents/releases/``) for testability. Falls back to the seed
-bundle at ``examples/incident_management/asr/seeds/releases/`` when
-the configured directory is missing or empty. No Postgres/pgvector
-dependency in this batch.
-
-Surface:
-
-- ``recent_for_service(service, *, hours=24)``
-- ``suspect_at(*, services, at, window_minutes=60)``
-- ``context(services, incident_at)`` -> :class:`L5ReleaseContext` ready
-  to attach to ``IncidentState.memory.l5_release``.
-"""
-
-
-from datetime import datetime, timedelta, timezone
-
-
-# ----- imports for examples/incident_management/asr/playbook_store.py -----
-"""L7 Playbook Store — filesystem backend.
-
-Read-only thin class over a directory of YAML playbooks. Each file
-follows the schema:
-
-.. code-block:: yaml
-
-    id: pb-payments-latency
-    title: "Payments service latency spike"
-    match_signals:
-      service: payments
-      metric: p99_latency
-      threshold_breach: true
-    hypothesis_steps:
-      - "Check recent payments deploys (L5)"
-      - "Check downstream dependencies (L2)"
-    remediation:
-      - tool: restart_service
-        args: { service: payments }
-    required_approval: true
-
-Accepts ``root: Path`` (the layer directory, conventionally
-``incidents/playbooks/``) for testability. Falls back to the seed
-bundle at ``examples/incident_management/asr/seeds/playbooks/`` when
-the configured directory is missing or empty. No FAISS / pgvector
-dependency in this batch — semantic match comes in 9d-vector later.
-
-Surface: ``get`` / ``list_all`` / ``match``. ``match`` produces a list
-of :class:`L7PlaybookSuggestion` ranked by signal-overlap score, ready
-to drop onto ``IncidentState.memory.l7_playbooks``.
-"""
-
-
-
-
-
 # ----- imports for examples/incident_management/asr/supervisor_node.py -----
 """ASR supervisor router — hydration + single-active-investigation gate.
 
@@ -930,85 +994,20 @@ from typing import Any, Callable, TypedDict
 
 
 
-# ----- imports for examples/incident_management/asr/hypothesis_loop.py -----
-"""ASR triage hypothesis-refinement loop helpers.
-
-The triage agent runs an iterative pattern: generate a hypothesis →
-gather evidence (L1 current findings, L3-equivalent past similar
-incidents, L5 recent releases) → score → refine OR accept. The loop
-is bounded so a stuck hypothesis doesn't spin forever.
-
-This module ships the *deterministic* primitives that gate the loop:
-
-* :func:`score_hypothesis` — token-overlap heuristic. Pure, no LLM.
-  Returns a normalised score in ``[0.0, 1.0]`` plus a one-sentence
-  rationale. Tests can assert exact behaviour.
-
-* :func:`should_refine` — boolean decision based on the current score
-  and the iteration counter. Refines while score < 0.7 AND
-  iterations < 3.
-
-The agent's LLM-driven generation step (the *hypothesis* itself) lives
-in the system prompt at ``skills/triage/system.md``; only the scoring
-and continue/stop predicates are deterministic Python so the loop's
-boundary conditions are exercised in unit tests without spinning the
-LLM.
-
-Design note: tokenisation mirrors :mod:`runtime.similarity` — same
-regex, same stopword list — so a hypothesis containing service names
-and timing words ranks consistent with the dedup pipeline's notion of
-"similar".
-"""
-
-
-from typing import TypedDict
-
-
-# Loop bounds.
-# ----- imports for examples/incident_management/asr/resolution_helpers.py -----
-"""Resolution agent helpers — playbook → tool-call translation.
-
-The resolution agent matches the L7 PlaybookStore for the incident's
-signals and produces a list of suggested tool calls. The framework's
-risk-rated gateway (``runtime.tools.gateway``) decides whether each
-call runs auto / notify-soft / require-approval based on its policy
-and the prod-environment override.
-
-This module is a thin, deterministic translator. The agent's prompt
-(``skills/resolution/system.md``) describes the reasoning; the helpers
-here are pure functions exercised by unit tests.
-
-Surface:
-
-* :class:`ToolCallSpec` — typed dict for a single suggested tool call.
-* :func:`playbook_to_tool_calls` — given a playbook dict (the YAML
-  shape :class:`PlaybookStore` already validates), return the list of
-  :class:`ToolCallSpec` entries the agent should issue.
-* :func:`top_playbook` — given the full
-  ``IncidentState.memory.l7_playbooks`` suggestion list, return the
-  highest-scoring playbook id (None if empty).
-"""
-
-
-from typing import Any, TypedDict
-
-
-
 # ----- imports for examples/incident_management/config.py -----
 """App-level config for the incident-management example.
 
-Holds the incident-flavored knobs (similarity threshold, intervention
-confidence threshold, escalation roster, environments, severity aliases)
-that the framework's generic ``runtime.config.AppConfig`` does not
-carry.
-
-The framework reads these via ``load_incident_app_config()``; tests that
-need to override values can either write a temporary YAML file and pass
-its path, or monkey-patch the loader to return a stubbed config.
+The framework reads incident-flavored knobs (similarity threshold,
+intervention confidence threshold, escalation roster, severity aliases,
+dedup pipeline, environments) generically via ``FrameworkAppConfig`` and
+``RuntimeConfig.{dedup,environments}_provider_path``. This module owns
+the YAML <-> ``FrameworkAppConfig`` lift plus the provider hooks
+referenced from ``config/code_review.runtime.yaml`` /
+``config/config.yaml``; the runtime never imports ``IncidentAppConfig``
+because that class no longer exists.
 """
 
 
-from typing import Literal
 
 
 
@@ -1019,18 +1018,6 @@ from typing import Literal
 # default in ``FrameworkAppConfig.dedup_system_prompt`` can be a
 # generic agent-orchestration prompt while the example app keeps its
 # SRE-specific phrasing.
-# ----- imports for examples/incident_management/state.py -----
-"""Incident-management domain state.
-
-``IncidentState`` extends ``Session`` with all incident-specific fields.
-The framework never imports this module; only example-app code does.
-"""
-
-
-
-
-
-
 # ----- imports for examples/incident_management/mcp_server.py -----
 """FastMCP server: incident_management tools, backed by SessionStore + HistoryStore.
 
@@ -1292,6 +1279,46 @@ _DEFAULT_DEDUP_SYSTEM_PROMPT = (
 )
 
 
+class UIBadge(BaseModel):
+    """One badge entry — label + Streamlit color."""
+    label: str
+    color: str  # streamlit-allowed: red|orange|yellow|blue|green|violet|gray|primary
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
+class UIDetailField(BaseModel):
+    """A configured detail-pane field. ``key`` is a dotted path resolved
+    against ``Session.extra_fields`` (or the session dict itself)."""
+    key: str
+    label: str
+    section: str = "summary"  # "summary" | "metrics" | "meta"
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
+class UIConfig(BaseModel):
+    """App-driven UI rendering knobs. Keeps the generic Streamlit shell
+    in ``runtime/ui.py`` agnostic of any specific domain — colors, labels,
+    and tag prefixes come from YAML.
+
+    ``badges`` is a 2-level dict: ``{field_name: {value: UIBadge}}``.
+    Example: ``{"status": {"open": {"label": "OPEN", "color": "red"}}}``.
+
+    ``detail_fields`` lists fields the detail pane renders, in order.
+    Each entry may target a section (``summary``/``metrics``/``meta``).
+
+    ``tags`` is an opaque key->tag-string map the UI consults for
+    cross-skill signals (e.g. ``prior_match_supported`` -> the literal
+    tag a skill emits).
+    """
+    badges: dict[str, dict[str, UIBadge]] = Field(default_factory=dict)
+    detail_fields: list[UIDetailField] = Field(default_factory=list)
+    tags: dict[str, str] = Field(default_factory=dict)
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
 class FrameworkAppConfig(BaseModel):
     """Generic application-supplied knobs the framework reads at runtime.
 
@@ -1309,6 +1336,11 @@ class FrameworkAppConfig(BaseModel):
     # Intake runner knobs: forwarded into IntakeContext at graph-build time.
     intake_top_k: int = 3
     intake_similarity_threshold: float = 0.7
+    # UI rendering knobs surfaced to the generic runtime UI. Mirrors
+    # AppConfig.ui — the FrameworkAppConfig provider can either copy
+    # AppConfig.ui or supply its own. Defaults to empty so apps that
+    # don't render with the generic UI pay nothing.
+    ui: UIConfig = Field(default_factory=UIConfig)
 
 
 def resolve_framework_app_config(
@@ -1351,6 +1383,7 @@ class AppConfig(BaseModel):
     paths: Paths = Field(default_factory=Paths)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    ui: UIConfig = Field(default_factory=UIConfig)
     # Declarative trigger registry. Each entry is one transport-flavoured
     # ``TriggerConfig`` (api/webhook/schedule/plugin). Typed as
     # ``list[Any]`` because Pydantic v2's discriminated-union binding
@@ -1501,6 +1534,11 @@ class Session(BaseModel):
     # session row so the UI can render "why was this marked duplicate?"
     # without needing a separate join.
     dedup_rationale: str | None = None
+    # Bag for app-specific session data the framework doesn't touch.
+    # Apps that previously subclassed Session to add typed fields now
+    # store them here. The storage layer round-trips this via the
+    # matching ``IncidentRow.extra_fields`` JSON column.
+    extra_fields: dict[str, Any] = Field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # App-overridable agent-input formatter hook.
@@ -5989,6 +6027,787 @@ def compose_runners(
 
     return _composed
 
+
+def hydrate_from_memory(
+    state: Any,
+    *,
+    kg_store: Any = None,
+    playbook_store: Any = None,
+    release_store: Any = None,
+    hydrator: Callable[..., Any] | None = None,
+    gate: Callable[..., str | None] | None = None,
+) -> dict[str, Any] | None:
+    """Generic memory-hydration runner shell.
+
+    Apps that wire L2 / L5 / L7 stores via :mod:`runtime.memory` plug
+    them in here. The framework supplies the runner-shape contract
+    (``state.session`` access, ``next_route='__end__'`` short-circuit,
+    duplicate-metadata stamping) so per-app supervisors collapse to:
+
+
+
+        def app_hydration(state, *, app_cfg=None):
+            return hydrate_from_memory(
+                state,
+                kg_store=...,
+                playbook_store=...,
+                release_store=...,
+                hydrator=app_specific_hydrate_callable,
+                gate=app_specific_gate_callable,  # optional
+            )
+
+        default_supervisor_runner = compose_runners(
+            default_intake_runner, app_hydration,
+        )
+
+    ``hydrator`` signature: ``(session, *, kg_store, playbook_store,
+    release_store) -> Any`` where the returned object is stamped on
+    ``session.memory`` if that attribute is settable. If ``hydrator``
+    is ``None`` the function is a no-op (returns ``None``).
+
+    ``gate`` signature: ``(session, *, kg_store) -> str | None`` —
+    return a parent session id to mark the new session as a duplicate
+    (caller stamps ``status='duplicate'`` and emits
+    ``next_route='__end__'``). When ``None`` is returned (or no gate
+    supplied) the session proceeds normally.
+
+    Returns ``None`` when no hydration occurred, otherwise a runner
+    patch suitable for merging by ``runtime.agents.supervisor``.
+    """
+    session = state.get("session") if hasattr(state, "get") else None
+    if session is None:
+        return None
+    if hydrator is None and gate is None:
+        return None
+
+    patch: dict[str, Any] = {}
+
+    if hydrator is not None:
+        try:
+            memory = hydrator(
+                session,
+                kg_store=kg_store,
+                playbook_store=playbook_store,
+                release_store=release_store,
+            )
+        except Exception:  # noqa: BLE001 — defensive, keep graph alive
+            _log.exception(
+                "hydrate_from_memory: hydrator raised; routing through",
+            )
+            memory = None
+
+        if memory is not None and hasattr(session, "memory"):
+            try:
+                session.memory = memory
+            except Exception:  # noqa: BLE001 — frozen / read-only field
+                _log.warning(
+                    "hydrate_from_memory: cannot set session.memory; "
+                    "downstream agents will not see hydrated context",
+                )
+        patch["session"] = session
+
+    if gate is not None:
+        try:
+            parent = gate(session, kg_store=kg_store)
+        except Exception:  # noqa: BLE001 — defensive
+            _log.exception(
+                "hydrate_from_memory: gate raised; routing through",
+            )
+            parent = None
+
+        if parent is not None:
+            try:
+                session.status = "duplicate"
+                if hasattr(session, "parent_session_id"):
+                    session.parent_session_id = parent
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "hydrate_from_memory: cannot stamp duplicate metadata "
+                    "on session %s", getattr(session, "id", "?"),
+                )
+            patch["session"] = session
+            patch["next_route"] = "__end__"
+
+    return patch or None
+
+# ====== module: runtime/memory/session_state.py ======
+
+class L2KGContext(BaseModel):
+    """L2 Knowledge Graph subgraph snapshot.
+
+    Mirrors ASR.md §3 L2 / §6: a small projection over the affected
+    components plus their immediate upstream / downstream neighbours.
+    ``raw`` carries the full assembled subgraph so downstream agents
+    can render or re-traverse without a second store call.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    components: list[str] = Field(default_factory=list)
+    upstream: list[str] = Field(default_factory=list)
+    downstream: list[str] = Field(default_factory=list)
+    raw: dict = Field(default_factory=dict)
+
+
+class L5ReleaseContext(BaseModel):
+    """L5 Release Context window relevant to an investigation.
+
+    Each entry in ``recent_releases`` is a release record dict with at
+    least ``service``, ``sha``, ``deployed_at``, ``author``.
+    ``suspect_releases`` is the subset of release ids correlated to
+    the session's anchor time within the configured window.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recent_releases: list[dict] = Field(default_factory=list)
+    suspect_releases: list[str] = Field(default_factory=list)
+
+
+class L7PlaybookSuggestion(BaseModel):
+    """A single L7 playbook the matcher proposes for this investigation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    playbook_id: str
+    score: float = Field(ge=0.0, le=1.0)
+    matched_signals: list[str] = Field(default_factory=list)
+
+
+class MemoryLayerState(BaseModel):
+    """Container for the memory-layer slots attached to ``IncidentState``.
+
+    The whole object is optional / empty by default so legacy sessions
+    written before this field existed round-trip cleanly: the field
+    hydrates to a default ``MemoryLayerState`` even when
+    ``extra_fields`` is missing the key entirely.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    l2_kg: L2KGContext | None = None
+    l5_release: L5ReleaseContext | None = None
+    l7_playbooks: list[L7PlaybookSuggestion] = Field(default_factory=list)
+
+# ====== module: runtime/memory/knowledge_graph.py ======
+
+_VALID_EDGE_KINDS: frozenset[str] = frozenset(
+    {"calls", "deploys", "reads", "writes"}
+)
+
+_SEED_ROOT = Path(__file__).parent / "seeds" / "kg"
+
+
+class KnowledgeGraphStore:
+    """Filesystem-backed L2 Knowledge Graph reader."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = Path(root)
+        self._components: dict[str, dict] = {}
+        self._edges: list[dict] = []
+        self._load()
+
+    # ----- loading ------------------------------------------------------
+
+    def _load(self) -> None:
+        comp_path = self._root / "components.json"
+        edges_path = self._root / "edges.json"
+
+        # Fall back to the bundled seed when the configured layer dir
+        # is missing or empty. Keeps tests and fresh checkouts working
+        # without forcing the operator to seed ``incidents/kg/``.
+        if not comp_path.exists() or not edges_path.exists():
+            comp_path = _SEED_ROOT / "components.json"
+            edges_path = _SEED_ROOT / "edges.json"
+
+        components_raw = json.loads(comp_path.read_text())
+        edges_raw = json.loads(edges_path.read_text())
+
+        for c in components_raw:
+            cid = c.get("id")
+            if not cid:
+                continue
+            self._components[cid] = dict(c)
+
+        for e in edges_raw:
+            kind = e.get("kind")
+            if kind not in _VALID_EDGE_KINDS:
+                # Skip silently rather than raise — air-gapped operators
+                # frequently hand-edit these files. A logged warning is
+                # the right move once observability lands; for now,
+                # ``list_edges()`` exposes the loaded set for tests.
+                continue
+            if "from" not in e or "to" not in e:
+                continue
+            self._edges.append({
+                "from": e["from"],
+                "to": e["to"],
+                "kind": kind,
+            })
+
+    # ----- introspection (mostly for tests) -----------------------------
+
+    def list_components(self) -> list[dict]:
+        return list(self._components.values())
+
+    def list_edges(self) -> list[dict]:
+        return list(self._edges)
+
+    # ----- public read API ----------------------------------------------
+
+    def get_component(self, comp_id: str) -> dict | None:
+        return self._components.get(comp_id)
+
+    def find_by_name(self, name: str) -> list[dict]:
+        """Case-insensitive substring match on the ``name`` field."""
+        if not name:
+            return []
+        needle = name.lower()
+        return [
+            dict(c)
+            for c in self._components.values()
+            if needle in (c.get("name") or "").lower()
+        ]
+
+    def neighbors(
+        self,
+        comp_id: str,
+        *,
+        kinds: set[str] | None = None,
+        hops: int = 1,
+    ) -> set[str]:
+        """Return the set of component ids reachable from ``comp_id``.
+
+        - ``kinds`` filters edges to a subset of the valid edge kinds.
+          ``None`` means "any kind".
+        - ``hops`` is the BFS depth (>= 1). The starting node itself is
+          *not* included in the returned set.
+        """
+        if hops < 1:
+            return set()
+        if comp_id not in self._components:
+            return set()
+
+        kind_filter = (
+            None
+            if kinds is None
+            else (set(kinds) & _VALID_EDGE_KINDS)
+        )
+
+        visited: set[str] = {comp_id}
+        frontier: set[str] = {comp_id}
+        for _ in range(hops):
+            next_frontier: set[str] = set()
+            for node in frontier:
+                for edge in self._edges:
+                    if kind_filter is not None and edge["kind"] not in kind_filter:
+                        continue
+                    # Treat edges as undirected for neighbour expansion;
+                    # ``subgraph`` records direction explicitly via the
+                    # upstream / downstream split.
+                    if edge["from"] == node and edge["to"] not in visited:
+                        next_frontier.add(edge["to"])
+                    elif edge["to"] == node and edge["from"] not in visited:
+                        next_frontier.add(edge["from"])
+            visited |= next_frontier
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        visited.discard(comp_id)
+        return visited
+
+    def subgraph(
+        self,
+        comp_ids: Iterable[str],
+        hops: int = 1,
+    ) -> L2KGContext:
+        """Assemble an :class:`L2KGContext` for the given component set.
+
+        - ``components`` — the input set (filtered to ones we know about).
+        - ``upstream``   — distinct ids on the ``from`` side of any edge
+          whose ``to`` is in the input set.
+        - ``downstream`` — distinct ids on the ``to`` side of any edge
+          whose ``from`` is in the input set.
+        - ``raw``        — full subgraph snapshot
+          (``{"nodes": [...], "edges": [...]}``) including ``hops``
+          worth of neighbour expansion, useful for UI rendering.
+        """
+        seeds = {c for c in comp_ids if c in self._components}
+
+        upstream: set[str] = set()
+        downstream: set[str] = set()
+        for edge in self._edges:
+            if edge["to"] in seeds and edge["from"] not in seeds:
+                upstream.add(edge["from"])
+            if edge["from"] in seeds and edge["to"] not in seeds:
+                downstream.add(edge["to"])
+
+        # Expand to ``hops`` neighbourhood for the raw snapshot.
+        expanded: set[str] = set(seeds)
+        for s in seeds:
+            expanded |= self.neighbors(s, hops=hops)
+
+        raw_nodes = [
+            self._components[i] for i in expanded if i in self._components
+        ]
+        raw_edges = [
+            edge
+            for edge in self._edges
+            if edge["from"] in expanded and edge["to"] in expanded
+        ]
+
+        return L2KGContext(
+            components=sorted(seeds),
+            upstream=sorted(upstream),
+            downstream=sorted(downstream),
+            raw={"nodes": raw_nodes, "edges": raw_edges},
+        )
+
+# ====== module: runtime/memory/release_context.py ======
+
+_SEED_ROOT = Path(__file__).parent / "seeds" / "releases"
+
+
+def _parse_iso(ts: str) -> datetime:
+    """Parse an ISO-8601 timestamp tolerating the ``Z`` suffix."""
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+class ReleaseContextStore:
+    """Filesystem-backed L5 Release Context reader."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = Path(root)
+        self._releases: list[dict] = []
+        self._load()
+
+    # ----- loading ------------------------------------------------------
+
+    def _load(self) -> None:
+        path = self._root / "recent.json"
+        if not path.exists():
+            path = _SEED_ROOT / "recent.json"
+
+        records = json.loads(path.read_text())
+        cleaned: list[dict] = []
+        for r in records:
+            if not r.get("id") or not r.get("service") or not r.get("deployed_at"):
+                continue
+            try:
+                _parse_iso(r["deployed_at"])
+            except ValueError:
+                continue
+            cleaned.append(dict(r))
+
+        cleaned.sort(
+            key=lambda r: _parse_iso(r["deployed_at"]),
+            reverse=True,
+        )
+        self._releases = cleaned
+
+    # ----- introspection (mostly for tests) -----------------------------
+
+    def list_all(self) -> list[dict]:
+        return [dict(r) for r in self._releases]
+
+    # ----- public read API ----------------------------------------------
+
+    def recent_for_service(
+        self,
+        service: str,
+        *,
+        hours: int = 24,
+    ) -> list[dict]:
+        """Releases for ``service`` deployed within the last ``hours``.
+
+        ``hours`` is measured against ``datetime.now(UTC)``; for
+        deterministic correlation work prefer :meth:`context` /
+        :meth:`suspect_at` which take an explicit ``at``/``incident_at``
+        anchor.
+        """
+        if hours <= 0:
+            return []
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        out = [
+            dict(r)
+            for r in self._releases
+            if r["service"] == service and _parse_iso(r["deployed_at"]) >= cutoff
+        ]
+        # Already in descending order from ``_load``.
+        return out
+
+    def suspect_at(
+        self,
+        *,
+        services: list[str],
+        at: datetime,
+        window_minutes: int = 60,
+    ) -> list[str]:
+        """Release ids for ``services`` deployed within ``window_minutes``
+        of ``at``.
+
+        The window is symmetric around ``at`` so a release shipped right
+        before *or* right after that anchor time is surfaced — useful
+        for both "deploy caused it" and "deploy is the rollback" cases.
+        Returns release ids sorted by ``deployed_at`` descending.
+        """
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        if window_minutes <= 0:
+            return []
+
+        wanted = set(services)
+        delta = timedelta(minutes=window_minutes)
+        lo = at - delta
+        hi = at + delta
+
+        suspects: list[tuple[datetime, str]] = []
+        for r in self._releases:
+            if r["service"] not in wanted:
+                continue
+            deployed_at = _parse_iso(r["deployed_at"])
+            if lo <= deployed_at <= hi:
+                suspects.append((deployed_at, r["id"]))
+
+        suspects.sort(key=lambda t: t[0], reverse=True)
+        return [rid for _, rid in suspects]
+
+    def context(
+        self,
+        services: list[str],
+        incident_at: datetime,
+    ) -> L5ReleaseContext:
+        """Assemble an :class:`L5ReleaseContext` for the investigation.
+
+        - ``recent_releases`` — all releases for the given services in
+          the last 24h relative to ``incident_at`` (descending).
+        - ``suspect_releases`` — release ids inside a 60-minute window
+          around ``incident_at``.
+        """
+        if incident_at.tzinfo is None:
+            incident_at = incident_at.replace(tzinfo=timezone.utc)
+
+        wanted = set(services)
+        cutoff = incident_at - timedelta(hours=24)
+        recent = [
+            dict(r)
+            for r in self._releases
+            if r["service"] in wanted and cutoff <= _parse_iso(r["deployed_at"]) <= incident_at
+        ]
+        suspects = self.suspect_at(
+            services=services, at=incident_at, window_minutes=60
+        )
+        return L5ReleaseContext(
+            recent_releases=recent,
+            suspect_releases=suspects,
+        )
+
+# ====== module: runtime/memory/playbook_store.py ======
+
+_SEED_ROOT = Path(__file__).parent / "seeds" / "playbooks"
+
+
+def _normalise(value: Any) -> str:
+    """Lowercase a scalar for case-insensitive equality."""
+    if isinstance(value, bool):
+        # ``str(True) == "True"`` would never match user-supplied
+        # ``"true"``; standardise on the JSON/YAML lowercase form.
+        return "true" if value else "false"
+    return str(value).strip().lower()
+
+
+class PlaybookStore:
+    """Filesystem-backed L7 Playbook reader."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = Path(root)
+        self._playbooks: dict[str, dict] = {}
+        self._load()
+
+    # ----- loading ------------------------------------------------------
+
+    def _load(self) -> None:
+        roots: list[Path] = [self._root]
+        # Fall back to the bundled seed when the configured layer dir
+        # has no playbooks yet.
+        if not self._has_yaml(self._root):
+            roots = [_SEED_ROOT]
+
+        for r in roots:
+            if not r.exists() or not r.is_dir():
+                continue
+            for path in sorted(r.iterdir()):
+                if path.suffix.lower() not in {".yaml", ".yml"}:
+                    continue
+                try:
+                    data = yaml.safe_load(path.read_text())
+                except yaml.YAMLError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                pid = data.get("id")
+                if not pid or not isinstance(pid, str):
+                    continue
+                self._playbooks[pid] = data
+
+    @staticmethod
+    def _has_yaml(root: Path) -> bool:
+        if not root.exists() or not root.is_dir():
+            return False
+        return any(
+            p.suffix.lower() in {".yaml", ".yml"} for p in root.iterdir()
+        )
+
+    # ----- public read API ----------------------------------------------
+
+    def get(self, playbook_id: str) -> dict | None:
+        pb = self._playbooks.get(playbook_id)
+        return None if pb is None else dict(pb)
+
+    def list_all(self) -> list[dict]:
+        return [dict(p) for p in self._playbooks.values()]
+
+    def match(self, signals: dict) -> list[L7PlaybookSuggestion]:
+        """Score every playbook against ``signals`` (case-insensitive eq).
+
+        Score = ``matched / total`` where ``total`` is the number of
+        keys declared on the playbook's ``match_signals`` block. A
+        playbook with no declared signals scores 0 and is dropped from
+        the result. Suggestions are returned in descending score, then
+        ascending ``playbook_id`` for deterministic ties.
+        """
+        if not signals:
+            return []
+
+        norm_signals = {
+            str(k).strip().lower(): _normalise(v)
+            for k, v in signals.items()
+        }
+
+        out: list[L7PlaybookSuggestion] = []
+        for pid, pb in self._playbooks.items():
+            declared = pb.get("match_signals") or {}
+            if not isinstance(declared, dict) or not declared:
+                continue
+
+            total = len(declared)
+            matched_keys: list[str] = []
+            for key, expected in declared.items():
+                k = str(key).strip().lower()
+                if k in norm_signals and norm_signals[k] == _normalise(expected):
+                    matched_keys.append(f"{key}={expected}")
+
+            if not matched_keys:
+                continue
+
+            out.append(
+                L7PlaybookSuggestion(
+                    playbook_id=pid,
+                    score=len(matched_keys) / total,
+                    matched_signals=sorted(matched_keys),
+                )
+            )
+
+        out.sort(key=lambda s: (-s.score, s.playbook_id))
+        return out
+
+# ====== module: runtime/memory/hypothesis.py ======
+
+MAX_ITERATIONS: int = 3
+ACCEPT_THRESHOLD: float = 0.7
+
+
+# Mirror runtime.similarity's tokenisation so the score's notion of
+# "overlap" matches the dedup / lookup_similar_incidents path.
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_STOP: frozenset[str] = frozenset({
+    "a", "an", "the", "of", "in", "on", "to", "and", "or",
+    "is", "was", "with", "for", "be", "are", "as", "at",
+    "by", "from", "has", "had", "have", "it", "that", "this",
+    "we", "i", "you", "they", "but", "not", "no", "if",
+})
+
+
+class HypothesisScore(TypedDict):
+    """Result returned by :func:`score_hypothesis`."""
+
+    score: float
+    rationale: str
+    matched_terms: list[str]
+
+
+def _tokens(text: str) -> set[str]:
+    return {
+        t for t in _TOKEN_RE.findall(text.lower())
+        if t not in _STOP and len(t) > 1
+    }
+
+
+def score_hypothesis(
+    hypothesis: str,
+    evidence: list[str],
+) -> HypothesisScore:
+    """Score how well ``evidence`` supports ``hypothesis``.
+
+    Token-overlap heuristic. The score is the fraction of hypothesis
+    tokens that appear in *any* evidence string, capped at 1.0.
+
+    - Empty hypothesis -> ``0.0`` (defensive; the LLM should never
+      produce an empty hypothesis but the loop must not crash).
+    - Empty evidence list -> ``0.0`` (no support).
+    - Score is always in ``[0.0, 1.0]`` inclusive.
+
+    Returns a :class:`HypothesisScore` with the score, a short
+    machine-generated rationale, and the matched tokens (handy for
+    rendering in the UI's hypothesis trail).
+    """
+    h_tokens = _tokens(hypothesis)
+    if not h_tokens:
+        return HypothesisScore(
+            score=0.0,
+            rationale="Empty hypothesis — no tokens to score against evidence.",
+            matched_terms=[],
+        )
+    if not evidence:
+        return HypothesisScore(
+            score=0.0,
+            rationale=f"No evidence supplied to support {len(h_tokens)} hypothesis terms.",
+            matched_terms=[],
+        )
+
+    e_tokens: set[str] = set()
+    for snippet in evidence:
+        e_tokens |= _tokens(snippet)
+
+    matched = h_tokens & e_tokens
+    score = len(matched) / len(h_tokens)
+    # Round to 3 dp to keep the audit trail readable; score is still a
+    # float for callers that want a tighter comparison.
+    score = round(score, 3)
+
+    rationale = (
+        f"Matched {len(matched)}/{len(h_tokens)} hypothesis terms "
+        f"in {len(evidence)} evidence snippets."
+    )
+    return HypothesisScore(
+        score=score,
+        rationale=rationale,
+        matched_terms=sorted(matched),
+    )
+
+
+def should_refine(score: float, iterations: int) -> bool:
+    """Loop-control predicate: True when the agent should refine again.
+
+    Refines while:
+
+    * the current score is below :data:`ACCEPT_THRESHOLD`, AND
+    * the iteration count is strictly less than :data:`MAX_ITERATIONS`.
+
+    The iteration counter is the number of *completed* rounds — so
+    ``should_refine(score=0.5, iterations=0)`` returns ``True`` (we've
+    done 0 rounds, want at least 1), ``should_refine(score=0.5,
+    iterations=3)`` returns ``False`` (cap hit).
+
+    Defensive on bad inputs: negative iterations are clamped to 0;
+    out-of-range scores are clamped to ``[0.0, 1.0]``.
+    """
+    if score is None:
+        return iterations < MAX_ITERATIONS
+    s = max(0.0, min(1.0, float(score)))
+    n = max(0, int(iterations))
+    return s < ACCEPT_THRESHOLD and n < MAX_ITERATIONS
+
+
+__all__ = [
+    "ACCEPT_THRESHOLD",
+    "HypothesisScore",
+    "MAX_ITERATIONS",
+    "score_hypothesis",
+    "should_refine",
+]
+
+# ====== module: runtime/memory/resolution.py ======
+
+class ToolCallSpec(TypedDict):
+    """A single suggested tool call sourced from a playbook step."""
+
+    tool: str
+    args: dict[str, Any]
+    requires_approval: bool
+
+
+def playbook_to_tool_calls(playbook: dict) -> list[ToolCallSpec]:
+    """Translate a playbook dict's ``remediation`` block into tool calls.
+
+    Each ``remediation`` entry is expected to have:
+
+    - ``tool`` (str, required) — the tool name as known to the gateway.
+    - ``args`` (dict, optional) — keyword args; defaults to ``{}``.
+
+    The playbook's top-level ``required_approval`` flag (see
+    ``examples/incident_management/asr/seeds/playbooks/*.yaml``) is
+    propagated to every emitted spec — it represents the playbook
+    author's stated risk posture. The gateway's risk policy still has
+    final say at execution time; this flag is purely advisory metadata
+    for the agent's prompt and the UI.
+
+    Returns an empty list when ``playbook`` is None / lacks
+    ``remediation`` / has malformed entries — the caller can branch on
+    "no suggestion" without a try/except.
+    """
+    if not playbook or not isinstance(playbook, dict):
+        return []
+    remediation = playbook.get("remediation") or []
+    if not isinstance(remediation, list):
+        return []
+
+    requires_approval = bool(playbook.get("required_approval"))
+    out: list[ToolCallSpec] = []
+    for entry in remediation:
+        if not isinstance(entry, dict):
+            continue
+        tool = entry.get("tool")
+        if not tool or not isinstance(tool, str):
+            continue
+        args = entry.get("args") or {}
+        if not isinstance(args, dict):
+            args = {}
+        out.append(ToolCallSpec(
+            tool=tool,
+            args=dict(args),
+            requires_approval=requires_approval,
+        ))
+    return out
+
+
+def top_playbook(
+    suggestions: list[L7PlaybookSuggestion],
+) -> str | None:
+    """Return the playbook_id of the highest-scoring suggestion, or None.
+
+    ``suggestions`` is the list ``PlaybookStore.match`` already sorts
+    by descending score; we still pick by ``max`` so callers that pass
+    a re-ordered list (e.g. tests) still get a deterministic answer.
+    """
+    if not suggestions:
+        return None
+    best = max(suggestions, key=lambda s: (s.score, -hash(s.playbook_id)))
+    return best.playbook_id
+
+
+__all__ = [
+    "ToolCallSpec",
+    "playbook_to_tool_calls",
+    "top_playbook",
+]
+
 # ====== module: runtime/orchestrator.py ======
 
 if TYPE_CHECKING:
@@ -7393,493 +8212,6 @@ def register_dedup_routes(
             note=payload.note,
         )
 
-# ====== module: examples/incident_management/asr/memory_state.py ======
-
-class L2KGContext(BaseModel):
-    """L2 Knowledge Graph subgraph snapshot.
-
-    Mirrors ASR.md §3 L2 / §6: a small projection over the affected
-    components plus their immediate upstream / downstream neighbours.
-    ``raw`` carries the full assembled subgraph so downstream agents
-    can render or re-traverse without a second store call.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    components: list[str] = Field(default_factory=list)
-    upstream: list[str] = Field(default_factory=list)
-    downstream: list[str] = Field(default_factory=list)
-    raw: dict = Field(default_factory=dict)
-
-
-class L5ReleaseContext(BaseModel):
-    """L5 Release Context window relevant to an investigation.
-
-    Each entry in ``recent_releases`` is a release record dict with at
-    least ``service``, ``sha``, ``deployed_at``, ``author``.
-    ``suspect_releases`` is the subset of release ids correlated to
-    the incident's start time within the configured window.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    recent_releases: list[dict] = Field(default_factory=list)
-    suspect_releases: list[str] = Field(default_factory=list)
-
-
-class L7PlaybookSuggestion(BaseModel):
-    """A single L7 playbook the matcher proposes for this investigation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    playbook_id: str
-    score: float = Field(ge=0.0, le=1.0)
-    matched_signals: list[str] = Field(default_factory=list)
-
-
-class MemoryLayerState(BaseModel):
-    """Container for the memory-layer slots attached to ``IncidentState``.
-
-    The whole object is optional / empty by default so legacy sessions
-    written before this field existed round-trip cleanly: the field
-    hydrates to a default ``MemoryLayerState`` even when
-    ``extra_fields`` is missing the key entirely.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    l2_kg: L2KGContext | None = None
-    l5_release: L5ReleaseContext | None = None
-    l7_playbooks: list[L7PlaybookSuggestion] = Field(default_factory=list)
-
-# ====== module: examples/incident_management/asr/kg_store.py ======
-
-_VALID_EDGE_KINDS: frozenset[str] = frozenset(
-    {"calls", "deploys", "reads", "writes"}
-)
-
-_SEED_ROOT = Path(__file__).parent / "seeds" / "kg"
-
-
-class KGStore:
-    """Filesystem-backed L2 Knowledge Graph reader."""
-
-    def __init__(self, root: Path) -> None:
-        self._root = Path(root)
-        self._components: dict[str, dict] = {}
-        self._edges: list[dict] = []
-        self._load()
-
-    # ----- loading ------------------------------------------------------
-
-    def _load(self) -> None:
-        comp_path = self._root / "components.json"
-        edges_path = self._root / "edges.json"
-
-        # Fall back to the bundled seed when the configured layer dir
-        # is missing or empty. Keeps tests and fresh checkouts working
-        # without forcing the operator to seed ``incidents/kg/``.
-        if not comp_path.exists() or not edges_path.exists():
-            comp_path = _SEED_ROOT / "components.json"
-            edges_path = _SEED_ROOT / "edges.json"
-
-        components_raw = json.loads(comp_path.read_text())
-        edges_raw = json.loads(edges_path.read_text())
-
-        for c in components_raw:
-            cid = c.get("id")
-            if not cid:
-                continue
-            self._components[cid] = dict(c)
-
-        for e in edges_raw:
-            kind = e.get("kind")
-            if kind not in _VALID_EDGE_KINDS:
-                # Skip silently rather than raise — air-gapped operators
-                # frequently hand-edit these files. A logged warning is
-                # the right move once observability lands; for now,
-                # ``list_edges()`` exposes the loaded set for tests.
-                continue
-            if "from" not in e or "to" not in e:
-                continue
-            self._edges.append({
-                "from": e["from"],
-                "to": e["to"],
-                "kind": kind,
-            })
-
-    # ----- introspection (mostly for tests) -----------------------------
-
-    def list_components(self) -> list[dict]:
-        return list(self._components.values())
-
-    def list_edges(self) -> list[dict]:
-        return list(self._edges)
-
-    # ----- public read API ----------------------------------------------
-
-    def get_component(self, comp_id: str) -> dict | None:
-        return self._components.get(comp_id)
-
-    def find_by_name(self, name: str) -> list[dict]:
-        """Case-insensitive substring match on the ``name`` field."""
-        if not name:
-            return []
-        needle = name.lower()
-        return [
-            dict(c)
-            for c in self._components.values()
-            if needle in (c.get("name") or "").lower()
-        ]
-
-    def neighbors(
-        self,
-        comp_id: str,
-        *,
-        kinds: set[str] | None = None,
-        hops: int = 1,
-    ) -> set[str]:
-        """Return the set of component ids reachable from ``comp_id``.
-
-        - ``kinds`` filters edges to a subset of the valid edge kinds.
-          ``None`` means "any kind".
-        - ``hops`` is the BFS depth (>= 1). The starting node itself is
-          *not* included in the returned set.
-        """
-        if hops < 1:
-            return set()
-        if comp_id not in self._components:
-            return set()
-
-        kind_filter = (
-            None
-            if kinds is None
-            else (set(kinds) & _VALID_EDGE_KINDS)
-        )
-
-        visited: set[str] = {comp_id}
-        frontier: set[str] = {comp_id}
-        for _ in range(hops):
-            next_frontier: set[str] = set()
-            for node in frontier:
-                for edge in self._edges:
-                    if kind_filter is not None and edge["kind"] not in kind_filter:
-                        continue
-                    # Treat edges as undirected for neighbour expansion;
-                    # ``subgraph`` records direction explicitly via the
-                    # upstream / downstream split.
-                    if edge["from"] == node and edge["to"] not in visited:
-                        next_frontier.add(edge["to"])
-                    elif edge["to"] == node and edge["from"] not in visited:
-                        next_frontier.add(edge["from"])
-            visited |= next_frontier
-            frontier = next_frontier
-            if not frontier:
-                break
-
-        visited.discard(comp_id)
-        return visited
-
-    def subgraph(
-        self,
-        comp_ids: Iterable[str],
-        hops: int = 1,
-    ) -> L2KGContext:
-        """Assemble an :class:`L2KGContext` for the given component set.
-
-        - ``components`` — the input set (filtered to ones we know about).
-        - ``upstream``   — distinct ids on the ``from`` side of any edge
-          whose ``to`` is in the input set.
-        - ``downstream`` — distinct ids on the ``to`` side of any edge
-          whose ``from`` is in the input set.
-        - ``raw``        — full subgraph snapshot
-          (``{"nodes": [...], "edges": [...]}``) including ``hops``
-          worth of neighbour expansion, useful for UI rendering.
-        """
-        seeds = {c for c in comp_ids if c in self._components}
-
-        upstream: set[str] = set()
-        downstream: set[str] = set()
-        for edge in self._edges:
-            if edge["to"] in seeds and edge["from"] not in seeds:
-                upstream.add(edge["from"])
-            if edge["from"] in seeds and edge["to"] not in seeds:
-                downstream.add(edge["to"])
-
-        # Expand to ``hops`` neighbourhood for the raw snapshot.
-        expanded: set[str] = set(seeds)
-        for s in seeds:
-            expanded |= self.neighbors(s, hops=hops)
-
-        raw_nodes = [
-            self._components[i] for i in expanded if i in self._components
-        ]
-        raw_edges = [
-            edge
-            for edge in self._edges
-            if edge["from"] in expanded and edge["to"] in expanded
-        ]
-
-        return L2KGContext(
-            components=sorted(seeds),
-            upstream=sorted(upstream),
-            downstream=sorted(downstream),
-            raw={"nodes": raw_nodes, "edges": raw_edges},
-        )
-
-# ====== module: examples/incident_management/asr/release_store.py ======
-
-_SEED_ROOT = Path(__file__).parent / "seeds" / "releases"
-
-
-def _parse_iso(ts: str) -> datetime:
-    """Parse an ISO-8601 timestamp tolerating the ``Z`` suffix."""
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
-    dt = datetime.fromisoformat(ts)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-class ReleaseStore:
-    """Filesystem-backed L5 Release Context reader."""
-
-    def __init__(self, root: Path) -> None:
-        self._root = Path(root)
-        self._releases: list[dict] = []
-        self._load()
-
-    # ----- loading ------------------------------------------------------
-
-    def _load(self) -> None:
-        path = self._root / "recent.json"
-        if not path.exists():
-            path = _SEED_ROOT / "recent.json"
-
-        records = json.loads(path.read_text())
-        cleaned: list[dict] = []
-        for r in records:
-            if not r.get("id") or not r.get("service") or not r.get("deployed_at"):
-                continue
-            try:
-                _parse_iso(r["deployed_at"])
-            except ValueError:
-                continue
-            cleaned.append(dict(r))
-
-        cleaned.sort(
-            key=lambda r: _parse_iso(r["deployed_at"]),
-            reverse=True,
-        )
-        self._releases = cleaned
-
-    # ----- introspection (mostly for tests) -----------------------------
-
-    def list_all(self) -> list[dict]:
-        return [dict(r) for r in self._releases]
-
-    # ----- public read API ----------------------------------------------
-
-    def recent_for_service(
-        self,
-        service: str,
-        *,
-        hours: int = 24,
-    ) -> list[dict]:
-        """Releases for ``service`` deployed within the last ``hours``.
-
-        ``hours`` is measured against ``datetime.now(UTC)``; for
-        deterministic correlation work prefer :meth:`context` /
-        :meth:`suspect_at` which take an explicit ``at``/``incident_at``
-        anchor.
-        """
-        if hours <= 0:
-            return []
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        out = [
-            dict(r)
-            for r in self._releases
-            if r["service"] == service and _parse_iso(r["deployed_at"]) >= cutoff
-        ]
-        # Already in descending order from ``_load``.
-        return out
-
-    def suspect_at(
-        self,
-        *,
-        services: list[str],
-        at: datetime,
-        window_minutes: int = 60,
-    ) -> list[str]:
-        """Release ids for ``services`` deployed within ``window_minutes``
-        of ``at``.
-
-        The window is symmetric around ``at`` so a release shipped right
-        before *or* right after the incident start is surfaced — useful
-        for both "deploy caused it" and "deploy is the rollback" cases.
-        Returns release ids sorted by ``deployed_at`` descending.
-        """
-        if at.tzinfo is None:
-            at = at.replace(tzinfo=timezone.utc)
-        if window_minutes <= 0:
-            return []
-
-        wanted = set(services)
-        delta = timedelta(minutes=window_minutes)
-        lo = at - delta
-        hi = at + delta
-
-        suspects: list[tuple[datetime, str]] = []
-        for r in self._releases:
-            if r["service"] not in wanted:
-                continue
-            deployed_at = _parse_iso(r["deployed_at"])
-            if lo <= deployed_at <= hi:
-                suspects.append((deployed_at, r["id"]))
-
-        suspects.sort(key=lambda t: t[0], reverse=True)
-        return [rid for _, rid in suspects]
-
-    def context(
-        self,
-        services: list[str],
-        incident_at: datetime,
-    ) -> L5ReleaseContext:
-        """Assemble an :class:`L5ReleaseContext` for the investigation.
-
-        - ``recent_releases`` — all releases for the given services in
-          the last 24h relative to ``incident_at`` (descending).
-        - ``suspect_releases`` — release ids inside a 60-minute window
-          around ``incident_at``.
-        """
-        if incident_at.tzinfo is None:
-            incident_at = incident_at.replace(tzinfo=timezone.utc)
-
-        wanted = set(services)
-        cutoff = incident_at - timedelta(hours=24)
-        recent = [
-            dict(r)
-            for r in self._releases
-            if r["service"] in wanted and cutoff <= _parse_iso(r["deployed_at"]) <= incident_at
-        ]
-        suspects = self.suspect_at(
-            services=services, at=incident_at, window_minutes=60
-        )
-        return L5ReleaseContext(
-            recent_releases=recent,
-            suspect_releases=suspects,
-        )
-
-# ====== module: examples/incident_management/asr/playbook_store.py ======
-
-_SEED_ROOT = Path(__file__).parent / "seeds" / "playbooks"
-
-
-def _normalise(value: Any) -> str:
-    """Lowercase a scalar for case-insensitive equality."""
-    if isinstance(value, bool):
-        # ``str(True) == "True"`` would never match user-supplied
-        # ``"true"``; standardise on the JSON/YAML lowercase form.
-        return "true" if value else "false"
-    return str(value).strip().lower()
-
-
-class PlaybookStore:
-    """Filesystem-backed L7 Playbook reader."""
-
-    def __init__(self, root: Path) -> None:
-        self._root = Path(root)
-        self._playbooks: dict[str, dict] = {}
-        self._load()
-
-    # ----- loading ------------------------------------------------------
-
-    def _load(self) -> None:
-        roots: list[Path] = [self._root]
-        # Fall back to the bundled seed when the configured layer dir
-        # has no playbooks yet.
-        if not self._has_yaml(self._root):
-            roots = [_SEED_ROOT]
-
-        for r in roots:
-            if not r.exists() or not r.is_dir():
-                continue
-            for path in sorted(r.iterdir()):
-                if path.suffix.lower() not in {".yaml", ".yml"}:
-                    continue
-                try:
-                    data = yaml.safe_load(path.read_text())
-                except yaml.YAMLError:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                pid = data.get("id")
-                if not pid or not isinstance(pid, str):
-                    continue
-                self._playbooks[pid] = data
-
-    @staticmethod
-    def _has_yaml(root: Path) -> bool:
-        if not root.exists() or not root.is_dir():
-            return False
-        return any(
-            p.suffix.lower() in {".yaml", ".yml"} for p in root.iterdir()
-        )
-
-    # ----- public read API ----------------------------------------------
-
-    def get(self, playbook_id: str) -> dict | None:
-        pb = self._playbooks.get(playbook_id)
-        return None if pb is None else dict(pb)
-
-    def list_all(self) -> list[dict]:
-        return [dict(p) for p in self._playbooks.values()]
-
-    def match(self, signals: dict) -> list[L7PlaybookSuggestion]:
-        """Score every playbook against ``signals`` (case-insensitive eq).
-
-        Score = ``matched / total`` where ``total`` is the number of
-        keys declared on the playbook's ``match_signals`` block. A
-        playbook with no declared signals scores 0 and is dropped from
-        the result. Suggestions are returned in descending score, then
-        ascending ``playbook_id`` for deterministic ties.
-        """
-        if not signals:
-            return []
-
-        norm_signals = {
-            str(k).strip().lower(): _normalise(v)
-            for k, v in signals.items()
-        }
-
-        out: list[L7PlaybookSuggestion] = []
-        for pid, pb in self._playbooks.items():
-            declared = pb.get("match_signals") or {}
-            if not isinstance(declared, dict) or not declared:
-                continue
-
-            total = len(declared)
-            matched_keys: list[str] = []
-            for key, expected in declared.items():
-                k = str(key).strip().lower()
-                if k in norm_signals and norm_signals[k] == _normalise(expected):
-                    matched_keys.append(f"{key}={expected}")
-
-            if not matched_keys:
-                continue
-
-            out.append(
-                L7PlaybookSuggestion(
-                    playbook_id=pid,
-                    score=len(matched_keys) / total,
-                    matched_signals=sorted(matched_keys),
-                )
-            )
-
-        out.sort(key=lambda s: (-s.score, s.playbook_id))
-        return out
-
 # ====== module: examples/incident_management/asr/supervisor_node.py ======
 
 logger = logging.getLogger(__name__)
@@ -7925,7 +8257,7 @@ _TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{2,}")
 # ---------------------------------------------------------------------------
 
 
-def extract_components(query: str, kg_store: KGStore) -> list[str]:
+def extract_components(query: str, kg_store: KnowledgeGraphStore) -> list[str]:
     """Return component ids referenced by ``query`` (heuristic, deterministic).
 
     Strategy:
@@ -8030,11 +8362,11 @@ def find_active_duplicate(
 
 def _service_names_for_components(
     components: list[str],
-    kg_store: KGStore,
+    kg_store: KnowledgeGraphStore,
 ) -> list[str]:
     """Map component ids → service names for the L5 release lookup.
 
-    ``ReleaseStore.context`` matches on the ``service`` field of each
+    ``ReleaseContextStore.context`` matches on the ``service`` field of each
     release record, which is conventionally the component's KG ``id``
     (e.g. ``"payments"``) — but if a component records a distinct
     ``service`` field that's preferred. Falls back to the id.
@@ -8056,7 +8388,7 @@ def _signals_for_match(
     *,
     query: str,
     components: list[str],
-    kg_store: KGStore,
+    kg_store: KnowledgeGraphStore,
 ) -> dict[str, Any]:
     """Build the signal dict for :meth:`PlaybookStore.match`.
 
@@ -8089,8 +8421,8 @@ def _signals_for_match(
 def hydrate_and_gate(
     *,
     incident: Any,
-    kg_store: KGStore,
-    release_store: ReleaseStore,
+    kg_store: KnowledgeGraphStore,
+    release_store: ReleaseContextStore,
     playbook_store: PlaybookStore,
     active_sessions: list[dict[str, Any]] | None = None,
     incident_at: datetime | None = None,
@@ -8207,73 +8539,75 @@ __all__ = [
 # ``next_route``) so the framework supervisor merge logic stays simple.
 
 
-_DEFAULT_SEEDS = Path(__file__).parent / "seeds"
+_DEFAULT_SEEDS = Path(_knowledge_graph_mod.__file__).parent / "seeds"
 
 
 def make_hydrate_runner(
     *,
-    kg_store: KGStore,
-    release_store: ReleaseStore,
+    kg_store: KnowledgeGraphStore,
+    release_store: ReleaseContextStore,
     playbook_store: PlaybookStore,
     get_active_sessions: Callable[[], list[dict[str, Any]]] | None = None,
     component_lookup: Callable[[str], list[str]] | None = None,
 ) -> Callable[..., dict[str, Any] | None]:
     """Build a framework-compatible supervisor runner from explicit stores.
 
+    Wraps the generic :func:`runtime.intake.hydrate_from_memory`
+    runner-shape with this app's ``hydrate_and_gate`` pipeline. The
+    framework helper handles the boilerplate (session extraction,
+    memory-attribute stamping, duplicate-metadata + ``next_route``
+    short-circuit); we only supply the app-specific hydrate + gate
+    callables that operate on an :class:`IncidentState` query.
+
     ``get_active_sessions`` is invoked on every node entry so the dup
-    gate sees the live in-flight set. Pass ``None`` (default) to disable
-    the gate entirely — useful for unit-style harnesses that don't have
-    an ``OrchestratorService`` running.
+    gate sees the live in-flight set. Pass ``None`` (default) to
+    disable the gate entirely — useful for unit-style harnesses that
+    don't have an ``OrchestratorService`` running.
     """
     _list_active = get_active_sessions or (lambda: [])
 
-    def _runner(state: Any, *, app_cfg: Any | None = None) -> dict[str, Any] | None:
-        session = state.get("session") if hasattr(state, "get") else None
-        if session is None:
-            return None
+    def _hydrator(
+        session: Any,
+        *,
+        kg_store: Any = None,
+        playbook_store: Any = None,
+        release_store: Any = None,
+    ) -> MemoryLayerState | None:
+        """Run :func:`hydrate_and_gate` and return the memory bundle."""
+        decision = hydrate_and_gate(
+            incident=session,
+            kg_store=kg_store,
+            release_store=release_store,
+            playbook_store=playbook_store,
+            active_sessions=_list_active(),
+            component_lookup=component_lookup,
+        )
+        # Cache decision on a hidden attribute so the gate callable
+        # can reuse it without re-running the hydration.
         try:
-            decision = hydrate_and_gate(
-                incident=session,
-                kg_store=kg_store,
-                release_store=release_store,
-                playbook_store=playbook_store,
-                active_sessions=_list_active(),
-                component_lookup=component_lookup,
-            )
-        except Exception:  # noqa: BLE001 — defensive, keep graph alive
-            logger.exception(
-                "asr supervisor runner: hydrate_and_gate raised; routing to triage",
-            )
+            session.__dict__["_asr_decision"] = decision
+        except Exception:  # noqa: BLE001 — frozen
+            pass
+        return decision.get("memory")
+
+    def _gate(session: Any, *, kg_store: Any = None) -> str | None:
+        """Return parent session id when the active-investigation gate fires."""
+        decision = session.__dict__.get("_asr_decision") if hasattr(session, "__dict__") else None
+        if not decision:
             return None
+        if decision.get("status") != "duplicate":
+            return None
+        return decision.get("parent_session_id")
 
-        # Stamp the hydrated memory bundle onto the live IncidentState
-        # (duck-typed: the ``memory`` attribute is set when present).
-        memory = decision.get("memory")
-        if memory is not None and hasattr(session, "memory"):
-            try:
-                session.memory = memory
-            except Exception:  # noqa: BLE001 — frozen / read-only field
-                logger.warning(
-                    "asr supervisor runner: cannot set session.memory; "
-                    "downstream agents will not see hydrated context",
-                )
-
-        if decision.get("status") == "duplicate":
-            parent = decision.get("parent_session_id")
-            # Stamp dup metadata so the persisted row reflects the gate
-            # outcome before the graph terminates.
-            try:
-                session.status = "duplicate"
-                if parent and hasattr(session, "parent_session_id"):
-                    session.parent_session_id = parent
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "asr supervisor runner: cannot stamp duplicate metadata "
-                    "on session %s", getattr(session, "id", "?"),
-                )
-            return {"session": session, "next_route": "__end__"}
-
-        return {"session": session}
+    def _runner(state: Any, *, app_cfg: Any | None = None) -> dict[str, Any] | None:
+        return hydrate_from_memory(
+            state,
+            kg_store=kg_store,
+            playbook_store=playbook_store,
+            release_store=release_store,
+            hydrator=_hydrator,
+            gate=_gate,
+        )
 
     return _runner
 
@@ -8281,8 +8615,8 @@ def make_hydrate_runner(
 
 def make_default_supervisor_runner(
     *,
-    kg_store: KGStore,
-    release_store: ReleaseStore,
+    kg_store: KnowledgeGraphStore,
+    release_store: ReleaseContextStore,
     playbook_store: PlaybookStore,
     get_active_sessions: Callable[[], list[dict[str, Any]]] | None = None,
     component_lookup: Callable[[str], list[str]] | None = None,
@@ -8308,8 +8642,8 @@ def make_default_supervisor_runner(
 # overhead is just a closure invocation. Constructor stays cheap:
 # the stores read seed JSON lazily on first access.
 _BUILT_DEFAULT_RUNNER = make_default_supervisor_runner(
-    kg_store=KGStore(_DEFAULT_SEEDS / "kg"),
-    release_store=ReleaseStore(_DEFAULT_SEEDS / "releases"),
+    kg_store=KnowledgeGraphStore(_DEFAULT_SEEDS / "kg"),
+    release_store=ReleaseContextStore(_DEFAULT_SEEDS / "releases"),
     playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
     get_active_sessions=lambda: [],
 )
@@ -8332,197 +8666,6 @@ def default_supervisor_runner(
     hydration step is skipped.
     """
     return _BUILT_DEFAULT_RUNNER(state, app_cfg=app_cfg)
-
-# ====== module: examples/incident_management/asr/hypothesis_loop.py ======
-
-MAX_ITERATIONS: int = 3
-ACCEPT_THRESHOLD: float = 0.7
-
-
-# Mirror runtime.similarity's tokenisation so the score's notion of
-# "overlap" matches the dedup / lookup_similar_incidents path.
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-_STOP: frozenset[str] = frozenset({
-    "a", "an", "the", "of", "in", "on", "to", "and", "or",
-    "is", "was", "with", "for", "be", "are", "as", "at",
-    "by", "from", "has", "had", "have", "it", "that", "this",
-    "we", "i", "you", "they", "but", "not", "no", "if",
-})
-
-
-class HypothesisScore(TypedDict):
-    """Result returned by :func:`score_hypothesis`."""
-
-    score: float
-    rationale: str
-    matched_terms: list[str]
-
-
-def _tokens(text: str) -> set[str]:
-    return {
-        t for t in _TOKEN_RE.findall(text.lower())
-        if t not in _STOP and len(t) > 1
-    }
-
-
-def score_hypothesis(
-    hypothesis: str,
-    evidence: list[str],
-) -> HypothesisScore:
-    """Score how well ``evidence`` supports ``hypothesis``.
-
-    Token-overlap heuristic. The score is the fraction of hypothesis
-    tokens that appear in *any* evidence string, capped at 1.0.
-
-    - Empty hypothesis -> ``0.0`` (defensive; the LLM should never
-      produce an empty hypothesis but the loop must not crash).
-    - Empty evidence list -> ``0.0`` (no support).
-    - Score is always in ``[0.0, 1.0]`` inclusive.
-
-    Returns a :class:`HypothesisScore` with the score, a short
-    machine-generated rationale, and the matched tokens (handy for
-    rendering in the UI's hypothesis trail).
-    """
-    h_tokens = _tokens(hypothesis)
-    if not h_tokens:
-        return HypothesisScore(
-            score=0.0,
-            rationale="Empty hypothesis — no tokens to score against evidence.",
-            matched_terms=[],
-        )
-    if not evidence:
-        return HypothesisScore(
-            score=0.0,
-            rationale=f"No evidence supplied to support {len(h_tokens)} hypothesis terms.",
-            matched_terms=[],
-        )
-
-    e_tokens: set[str] = set()
-    for snippet in evidence:
-        e_tokens |= _tokens(snippet)
-
-    matched = h_tokens & e_tokens
-    score = len(matched) / len(h_tokens)
-    # Round to 3 dp to keep the audit trail readable; score is still a
-    # float for callers that want a tighter comparison.
-    score = round(score, 3)
-
-    rationale = (
-        f"Matched {len(matched)}/{len(h_tokens)} hypothesis terms "
-        f"in {len(evidence)} evidence snippets."
-    )
-    return HypothesisScore(
-        score=score,
-        rationale=rationale,
-        matched_terms=sorted(matched),
-    )
-
-
-def should_refine(score: float, iterations: int) -> bool:
-    """Loop-control predicate: True when the agent should refine again.
-
-    Refines while:
-
-    * the current score is below :data:`ACCEPT_THRESHOLD`, AND
-    * the iteration count is strictly less than :data:`MAX_ITERATIONS`.
-
-    The iteration counter is the number of *completed* rounds — so
-    ``should_refine(score=0.5, iterations=0)`` returns ``True`` (we've
-    done 0 rounds, want at least 1), ``should_refine(score=0.5,
-    iterations=3)`` returns ``False`` (cap hit).
-
-    Defensive on bad inputs: negative iterations are clamped to 0;
-    out-of-range scores are clamped to ``[0.0, 1.0]``.
-    """
-    if score is None:
-        return iterations < MAX_ITERATIONS
-    s = max(0.0, min(1.0, float(score)))
-    n = max(0, int(iterations))
-    return s < ACCEPT_THRESHOLD and n < MAX_ITERATIONS
-
-
-__all__ = [
-    "ACCEPT_THRESHOLD",
-    "HypothesisScore",
-    "MAX_ITERATIONS",
-    "score_hypothesis",
-    "should_refine",
-]
-
-# ====== module: examples/incident_management/asr/resolution_helpers.py ======
-
-class ToolCallSpec(TypedDict):
-    """A single suggested tool call sourced from a playbook step."""
-
-    tool: str
-    args: dict[str, Any]
-    requires_approval: bool
-
-
-def playbook_to_tool_calls(playbook: dict) -> list[ToolCallSpec]:
-    """Translate a playbook dict's ``remediation`` block into tool calls.
-
-    Each ``remediation`` entry is expected to have:
-
-    - ``tool`` (str, required) — the tool name as known to the gateway.
-    - ``args`` (dict, optional) — keyword args; defaults to ``{}``.
-
-    The playbook's top-level ``required_approval`` flag (see
-    ``examples/incident_management/asr/seeds/playbooks/*.yaml``) is
-    propagated to every emitted spec — it represents the playbook
-    author's stated risk posture. The gateway's risk policy still has
-    final say at execution time; this flag is purely advisory metadata
-    for the agent's prompt and the UI.
-
-    Returns an empty list when ``playbook`` is None / lacks
-    ``remediation`` / has malformed entries — the caller can branch on
-    "no suggestion" without a try/except.
-    """
-    if not playbook or not isinstance(playbook, dict):
-        return []
-    remediation = playbook.get("remediation") or []
-    if not isinstance(remediation, list):
-        return []
-
-    requires_approval = bool(playbook.get("required_approval"))
-    out: list[ToolCallSpec] = []
-    for entry in remediation:
-        if not isinstance(entry, dict):
-            continue
-        tool = entry.get("tool")
-        if not tool or not isinstance(tool, str):
-            continue
-        args = entry.get("args") or {}
-        if not isinstance(args, dict):
-            args = {}
-        out.append(ToolCallSpec(
-            tool=tool,
-            args=dict(args),
-            requires_approval=requires_approval,
-        ))
-    return out
-
-
-def top_playbook(
-    suggestions: list[L7PlaybookSuggestion],
-) -> str | None:
-    """Return the playbook_id of the highest-scoring suggestion, or None.
-
-    ``suggestions`` is the list ``PlaybookStore.match`` already sorts
-    by descending score; we still pick by ``max`` so callers that pass
-    a re-ordered list (e.g. tests) still get a deterministic answer.
-    """
-    if not suggestions:
-        return None
-    best = max(suggestions, key=lambda s: (s.score, -hash(s.playbook_id)))
-    return best.playbook_id
-
-
-__all__ = [
-    "ToolCallSpec",
-    "playbook_to_tool_calls",
-    "top_playbook",
-]
 
 # ====== module: examples/incident_management/config.py ======
 
@@ -8554,7 +8697,22 @@ _INCIDENT_ESCALATION_TEAMS: list[str] = [
 ]
 
 
-def _default_incident_framework_cfg() -> FrameworkAppConfig:
+_INCIDENT_ENVIRONMENTS: list[str] = ["production", "staging", "dev", "local"]
+
+
+_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "incident_management.yaml"
+)
+
+
+def _read_yaml(path: str | Path | None) -> dict:
+    p = Path(path) if path else _DEFAULT_PATH
+    if not p.exists():
+        return {}
+    return yaml.safe_load(p.read_text()) or {}
+
+
+def _default_framework_cfg() -> FrameworkAppConfig:
     """Default ``FrameworkAppConfig`` populated with incident-tuned values."""
     return FrameworkAppConfig(
         confidence_threshold=0.75,
@@ -8565,213 +8723,78 @@ def _default_incident_framework_cfg() -> FrameworkAppConfig:
     )
 
 
-class IncidentAppConfig(BaseModel):
-    """Domain-level configuration for the incident-management app.
+def load_app_config(path: str | Path | None = None) -> FrameworkAppConfig:
+    """Load the incident app YAML and return a ``FrameworkAppConfig``.
 
-    Defaults are tuned to match the values currently shipped in
-    ``config/config.yaml`` (notably ``similarity_threshold=0.2``, which
-    is the operative default — the old framework default of 0.85 was
-    masked by the YAML override and was never actually used).
-
-    The cross-cutting fields the framework reads
+    The YAML may carry framework-flavored keys at the top level
     (``confidence_threshold``, ``similarity_threshold``,
-    ``escalation_teams``, ``severity_aliases``,
-    ``dedup_system_prompt``) live on a composed
-    :class:`runtime.config.FrameworkAppConfig` accessible via
-    ``IncidentAppConfig().framework``. The flat top-level attributes
-    are kept as read-through proxies for back-compat with existing
-    callers.
+    ``escalation_teams``, ``severity_aliases``, ``dedup_system_prompt``,
+    ``ui``) and/or under a ``framework:`` block; both are folded into
+    the returned ``FrameworkAppConfig``. Domain-specific top-level keys
+    (``dedup``, ``environments``, ``store_path``, ``similarity_method``)
+    are ignored here — they are surfaced via the dedicated provider
+    hooks below. Falls back to ``_default_framework_cfg()`` when the
+    file is missing.
     """
+    raw = _read_yaml(path)
+    if not raw:
+        return _default_framework_cfg()
 
-    framework: FrameworkAppConfig = Field(
-        default_factory=_default_incident_framework_cfg,
-    )
-
-    store_path: str = "incidents"
-    similarity_method: Literal["keyword", "embedding"] = "keyword"
-    environments: list[str] = Field(
-        default_factory=lambda: ["production", "staging", "dev", "local"],
-    )
-    # Optional two-stage dedup pipeline. Off-by-default at the
-    # framework level via ``DedupConfig.enabled=False``; the bundled
-    # YAML for the incident-management example opts in. ``None`` means
-    # "framework default" (off).
-    dedup: DedupConfig | None = None
-
-    # ------------------------------------------------------------------
-    # Read-through proxies for the framework-level fields. Existing
-    # callers (UI, MCP server, tests) read these as flat attributes;
-    # the runtime now reads them off ``self.framework`` directly.
-    # ------------------------------------------------------------------
-    @property
-    def similarity_threshold(self) -> float:
-        return self.framework.similarity_threshold
-
-    @property
-    def confidence_threshold(self) -> float:
-        return self.framework.confidence_threshold
-
-    @property
-    def escalation_teams(self) -> list[str]:
-        return self.framework.escalation_teams
-
-    @property
-    def severity_aliases(self) -> dict[str, str]:
-        return self.framework.severity_aliases
-
-
-_DEFAULT_PATH = Path(__file__).parent / "config.yaml"
-
-
-def load_incident_app_config(
-    path: str | Path | None = None,
-) -> IncidentAppConfig:
-    """Load the incident app config from ``path`` (or the example default).
-
-    Falls back to a fully-defaulted ``IncidentAppConfig`` when the file is
-    missing — this keeps unit tests deterministic without forcing every
-    ``AppConfig(...)``-constructed test to also create an app config file.
-
-    Top-level YAML keys that match the legacy flat shape
-    (``confidence_threshold``, ``similarity_threshold``,
-    ``escalation_teams``, ``severity_aliases``) are folded into the
-    composed :class:`FrameworkAppConfig` automatically so existing
-    config.yaml files keep loading.
-    """
-    p = Path(path) if path else _DEFAULT_PATH
-    if not p.exists():
-        return IncidentAppConfig()
-    raw = yaml.safe_load(p.read_text()) or {}
-
-    # Back-compat: lift flat top-level keys that now live on the
-    # composed FrameworkAppConfig.
     fw_kwargs: dict[str, object] = {}
     if "framework" in raw:
-        fw_block = raw.pop("framework") or {}
-        fw_kwargs.update(fw_block)
+        fw_kwargs.update(raw.get("framework") or {})
     for legacy_key in (
         "confidence_threshold",
         "similarity_threshold",
         "escalation_teams",
         "severity_aliases",
         "dedup_system_prompt",
+        "ui",
     ):
         if legacy_key in raw:
-            fw_kwargs[legacy_key] = raw.pop(legacy_key)
-    if fw_kwargs:
-        # Start from the incident defaults, then overlay user values.
-        defaults = _default_incident_framework_cfg()
-        merged = defaults.model_dump()
-        merged.update(fw_kwargs)
-        raw["framework"] = FrameworkAppConfig(**merged)
-    return IncidentAppConfig(**raw)
+            fw_kwargs[legacy_key] = raw[legacy_key]
+
+    defaults = _default_framework_cfg()
+    if not fw_kwargs:
+        return defaults
+    merged = defaults.model_dump()
+    merged.update(fw_kwargs)
+    return FrameworkAppConfig(**merged)
+
+
+# ---------------------------------------------------------------------------
+# Provider hooks referenced from ``config/config.yaml``'s ``runtime:`` block.
+# The runtime resolves these dotted paths into no-arg callables so it
+# never imports ``examples.incident_management.config`` directly.
+# ---------------------------------------------------------------------------
 
 
 def framework_app_config_provider() -> FrameworkAppConfig:
-    """Provider hook referenced from ``RuntimeConfig.framework_app_config_path``.
-
-    Returns the same :class:`FrameworkAppConfig` view the loaded
-    :class:`IncidentAppConfig` exposes via ``.framework`` — the runtime
-    reads this directly without ever importing ``IncidentAppConfig``.
-    """
-    return load_incident_app_config().framework
+    """Provider for ``RuntimeConfig.framework_app_config_path``."""
+    return load_app_config()
 
 
 def dedup_config_provider() -> DedupConfig | None:
-    """Provider hook referenced from ``RuntimeConfig.dedup_config_path``.
+    """Provider for ``RuntimeConfig.dedup_config_path``.
 
     Returns the configured dedup pipeline shape (or ``None`` when the
-    bundled config disables it) so the runtime can build the pipeline
-    without importing ``IncidentAppConfig``.
+    bundled YAML disables it) so the runtime can build the pipeline
+    without importing an app-specific config module.
     """
-    return load_incident_app_config().dedup
+    raw = _read_yaml(None)
+    block = raw.get("dedup")
+    if block is None:
+        return None
+    return DedupConfig(**block)
 
 
 def environments_provider() -> list[str]:
-    """Provider hook for ``RuntimeConfig.environments_provider_path``.
-
-    Returns the incident-management environments roster the
-    ``GET /environments`` endpoint surfaces to UI clients.
-    """
-    return list(load_incident_app_config().environments)
-
-# ====== module: examples/incident_management/state.py ======
-
-_INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
-_UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
-
-IncidentStatus = Literal[
-    "new",
-    "in_progress",
-    "matched",
-    "resolved",
-    "escalated",
-    "awaiting_input",
-    "stopped",
-    "deleted",
-    # Terminal status set by the dedup pipeline when stage-2 LLM
-    # confirms this session is a duplicate of a prior closed session.
-    # Non-destructive: the row stays queryable with ``parent_session_id``
-    # pointing at the original. Retraction (``POST /sessions/{id}/un-duplicate``)
-    # flips status back to ``"new"``.
-    "duplicate",
-]
-
-
-class Reporter(BaseModel):
-    id: str
-    team: str
-
-
-class IncidentState(Session):
-    """Incident-specific session fields layered on the generic ``Session``."""
-
-    query: str
-    environment: str
-    reporter: Reporter
-    summary: str = ""
-    tags: list[str] = Field(default_factory=list)
-    severity: str | None = None
-    category: str | None = None
-    matched_prior_inc: str | None = None
-    embedding: list[float] | None = None
-    resolution: Any = None
-
-    # ASR memory-layer slots (L2 KG, L5 Release, L7 Playbooks).
-    # Round-tripped via ``extra_fields`` — no row schema change needed.
-    memory: MemoryLayerState = Field(default_factory=MemoryLayerState)
-
-    # Override the framework agent-input hook with the incident-shaped
-    # preamble (id, environment, query, status, findings, user inputs).
-    # The shape was previously hardcoded inside ``runtime.graph`` —
-    # moved here so the framework no longer assumes incident-management
-    # fields exist on every session.
-    def to_agent_input(self) -> str:
-        base = (
-            f"Incident {self.id}\n"
-            f"Environment: {self.environment}\n"
-            f"Query: {self.query}\n"
-            f"Status: {self.status}\n"
-        )
-        for agent_key, finding in self.findings.items():
-            base += f"Findings ({agent_key}): {finding}\n"
-        if self.user_inputs:
-            bullets = "\n".join(f"- {ui}" for ui in self.user_inputs)
-            base += (
-                "\nUser-provided context (appended via intervention):\n"
-                f"{bullets}\n"
-            )
-        return base
-
-    # Explicit override of the framework id_format hook so the
-    # incident-management app continues to mint ``INC-YYYYMMDD-NNN``
-    # ids regardless of any future change to the framework default.
-    @classmethod
-    def id_format(cls, *, seq: int) -> str:
-        from datetime import datetime, timezone
-
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        return f"INC-{today}-{seq:03d}"
+    """Provider for ``RuntimeConfig.environments_provider_path``."""
+    raw = _read_yaml(None)
+    envs = raw.get("environments")
+    if envs is None:
+        return list(_INCIDENT_ENVIRONMENTS)
+    return list(envs)
 
 # ====== module: examples/incident_management/mcp_server.py ======
 
@@ -8797,7 +8820,7 @@ class IncidentMCPServer:
     store: SessionStore | None = None
     history: HistoryStore | None = None
     severity_aliases: dict[str, str] = field(
-        default_factory=lambda: load_incident_app_config().severity_aliases
+        default_factory=lambda: load_app_config().severity_aliases
     )
     mcp: FastMCP = field(init=False)
 
@@ -8843,7 +8866,9 @@ class IncidentMCPServer:
             limit=5,
         )
         return {"matches": [
-            {"id": i.id, "summary": i.summary, "resolution": i.resolution,
+            {"id": i.id,
+             "summary": i.extra_fields.get("summary", ""),
+             "resolution": i.extra_fields.get("resolution"),
              "score": round(s, 3)}
             for i, s in hits
         ]}
@@ -8901,17 +8926,19 @@ class IncidentMCPServer:
         if "status" in patch:
             inc.status = patch["status"]
         if "severity" in patch:
-            inc.severity = normalize_severity(patch["severity"], self.severity_aliases)
+            inc.extra_fields["severity"] = normalize_severity(
+                patch["severity"], self.severity_aliases
+            )
         if "category" in patch:
-            inc.category = patch["category"]
+            inc.extra_fields["category"] = patch["category"]
         if "summary" in patch:
-            inc.summary = patch["summary"]
+            inc.extra_fields["summary"] = patch["summary"]
         if "tags" in patch:
-            inc.tags = list(patch["tags"])
+            inc.extra_fields["tags"] = list(patch["tags"])
         if "matched_prior_inc" in patch:
-            inc.matched_prior_inc = patch["matched_prior_inc"]
+            inc.extra_fields["matched_prior_inc"] = patch["matched_prior_inc"]
         if "resolution" in patch:
-            inc.resolution = patch["resolution"]
+            inc.extra_fields["resolution"] = patch["resolution"]
         for key, value in patch.items():
             if key.startswith("findings_"):
                 inc.findings[key[len("findings_"):]] = value

@@ -74,7 +74,7 @@ runtime:
   # domain state class (see examples/incident_management/state.py).
   # Apps swapping in a different state class point this at their own
   # ``Session`` subclass.
-  state_class: examples.incident_management.state.IncidentState
+  state_class: null  # bare runtime.state.Session — app data in extra_fields
   # Cross-cutting framework knobs (confidence threshold, escalation
   # roster, severity aliases, dedup prompt) come from a no-arg
   # provider the example app exposes. Lets the runtime read them

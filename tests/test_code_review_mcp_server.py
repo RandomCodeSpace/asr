@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from examples.code_review.state import CodeReviewState, PullRequest
+from runtime.state import Session
 from examples.code_review.mcp_server import CodeReviewMCPServer
 
 
@@ -24,7 +24,7 @@ _TODAY = datetime.now(timezone.utc).strftime("%Y%m%d")
 
 
 class InMemorySessionStore:
-    """Drop-in stand-in for ``SessionStore[CodeReviewState]``.
+    """Drop-in stand-in for ``SessionStore[Session]``.
 
     Implements only the slice the MCP server uses: ``load(id)`` and
     ``save(state)``. Stores deep copies so a caller mutating a returned
@@ -33,35 +33,37 @@ class InMemorySessionStore:
     """
 
     def __init__(self) -> None:
-        self._cells: dict[str, CodeReviewState] = {}
+        self._cells: dict[str, Session] = {}
 
-    def save(self, state: CodeReviewState) -> None:
+    def save(self, state: Session) -> None:
         self._cells[state.id] = copy.deepcopy(state)
 
-    def load(self, session_id: str) -> CodeReviewState:
+    def load(self, session_id: str) -> Session:
         if session_id not in self._cells:
             raise FileNotFoundError(session_id)
         return copy.deepcopy(self._cells[session_id])
 
 
-def _make_state(seq: int = 1) -> CodeReviewState:
-    """Build a fully-formed ``CodeReviewState`` with a valid id."""
-    return CodeReviewState(
+def _make_state(seq: int = 1) -> Session:
+    """Build a fully-formed ``Session`` carrying a code-review pr blob."""
+    return Session(
         id=f"INC-{_TODAY}-{seq:03d}",
         status="new",
         created_at=_NOW,
         updated_at=_NOW,
-        pr=PullRequest(
-            repo="org/repo",
-            number=42,
-            title="Add caching layer",
-            author="alice",
-            base_sha="aaaaaaa",
-            head_sha="bbbbbbb",
-            additions=12,
-            deletions=3,
-            files_changed=2,
-        ),
+        extra_fields={
+            "pr": {
+                "repo": "org/repo",
+                "number": 42,
+                "title": "Add caching layer",
+                "author": "alice",
+                "base_sha": "aaaaaaa",
+                "head_sha": "bbbbbbb",
+                "additions": 12,
+                "deletions": 3,
+                "files_changed": 2,
+            },
+        },
     )
 
 

@@ -1,14 +1,15 @@
 from __future__ import annotations
-# ----- imports for examples/incident_management/ui.py -----
-"""Streamlit UI — 2 tabs + always-on sidebar with recent INCs.
+# ----- imports for src/runtime/ui.py -----
+"""Generic Streamlit UI — 2 tabs + always-on sidebar with recent sessions.
 
-Run via::
+Made app-agnostic: status pills, configured-field badges, detail-pane
+fields, and prior-match tags all flow from :class:`runtime.config.UIConfig`
+so the shell stays domain-neutral.
 
-    python -m examples.incident_management
-
-A backwards-compat shim at ``ui/streamlit_app.py`` re-exports this
-module so legacy ``streamlit run ui/streamlit_app.py`` invocations
-keep working.
+Apps point at this module via their bootstrap entry (e.g.
+``streamlit run -m runtime.ui`` with ``APP_CONFIG`` in env, or a thin
+shim under ``examples/<app>/__main__.py`` that hands a config path
+in).
 """
 # Lifecycle note: the Orchestrator owns FastMCP clients tied to a specific
 # asyncio event loop. Streamlit re-runs the script on every interaction and we
@@ -23,8 +24,9 @@ keep working.
 # that need no MCP clients. It builds the store from the same config the
 # Orchestrator uses so both share the same SQLite DB.
 
-from app import AppConfig, Base, IncidentAppConfig, MetadataConfig, Orchestrator, OrchestratorService, SessionStore, build_embedder, build_engine, build_vector_store, load_config, load_incident_app_config, resolve_state_class
+from app import AppConfig, Base, FrameworkAppConfig, MetadataConfig, Orchestrator, OrchestratorService, SessionStore, UIBadge, build_embedder, build_engine, build_vector_store, load_config, resolve_framework_app_config, resolve_state_class
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,11 +40,22 @@ import streamlit as st
 
 
 
+# Default config path; apps override via the ``APP_CONFIG`` env var.
 
 
-# ====== module: examples/incident_management/ui.py ======
+# ====== module: src/runtime/ui.py ======
 
-CONFIG_PATH = Path("config/config.yaml")
+CONFIG_PATH = Path(os.environ.get("APP_CONFIG", "config/config.yaml"))
+
+
+def _load_app_cfg(cfg: AppConfig) -> FrameworkAppConfig:
+    """Resolve the application's :class:`FrameworkAppConfig` provider.
+
+    Falls back to a bare ``FrameworkAppConfig()`` if the YAML doesn't
+    register one. Centralised here so the UI never imports an
+    app-specific config module.
+    """
+    return resolve_framework_app_config(cfg.runtime.framework_app_config_path)
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +94,8 @@ def _get_service(cfg: AppConfig) -> OrchestratorService | None:
     Wrapped in ``st.cache_resource`` so the background thread + asyncio
     loop are built exactly once per Streamlit server process and reused
     across reruns. Returns ``None`` when running outside a Streamlit
-    runtime context (e.g. ``import examples.incident_management.ui``
-    from a test) so the module stays importable headlessly.
+    script-run context (e.g. plain module import from a test) so the
+    module stays importable headlessly.
     """
     try:
         return _cached_service(cfg)
@@ -101,8 +114,7 @@ def _cached_service(cfg: AppConfig) -> OrchestratorService:
     return svc
 
 
-def _make_repository(cfg: AppConfig,
-                     app_cfg: IncidentAppConfig) -> SessionStore:
+def _make_repository(cfg: AppConfig) -> SessionStore:
     """Build a SessionStore from config — mirrors Orchestrator.create logic.
 
     Returns the active CRUD ``SessionStore`` only. The UI does not need
@@ -113,7 +125,7 @@ def _make_repository(cfg: AppConfig,
     default_url = MetadataConfig().url
     url = (
         cfg.storage.metadata.url if cfg.storage.metadata.url != default_url
-        else f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
+        else f"sqlite:///{Path(cfg.paths.incidents_dir) / 'metadata.db'}"
     )
     engine = build_engine(MetadataConfig(url=url, pool_size=cfg.storage.metadata.pool_size, echo=cfg.storage.metadata.echo))
     Base.metadata.create_all(engine)
@@ -132,20 +144,44 @@ def _make_repository(cfg: AppConfig,
     )
 
 
-def _load_metadata_dicts(cfg: AppConfig,
-                         app_cfg: IncidentAppConfig) -> tuple[list[dict], list[dict], list[str]]:
+def _load_metadata_dicts(
+    cfg: AppConfig,
+) -> tuple[list[dict], list[dict], list[str]]:
     """Build a transient orchestrator, snapshot agents/tools/envs, then aclose.
 
     Per-rerun cost is dominated by FastMCP client startup (~100-200ms total for
     in-process servers); acceptable for a UI rerun.
+
+    Environments come from the app's ``environments_provider_path`` (a
+    ``module:callable`` reference on :class:`runtime.config.RuntimeConfig`).
+    Apps that don't expose environments leave the field unset; the UI
+    just renders an empty list.
     """
     async def _go():
         orch = await Orchestrator.create(cfg)
         try:
-            return orch.list_agents(), orch.list_tools(), list(app_cfg.environments)
+            return orch.list_agents(), orch.list_tools(), _resolve_environments(cfg)
         finally:
             await orch.aclose()
     return asyncio.run(_go())
+
+
+def _resolve_environments(cfg: AppConfig) -> list[str]:
+    """Resolve the ``runtime.environments_provider_path`` provider, if set."""
+    dotted = cfg.runtime.environments_provider_path
+    if not dotted:
+        return []
+    if ":" not in dotted:
+        return []
+    module_name, _, attr = dotted.partition(":")
+    try:
+        import importlib
+        mod = importlib.import_module(module_name)
+        provider = getattr(mod, attr)
+        envs = provider()
+    except Exception:  # pragma: no cover - defensive
+        return []
+    return list(envs) if envs else []
 
 
 # Color palette for st.badge — Streamlit accepts: blue/green/orange/red/violet/gray/primary.
@@ -172,29 +208,11 @@ _STATUS_LABEL = {
     "stopped": "STOPPED",
 }
 
-_SEVERITY_COLOR = {
-    "low": "green",
-    "medium": "orange",
-    "high": "red",
-}
-
-# Unknown categories fall back to "gray" via the .get() in _category_badge.
-_CATEGORY_COLOR = {
-    "latency": "orange",
-    "availability": "red",
-    "data": "violet",
-    "security": "red",
-    "capacity": "blue",
-    "performance": "orange",
-    "config": "gray",
-}
-
-
 def _badge(label: str, color: str) -> None:
     """Render an inline coloured pill via st.badge.
 
     Centralised so the small label/colour decisions live in one place and
-    the rest of the UI can call ``_status_badge(inc)`` etc. without
+    the rest of the UI can call ``_status_badge(...)`` etc. without
     touching the palette dicts directly.
     """
     st.badge(label, color=color)
@@ -207,16 +225,22 @@ def _status_badge(status: str | None) -> None:
            _STATUS_COLOR.get(status, "gray"))
 
 
-def _severity_badge(severity: str | None) -> None:
-    if not severity:
-        return
-    _badge(severity.upper(), _SEVERITY_COLOR.get(severity, "gray"))
+def _generic_badge(value: str | None,
+                   badge_map: dict[str, UIBadge]) -> None:
+    """Render a config-driven badge.
 
-
-def _category_badge(category: str | None) -> None:
-    if not category:
+    ``badge_map`` is the inner dict from
+    :class:`runtime.config.UIConfig.badges` for one field. Unknown
+    values render as an upper-cased gray pill so an unconfigured value
+    still surfaces something.
+    """
+    if not value:
         return
-    _badge(category, _CATEGORY_COLOR.get(category, "gray"))
+    badge = badge_map.get(value.lower())
+    if badge:
+        _badge(badge.label, badge.color)
+    else:
+        _badge(value.upper(), "gray")
 
 
 def _age(ts: str) -> str:
@@ -245,32 +269,80 @@ def _badge_md(label: str | None, palette: dict[str, str]) -> str:
     return f":{color}-badge[{label}]"
 
 
+def _palette_from_badges(badge_map: dict[str, UIBadge]) -> dict[str, str]:
+    """Flatten a ``dict[str, UIBadge]`` into ``{value: color}`` for
+    :func:`_badge_md`. Keeps the markdown-badge helper agnostic of the
+    config layer.
+    """
+    return {k: v.color for k, v in badge_map.items()}
+
+
+def _badge_field_slots(app_cfg: FrameworkAppConfig) -> tuple[str, str]:
+    """Pick the two badge fields the row + detail panes render.
+
+    The runtime is agnostic to which field names an app uses; we just
+    take the configured ``app_cfg.ui.badges`` keys in declared order.
+    Apps that configure fewer than two fields get blank slots so the
+    layout stays stable.
+    """
+    keys = [k for k in app_cfg.ui.badges if k != "status"]
+    primary = keys[0] if keys else ""
+    secondary = keys[1] if len(keys) > 1 else ""
+    return primary, secondary
+
+
+def _resolve_field(item: dict, dotted_key: str) -> str:
+    """Resolve a dotted-path key against ``item.extra_fields`` (preferred)
+    or the item dict itself.
+
+    Returns ``""`` for missing values so callers can use the result
+    directly in markdown without ``None`` checks.
+    """
+    parts = dotted_key.split(".")
+    cur: object = item.get("extra_fields", item)
+    for p in parts:
+        if not isinstance(cur, dict):
+            return ""
+        cur = cur.get(p, "")
+    return str(cur) if cur else ""
+
+
 def _fmt_tokens_short(n: int) -> str:
     """Compact form for the sidebar: ``12.3k`` / ``842``."""
     return f"{n / 1000:.1f}k" if n >= 1000 else f"{n}"
 
 
-def _render_inc_row(inc: dict, store: SessionStore) -> None:
-    """One INC row as an expander.
+def _render_session_row(sess: dict, store: SessionStore,
+                        app_cfg: FrameworkAppConfig) -> None:
+    """One session row as an expander.
 
-    Header shows INC id + env badge + status badge. The body holds
-    severity/category badges, age + tokens, an excerpt of the summary,
-    and Open + delete actions. The currently-selected INC is expanded
-    by default so its details are visible without an extra click.
+    Header shows session id + env badge + status badge. The body holds
+    configured-field badges (driven by ``app_cfg.ui.badges``), age +
+    tokens, an excerpt of the summary, and Open + delete actions. The
+    currently-selected session is expanded by default so its details
+    are visible without an extra click.
     """
-    inc_id = inc["id"]
-    status = inc.get("status") or ""
-    env = inc.get("environment", "")
-    age = _age(inc.get("created_at", ""))
-    sev = (inc.get("severity") or "")
-    cat = (inc.get("category") or "")
-    summary = (inc.get("summary") or inc.get("query") or "").strip()
-    toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
+    session_id = sess["id"]
+    status = sess.get("status") or ""
+    env = sess.get("environment", "")
+    age = _age(sess.get("created_at", ""))
+    sev_field, cat_field = _badge_field_slots(app_cfg)
+    sev = (sess.get(sev_field) or "") if sev_field else ""
+    cat = (sess.get(cat_field) or "") if cat_field else ""
+    summary = (sess.get("summary") or sess.get("query") or "").strip()
+    toks = (sess.get("token_usage") or {}).get("total_tokens", 0)
     is_deleted = status == "deleted"
-    is_selected = st.session_state.get("selected_incident") == inc_id
+    is_selected = st.session_state.get("selected_session") == session_id
+
+    sev_palette = _palette_from_badges(
+        app_cfg.ui.badges.get(sev_field, {}) if sev_field else {}
+    )
+    cat_palette = _palette_from_badges(
+        app_cfg.ui.badges.get(cat_field, {}) if cat_field else {}
+    )
 
     header = (
-        f"`{inc_id}` "
+        f"`{session_id}` "
         f"{_badge_md(env or None, _ENV_COLOR)} "
         f"{_badge_md(status, _STATUS_COLOR)} "
         f"`{_fmt_tokens_short(toks)}`"
@@ -282,34 +354,32 @@ def _render_inc_row(inc: dict, store: SessionStore) -> None:
     exp_col, del_col = st.columns([10, 1], gap="small")
     with del_col:
         if not is_deleted:
-            if st.button("×", key=f"del_{inc_id}",
+            if st.button("×", key=f"del_{session_id}",
                          help="Soft-delete",
                          type="tertiary",
                          use_container_width=True):
-                store.delete(inc_id)
-                if st.session_state.get("selected_incident") == inc_id:
-                    st.session_state.pop("selected_incident", None)
+                store.delete(session_id)
+                if st.session_state.get("selected_session") == session_id:
+                    st.session_state.pop("selected_session", None)
                 st.rerun()
 
     with exp_col, st.expander(header, expanded=is_selected):
         # Line 1: severity + category + age + updated-time. The time
-        # carries a hover tooltip with the full timestamp and reporter
-        # attribution, so the inline row stays compact.
-        updated = inc.get("updated_at") or ""
-        reporter = inc.get("reporter") or {}
-        rep_id = reporter.get("id") or ""
-        rep_team = reporter.get("team") or ""
+        # carries a hover tooltip with the full timestamp and any
+        # configured submitter-style attribution, so the inline row
+        # stays compact.
+        updated = sess.get("updated_at") or ""
         meta_bits = [b for b in (
-            _badge_md(sev.lower() if sev else None, _SEVERITY_COLOR),
-            _badge_md(cat or None, _CATEGORY_COLOR),
+            _badge_md(sev.lower() if sev else None, sev_palette),
+            _badge_md(cat or None, cat_palette),
         ) if b]
         if age:
             meta_bits.append(f"`{age}`")
         if updated and len(updated) >= 16:
             time_str = updated[11:16]  # "HH:MM" out of "YYYY-MM-DDTHH:MM:SSZ"
             tooltip_parts = [f"updated {updated}"]
-            if rep_id:
-                attrib = f"by {rep_id}" + (f" ({rep_team})" if rep_team else "")
+            attrib = _summary_attribution(sess, app_cfg)
+            if attrib:
                 tooltip_parts.append(attrib)
             tooltip = " · ".join(tooltip_parts)
             meta_bits.append(
@@ -325,16 +395,38 @@ def _render_inc_row(inc: dict, store: SessionStore) -> None:
             short = summary if len(summary) <= 160 else summary[:157] + "…"
             st.markdown(f"> {short}")
 
-        if st.button("Open", key=f"inc_{inc_id}",
+        if st.button("Open", key=f"sess_{session_id}",
                      type="primary",
                      use_container_width=True):
-            st.session_state["selected_incident"] = inc_id
+            st.session_state["selected_session"] = session_id
+
+
+def _summary_attribution(sess: dict, app_cfg: FrameworkAppConfig) -> str:
+    """Build a one-line attribution string from configured summary fields.
+
+    Reads :attr:`runtime.config.UIConfig.detail_fields` filtered to
+    ``section == "summary"``. The first non-empty field becomes the
+    leading ``by <value>`` clause; further fields render as
+    parenthetical context.
+    """
+    parts: list[str] = []
+    for field in app_cfg.ui.detail_fields:
+        if field.section != "summary":
+            continue
+        v = _resolve_field(sess, field.key)
+        if v:
+            parts.append(v)
+    if not parts:
+        return ""
+    head, *rest = parts
+    suffix = f" ({', '.join(rest)})" if rest else ""
+    return f"by {head}{suffix}"
 
 
 def _render_active_row(active: dict) -> None:
     """One in-flight session as a button row.
 
-    The row reuses the same ``selected_incident`` session-state key as the
+    The row reuses the same ``selected_session`` session-state key as the
     history rows so clicking flips the detail pane to the live session.
     The status badge mirrors the same palette as history so the visual
     grammar stays consistent — ``in_progress`` reads the same colour
@@ -352,25 +444,26 @@ def _render_active_row(active: dict) -> None:
         bits.append(f"`{age}`")
     label = " ".join([f"`{sid}`"] + bits).strip()
 
-    is_selected = st.session_state.get("selected_incident") == sid
+    is_selected = st.session_state.get("selected_session") == sid
     btn_type = "primary" if is_selected else "secondary"
     # Markdown badges don't render inside ``st.button`` labels, so split
     # the row into a markdown line + a compact "Open" button beneath.
     st.markdown(label, unsafe_allow_html=True)
     if st.button("Open", key=f"active_open_{sid}",
                  type=btn_type, use_container_width=True):
-        st.session_state["selected_incident"] = sid
+        st.session_state["selected_session"] = sid
         st.rerun()
 
 
 def render_sidebar(store: SessionStore,
+                   app_cfg: FrameworkAppConfig,
                    service: OrchestratorService | None = None) -> None:
     """Render the always-on sidebar with two sections: in-flight + history.
 
     The **In-flight** block reads the live registry from
     ``OrchestratorService.list_active_sessions`` so concurrent runs show
-    up immediately. The **History** block is unchanged — paginated INCs
-    pulled from ``SessionStore.list_recent`` with a status filter.
+    up immediately. The **History** block is paginated sessions pulled
+    from ``SessionStore.list_recent`` with a status filter.
 
     ``service`` is optional so this function stays callable from headless
     smoke tests / unit tests that don't spin up the orchestrator.
@@ -389,8 +482,8 @@ def render_sidebar(store: SessionStore,
                 active = []
         if active:
             st.markdown("### In-flight")
-            for sess in active:
-                _render_active_row(sess)
+            for entry in active:
+                _render_active_row(entry)
             st.markdown("---")
 
         # ------------------------------------------------------------
@@ -420,10 +513,10 @@ def render_sidebar(store: SessionStore,
             recent = [i for i in recent if i["status"] == status_filter]
 
         if not recent:
-            st.caption("No incidents.")
+            st.caption("No sessions.")
             return
-        for inc in recent[:20]:
-            _render_inc_row(inc, store)
+        for sess in recent[:20]:
+            _render_session_row(sess, store, app_cfg)
 
 
 def _render_kv_dict_value(key: str, v: dict) -> None:
@@ -595,30 +688,42 @@ def _render_hypothesis_list(items: list, label: str) -> None:
             _render_one_hypothesis(h, label, i)
 
 
-def _render_incident_top_badges(inc: dict) -> None:
-    """Render status / severity / category badge columns and the awaiting-input warning."""
+def _render_top_badges(sess: dict, app_cfg: FrameworkAppConfig) -> None:
+    """Render status + two configured-field badge columns plus the
+    awaiting-input warning.
+
+    The two extra slots read whichever fields the app configures under
+    ``app_cfg.ui.badges`` (typically a primary axis and a secondary
+    classifier). Status uses the framework's built-in palette so
+    live/historic states stay consistent across apps.
+    """
+    sev_field, cat_field = _badge_field_slots(app_cfg)
     b1, b2, b3 = st.columns([1, 1, 1])
     with b1:
         st.caption("Status")
-        _status_badge(inc.get("status"))
+        _status_badge(sess.get("status"))
     with b2:
-        st.caption("Severity")
-        _severity_badge(inc.get("severity"))
+        st.caption(sev_field.title() if sev_field else "")
+        if sev_field:
+            _generic_badge(sess.get(sev_field),
+                           app_cfg.ui.badges.get(sev_field, {}))
     with b3:
-        st.caption("Category")
-        _category_badge(inc.get("category"))
-    if inc.get("status") == "awaiting_input":
-        _pi = inc.get("pending_intervention") or {}
+        st.caption(cat_field.title() if cat_field else "")
+        if cat_field:
+            _generic_badge(sess.get(cat_field),
+                           app_cfg.ui.badges.get(cat_field, {}))
+    if sess.get("status") == "awaiting_input":
+        _pi = sess.get("pending_intervention") or {}
         _upstream = _pi.get("upstream_agent") or "the upstream agent"
         st.warning(
             f"**Human intervention required.** The intervention gate "
-            f"paused this INC because {_upstream} confidence was "
+            f"paused this session because {_upstream} confidence was "
             f"below the configured threshold. Use the controls below to "
             f"resume with input, escalate, or stop."
         )
 
 
-def _render_incident_metrics(inc: dict) -> None:
+def _render_metrics(sess: dict) -> None:
     """Render tokens / active duration / total time metric columns.
 
     - **Active duration** is the sum of each agent run's wall-clock —
@@ -626,14 +731,14 @@ def _render_incident_metrics(inc: dict) -> None:
     - **Total time** is ``created_at → updated_at`` — wall-clock from
       first report to the last write (covers awaiting-input pauses).
     """
-    token_total = (inc.get("token_usage") or {}).get("total_tokens", 0)
-    runs = inc.get("agents_run") or []
+    token_total = (sess.get("token_usage") or {}).get("total_tokens", 0)
+    runs = sess.get("agents_run") or []
     active_s = sum(
         _duration_seconds(r.get("started_at", ""), r.get("ended_at", ""))
         for r in runs
     )
-    total_s = _duration_seconds(inc.get("created_at", ""),
-                                inc.get("updated_at", ""))
+    total_s = _duration_seconds(sess.get("created_at", ""),
+                                sess.get("updated_at", ""))
     if active_s == 0:
         active_s = total_s
     m1, m2, m3 = st.columns(3)
@@ -642,21 +747,31 @@ def _render_incident_metrics(inc: dict) -> None:
     m3.metric("Total time", _fmt_duration(total_s))
 
 
-def _render_incident_prior_match(inc: dict) -> None:
-    """Render the prior-incident callout when matched_prior_inc is set."""
-    tags = inc.get("tags") or []
-    if "hypothesis:prior_match_supported" in tags:
+def _render_prior_match(sess: dict, app_cfg: FrameworkAppConfig) -> None:
+    """Render the prior-session callout when ``matched_prior_inc`` is set.
+
+    Tag strings are resolved from :attr:`runtime.config.UIConfig.tags`
+    so apps without a prior-match concept can leave the keys unset and
+    skip the panel entirely.
+    """
+    supported = app_cfg.ui.tags.get("prior_match_supported", "")
+    rejected = app_cfg.ui.tags.get("prior_match_rejected", "")
+    if not supported and not rejected:
+        # App doesn't use the prior-match feature; render nothing.
+        return
+    tags = sess.get("tags") or []
+    if supported and supported in tags:
         stance = "supported by current evidence"
         callout = st.success
-    elif "hypothesis:prior_match_rejected" in tags:
+    elif rejected and rejected in tags:
         stance = "rejected — fresh evidence diverges from prior cause"
         callout = st.warning
     else:
         stance = "not yet validated"
         callout = st.info
     callout(
-        f"**Prior similar incident (hypothesis):** "
-        f"`{inc['matched_prior_inc']}` — {stance}.  \n"
+        f"**Prior similar session (hypothesis):** "
+        f"`{sess['matched_prior_inc']}` — {stance}.  \n"
         f"_Same symptom can have different root causes "
         f"(code bug vs. network vs. resource overload), so the prior "
         f"cause is one ranked hypothesis for the deep investigator — "
@@ -664,21 +779,30 @@ def _render_incident_prior_match(inc: dict) -> None:
     )
 
 
-def _render_incident_summary_meta(inc: dict) -> None:
-    """Render the query, environment, tags, summary, and prior-match callout."""
-    st.markdown(f"**Query:** {inc['query']}")
-    st.markdown(f"**Environment:** `{inc['environment']}`")
-    if inc.get("tags"):
-        st.markdown("**Tags:** " + " ".join(f"`{t}`" for t in inc["tags"]))
-    if inc.get("summary"):
-        st.markdown(f"**Summary:** {inc['summary']}")
-    if inc.get("matched_prior_inc"):
-        _render_incident_prior_match(inc)
+def _render_summary_meta(sess: dict, app_cfg: FrameworkAppConfig) -> None:
+    """Render the query, environment, tags, summary, configured detail
+    fields, and prior-match callout.
+    """
+    st.markdown(f"**Query:** {sess['query']}")
+    st.markdown(f"**Environment:** `{sess['environment']}`")
+    # App-configured summary fields (e.g. submitter id / team / component).
+    for field in app_cfg.ui.detail_fields:
+        if field.section != "summary":
+            continue
+        v = _resolve_field(sess, field.key)
+        if v:
+            st.markdown(f"**{field.label}:** {v}")
+    if sess.get("tags"):
+        st.markdown("**Tags:** " + " ".join(f"`{t}`" for t in sess["tags"]))
+    if sess.get("summary"):
+        st.markdown(f"**Summary:** {sess['summary']}")
+    if sess.get("matched_prior_inc"):
+        _render_prior_match(sess, app_cfg)
 
 
-def _render_agents_run_block(inc: dict) -> None:
+def _render_agents_run_block(sess: dict) -> None:
     """Render the ### Agents run section if agents_run is non-empty."""
-    agents_run = inc.get("agents_run", [])
+    agents_run = sess.get("agents_run", [])
     if not agents_run:
         return
     st.markdown("### Agents run")
@@ -709,7 +833,7 @@ def _is_hypothesis_list(value) -> bool:
     )
 
 
-def _render_findings_block(inc: dict) -> None:
+def _render_findings_block(sess: dict) -> None:
     """Render the ### Findings section for every agent that produced findings.
 
     Iterates over all entries in ``findings`` so custom YAML-defined agents
@@ -717,7 +841,7 @@ def _render_findings_block(inc: dict) -> None:
     (list of dicts with a ``cause`` key) are passed to ``_render_hypothesis_list``;
     everything else goes to ``_render_value``.
     """
-    findings = inc.get("findings") or {}
+    findings = sess.get("findings") or {}
     if not findings:
         return
     st.markdown("### Findings")
@@ -732,18 +856,18 @@ def _render_findings_block(inc: dict) -> None:
                 _render_value(value)
 
 
-def _render_resolution_block(inc: dict) -> None:
+def _render_resolution_block(sess: dict) -> None:
     """Render the ### Resolution section if resolution is present."""
-    if inc.get("resolution") is None:
+    if sess.get("resolution") is None:
         return
     st.markdown("### Resolution")
     with st.container(border=True):
-        _render_value(inc["resolution"])
+        _render_value(sess["resolution"])
 
 
-def _render_tool_calls_block(inc: dict) -> None:
+def _render_tool_calls_block(sess: dict) -> None:
     """Render the ### Tool calls section if tool_calls is non-empty."""
-    tool_calls = inc.get("tool_calls", [])
+    tool_calls = sess.get("tool_calls", [])
     if not tool_calls:
         return
     st.markdown("### Tool calls")
@@ -756,7 +880,7 @@ def _render_tool_calls_block(inc: dict) -> None:
 
 
 def _submit_approval_via_service(
-    cfg: AppConfig, inc_id: str, tool_call_id: str,
+    cfg: AppConfig, session_id: str, tool_call_id: str,
     decision: str, approver: str, rationale: str | None,
 ) -> None:
     """Resolve a pending tool approval through the OrchestratorService bridge.
@@ -786,7 +910,7 @@ def _submit_approval_via_service(
         orch = await svc._ensure_orchestrator()
         await orch.graph.ainvoke(
             Command(resume=payload),
-            config=orch._thread_config(inc_id),
+            config=orch._thread_config(session_id),
         )
 
     svc.submit_and_wait(_drive(), timeout=60.0)
@@ -808,7 +932,7 @@ def _is_hypothesis_trail(value) -> bool:
     )
 
 
-def _render_hypothesis_trail_block(inc: dict) -> None:
+def _render_hypothesis_trail_block(sess: dict) -> None:
     """Render the ### Hypothesis Trail panel.
 
     Reads-only view over the triage agent's per-iteration trail. The
@@ -818,11 +942,11 @@ def _render_hypothesis_trail_block(inc: dict) -> None:
     surfaces them as a collapsed accordion so an operator can audit
     how the hypothesis converged without scrolling through raw JSON.
 
-    No persistent state — pulls everything from ``inc["findings"]``.
-    Renders nothing when no trail is present so legacy incidents stay
+    No persistent state — pulls everything from ``sess["findings"]``.
+    Renders nothing when no trail is present so legacy sessions stay
     clean.
     """
-    findings = inc.get("findings") or {}
+    findings = sess.get("findings") or {}
     if not isinstance(findings, dict):
         return
 
@@ -858,7 +982,7 @@ def _render_hypothesis_trail_block(inc: dict) -> None:
                         st.caption(rationale)
 
 
-def _render_pending_approvals_block(inc: dict, inc_id: str) -> None:
+def _render_pending_approvals_block(sess: dict, session_id: str) -> None:
     """Render the ### Pending Approvals section for high-risk tool calls
     paused on the gateway's HITL approval handshake.
 
@@ -868,7 +992,7 @@ def _render_pending_approvals_block(inc: dict, inc_id: str) -> None:
     buttons (Approve / Reject) that resolve the pending interrupt via
     the OrchestratorService bridge.
     """
-    tool_calls = inc.get("tool_calls", [])
+    tool_calls = sess.get("tool_calls", [])
     pending = [
         (idx, tc) for idx, tc in enumerate(tool_calls)
         if (tc.get("status") if isinstance(tc, dict) else None) == "pending_approval"
@@ -886,22 +1010,22 @@ def _render_pending_approvals_block(inc: dict, inc_id: str) -> None:
             st.json(tc.get("args") or {})
             rationale = st.text_input(
                 "Rationale (optional)",
-                key=f"approval_rationale_{inc_id}_{idx}",
+                key=f"approval_rationale_{session_id}_{idx}",
                 placeholder="Why are you approving / rejecting?",
             )
             cols = st.columns(2)
             approve = cols[0].button(
                 "Approve", type="primary",
-                key=f"approval_approve_{inc_id}_{idx}",
+                key=f"approval_approve_{session_id}_{idx}",
             )
             reject = cols[1].button(
                 "Reject",
-                key=f"approval_reject_{inc_id}_{idx}",
+                key=f"approval_reject_{session_id}_{idx}",
             )
             if approve or reject:
                 decision = "approve" if approve else "reject"
                 _submit_approval_via_service(
-                    cfg, inc_id, str(idx),
+                    cfg, session_id, str(idx),
                     decision=decision,
                     approver="ui-user",
                     rationale=rationale.strip() or None,
@@ -909,45 +1033,54 @@ def _render_pending_approvals_block(inc: dict, inc_id: str) -> None:
                 st.rerun()
 
 
-def render_incident_detail(store: SessionStore,
-                           agent_names: frozenset[str] = frozenset()) -> None:
-    inc_id = st.session_state.get("selected_incident")
-    if not inc_id:
+def render_session_detail(store: SessionStore,
+                          app_cfg: FrameworkAppConfig,
+                          agent_names: frozenset[str] = frozenset()) -> None:
+    """Render the full detail view for the currently selected session.
+
+    The header carries the session id, environment + status badges, and
+    a compact token total. Body sections include configured top
+    badges, metrics, summary meta, intervention controls (when paused),
+    pending tool approvals, hypothesis trail, agents run, findings,
+    resolution, and the raw JSON dump.
+    """
+    session_id = st.session_state.get("selected_session")
+    if not session_id:
         return
     try:
-        inc = store.load(inc_id).model_dump()
+        sess = store.load(session_id).model_dump()
     except FileNotFoundError:
         return
-    status = inc.get("status") or ""
-    env = inc.get("environment") or ""
-    toks = (inc.get("token_usage") or {}).get("total_tokens", 0)
+    status = sess.get("status") or ""
+    env = sess.get("environment") or ""
+    toks = (sess.get("token_usage") or {}).get("total_tokens", 0)
     header = (
-        f"`{inc_id}` "
+        f"`{session_id}` "
         f"{_badge_md(env or None, _ENV_COLOR)} "
         f"{_badge_md(status, _STATUS_COLOR)} "
         f"`{_fmt_tokens_short(toks)}`"
     ).strip()
     with st.expander(header, expanded=True):
-        _render_incident_top_badges(inc)
-        _render_incident_metrics(inc)
-        _render_incident_summary_meta(inc)
-        if inc.get("status") == "awaiting_input" and inc.get("pending_intervention"):
-            _render_intervention_block(inc, inc_id, agent_names)
+        _render_top_badges(sess, app_cfg)
+        _render_metrics(sess)
+        _render_summary_meta(sess, app_cfg)
+        if sess.get("status") == "awaiting_input" and sess.get("pending_intervention"):
+            _render_intervention_block(sess, session_id, app_cfg, agent_names)
         # Pending tool-approval cards (risk-rated gateway HITL).
         # Rendered above the agents/tool-calls blocks so a paused
         # approval is the first action surface the operator sees.
-        _render_pending_approvals_block(inc, inc_id)
+        _render_pending_approvals_block(sess, session_id)
         # Triage hypothesis-loop audit. Collapsed by default so the
         # agents/findings blocks stay the primary read; the trail is
         # one click away when an operator wants to audit how the triage
         # hypothesis converged.
-        _render_hypothesis_trail_block(inc)
-        _render_agents_run_block(inc)
-        _render_findings_block(inc)
-        _render_resolution_block(inc)
-        _render_tool_calls_block(inc)
+        _render_hypothesis_trail_block(sess)
+        _render_agents_run_block(sess)
+        _render_findings_block(sess)
+        _render_resolution_block(sess)
+        _render_tool_calls_block(sess)
         with st.expander("Raw JSON"):
-            st.json(inc)
+            st.json(sess)
 
     # Auto-poll while the session is in flight. The 1.5s nap is a
     # cooperative throttle: it blocks the script-runner thread, so the
@@ -975,9 +1108,9 @@ def _format_event(ev: dict, agent_names: frozenset[str] = frozenset()) -> str | 
     node = ev.get("node") or ""
     ts = ev.get("ts", "")
     if kind == "investigation_started":
-        return f"[{ts}] start  inc={ev.get('incident_id')}"
+        return f"[{ts}] start  id={ev.get('incident_id')}"
     if kind == "investigation_completed":
-        return f"[{ts}] done   inc={ev.get('incident_id')}"
+        return f"[{ts}] done   id={ev.get('incident_id')}"
     _node_visible = (not agent_names) or (node in agent_names)
     if kind == "on_chain_start" and _node_visible:
         return f"[{ts}] enter  {node}"
@@ -1007,20 +1140,20 @@ async def _run_investigation_async(cfg: AppConfig, query: str, environment: str,
         await orch.aclose()
 
 
-async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
+async def _resume_async(cfg: AppConfig, session_id: str, decision: dict,
                         log_area, lines: list[str],
                         agent_names: frozenset[str] = frozenset()) -> dict:
     """Build a fresh Orchestrator, stream resume events, aclose.
 
     Returns a small summary dict describing the outcome so the caller can show
     a banner: ``{"rejected": <reason or None>}``. ``rejected`` is set when the
-    orchestrator emits a ``resume_rejected`` event (e.g. INC no longer
+    orchestrator emits a ``resume_rejected`` event (e.g. session no longer
     awaiting_input, invalid escalation team).
     """
     outcome: dict = {"rejected": None}
     orch = await Orchestrator.create(cfg)
     try:
-        async for ev in orch.resume_investigation(inc_id, decision):
+        async for ev in orch.resume_investigation(session_id, decision):
             kind = ev.get("event")
             ts = ev.get("ts", "")
             if kind == "resume_started":
@@ -1043,7 +1176,8 @@ async def _resume_async(cfg: AppConfig, inc_id: str, decision: dict,
     return outcome
 
 
-def _render_intervention_block(inc: dict, inc_id: str,
+def _render_intervention_block(sess: dict, session_id: str,
+                               app_cfg: FrameworkAppConfig,
                                agent_names: frozenset[str] = frozenset()) -> None:
     """Render the intervention prompt above the agents_run section.
 
@@ -1052,10 +1186,9 @@ def _render_intervention_block(inc: dict, inc_id: str,
     submit button. On submit, calls `_resume_async` and then reruns.
     """
     cfg = load_config(CONFIG_PATH)
-    app_cfg = load_incident_app_config()
-    pi = inc.get("pending_intervention") or {}
+    pi = sess.get("pending_intervention") or {}
     conf = pi.get("confidence")
-    threshold = pi.get("threshold", 0.75)
+    threshold = pi.get("threshold", app_cfg.confidence_threshold)
     teams = pi.get("escalation_teams") or list(app_cfg.escalation_teams)
 
     conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
@@ -1077,7 +1210,7 @@ def _render_intervention_block(inc: dict, inc_id: str,
             )
         action = st.selectbox(
             "Action", ["resume_with_input", "escalate", "stop"],
-            key=f"intervention_action_{inc_id}",
+            key=f"intervention_action_{session_id}",
         )
         decision: dict = {"action": action}
         if action == "resume_with_input":
@@ -1085,27 +1218,27 @@ def _render_intervention_block(inc: dict, inc_id: str,
                 "Add context for the investigator", height=120,
                 placeholder="Anything the agent should know — recent changes, "
                             "logs you've already checked, suspected services…",
-                key=f"intervention_input_{inc_id}",
+                key=f"intervention_input_{session_id}",
             )
         elif action == "escalate":
             decision["team"] = st.selectbox(
-                "Escalate to team", teams, key=f"intervention_team_{inc_id}",
+                "Escalate to team", teams, key=f"intervention_team_{session_id}",
             )
 
         submit = st.button("Submit", type="primary",
-                           key=f"intervention_submit_{inc_id}")
+                           key=f"intervention_submit_{session_id}")
         if submit:
             if action == "resume_with_input" and not (decision.get("input") or "").strip():
                 st.warning("Add some context before resuming.")
                 return
             log_area = st.empty()
             lines: list[str] = []
-            outcome = asyncio.run(_resume_async(cfg, inc_id, decision, log_area, lines, agent_names))
+            outcome = asyncio.run(_resume_async(cfg, session_id, decision, log_area, lines, agent_names))
             if outcome.get("rejected"):
                 # Don't auto-rerun — let the user read the warning before the
-                # form goes away. Common causes: INC already closed, invalid
+                # form goes away. Common causes: session already closed, invalid
                 # escalation team, or a sub-graph exception that restored the
-                # INC to awaiting_input.
+                # session to awaiting_input.
                 st.warning(f"Resume rejected: {outcome['rejected']}")
                 return
             st.success(f"Resume complete (action: {action}).")
@@ -1223,8 +1356,8 @@ def main() -> None:
     st.set_page_config(page_title="ASR — Agent Orchestrator", layout="wide")
     _inject_global_css()
     cfg = load_config(CONFIG_PATH)
-    app_cfg = load_incident_app_config()
-    store = _make_repository(cfg, app_cfg)
+    app_cfg = _load_app_cfg(cfg)
+    store = _make_repository(cfg)
 
     # Process-singleton background service for the in-flight session
     # list. ``_get_service`` returns ``None`` when called outside a
@@ -1234,10 +1367,10 @@ def main() -> None:
 
     # One-shot snapshot of agent/tool metadata + environments. ~100-200ms per
     # rerun; acceptable, and keeps async resources strictly scoped.
-    agents, tools, environments = _load_metadata_dicts(cfg, app_cfg)
+    agents, tools, environments = _load_metadata_dicts(cfg)
     agent_names: frozenset[str] = frozenset(a["name"] for a in agents)
 
-    render_sidebar(store, service)
+    render_sidebar(store, app_cfg, service)
 
     tab_investigate, tab_registry = st.tabs(["Investigate", "Agents & Tools"])
 
@@ -1250,10 +1383,10 @@ def main() -> None:
             submitted = st.form_submit_button("Start investigation", type="primary")
 
         if submitted and query.strip():
-            # Hide any previously-selected INC immediately — the detail
+            # Hide any previously-selected session immediately — the detail
             # panel below won't be reached this script-run, so during the
             # blocking asyncio.run the user sees only the live timeline.
-            st.session_state.pop("selected_incident", None)
+            st.session_state.pop("selected_session", None)
 
             timeline_box = st.container()
             timeline_box.markdown("### Live timeline")
@@ -1262,14 +1395,14 @@ def main() -> None:
 
             asyncio.run(_run_investigation_async(cfg, query, environment, log_area, lines, agent_names))
 
-            # Surface the resulting INC for one-click drill-in
+            # Surface the resulting session for one-click drill-in
             recent = [i.model_dump() for i in store.list_recent(1)]
             if recent:
-                st.session_state["selected_incident"] = recent[0]["id"]
+                st.session_state["selected_session"] = recent[0]["id"]
                 st.success(f"Investigation complete — {recent[0]['id']} ({recent[0]['status']})")
                 st.rerun()
         else:
-            render_incident_detail(store, agent_names)
+            render_session_detail(store, app_cfg, agent_names)
 
     with tab_registry:
         st.header("Agents & Tools registry")

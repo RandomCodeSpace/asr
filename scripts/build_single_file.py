@@ -122,7 +122,6 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
     (EXAMPLES_ROOT, "incident_management/asr/supervisor_node.py"),
     (EXAMPLES_ROOT, "incident_management/config.py"),
-    (EXAMPLES_ROOT, "incident_management/state.py"),
     (EXAMPLES_ROOT, "incident_management/mcp_server.py"),
 ]
 
@@ -131,7 +130,6 @@ INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
 # bundle drops out of the same build script.
 CODE_REVIEW_APP_MODULE_ORDER: list[tuple[Path, str]] = [
     (EXAMPLES_ROOT, "code_review/config.py"),
-    (EXAMPLES_ROOT, "code_review/state.py"),
     (EXAMPLES_ROOT, "code_review/mcp_server.py"),
 ]
 

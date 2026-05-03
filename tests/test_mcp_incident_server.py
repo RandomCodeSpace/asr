@@ -1,7 +1,7 @@
 import pytest
 
-from examples.incident_management.state import IncidentState
 from runtime.config import MetadataConfig
+from runtime.state import Session
 from runtime.storage.engine import build_engine
 from runtime.storage.history_store import HistoryStore
 from runtime.storage.models import Base
@@ -16,8 +16,8 @@ def _make_repo(tmp_path, *, similarity_threshold: float = 0.3):
     """Create a keyword-based store + history (no embedder) for fast unit tests."""
     eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
     Base.metadata.create_all(eng)
-    store = SessionStore(engine=eng, state_cls=IncidentState, embedder=None)
-    history = HistoryStore(engine=eng, state_cls=IncidentState, embedder=None,
+    store = SessionStore(engine=eng, state_cls=Session, embedder=None)
+    history = HistoryStore(engine=eng, state_cls=Session, embedder=None,
                            similarity_threshold=similarity_threshold)
     return store, history
 
@@ -44,7 +44,7 @@ async def test_create_then_lookup_returns_match(setup_store):
     # mark resolved so it appears in lookup
     inc_loaded = setup_store.load(inc["id"])
     inc_loaded.status = "resolved"
-    inc_loaded.resolution = "scaled up"
+    inc_loaded.extra_fields["resolution"] = "scaled up"
     setup_store.save(inc_loaded)
 
     result = await lookup_similar_incidents(query="api latency production", environment="production")

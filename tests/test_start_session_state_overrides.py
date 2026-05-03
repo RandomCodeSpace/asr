@@ -62,7 +62,7 @@ def cfg(tmp_path):
             incidents_dir=str(tmp_path),
         ),
         runtime=RuntimeConfig(
-            state_class="examples.incident_management.state.IncidentState",
+            state_class=None,
         ),
     )
 
