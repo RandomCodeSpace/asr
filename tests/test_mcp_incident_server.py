@@ -58,8 +58,8 @@ async def test_update_incident_appends_finding(setup_store):
     await update_incident(incident_id=inc["id"], patch={"severity": "sev3", "category": "latency"})
     loaded = setup_store.load(inc["id"])
     # severity is normalized to the canonical {low, medium, high} vocabulary
-    assert loaded.severity == "medium"
-    assert loaded.category == "latency"
+    assert loaded.extra_fields.get("severity") == "medium"
+    assert loaded.extra_fields.get("category") == "latency"
 
 
 @pytest.mark.asyncio
@@ -71,7 +71,7 @@ async def test_update_incident_normalizes_severity(setup_store):
         ("sev4", "low"), ("info", "low"), ("LOW", "low"),
     ]:
         await update_incident(incident_id=inc["id"], patch={"severity": raw})
-        assert setup_store.load(inc["id"]).severity == want, raw
+        assert setup_store.load(inc["id"]).extra_fields.get("severity") == want, raw
 
 
 @pytest.mark.asyncio

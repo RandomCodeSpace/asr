@@ -93,7 +93,7 @@ def test_add_finding_appends_to_session(server, store) -> None:
     """``add_review_finding`` grows ``review_findings`` by exactly one."""
     state = _make_state(seq=1)
     store.save(state)
-    assert store.load(state.id).review_findings == []
+    assert store.load(state.id).extra_fields.get("review_findings", []) == []
 
     result = asyncio.run(server._tool_add_review_finding(
         session_id=state.id,
@@ -108,13 +108,14 @@ def test_add_finding_appends_to_session(server, store) -> None:
     assert result["findings_count"] == 1
 
     reloaded = store.load(state.id)
-    assert len(reloaded.review_findings) == 1
-    finding = reloaded.review_findings[0]
-    assert finding.severity == "warning"
-    assert finding.file == "src/api.py"
-    assert finding.line == 42
-    assert finding.category == "performance"
-    assert finding.suggestion is not None
+    findings = reloaded.extra_fields.get("review_findings", [])
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["severity"] == "warning"
+    assert finding["file"] == "src/api.py"
+    assert finding["line"] == 42
+    assert finding["category"] == "performance"
+    assert finding["suggestion"] is not None
 
 
 def test_set_recommendation_writes_summary(server, store) -> None:
@@ -134,8 +135,8 @@ def test_set_recommendation_writes_summary(server, store) -> None:
     }
 
     reloaded = store.load(state.id)
-    assert reloaded.overall_recommendation == "request_changes"
-    assert reloaded.review_summary == "Two error-severity issues block merge; see findings."
+    assert reloaded.extra_fields.get("overall_recommendation") == "request_changes"
+    assert reloaded.extra_fields.get("review_summary") == "Two error-severity issues block merge; see findings."
 
 
 def test_set_recommendation_rejects_invalid_value(server, store) -> None:
@@ -150,7 +151,7 @@ def test_set_recommendation_rejects_invalid_value(server, store) -> None:
         ))
     # Storage untouched: the load still returns the default None recommendation.
     reloaded = store.load(state.id)
-    assert reloaded.overall_recommendation is None
+    assert reloaded.extra_fields.get("overall_recommendation") is None
 
 
 def test_fetch_pr_diff_returns_synthetic_when_no_fixture(server, tmp_path) -> None:
