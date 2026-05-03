@@ -67,11 +67,8 @@ mcp:
 paths:
   skills_dir: examples/incident_management/skills
   incidents_dir: incidents
-orchestrator:
-  # P9-9h: ASR investigation supervisor is the entry agent. It hydrates
-  # L2/L5/L7 memory and applies the single-active-investigation gate
-  # before dispatching to ``triage``.
-  entry_agent: asr_supervisor
+# orchestrator: omitted — framework defaults apply (entry_agent='intake').
+# Override here only if you want to point the entry at a different skill.
 runtime:
   # Wires the orchestrator and storage layer to the incident-management
   # domain state class (see examples/incident_management/state.py).
