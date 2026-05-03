@@ -96,9 +96,15 @@ def test_example_skills_dir_exists():
 
 
 def test_example_ui_importable():
+    """The framework UI replaces the per-example ``ui.py`` files.
+
+    After the Wave 1 strip-down, ``runtime.ui`` is the single
+    Streamlit entry point shared across apps; the per-app file was
+    removed so the contract is now "the framework UI imports cleanly".
+    """
     import importlib.util
-    spec = importlib.util.find_spec("examples.incident_management.ui")
-    assert spec is not None, "examples.incident_management.ui must be importable"
+    spec = importlib.util.find_spec("runtime.ui")
+    assert spec is not None, "runtime.ui must be importable"
 
 
 def test_example_main_module_importable():
@@ -115,17 +121,17 @@ def test_should_poll_only_for_in_flight():
     """``_should_poll`` is the pure helper that gates auto-refresh.
 
     Statuses inside ``{running, in_progress, awaiting_input}`` are live
-    runs; everything else (terminal incident statuses + unknown values)
+    runs; everything else (terminal session statuses + unknown values)
     is treated as terminal so the detail pane stops polling.
     """
-    from examples.incident_management.ui import _should_poll
+    from runtime.ui import _should_poll
 
     # In-flight — should poll
     assert _should_poll("running") is True
     assert _should_poll("in_progress") is True
     assert _should_poll("awaiting_input") is True
 
-    # Terminal incident statuses — should not poll
+    # Terminal session statuses — should not poll
     assert _should_poll("resolved") is False
     assert _should_poll("escalated") is False
     assert _should_poll("stopped") is False
@@ -142,14 +148,14 @@ def test_should_poll_only_for_in_flight():
 def test_ui_module_imports_without_orchestrator():
     """The UI module must import cleanly without a Streamlit runtime.
 
-    Importability is the contract for ``examples.incident_management.ui``:
-    the in-flight-sidebar wiring (``OrchestratorService.get_or_create``,
+    Importability is the contract for ``runtime.ui``: the
+    in-flight-sidebar wiring (``OrchestratorService.get_or_create``,
     ``st.cache_resource`` for the service singleton) must NOT fire at
     import time, otherwise tests / docs tooling that load the module
     headlessly will explode.
     """
     import importlib
-    import examples.incident_management.ui as ui_mod
+    import runtime.ui as ui_mod
 
     importlib.reload(ui_mod)
     # Sanity — both the new helpers and the existing entrypoint survived
@@ -171,7 +177,7 @@ def test_ui_module_exposes_pending_approval_helpers():
     runtime, not by pytest.
     """
     import importlib
-    import examples.incident_management.ui as ui_mod
+    import runtime.ui as ui_mod
 
     importlib.reload(ui_mod)
     assert callable(ui_mod._render_pending_approvals_block), (
