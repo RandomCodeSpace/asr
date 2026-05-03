@@ -4,7 +4,7 @@ import pytest
 from examples.incident_management.state import IncidentState
 from orchestrator.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
 from orchestrator.mcp_loader import load_tools
-from orchestrator.mcp_servers.incident import set_state as set_inc_state
+from examples.incident_management.mcp_server import set_state as set_inc_state
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.history_store import HistoryStore
@@ -37,7 +37,7 @@ def cfg(tmp_path):
         llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[
             MCPServerConfig(name="local_inc", transport="in_process",
-                            module="orchestrator.mcp_servers.incident",
+                            module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
                             module="orchestrator.mcp_servers.observability",

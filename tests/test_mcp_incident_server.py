@@ -6,7 +6,7 @@ from orchestrator.storage.engine import build_engine
 from orchestrator.storage.history_store import HistoryStore
 from orchestrator.storage.models import Base
 from orchestrator.storage.session_store import SessionStore
-from orchestrator.mcp_servers.incident import (
+from examples.incident_management.mcp_server import (
     set_state, lookup_similar_incidents, create_incident, update_incident,
     IncidentMCPServer,
 )
@@ -24,8 +24,16 @@ def _make_repo(tmp_path, *, similarity_threshold: float = 0.3):
 
 @pytest.fixture(autouse=True)
 def setup_store(tmp_path):
+    # Reset severity_aliases to the YAML-loaded default — protects this
+    # test from sibling tests that may have configured the module-level
+    # _default_server with a different alias set.
+    from examples.incident_management.config import load_incident_app_config
     store, history = _make_repo(tmp_path)
-    set_state(store=store, history=history)
+    set_state(
+        store=store,
+        history=history,
+        severity_aliases=dict(load_incident_app_config().severity_aliases),
+    )
     yield store
 
 

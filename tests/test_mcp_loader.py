@@ -4,7 +4,7 @@ import pytest
 from examples.incident_management.state import IncidentState
 from orchestrator.config import EmbeddingConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
 from orchestrator.mcp_loader import load_tools, ToolRegistry
-from orchestrator.mcp_servers.incident import set_state as set_inc_state
+from examples.incident_management.mcp_server import set_state as set_inc_state
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.history_store import HistoryStore

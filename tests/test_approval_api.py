@@ -47,7 +47,7 @@ def cfg(tmp_path):
         llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[
             MCPServerConfig(name="local_inc", transport="in_process",
-                            module="orchestrator.mcp_servers.incident",
+                            module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
                             module="orchestrator.mcp_servers.observability",

@@ -88,9 +88,9 @@ def test_mcp_server_in_process_requires_module():
         name="local_inc",
         transport="in_process",
         category="incident_management",
-        module="orchestrator.mcp_servers.incident",
+        module="examples.incident_management.mcp_server",
     )
-    assert server.module == "orchestrator.mcp_servers.incident"
+    assert server.module == "examples.incident_management.mcp_server"
 
 
 def test_mcp_server_http_requires_url():
