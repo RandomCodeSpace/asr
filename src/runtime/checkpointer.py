@@ -47,8 +47,13 @@ def _sqlite_path_from_url(url: str) -> str:
     if path.startswith("//"):
         # sqlite:////abs/path -> urlparse path "//abs/path" -> "/abs/path"
         return path[1:]
-    # sqlite:///x -> urlparse path "/x". sqlite3 accepts both absolute
-    # and relative; tests use absolute via tmp_path.
+    # sqlite:///<rel> -> urlparse path "/<rel>". SQLAlchemy treats this
+    # as a path *relative* to CWD; strip the leading slash so the helper
+    # agrees (otherwise mkdir tries the filesystem root). Tests pass
+    # absolute paths via tmp_path which composes to the four-slash form
+    # above, so this branch only matters for the relative case.
+    if path.startswith("/"):
+        return path[1:]
     return path
 
 

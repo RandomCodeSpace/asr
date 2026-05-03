@@ -33,10 +33,27 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session as SqlSession
 
 from runtime.storage.models import IncidentRow
+
+# Columns added after the initial schema. Each entry is
+# ``(column_name, sql_type, default_clause_or_None)``. SQLite ``ADD
+# COLUMN`` cannot add a non-nullable column without a constant default,
+# so every entry here is nullable — Pydantic hydrates the missing keys
+# at read time. Append-only: never reorder, never delete. Removing a
+# column needs a separate destructive migration with explicit sign-off.
+_FORWARD_COLUMNS: list[tuple[str, str]] = [
+    ("parent_session_id", "VARCHAR"),  # P7-A dedup linkage
+    ("dedup_rationale", "TEXT"),       # P7-E LLM rationale
+    ("extra_fields", "JSON"),          # P2 generic round-trip tunnel
+]
+_FORWARD_INDEXES: list[tuple[str, str, str]] = [
+    # (index_name, table, column) — mirrors models.IncidentRow.__table_args__.
+    ("ix_incidents_parent_session_id", "incidents", "parent_session_id"),
+]
 
 # Default audit fields. Mirrors the Pydantic defaults on
 # :class:`runtime.state.ToolCall` (P4-D). Keep these in sync — a divergence
@@ -129,3 +146,42 @@ def migrate_tool_calls_audit(engine: Engine) -> dict[str, int]:
         "sessions_updated": updated,
         "rows_filled": filled,
     }
+
+
+def migrate_add_session_columns(engine: Engine) -> dict[str, int]:
+    """Add post-initial columns to ``incidents`` if missing. Idempotent.
+
+    Phase 2 introduced ``extra_fields`` (generic JSON round-trip tunnel)
+    and Phase 7 introduced ``parent_session_id`` + ``dedup_rationale``.
+    Existing on-disk databases provisioned before those phases lack the
+    columns; SQLAlchemy's read-side query then errors with
+    ``no such column``. This walker uses ``PRAGMA table_info`` (via
+    SQLAlchemy's ``inspect``) to detect missing columns and adds each
+    one nullable. Running on a freshly-migrated DB is a no-op.
+
+    Returns ``{"columns_added": N, "indexes_added": M}``.
+    """
+    inspector = inspect(engine)
+    if "incidents" not in inspector.get_table_names():
+        # Fresh DB; ``Base.metadata.create_all`` already produced the
+        # full schema. Nothing to backfill.
+        return {"columns_added": 0, "indexes_added": 0}
+    existing_cols = {c["name"] for c in inspector.get_columns("incidents")}
+    existing_idx = {i["name"] for i in inspector.get_indexes("incidents")}
+    added_cols = 0
+    added_idx = 0
+    with engine.begin() as conn:
+        for col, sql_type in _FORWARD_COLUMNS:
+            if col not in existing_cols:
+                conn.execute(text(f"ALTER TABLE incidents ADD COLUMN {col} {sql_type}"))
+                added_cols += 1
+        for idx_name, table, col in _FORWARD_INDEXES:
+            if idx_name in existing_idx:
+                continue
+            # If the column itself was just added (or already present)
+            # the index is safe to create now.
+            cols_after = {c["name"] for c in inspect(conn).get_columns(table)}
+            if col in cols_after:
+                conn.execute(text(f"CREATE INDEX {idx_name} ON {table} ({col})"))
+                added_idx += 1
+    return {"columns_added": added_cols, "indexes_added": added_idx}
