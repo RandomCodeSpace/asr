@@ -151,3 +151,107 @@ def compose_runners(
         return merged or None
 
     return _composed
+
+
+def hydrate_from_memory(
+    state: Any,
+    *,
+    kg_store: Any = None,
+    playbook_store: Any = None,
+    release_store: Any = None,
+    hydrator: Callable[..., Any] | None = None,
+    gate: Callable[..., str | None] | None = None,
+) -> dict[str, Any] | None:
+    """Generic memory-hydration runner shell.
+
+    Apps that wire L2 / L5 / L7 stores via :mod:`runtime.memory` plug
+    them in here. The framework supplies the runner-shape contract
+    (``state.session`` access, ``next_route='__end__'`` short-circuit,
+    duplicate-metadata stamping) so per-app supervisors collapse to:
+
+        from runtime.intake import compose_runners, default_intake_runner
+        from runtime.intake import hydrate_from_memory
+
+        def app_hydration(state, *, app_cfg=None):
+            return hydrate_from_memory(
+                state,
+                kg_store=...,
+                playbook_store=...,
+                release_store=...,
+                hydrator=app_specific_hydrate_callable,
+                gate=app_specific_gate_callable,  # optional
+            )
+
+        default_supervisor_runner = compose_runners(
+            default_intake_runner, app_hydration,
+        )
+
+    ``hydrator`` signature: ``(session, *, kg_store, playbook_store,
+    release_store) -> Any`` where the returned object is stamped on
+    ``session.memory`` if that attribute is settable. If ``hydrator``
+    is ``None`` the function is a no-op (returns ``None``).
+
+    ``gate`` signature: ``(session, *, kg_store) -> str | None`` —
+    return a parent session id to mark the new session as a duplicate
+    (caller stamps ``status='duplicate'`` and emits
+    ``next_route='__end__'``). When ``None`` is returned (or no gate
+    supplied) the session proceeds normally.
+
+    Returns ``None`` when no hydration occurred, otherwise a runner
+    patch suitable for merging by ``runtime.agents.supervisor``.
+    """
+    session = state.get("session") if hasattr(state, "get") else None
+    if session is None:
+        return None
+    if hydrator is None and gate is None:
+        return None
+
+    patch: dict[str, Any] = {}
+
+    if hydrator is not None:
+        try:
+            memory = hydrator(
+                session,
+                kg_store=kg_store,
+                playbook_store=playbook_store,
+                release_store=release_store,
+            )
+        except Exception:  # noqa: BLE001 — defensive, keep graph alive
+            _log.exception(
+                "hydrate_from_memory: hydrator raised; routing through",
+            )
+            memory = None
+
+        if memory is not None and hasattr(session, "memory"):
+            try:
+                session.memory = memory
+            except Exception:  # noqa: BLE001 — frozen / read-only field
+                _log.warning(
+                    "hydrate_from_memory: cannot set session.memory; "
+                    "downstream agents will not see hydrated context",
+                )
+        patch["session"] = session
+
+    if gate is not None:
+        try:
+            parent = gate(session, kg_store=kg_store)
+        except Exception:  # noqa: BLE001 — defensive
+            _log.exception(
+                "hydrate_from_memory: gate raised; routing through",
+            )
+            parent = None
+
+        if parent is not None:
+            try:
+                session.status = "duplicate"
+                if hasattr(session, "parent_session_id"):
+                    session.parent_session_id = parent
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "hydrate_from_memory: cannot stamp duplicate metadata "
+                    "on session %s", getattr(session, "id", "?"),
+                )
+            patch["session"] = session
+            patch["next_route"] = "__end__"
+
+    return patch or None

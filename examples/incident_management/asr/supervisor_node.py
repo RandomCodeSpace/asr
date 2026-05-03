@@ -410,65 +410,71 @@ def make_hydrate_runner(
 ) -> Callable[..., dict[str, Any] | None]:
     """Build a framework-compatible supervisor runner from explicit stores.
 
+    Wraps the generic :func:`runtime.intake.hydrate_from_memory`
+    runner-shape with this app's ``hydrate_and_gate`` pipeline. The
+    framework helper handles the boilerplate (session extraction,
+    memory-attribute stamping, duplicate-metadata + ``next_route``
+    short-circuit); we only supply the app-specific hydrate + gate
+    callables that operate on an :class:`IncidentState` query.
+
     ``get_active_sessions`` is invoked on every node entry so the dup
-    gate sees the live in-flight set. Pass ``None`` (default) to disable
-    the gate entirely — useful for unit-style harnesses that don't have
-    an ``OrchestratorService`` running.
+    gate sees the live in-flight set. Pass ``None`` (default) to
+    disable the gate entirely — useful for unit-style harnesses that
+    don't have an ``OrchestratorService`` running.
     """
     _list_active = get_active_sessions or (lambda: [])
 
-    def _runner(state: Any, *, app_cfg: Any | None = None) -> dict[str, Any] | None:
-        session = state.get("session") if hasattr(state, "get") else None
-        if session is None:
-            return None
+    def _hydrator(
+        session: Any,
+        *,
+        kg_store: Any = None,
+        playbook_store: Any = None,
+        release_store: Any = None,
+    ) -> MemoryLayerState | None:
+        """Run :func:`hydrate_and_gate` and return the memory bundle."""
+        decision = hydrate_and_gate(
+            incident=session,
+            kg_store=kg_store,
+            release_store=release_store,
+            playbook_store=playbook_store,
+            active_sessions=_list_active(),
+            component_lookup=component_lookup,
+        )
+        # Cache decision on a hidden attribute so the gate callable
+        # can reuse it without re-running the hydration.
         try:
-            decision = hydrate_and_gate(
-                incident=session,
-                kg_store=kg_store,
-                release_store=release_store,
-                playbook_store=playbook_store,
-                active_sessions=_list_active(),
-                component_lookup=component_lookup,
-            )
-        except Exception:  # noqa: BLE001 — defensive, keep graph alive
-            logger.exception(
-                "asr supervisor runner: hydrate_and_gate raised; routing to triage",
-            )
+            session.__dict__["_asr_decision"] = decision
+        except Exception:  # noqa: BLE001 — frozen
+            pass
+        return decision.get("memory")
+
+    def _gate(session: Any, *, kg_store: Any = None) -> str | None:
+        """Return parent session id when the active-investigation gate fires."""
+        decision = session.__dict__.get("_asr_decision") if hasattr(session, "__dict__") else None
+        if not decision:
             return None
+        if decision.get("status") != "duplicate":
+            return None
+        return decision.get("parent_session_id")
 
-        # Stamp the hydrated memory bundle onto the live IncidentState
-        # (duck-typed: the ``memory`` attribute is set when present).
-        memory = decision.get("memory")
-        if memory is not None and hasattr(session, "memory"):
-            try:
-                session.memory = memory
-            except Exception:  # noqa: BLE001 — frozen / read-only field
-                logger.warning(
-                    "asr supervisor runner: cannot set session.memory; "
-                    "downstream agents will not see hydrated context",
-                )
-
-        if decision.get("status") == "duplicate":
-            parent = decision.get("parent_session_id")
-            # Stamp dup metadata so the persisted row reflects the gate
-            # outcome before the graph terminates.
-            try:
-                session.status = "duplicate"
-                if parent and hasattr(session, "parent_session_id"):
-                    session.parent_session_id = parent
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "asr supervisor runner: cannot stamp duplicate metadata "
-                    "on session %s", getattr(session, "id", "?"),
-                )
-            return {"session": session, "next_route": "__end__"}
-
-        return {"session": session}
+    def _runner(state: Any, *, app_cfg: Any | None = None) -> dict[str, Any] | None:
+        return hydrate_from_memory(
+            state,
+            kg_store=kg_store,
+            playbook_store=playbook_store,
+            release_store=release_store,
+            hydrator=_hydrator,
+            gate=_gate,
+        )
 
     return _runner
 
 
-from runtime.intake import compose_runners, default_intake_runner  # noqa: E402
+from runtime.intake import (  # noqa: E402
+    compose_runners,
+    default_intake_runner,
+    hydrate_from_memory,
+)
 
 
 def make_default_supervisor_runner(
