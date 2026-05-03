@@ -6,7 +6,7 @@ incident-shaped fields now live on ``examples.incident_management.state.Incident
 """
 import pytest
 
-from examples.incident_management.state import IncidentState, IncidentStatus, Reporter
+from examples.incident_management.state import IncidentState, Reporter
 from runtime.state import AgentRun
 
 

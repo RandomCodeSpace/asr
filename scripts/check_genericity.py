@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     counts = count_runtime_leaks(Path(args.root))
     t = total(counts)
-    print(f"Runtime leak counts (excluding comments):")
+    print("Runtime leak counts (excluding comments):")
     for tok in TOKENS:
         print(f"  {tok}: {counts[tok]}")
     print(f"  TOTAL: {t}")

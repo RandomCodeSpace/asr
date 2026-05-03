@@ -17,7 +17,6 @@ from pydantic import ValidationError
 
 from runtime.skill import (
     DispatchRule,
-    RouteRule,
     Skill,
     _validate_cron,
     _validate_safe_expr,

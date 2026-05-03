@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any, TypedDict
 
-import pytest
 from langchain_core.tools import BaseTool
 
 from runtime.config import GatewayConfig

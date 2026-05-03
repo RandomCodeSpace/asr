@@ -22,13 +22,11 @@ executor; the scheduler thread itself never blocks on tool I/O.
 """
 from __future__ import annotations
 
-import ast
 import logging
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from runtime.skill import Skill, _validate_safe_expr
 

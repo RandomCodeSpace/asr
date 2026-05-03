@@ -19,7 +19,7 @@ from runtime.config import (
 )
 from runtime.orchestrator import Orchestrator
 from runtime.dedup import (
-    DedupConfig, DedupDecision, DedupPipeline, DedupResult,
+    DedupConfig, DedupDecision, DedupResult,
 )
 
 

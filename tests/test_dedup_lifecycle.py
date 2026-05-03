@@ -8,7 +8,6 @@ up a real LLM.
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 
 import pytest
 
@@ -16,7 +15,7 @@ from runtime.config import (
     AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths, RuntimeConfig,
 )
 from runtime.orchestrator import Orchestrator
-from runtime.dedup import DedupConfig, DedupDecision, DedupPipeline, DedupResult
+from runtime.dedup import DedupConfig, DedupDecision, DedupResult
 
 
 @pytest.fixture

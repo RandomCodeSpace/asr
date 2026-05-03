@@ -1,7 +1,6 @@
 """Shared fixtures for trigger registry tests."""
 from __future__ import annotations
 
-import os
 import pytest
 from pydantic import BaseModel
 

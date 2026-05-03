@@ -1,7 +1,6 @@
 """IdempotencyStore tests — LRU + SQLite write-through + cold-restart survival."""
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone, timedelta
 
 import pytest

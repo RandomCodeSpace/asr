@@ -18,7 +18,6 @@ from runtime.config import (
     GatewayConfig,
     LLMConfig,
     MCPConfig,
-    MCPServerConfig,
     MetadataConfig,
     Paths,
     RuntimeConfig,

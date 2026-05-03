@@ -27,7 +27,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
-from typing import Any, Callable, Generic, Literal, Optional, TYPE_CHECKING, TypeVar
+from typing import Any, Callable, Generic, Literal, TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 

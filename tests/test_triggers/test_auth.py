@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends
 from fastapi.testclient import TestClient
 
 from runtime.triggers.auth import make_bearer_dep

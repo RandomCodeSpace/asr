@@ -19,12 +19,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from examples.incident_management.asr.memory_state import L7PlaybookSuggestion
 from examples.incident_management.asr.playbook_store import PlaybookStore
 from examples.incident_management.asr.resolution_helpers import (
-    ToolCallSpec,
     playbook_to_tool_calls,
     top_playbook,
 )

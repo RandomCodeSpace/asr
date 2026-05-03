@@ -16,7 +16,7 @@ import typing
 import pytest
 from sqlalchemy import create_engine
 
-from examples.incident_management.state import IncidentState, IncidentStatus, Reporter
+from examples.incident_management.state import IncidentState, IncidentStatus
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore
 

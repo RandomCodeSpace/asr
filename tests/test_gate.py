@@ -2,7 +2,6 @@
 import pytest
 from pytest import approx
 
-from langgraph.errors import GraphInterrupt
 
 from examples.incident_management.state import IncidentState
 from runtime.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MetadataConfig, ProviderConfig

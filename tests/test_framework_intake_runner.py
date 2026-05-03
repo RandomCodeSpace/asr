@@ -9,10 +9,8 @@ about them.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 from typing import Any
 
-import pytest
 
 from runtime.intake import IntakeContext, default_intake_runner, compose_runners
 from runtime.state import Session
@@ -247,9 +245,8 @@ def test_compose_runners_returns_none_when_all_runners_no_op() -> None:
 # Task 6: supervisor node passes intake_context to runner via app_cfg
 # ---------------------------------------------------------------------------
 
-from unittest.mock import MagicMock
 
-from runtime.agents.supervisor import make_supervisor_node
+from runtime.agents.supervisor import make_supervisor_node  # noqa: E402
 
 
 def test_supervisor_node_passes_intake_context_to_runner() -> None:

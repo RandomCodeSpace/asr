@@ -26,7 +26,6 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
-from typing import Any
 
 from sqlalchemy import DateTime, String, delete, select
 from sqlalchemy.engine import Engine, create_engine

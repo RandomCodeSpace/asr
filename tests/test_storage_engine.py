@@ -1,6 +1,5 @@
 """Engine smoke tests."""
 from __future__ import annotations
-import pytest
 
 
 def test_create_all_smoke(tmp_path):

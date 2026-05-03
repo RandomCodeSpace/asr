@@ -268,8 +268,8 @@ def _dedup_and_sort_future(all_imports: list[str]) -> list[str]:
                 continue
             seen.add(key)
         deduped.append(line)
-    future_lines = [l for l in deduped if l.strip().startswith("from __future__")]
-    other_lines = [l for l in deduped if not l.strip().startswith("from __future__")]
+    future_lines = [ln for ln in deduped if ln.strip().startswith("from __future__")]
+    other_lines = [ln for ln in deduped if not ln.strip().startswith("from __future__")]
     return future_lines + other_lines
 
 

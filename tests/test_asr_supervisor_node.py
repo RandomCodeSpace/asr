@@ -387,7 +387,7 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _make_incident() -> "IncidentState":
+def _make_incident() -> "IncidentState":  # noqa: F821 — string forward ref, imported in body
     from examples.incident_management.state import IncidentState, Reporter
     return IncidentState(
         id="INC-20260503-007",
@@ -438,7 +438,7 @@ def test_default_supervisor_runner_skips_hydration_on_short_circuit(monkeypatch)
     This pins the composition contract: compose_runners stops on first
     next_route so a dedup/duplicate hit skips expensive KG lookups.
     """
-    from runtime.intake import compose_runners, default_intake_runner
+    from runtime.intake import compose_runners
     from examples.incident_management.asr import supervisor_node as sn
 
     hydration_called = []

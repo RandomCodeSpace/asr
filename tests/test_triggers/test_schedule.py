@@ -1,7 +1,6 @@
 """ScheduleTransport tests — APScheduler in-process cron."""
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 

@@ -1,9 +1,7 @@
 """TriggerRegistry tests — resolution, lifecycle, dispatch, idempotency."""
 from __future__ import annotations
 
-import asyncio
 import pytest
-from pydantic import BaseModel
 
 from runtime.triggers import TriggerRegistry
 from runtime.triggers.base import TriggerInfo, TriggerTransport

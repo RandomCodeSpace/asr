@@ -708,7 +708,6 @@ def test_resource_cap_raises_when_exceeded(cfg_full):
     svc = OrchestratorService.get_or_create(cfg_full)
     svc.max_concurrent_sessions = 2
     svc.start()
-    sids: list[str] = []
     try:
         # Hold the registry at cap by inserting fake placeholder
         # entries on the loop thread — this is the deterministic way

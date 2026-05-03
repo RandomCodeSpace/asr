@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
 from sqlalchemy.orm import Session as SqlSession
 
 from runtime.storage import migrate_tool_calls_audit

@@ -466,7 +466,7 @@ def make_hydrate_runner(
     return _runner
 
 
-from runtime.intake import compose_runners, default_intake_runner
+from runtime.intake import compose_runners, default_intake_runner  # noqa: E402
 
 
 def make_default_supervisor_runner(

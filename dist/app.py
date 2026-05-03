@@ -661,7 +661,7 @@ each example app's YAML opts in.
 
 
 import enum
-from typing import Any, Callable, Generic, Literal, Optional, TYPE_CHECKING, TypeVar
+from typing import Any, Callable, Generic, Literal, TYPE_CHECKING, TypeVar
 
 
 # ----- imports for runtime/intake.py -----
