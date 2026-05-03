@@ -1,0 +1,243 @@
+"""Framework default intake runner — generic similarity retrieval and dedup gate.
+
+These tests pin the contract that ANY app gets when it declares a
+``kind: supervisor`` skill without an explicit ``runner:``: prior
+similar closed sessions are surfaced under
+``state.findings['prior_similar']`` so downstream agents can reason
+about them.
+"""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any
+
+import pytest
+
+from runtime.intake import IntakeContext, default_intake_runner, compose_runners
+from runtime.state import Session
+
+
+def _mk_session(sid: str = "S-001") -> Session:
+    return Session(
+        id=sid,
+        status="in_progress",
+        created_at="2026-05-03T10:00:00Z",
+        updated_at="2026-05-03T10:00:00Z",
+    )
+
+
+class _StubHistoryStore:
+    """Stub matching HistoryStore.find_similar(*, query, filter_kwargs, limit, threshold)."""
+
+    def __init__(self, hits: list[Session]) -> None:
+        self._hits = hits
+        self.calls: list[dict[str, Any]] = []
+
+    def find_similar(
+        self,
+        *,
+        query: str,
+        filter_kwargs: dict | None = None,
+        limit: int = 5,
+        threshold: float | None = None,
+    ) -> list[tuple[Session, float]]:
+        self.calls.append(
+            {"query": query, "filter_kwargs": filter_kwargs,
+             "limit": limit, "threshold": threshold}
+        )
+        return [(h, 0.9) for h in self._hits]
+
+
+# ---------------------------------------------------------------------------
+# Task 1: happy path — populate findings["prior_similar"]
+# ---------------------------------------------------------------------------
+
+def test_default_intake_runner_populates_prior_similar() -> None:
+    prior = _mk_session("S-PRIOR")
+    history = _StubHistoryStore(hits=[prior])
+    state = {"session": _mk_session("S-NEW")}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=None,
+        top_k=3, similarity_threshold=0.7,
+    )})()
+
+    patch = default_intake_runner(state, app_cfg=app_cfg)
+
+    assert patch is not None
+    assert "session" in patch
+    assert patch["session"].findings["prior_similar"] == [
+        {"id": "S-PRIOR", "status": "in_progress"}
+    ]
+    # Runner forwarded the configured top_k / threshold.
+    assert history.calls[0]["limit"] == 3
+    assert history.calls[0]["threshold"] == 0.7
+
+
+# ---------------------------------------------------------------------------
+# Task 2: no-op without context
+# ---------------------------------------------------------------------------
+
+def test_default_intake_runner_noop_without_context() -> None:
+    """Missing app_cfg or missing intake_context => no-op (returns None)."""
+    state = {"session": _mk_session()}
+
+    assert default_intake_runner(state, app_cfg=None) is None
+
+    class _NoCtx: ...
+
+    assert default_intake_runner(state, app_cfg=_NoCtx()) is None
+
+
+def test_default_intake_runner_noop_when_history_store_none() -> None:
+    """intake_context with history_store=None => no patch, no crash."""
+    state = {"session": _mk_session()}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=None, dedup_pipeline=None,
+    )})()
+
+    assert default_intake_runner(state, app_cfg=app_cfg) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 3: dedup short-circuit
+# ---------------------------------------------------------------------------
+
+class _StubDedupPipeline:
+    """Stub matching DedupPipeline.run(*, session, history_store) -> DedupResult."""
+
+    def __init__(self, *, parent_session_id: str | None, rationale: str | None) -> None:
+        self._parent = parent_session_id
+        self._rationale = rationale
+
+    async def run(self, *, session: Session, history_store: Any) -> Any:
+        from runtime.dedup import DedupResult, DedupDecision
+        decision = None
+        if self._parent is not None and self._rationale:
+            decision = DedupDecision(
+                is_duplicate=True,
+                confidence=0.95,
+                rationale=self._rationale,
+            )
+        return DedupResult(
+            matched=self._parent is not None,
+            parent_session_id=self._parent,
+            decision=decision,
+        )
+
+
+def test_default_intake_runner_short_circuits_on_dedup_hit() -> None:
+    new_session = _mk_session("S-NEW")
+    history = _StubHistoryStore(hits=[])
+    pipeline = _StubDedupPipeline(parent_session_id="S-PRIOR", rationale="same outage")
+    state = {"session": new_session}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=pipeline,
+    )})()
+
+    patch = default_intake_runner(state, app_cfg=app_cfg)
+
+    assert patch is not None
+    assert patch["next_route"] == "__end__"
+    assert patch["session"].parent_session_id == "S-PRIOR"
+    assert patch["session"].status == "duplicate"
+    assert patch["session"].dedup_rationale == "same outage"
+
+
+def test_default_intake_runner_no_short_circuit_when_not_duplicate() -> None:
+    new_session = _mk_session("S-NEW")
+    history = _StubHistoryStore(hits=[])
+    pipeline = _StubDedupPipeline(parent_session_id=None, rationale=None)
+    state = {"session": new_session}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=pipeline,
+    )})()
+
+    patch = default_intake_runner(state, app_cfg=app_cfg)
+
+    # No history hits, no dedup hit => nothing to write back.
+    assert patch is None or "next_route" not in patch
+    assert new_session.parent_session_id is None
+    assert new_session.status == "in_progress"
+
+
+def test_default_intake_runner_falls_through_under_running_loop() -> None:
+    """When called from within a running event loop, dedup falls through
+    gracefully (no asyncio.run RuntimeError propagates to caller)."""
+    new_session = _mk_session("S-LOOP")
+    history = _StubHistoryStore(hits=[])
+    pipeline = _StubDedupPipeline(parent_session_id="S-PRIOR", rationale="same outage")
+    state = {"session": new_session}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=pipeline,
+    )})()
+
+    # Run the sync runner from inside a running event loop by using a
+    # thread to host a fresh loop, then call the runner there.
+    import threading
+
+    result: dict[str, Any] = {}
+    error: list[Exception] = []
+
+    def _run_in_new_loop() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _inner():
+            # At this point there IS a running event loop.
+            # asyncio.run() inside default_intake_runner must not raise.
+            return default_intake_runner(state, app_cfg=app_cfg)
+
+        try:
+            result["patch"] = loop.run_until_complete(_inner())
+        except Exception as exc:
+            error.append(exc)
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=_run_in_new_loop)
+    t.start()
+    t.join()
+
+    assert not error, f"Unexpected error: {error[0]}"
+    # Under a running loop the dedup short-circuit is skipped; patch may
+    # be None (no history hits, dedup skipped) or a partial patch.
+    patch = result["patch"]
+    assert patch is None or "next_route" not in patch
+
+
+# ---------------------------------------------------------------------------
+# Task 4: compose_runners semantics
+# ---------------------------------------------------------------------------
+
+def test_compose_runners_merges_non_route_patches() -> None:
+    def r1(state, *, app_cfg=None):
+        return {"a": 1}
+
+    def r2(state, *, app_cfg=None):
+        return {"b": 2}
+
+    composed = compose_runners(r1, r2)
+    assert composed({}) == {"a": 1, "b": 2}
+
+
+def test_compose_runners_short_circuits_on_first_route() -> None:
+    seen = []
+
+    def r1(state, *, app_cfg=None):
+        seen.append("r1")
+        return {"x": 1, "next_route": "__end__"}
+
+    def r2(state, *, app_cfg=None):
+        seen.append("r2")
+        return {"y": 2}
+
+    composed = compose_runners(r1, r2)
+    out = composed({})
+    assert out == {"x": 1, "next_route": "__end__"}
+    assert seen == ["r1"]  # r2 never ran
+
+
+def test_compose_runners_returns_none_when_all_runners_no_op() -> None:
+    composed = compose_runners(lambda *a, **k: None, lambda *a, **k: None)
+    assert composed({}) is None
