@@ -1,11 +1,10 @@
-description: First-line agent — enriches the just-created INC and checks for known prior resolutions
-kind: responsive
-tools:
-  local: ["lookup_similar_incidents", "get_user_context", "update_incident"]
-routes:
-  - when: success
-    next: triage
-  - when: failed
-    next: __end__
-  - when: default
-    next: triage
+description: Intake supervisor — framework similarity retrieval + ASR memory hydration; dispatches to triage
+kind: supervisor
+subordinates:
+  - triage
+dispatch_strategy: rule
+runner: examples.incident_management.asr.supervisor_node:default_supervisor_runner
+dispatch_rules:
+  - when: "True"
+    target: triage
+max_dispatch_depth: 2
