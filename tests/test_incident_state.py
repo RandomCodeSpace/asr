@@ -43,7 +43,7 @@ def test_incident_status_values():
         "awaiting_input",
         "stopped",
         "deleted",
-        # P7-B: dedup pipeline terminal status.
+        # Dedup pipeline terminal status.
         "duplicate",
     }
     assert set(typing.get_args(IncidentStatus)) == expected
@@ -108,7 +108,7 @@ def test_example_main_module_importable():
 
 
 # ---------------------------------------------------------------------------
-# P3-I / P3-J — sidebar in-flight list + detail-pane polling
+# Sidebar in-flight list + detail-pane polling
 # ---------------------------------------------------------------------------
 
 def test_should_poll_only_for_in_flight():
@@ -143,7 +143,7 @@ def test_ui_module_imports_without_orchestrator():
     """The UI module must import cleanly without a Streamlit runtime.
 
     Importability is the contract for ``examples.incident_management.ui``:
-    the P3-I/J wiring (``OrchestratorService.get_or_create``,
+    the in-flight-sidebar wiring (``OrchestratorService.get_or_create``,
     ``st.cache_resource`` for the service singleton) must NOT fire at
     import time, otherwise tests / docs tooling that load the module
     headlessly will explode.
@@ -160,13 +160,13 @@ def test_ui_module_imports_without_orchestrator():
 
 
 # ---------------------------------------------------------------------------
-# P4-H — pending tool-approval cards (risk-rated gateway)
+# Pending tool-approval cards (risk-rated gateway)
 # ---------------------------------------------------------------------------
 
 
 def test_ui_module_exposes_pending_approval_helpers():
-    """P4-H: the UI must expose the pending-approval card renderer and
-    the OrchestratorService bridge that resolves it. Importability is
+    """The UI must expose the pending-approval card renderer and the
+    OrchestratorService bridge that resolves it. Importability is
     enough — the actual rendering is exercised by the Streamlit
     runtime, not by pytest.
     """
@@ -175,8 +175,8 @@ def test_ui_module_exposes_pending_approval_helpers():
 
     importlib.reload(ui_mod)
     assert callable(ui_mod._render_pending_approvals_block), (
-        "P4-H regression: _render_pending_approvals_block missing"
+        "regression: _render_pending_approvals_block missing"
     )
     assert callable(ui_mod._submit_approval_via_service), (
-        "P4-H regression: _submit_approval_via_service missing"
+        "regression: _submit_approval_via_service missing"
     )

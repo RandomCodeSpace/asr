@@ -4,8 +4,8 @@ Uses a FAISS-backed store + history with a stub embedder. Postgres
 parity is gated behind ``POSTGRES_TEST_URL`` env var; if unset, the
 postgres params skip.
 
-P2-J: migrated off the legacy ``IncidentRepository`` facade. The active
-CRUD lives on ``SessionStore``; similarity lookups on ``HistoryStore``.
+Active CRUD lives on ``SessionStore``; similarity lookups on
+``HistoryStore``.
 """
 from __future__ import annotations
 import pytest

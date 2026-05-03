@@ -1,8 +1,8 @@
 """Domain-state tests for the example ``IncidentState`` model.
 
-P2-J: rewritten off the deleted ``runtime.incident.Incident``. All
-incident-shaped fields now live on ``examples.incident_management.state.IncidentState``;
-``AgentRun`` lives on ``runtime.state``.
+Incident-shaped fields live on
+``examples.incident_management.state.IncidentState``; ``AgentRun``
+lives on ``runtime.state``.
 """
 import pytest
 

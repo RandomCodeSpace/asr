@@ -3,8 +3,7 @@
 Usage:
     python scripts/migrate_jsonl_to_sql.py [--config PATH] [--with-embeddings] [--dry-run]
 
-P2-J: migrated off the deleted ``IncidentRepository`` shim. Uses
-``SessionStore`` directly with the example app's ``IncidentState``.
+Uses ``SessionStore`` directly with the example app's ``IncidentState``.
 """
 from __future__ import annotations
 import argparse

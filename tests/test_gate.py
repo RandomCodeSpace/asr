@@ -116,7 +116,7 @@ async def _drive_gate_via_graph(store, inc, *, last_agent="deep_investigator",
 
 @pytest.mark.asyncio
 async def test_gate_pauses_when_no_di_confidence(tmp_path):
-    """P2-H: missing confidence → gate dual-writes Session row + interrupts."""
+    """Missing confidence → gate dual-writes Session row + interrupts."""
     store = _make_repo(tmp_path)
     inc = _seed(store, di_confidence=None)
     _, interrupted = await _drive_gate_via_graph(store, inc)
@@ -134,7 +134,7 @@ async def test_gate_pauses_when_no_di_confidence(tmp_path):
 
 @pytest.mark.asyncio
 async def test_gate_pauses_when_below_threshold(tmp_path):
-    """P2-H: low confidence below threshold → row dual-write + interrupt."""
+    """Low confidence below threshold → row dual-write + interrupt."""
     store = _make_repo(tmp_path)
     inc = _seed(store, di_confidence=0.42)
     _, interrupted = await _drive_gate_via_graph(store, inc)
@@ -225,7 +225,7 @@ async def test_gate_clears_stale_intervention_on_pass(tmp_path):
 
 @pytest.mark.asyncio
 async def test_gate_dual_writes_pending_intervention_and_interrupts(tmp_path):
-    """P2-H: when confidence is low, gate must:
+    """When confidence is low, gate must:
        1. Persist Session.pending_intervention to disk (dual-write).
        2. Surface a LangGraph Interrupt so the checkpointer pauses.
 
@@ -346,7 +346,7 @@ async def test_gate_default_framework_threshold_is_0_75(tmp_path):
 
 @pytest.mark.asyncio
 async def test_gate_resume_appends_user_input_and_clears_intervention(tmp_path):
-    """P2-H: resuming the gate via Command(resume=user_input) must:
+    """Resuming the gate via Command(resume=user_input) must:
        - Append the input to session.user_inputs.
        - Clear pending_intervention.
        - Move status off awaiting_input.

@@ -1,4 +1,4 @@
-"""Pending-approval timeout watchdog (P4-I).
+"""Pending-approval timeout watchdog.
 
 A high-risk tool call enters ``langgraph.types.interrupt()`` and the
 session sits in ``awaiting_input`` indefinitely. Without a watchdog

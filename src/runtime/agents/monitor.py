@@ -1,9 +1,9 @@
-"""Monitor agent kind — out-of-band scheduled observer (P6-E,F).
+"""Monitor agent kind — out-of-band scheduled observer.
 
 A monitor skill runs **outside** any session graph. The orchestrator
-owns one :class:`MonitorRunner` (a singleton, per the locked decision
-in §2.1 of the plan) which schedules registered monitor skills on a
-small bounded :class:`concurrent.futures.ThreadPoolExecutor` (R6).
+owns one :class:`MonitorRunner` (a singleton) which schedules registered
+monitor skills on a small bounded
+:class:`concurrent.futures.ThreadPoolExecutor`.
 Each tick:
 
 1. Calls every tool name in ``observe`` via the supplied callable
@@ -119,19 +119,19 @@ def make_monitor_callable(
     observe_fn: Callable[[str], Any],
     fire_trigger: Callable[[str, dict[str, Any]], None],
 ) -> Callable[[], None]:
-    """Build the callable a :class:`MonitorRunner` runs per tick (P6-F).
+    """Build the callable a :class:`MonitorRunner` runs per tick.
 
     ``observe_fn(tool_name)`` is the seam through which the runner
     invokes a tool. Production wires this to the orchestrator's MCP
     tool registry; tests wire it to deterministic stubs.
 
     ``fire_trigger(name, payload)`` is the seam through which the
-    runner fires a Phase-5 trigger. Production wires this to the
-    trigger registry; tests wire it to a recorder.
+    runner fires a trigger. Production wires this to the trigger
+    registry; tests wire it to a recorder.
 
     The returned callable is intentionally synchronous and exception-
     safe: a failed ``observe_fn`` or ``fire_trigger`` is logged and
-    swallowed so one bad monitor cannot stall the runner (R6).
+    swallowed so one bad monitor cannot stall the runner.
     """
     if skill.kind != "monitor":
         raise ValueError(
@@ -194,11 +194,11 @@ class _RegisteredMonitor:
 
 class MonitorRunner:
     """Owns a bounded thread pool and a scheduler thread that ticks
-    registered monitor skills on their cron schedules (P6-E).
+    registered monitor skills on their cron schedules.
 
     Exactly one ``MonitorRunner`` exists per ``OrchestratorService``
-    instance (per the §2.1 locked decision); the runner is built at
-    service startup and shut down at service teardown.
+    instance; the runner is built at service startup and shut down at
+    service teardown.
 
     Concurrency: each tick is dispatched to the
     :class:`~concurrent.futures.ThreadPoolExecutor` so the scheduler

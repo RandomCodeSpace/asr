@@ -1,4 +1,4 @@
-"""P9-9k — resolution agent helpers + prod-HITL override.
+"""Resolution agent helpers + prod-HITL override.
 
 Two concerns covered here:
 

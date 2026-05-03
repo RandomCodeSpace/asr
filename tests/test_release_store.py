@@ -1,4 +1,4 @@
-"""P9-9c — L5 Release Context store.
+"""L5 Release Context store.
 
 Pin tests for ``ReleaseStore``. Cover seed fallback, sort order,
 service filtering, the symmetric correlation window, and the

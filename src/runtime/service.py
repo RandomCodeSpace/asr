@@ -13,24 +13,24 @@ Lifecycle::
     result = fut.result(timeout=30)
     svc.shutdown() # cancels in-flight tasks, closes MCP clients, joins thread
 
-Phase 3 layers:
-  - P3-A: skeleton + singleton + start/shutdown lifecycle.
-  - P3-B: ``submit()`` / ``submit_and_wait()`` thread-safe bridge.
-  - P3-C: shared ``MCPClientPool`` with per-server ``asyncio.Lock``.
-  - P3-D: ``start_session()`` schedules a per-session asyncio task on the
+Capabilities:
+  - Skeleton + singleton + start/shutdown lifecycle.
+  - ``submit()`` / ``submit_and_wait()`` thread-safe bridge.
+  - Shared ``MCPClientPool`` with per-server ``asyncio.Lock``.
+  - ``start_session()`` schedules a per-session asyncio task on the
     service's loop and returns the session id immediately (the agent run
     continues in the background). Active tasks are tracked in an
     in-memory registry that evicts on completion / cancellation.
-  - P3-E: ``list_active_sessions()`` returns a thread-safe snapshot of
+  - ``list_active_sessions()`` returns a thread-safe snapshot of
     the in-flight registry; the snapshot coroutine runs on the loop so
     readers from any thread see a point-in-time consistent view.
-  - P3-F: ``stop_session(sid)`` cancels the in-flight task, waits up
+  - ``stop_session(sid)`` cancels the in-flight task, waits up
     to 5 s for graceful exit, and persists ``status="stopped"`` on the
     row (clearing ``pending_intervention``). Idempotent — a no-op for
     unknown ids or already-completed sessions.
-  - P3-G: hard cap on concurrent sessions. ``start_session`` raises
+  - Hard cap on concurrent sessions. ``start_session`` raises
     ``SessionCapExceeded`` once ``len(self._registry) >=
-    self.max_concurrent_sessions``. Fail fast; queueing is Phase 4+.
+    self.max_concurrent_sessions``. Fail fast; queueing is not supported.
 
 The singleton is process-scoped and reset on ``shutdown()`` so that test
 suites can build, tear down, and rebuild the service without leaking
@@ -81,11 +81,9 @@ class SessionCapExceeded(RuntimeError):
     """Raised by ``start_session`` when the service is already running
     ``max_concurrent_sessions`` sessions.
 
-    Phase 3 decision (R5): fail fast, do not queue. Queueing implies
-    an admission/notification surface which lands in Phase 4+. Callers
-    (Streamlit, FastAPI handlers) catch this and surface a clear error
-    — Streamlit shows a toast; the HTTP layer translates it to a 429
-    with ``Retry-After``.
+    Fail fast, do not queue. Callers (Streamlit, FastAPI handlers)
+    catch this and surface a clear error — Streamlit shows a toast;
+    the HTTP layer translates it to a 429 with ``Retry-After``.
     """
 
     def __init__(self, cap: int) -> None:
@@ -99,9 +97,9 @@ class SessionCapExceeded(RuntimeError):
 class OrchestratorService:
     """Process-singleton orchestrator service.
 
-    P3-A surface: construction, singleton accessor, ``start()`` /
-    ``shutdown()``. No coroutine submission or MCP pool yet — those land
-    in P3-B and P3-C respectively.
+    Surface: construction, singleton accessor, ``start()`` /
+    ``shutdown()``, coroutine submission bridge, and the shared MCP
+    client pool.
     """
 
     def __init__(
@@ -110,9 +108,9 @@ class OrchestratorService:
         max_concurrent_sessions: int | None = None,
     ) -> None:
         self.cfg = cfg
-        # P3-G: resource cap. Prefer the explicit constructor arg; fall
-        # back to ``cfg.runtime.max_concurrent_sessions``. Tests mutate
-        # this attribute directly to drive cap behaviour deterministically.
+        # Resource cap. Prefer the explicit constructor arg; fall back
+        # to ``cfg.runtime.max_concurrent_sessions``. Tests mutate this
+        # attribute directly to drive cap behaviour deterministically.
         self.max_concurrent_sessions: int = (
             max_concurrent_sessions
             if max_concurrent_sessions is not None
@@ -132,8 +130,8 @@ class OrchestratorService:
         # Per-server-name asyncio.Lock guarding lazy build. Created on the
         # loop the first time the server is requested.
         self._mcp_build_locks: dict[str, asyncio.Lock] = {}
-        # P3-D/E: shared Orchestrator (lazy-built on first session start)
-        # and the in-flight session registry. The registry dict itself is
+        # Shared Orchestrator (lazy-built on first session start) and
+        # the in-flight session registry. The registry dict itself is
         # only mutated from the loop thread (writers go through
         # ``submit_and_wait``); readers also hop through the loop so the
         # snapshot is point-in-time consistent with concurrent mutators.
@@ -142,9 +140,9 @@ class OrchestratorService:
         # Lazily-built lock for serialising orchestrator construction
         # under concurrent ``start_session`` calls. Created on the loop.
         self._orch_build_lock: asyncio.Lock | None = None
-        # P4-I: pending-approval timeout watchdog. Started in ``start()``
-        # iff ``cfg.runtime.gateway`` is configured; otherwise None and
-        # the lifecycle hooks are no-ops.
+        # Pending-approval timeout watchdog. Started in ``start()`` iff
+        # ``cfg.runtime.gateway`` is configured; otherwise None and the
+        # lifecycle hooks are no-ops.
         self._approval_watchdog: Any | None = None
 
     @classmethod
@@ -181,11 +179,11 @@ class OrchestratorService:
         self._thread.start()
         if not self._started.wait(timeout=5.0):
             raise RuntimeError("OrchestratorService loop failed to start within 5s")
-        # P4-I: arm the pending-approval watchdog iff a gateway is
-        # configured. The watchdog is harmless when no high-risk tool
-        # calls ever fire (it scans the empty registry), but skipping
-        # the start when the gateway is off keeps process startup
-        # quiet for apps that have not opted into HITL.
+        # Arm the pending-approval watchdog iff a gateway is configured.
+        # The watchdog is harmless when no high-risk tool calls ever
+        # fire (it scans the empty registry), but skipping the start
+        # when the gateway is off keeps process startup quiet for apps
+        # that have not opted into HITL.
         gateway_cfg = getattr(self.cfg.runtime, "gateway", None)
         if gateway_cfg is not None:
             from runtime.tools.approval_watchdog import ApprovalWatchdog
@@ -321,7 +319,7 @@ class OrchestratorService:
         return self._mcp_locks[server_name]
 
     # ------------------------------------------------------------------
-    # P3-D: per-session task scheduling + in-flight registry
+    # Per-session task scheduling + in-flight registry
     # ------------------------------------------------------------------
 
     async def _ensure_orchestrator(self) -> Any:
@@ -361,7 +359,7 @@ class OrchestratorService:
         returns. The actual graph run is launched as an ``asyncio.Task``
         on the same loop and runs in the background — the caller does
         **not** block on it. Listen via :meth:`list_active_sessions` and
-        per-session state lookups (a future P3-F+ surface) for progress.
+        per-session state lookups for progress.
 
         ``state_overrides`` is a free-form dict of domain fields the app
         stamps onto the new session row. The framework only projects
@@ -402,8 +400,8 @@ class OrchestratorService:
         env = (resolved_overrides or {}).get("environment", "")
 
         async def _scheduler() -> str:
-            # P3-G: enforce the concurrency cap on the loop thread so
-            # the registry size check is race-free. Fail-fast with
+            # Enforce the concurrency cap on the loop thread so the
+            # registry size check is race-free. Fail-fast with
             # ``SessionCapExceeded``; the exception propagates through
             # ``submit_and_wait`` -> ``Future.result()`` to the caller.
             if len(self._registry) >= self.max_concurrent_sessions:
@@ -421,9 +419,9 @@ class OrchestratorService:
                 reporter_team=sub_team,
             )
             session_id = inc.id
-            # P5-I: stamp trigger provenance onto the row before the
-            # graph runs so any crash mid-graph still leaves an audit
-            # trail. ``inc.findings`` is a JSON dict on the row.
+            # Stamp trigger provenance onto the row before the graph
+            # runs so any crash mid-graph still leaves an audit trail.
+            # ``inc.findings`` is a JSON dict on the row.
             if trigger is not None:
                 try:
                     received_at = trigger.received_at.strftime(
@@ -461,8 +459,8 @@ class OrchestratorService:
                     # Mark the registry entry so any concurrent snapshot
                     # observes the failure before the done-callback
                     # evicts it. The exception itself is preserved on
-                    # the task object for ``stop_session`` (P3-F+) and
-                    # any other observer that holds a Task reference.
+                    # the task object for ``stop_session`` and any
+                    # other observer that holds a Task reference.
                     e = self._registry.get(session_id)
                     if e is not None:
                         e.status = "error"
@@ -482,7 +480,7 @@ class OrchestratorService:
         return self.submit_and_wait(_scheduler(), timeout=30.0)
 
     # ------------------------------------------------------------------
-    # P3-F: stop_session — cancel in-flight task + persist stopped status
+    # stop_session — cancel in-flight task + persist stopped status
     # ------------------------------------------------------------------
 
     def stop_session(self, session_id: str) -> None:
@@ -494,8 +492,8 @@ class OrchestratorService:
         mid-resume doesn't leave a stale prompt on the row.
 
         Partial work (recorded ``tool_calls``, ``agents_run``) is
-        preserved — Phase 2 wrote them as they happened, and stopping
-        is not a rollback.
+        preserved — they are written as they happen, and stopping is
+        not a rollback.
         """
 
         async def _stop() -> None:
@@ -536,7 +534,7 @@ class OrchestratorService:
         self.submit_and_wait(_stop(), timeout=10.0)
 
     # ------------------------------------------------------------------
-    # P3-E: active-session registry snapshot accessor
+    # Active-session registry snapshot accessor
     # ------------------------------------------------------------------
 
     def list_active_sessions(self) -> list[dict[str, Any]]:
@@ -579,7 +577,7 @@ class OrchestratorService:
             return
         loop = self._loop
         thread = self._thread
-        # P4-I: stop the watchdog before draining sessions so its scan
+        # Stop the watchdog before draining sessions so its scan
         # doesn't race against the registry teardown below.
         if loop.is_running() and self._approval_watchdog is not None:
             try:

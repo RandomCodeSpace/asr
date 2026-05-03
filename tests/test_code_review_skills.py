@@ -1,7 +1,7 @@
 """Skill-loader tests for ``examples/code_review/skills/``.
 
-Verifies P8-D scaffolding: the three skill directories load via the
-framework's :func:`runtime.skill.load_all_skills`, and the ``_common/``
+Verifies the three skill directories load via the framework's
+:func:`runtime.skill.load_all_skills` and that the ``_common/``
 fragment is shared across all three agent prompts.
 """
 from __future__ import annotations

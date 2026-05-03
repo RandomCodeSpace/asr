@@ -5,26 +5,27 @@ Four artifacts are produced:
 - ``dist/app.py`` — framework-only bundle (``src/runtime/`` flattened).
   No ``examples.*`` source code; intra-bundle imports pointing at any
   example package are stripped, leaving the runtime to look up example
-  symbols dynamically. Post-Phase-1 narrative: framework is generic,
-  apps live in ``examples/``.
+  symbols dynamically. Framework is generic; apps live in
+  ``examples/``.
 - ``dist/apps/incident-management.py`` — self-contained incident-management
   app bundle: runtime modules + ``examples/incident_management/{config,state,
   mcp_server}.py``. Ship target.
 - ``dist/apps/code-review.py`` — self-contained code-review app bundle
-  (P8-K). Same runtime modules + ``examples/code_review/{config,state,
-  mcp_server}.py``. Proves the framework is generic by producing a second
-  app bundle from the same runtime.
+  with the same runtime modules + ``examples/code_review/{config,state,
+  mcp_server}.py``. Demonstrates that the framework is generic by
+  producing a second app bundle from the same runtime.
 - ``dist/ui.py`` — Streamlit UI only; ``examples/incident_management/ui.py``
   with intra-bundle ``from {orchestrator,runtime,examples.*}`` imports
   rewritten to ``from app import ...``.
 
-Layout choice rationale: the user's deployment workflow is a 7-file copy-only
-payload — historically a single ``dist/app.py`` (framework + app combined) and
-``dist/ui.py``. Phase 1 separates framework from example, so we now emit a
-clean runtime-only ``dist/app.py`` for the framework story AND a fully
-self-contained ``dist/apps/incident-management.py`` for the deployment story.
-Deploy-time contract: copy ``dist/apps/incident-management.py`` as ``app.py``
-into the corporate env (along with ``dist/ui.py`` and the config tail).
+Layout choice: the user's deployment workflow is a 7-file copy-only
+payload. Historically a single ``dist/app.py`` (framework + app combined)
+and ``dist/ui.py``. Now the framework and the example are split, so we
+emit a runtime-only ``dist/app.py`` for the framework story AND a fully
+self-contained ``dist/apps/incident-management.py`` for the deployment
+story. Deploy-time contract: copy ``dist/apps/incident-management.py``
+as ``app.py`` into the corporate env (along with ``dist/ui.py`` and the
+config tail).
 
 Run: python scripts/build_single_file.py
 """
@@ -34,7 +35,7 @@ from pathlib import Path
 
 RUNTIME_ROOT = Path("src/runtime")
 EXAMPLES_ROOT = Path("examples")
-# Post-P1-J: the UI lives at examples/incident_management/ui.py.
+# The UI lives at examples/incident_management/ui.py.
 # ui/streamlit_app.py is a one-line back-compat shim that re-exports it,
 # which strips to nothing under the bundler's intra-import rewrite — so
 # read the canonical source directly.
@@ -42,20 +43,14 @@ UI = Path("examples/incident_management/ui.py")
 OUT_APP = Path("dist/app.py")
 OUT_UI = Path("dist/ui.py")
 OUT_INCIDENT_APP = Path("dist/apps/incident-management.py")
-# P8-K: second app bundle, proving the framework is genuinely generic.
+# Second app bundle, demonstrating the framework is genuinely generic.
 OUT_CODE_REVIEW_APP = Path("dist/apps/code-review.py")
 
 # Order matters — emit modules in dependency order.
-# After P1-H, src/orchestrator/*.py modules became thin re-export shims;
-# the canonical module bodies live under src/runtime/. The bundler reads
-# from src/runtime/ for those, plus src/runtime/state.py (introduced in
-# P1-B). The two exceptions are:
-#   - src/orchestrator/config.py — still owns the legacy ``AppConfig``
-#     subclass that re-introduces ``incidents`` / ``intervention`` /
-#     ``environments`` fields for back-compat callers.
-#   - examples/incident_management/* — the canonical incident MCP server
-#     and its app config live here (only included in the incident-management
-#     app bundle, not in the runtime-only bundle).
+# Canonical module bodies live under src/runtime/; the bundler reads
+# from there for runtime modules. examples/incident_management/* modules
+# are included only in the incident-management app bundle (not in the
+# runtime-only bundle).
 RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "config.py"),
     (RUNTIME_ROOT, "state.py"),
@@ -76,7 +71,7 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "graph.py"),
     (RUNTIME_ROOT, "checkpointer_postgres.py"),
     (RUNTIME_ROOT, "checkpointer.py"),
-    # P5: trigger registry — bundled before orchestrator.py / api.py so
+    # Trigger registry — bundled before orchestrator.py / api.py so
     # ``TriggerInfo`` and ``TriggerRegistry`` are already in module
     # scope when those modules' bodies execute.
     (RUNTIME_ROOT, "triggers/base.py"),
@@ -89,7 +84,7 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "triggers/transports/schedule.py"),
     (RUNTIME_ROOT, "triggers/transports/plugin.py"),
     (RUNTIME_ROOT, "triggers/registry.py"),
-    # P7: dedup pipeline — bundled before orchestrator so the symbols
+    # Dedup pipeline — bundled before orchestrator so the symbols
     # (DedupConfig, DedupPipeline) are already module-scoped when
     # orchestrator.py executes its imports.
     (RUNTIME_ROOT, "dedup.py"),
@@ -99,7 +94,7 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "intake.py"),
     (RUNTIME_ROOT, "orchestrator.py"),
     (RUNTIME_ROOT, "api.py"),
-    # P7-H: retraction routes are a side-car router so they don't bloat
+    # Retraction routes are a side-car router so they don't bloat
     # api.py. Bundled after api.py so register_dedup_routes can be
     # invoked against the FastAPI app at the bottom of the bundle.
     (RUNTIME_ROOT, "api_dedup.py"),
@@ -109,14 +104,12 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 # incident-management app bundle. Order matters: config and state must
 # precede mcp_server / ui which import from them.
 #
-# P9-9a..9d: ``asr/memory_state.py`` is imported by ``state.py`` so it
-# must come first. The three filesystem-backed stores (KG / Release /
-# Playbook) live in the bundle so app code can reach them, but they
-# don't yet wire into mcp_server — that's 9e+ territory.
-# P9-9h/9i/9k: supervisor_node + hypothesis_loop + resolution_helpers
-# are pure-Python helpers consumed by the asr_supervisor / triage /
-# resolution skills. They depend on the four memory-layer modules
-# above so are ordered after them.
+# ``asr/memory_state.py`` is imported by ``state.py`` so it must come
+# first. The three filesystem-backed stores (KG / Release / Playbook)
+# live in the bundle so app code can reach them. supervisor_node +
+# hypothesis_loop + resolution_helpers are pure-Python helpers consumed
+# by the asr_supervisor / triage / resolution skills; they depend on
+# the four memory-layer modules above so are ordered after them.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
     (EXAMPLES_ROOT, "incident_management/asr/memory_state.py"),
     (EXAMPLES_ROOT, "incident_management/asr/kg_store.py"),
@@ -130,7 +123,7 @@ INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
     (EXAMPLES_ROOT, "incident_management/mcp_server.py"),
 ]
 
-# P8-K: code-review app modules — same shape as the incident bundle but
+# Code-review app modules — same shape as the incident bundle but
 # pulls from ``examples/code_review/`` so a second self-contained app
 # bundle drops out of the same build script.
 CODE_REVIEW_APP_MODULE_ORDER: list[tuple[Path, str]] = [
@@ -142,9 +135,9 @@ CODE_REVIEW_APP_MODULE_ORDER: list[tuple[Path, str]] = [
 # Matches both single-line and parenthesized multi-line intra-package imports.
 # Intra-bundle prefixes — symbols from these modules land in the bundle and
 # their import lines must be stripped to avoid `ModuleNotFoundError` at import
-# time (the bundle is `app.py` standalone, not a package). P8-K adds
-# ``examples.code_review`` so its intra-package imports also get stripped
-# from the code-review bundle.
+# time (the bundle is `app.py` standalone, not a package). The
+# ``examples.code_review`` prefix is included so its intra-package
+# imports also get stripped from the code-review bundle.
 _INTRA_PREFIXES = (
     r"(?:orchestrator|runtime|examples\.incident_management|examples\.code_review)"
 )
@@ -162,7 +155,7 @@ PACKAGE_INIT_RE = re.compile(r"^\s*from\s+__future__\s+import\s+.*$", re.MULTILI
 # For UI rewriting: capture the symbols, handling parenthesized form.
 # Matches every intra-bundle prefix the UI may import from:
 # legacy ``orchestrator.X`` plus the canonical ``runtime.X`` and
-# ``examples.incident_management.X`` paths used post-Phase-1.
+# ``examples.incident_management.X`` paths.
 _FROM_ORCH_RE = re.compile(
     rf"^\s*from\s+{_INTRA_PREFIXES}(?:\.[\w.]+)?\s+import\s+"
     r"(?:\(([^)]*)\)|(.*?))\s*$",
@@ -340,11 +333,11 @@ def build_incident_app() -> None:
 
 
 def build_code_review_app() -> None:
-    """Build dist/apps/code-review.py — runtime + code-review app (P8-K).
+    """Build dist/apps/code-review.py — runtime + code-review app.
 
-    Self-contained app bundle proving the framework is generic. Same
-    runtime modules as ``dist/apps/incident-management.py`` (loaded
-    first so example modules can reference framework symbols), then
+    Self-contained app bundle. Same runtime modules as
+    ``dist/apps/incident-management.py`` (loaded first so example
+    modules can reference framework symbols), then
     ``examples/code_review/{config,state,mcp_server}.py`` flattened
     with intra-bundle imports stripped.
     """

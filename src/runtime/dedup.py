@@ -44,7 +44,7 @@ StateT = TypeVar("StateT", bound=BaseModel)
 
 
 # ---------------------------------------------------------------------------
-# Config (P7-C)
+# Config
 # ---------------------------------------------------------------------------
 
 
@@ -56,7 +56,7 @@ class DedupScope(BaseModel):
 
 
 class DedupConfig(BaseModel):
-    """Configuration for the two-stage dedup pipeline (P7-C).
+    """Configuration for the two-stage dedup pipeline.
 
     All numeric thresholds are inclusive at the lower bound (``>=``),
     so a candidate hitting exactly ``stage1_threshold`` is considered.
@@ -103,7 +103,7 @@ class DedupConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Decision schema (P7-E)
+# Decision schema
 # ---------------------------------------------------------------------------
 
 
@@ -146,7 +146,7 @@ class _Stage2Outcome(enum.Enum):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 prompt (P7-E)
+# Stage 2 prompt
 # ---------------------------------------------------------------------------
 
 
@@ -183,9 +183,9 @@ def _parse_decision_tagged(
     """Parse the LLM's text into a ``DedupDecision`` with a failure tag.
 
     Returns ``(decision, None)`` on success, ``(None, exc)`` on any
-    parse / validation failure (P7-E: "treat as not-duplicate, do not
-    retry — budget protection"). Empty input is also a parse failure
-    so the pipeline can surface model-stopped-responding as a signal.
+    parse / validation failure ("treat as not-duplicate, do not retry —
+    budget protection"). Empty input is also a parse failure so the
+    pipeline can surface model-stopped-responding as a signal.
 
     Emits a structured ``warning`` log on any failure with fields a
     log aggregator can pick up via the LogRecord ``extra`` namespace:
@@ -251,7 +251,7 @@ def _parse_decision(raw: str) -> DedupDecision | None:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline (P7-D)
+# Pipeline
 # ---------------------------------------------------------------------------
 
 

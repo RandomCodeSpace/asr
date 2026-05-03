@@ -124,7 +124,7 @@ def build_fastmcp_client(server_cfg: MCPServerConfig):
     Returned client is not yet attached to any exit stack — the caller is
     responsible for ``await stack.enter_async_context(client)``. Used by
     :class:`runtime.service.OrchestratorService` to populate the
-    process-singleton MCP client pool (P3-C); the legacy per-orchestrator
+    process-singleton MCP client pool; the legacy per-orchestrator
     loaders below stay as-is.
     """
     from fastmcp import Client

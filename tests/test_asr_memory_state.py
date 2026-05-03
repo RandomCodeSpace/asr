@@ -1,11 +1,11 @@
-"""P9-9a — ``IncidentState.memory`` round-trips through ``SessionStore``.
+"""``IncidentState.memory`` round-trips through ``SessionStore``.
 
-The new ASR memory-layer slot ``memory: MemoryLayerState`` lives on
-``IncidentState`` but has no typed column on ``IncidentRow``; it has
-to ride through the P8-J ``extra_fields`` JSON bag. These tests pin
-both the default-empty shape and the populated round-trip so future
-schema work doesn't silently drop sub-graph / release / playbook
-context off the session.
+The ASR memory-layer slot ``memory: MemoryLayerState`` lives on
+``IncidentState`` but has no typed column on ``IncidentRow``; it rides
+through the ``extra_fields`` JSON bag. These tests pin both the
+default-empty shape and the populated round-trip so future schema work
+doesn't silently drop sub-graph / release / playbook context off the
+session.
 """
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def test_incident_state_default_memory_is_empty():
     assert inc.memory.l7_playbooks == []
 
 
-# ---- Round-trip through SessionStore (P8-J extra_fields) ---------------
+# ---- Round-trip through SessionStore (extra_fields) -------------------
 
 
 def test_default_memory_round_trips_through_session_store(engine):

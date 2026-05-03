@@ -46,10 +46,10 @@ async def test_full_flow_short_circuits_on_known_match(tmp_path, monkeypatch):
     cfg.runtime = RuntimeConfig(
         state_class="examples.incident_management.state.IncidentState",
     )
-    # incidents.similarity_threshold (was set to 0.2 here) lives on
-    # IncidentAppConfig now (P1-E). The example app's bundled
-    # examples/incident_management/config.yaml already pins it to 0.2,
-    # which is what load_incident_app_config() returns by default.
+    # incidents.similarity_threshold lives on IncidentAppConfig. The
+    # example app's bundled examples/incident_management/config.yaml
+    # already pins it to 0.2, which is what load_incident_app_config()
+    # returns by default.
 
     orch = await Orchestrator.create(cfg)
     try:

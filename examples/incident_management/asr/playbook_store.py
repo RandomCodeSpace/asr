@@ -1,4 +1,4 @@
-"""L7 Playbook Store — filesystem backend (Phase 9 — 9d).
+"""L7 Playbook Store — filesystem backend.
 
 Read-only thin class over a directory of YAML playbooks. Each file
 follows the schema:

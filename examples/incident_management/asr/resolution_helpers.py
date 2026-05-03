@@ -1,4 +1,4 @@
-"""Resolution agent helpers — playbook → tool-call translation (P9-9k).
+"""Resolution agent helpers — playbook → tool-call translation.
 
 The resolution agent matches the L7 PlaybookStore for the incident's
 signals and produces a list of suggested tool calls. The framework's

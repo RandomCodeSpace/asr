@@ -2,8 +2,8 @@
 
 Holds the incident-flavored knobs (similarity threshold, intervention
 confidence threshold, escalation roster, environments, severity aliases)
-that used to live in the framework's ``runtime.config.AppConfig`` before
-P1-E.
+that the framework's generic ``runtime.config.AppConfig`` does not
+carry.
 
 The framework reads these via ``load_incident_app_config()``; tests that
 need to override values can either write a temporary YAML file and pass
@@ -92,7 +92,7 @@ class IncidentAppConfig(BaseModel):
     environments: list[str] = Field(
         default_factory=lambda: ["production", "staging", "dev", "local"],
     )
-    # P7-C: optional two-stage dedup pipeline. Off-by-default at the
+    # Optional two-stage dedup pipeline. Off-by-default at the
     # framework level via ``DedupConfig.enabled=False``; the bundled
     # YAML for the incident-management example opts in. ``None`` means
     # "framework default" (off).

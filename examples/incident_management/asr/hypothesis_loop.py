@@ -1,4 +1,4 @@
-"""ASR triage hypothesis-refinement loop helpers (P9-9i).
+"""ASR triage hypothesis-refinement loop helpers.
 
 The triage agent runs an iterative pattern: generate a hypothesis →
 gather evidence (L1 current findings, L3-equivalent past similar
@@ -32,7 +32,7 @@ import re
 from typing import TypedDict
 
 
-# Loop bounds (locked per P9-9i plan).
+# Loop bounds.
 MAX_ITERATIONS: int = 3
 ACCEPT_THRESHOLD: float = 0.7
 

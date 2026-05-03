@@ -1,9 +1,7 @@
 """Idempotent migrations for the JSON-shaped row payloads.
 
-P4-M — fill the per-call audit fields added in P4-D for legacy rows.
-
-The Phase-4 risk-rated tool gateway (P4-A..H) extended :class:`runtime.state.ToolCall`
-with five optional audit fields:
+Fills the per-call audit fields on :class:`runtime.state.ToolCall` for
+legacy rows. The risk-rated tool gateway uses five optional audit fields:
 
   * ``risk``          — ``"low" | "medium" | "high" | None``
   * ``status``        — ``ToolStatus`` literal (default ``"executed"``)
@@ -11,13 +9,13 @@ with five optional audit fields:
   * ``approved_at``   — ISO-8601 timestamp of the decision
   * ``approval_rationale`` — free-text justification
 
-Pre-Phase-4 rows in the ``incidents.tool_calls`` JSON column lack these
+Older rows in the ``incidents.tool_calls`` JSON column lack these
 fields. Pydantic hydrates the missing keys with their defaults at read
 time so reading is already back-compat — but the on-disk JSON still
 shows the legacy shape until something rewrites the row.
 
 This migration walks every session, normalises the JSON-shaped
-``tool_calls`` list to the post-P4-D schema, and saves the row back
+``tool_calls`` list to the current audit schema, and saves the row back
 when (and only when) at least one entry changed. Idempotent — running
 twice is safe (the second pass is a no-op because every row already
 has the fields).
@@ -46,9 +44,9 @@ from runtime.storage.models import IncidentRow
 # at read time. Append-only: never reorder, never delete. Removing a
 # column needs a separate destructive migration with explicit sign-off.
 _FORWARD_COLUMNS: list[tuple[str, str]] = [
-    ("parent_session_id", "VARCHAR"),  # P7-A dedup linkage
-    ("dedup_rationale", "TEXT"),       # P7-E LLM rationale
-    ("extra_fields", "JSON"),          # P2 generic round-trip tunnel
+    ("parent_session_id", "VARCHAR"),  # dedup linkage
+    ("dedup_rationale", "TEXT"),       # LLM rationale
+    ("extra_fields", "JSON"),          # generic round-trip tunnel
 ]
 _FORWARD_INDEXES: list[tuple[str, str, str]] = [
     # (index_name, table, column) — mirrors models.IncidentRow.__table_args__.
@@ -56,10 +54,10 @@ _FORWARD_INDEXES: list[tuple[str, str, str]] = [
 ]
 
 # Default audit fields. Mirrors the Pydantic defaults on
-# :class:`runtime.state.ToolCall` (P4-D). Keep these in sync — a divergence
-# means rows hydrated post-migration would carry different defaults than
-# rows hydrated via the Pydantic constructor, which would surface as
-# subtle test flakes long after the migration ran.
+# :class:`runtime.state.ToolCall`. Keep these in sync — a divergence
+# means rows hydrated post-migration would carry different defaults
+# than rows hydrated via the Pydantic constructor, which would surface
+# as subtle test flakes long after the migration ran.
 _AUDIT_DEFAULTS: dict[str, Any] = {
     "status": "executed",
     "risk": None,
@@ -151,13 +149,12 @@ def migrate_tool_calls_audit(engine: Engine) -> dict[str, int]:
 def migrate_add_session_columns(engine: Engine) -> dict[str, int]:
     """Add post-initial columns to ``incidents`` if missing. Idempotent.
 
-    Phase 2 introduced ``extra_fields`` (generic JSON round-trip tunnel)
-    and Phase 7 introduced ``parent_session_id`` + ``dedup_rationale``.
-    Existing on-disk databases provisioned before those phases lack the
-    columns; SQLAlchemy's read-side query then errors with
-    ``no such column``. This walker uses ``PRAGMA table_info`` (via
-    SQLAlchemy's ``inspect``) to detect missing columns and adds each
-    one nullable. Running on a freshly-migrated DB is a no-op.
+    Older on-disk databases may lack ``extra_fields``,
+    ``parent_session_id``, or ``dedup_rationale``; SQLAlchemy's read-side
+    query then errors with ``no such column``. This walker uses
+    ``PRAGMA table_info`` (via SQLAlchemy's ``inspect``) to detect
+    missing columns and adds each one nullable. Running on a freshly-
+    migrated DB is a no-op.
 
     Returns ``{"columns_added": N, "indexes_added": M}``.
     """

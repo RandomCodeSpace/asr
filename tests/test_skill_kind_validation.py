@@ -1,6 +1,4 @@
-"""Tests for the Phase-6 ``Skill.kind`` discriminator and per-kind validators.
-
-Covers P6-A and P6-B:
+"""Tests for the ``Skill.kind`` discriminator and per-kind validators.
 
 * Each ``kind`` parses with a minimal valid config.
 * Each forbidden field combination is rejected with a message naming

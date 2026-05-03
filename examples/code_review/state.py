@@ -64,8 +64,8 @@ class CodeReviewState(Session):
             )
         return base
 
-    # P8-C: code-review has its own id namespace so two apps running
-    # against the same metadata DB cannot collide on session ids.
+    # Code-review has its own id namespace so two apps running against
+    # the same metadata DB cannot collide on session ids.
     # ``CR-YYYYMMDD-NNN`` mirrors the incident shape but keeps the
     # prefix distinct.
     @classmethod

@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 _UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-# P4-D: per-call audit metadata for the risk-rated tool gateway.
+# Per-call audit metadata for the risk-rated tool gateway.
 ToolRisk = Literal["low", "medium", "high"]
 ToolStatus = Literal[
     "executed",                 # auto / legacy default
@@ -39,10 +39,10 @@ class ToolCall(BaseModel):
     args: dict
     result: dict | str | list | int | float | bool | None
     ts: str
-    # P4-D: audit fields for the risk-rated gateway. All optional and
+    # Audit fields for the risk-rated gateway. All optional and
     # default-permissive so legacy rows in the JSON column hydrate with
     # ``status="executed"`` and the rest of the fields ``None`` —
-    # preserving back-compat with Phase-1 / Phase-3 incidents.
+    # preserving back-compat with older sessions.
     risk: ToolRisk | None = None
     status: ToolStatus = "executed"
     approver: str | None = None
@@ -85,12 +85,12 @@ class Session(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
-    # P7-A: dedup linkage. NULL by default; set when this session is
+    # Dedup linkage. NULL by default; set when this session is
     # confirmed as a duplicate of a prior closed session. The value is
     # the prior session's id; the link is non-destructive — both
     # sessions remain queryable. See ``runtime.dedup``.
     parent_session_id: str | None = None
-    # P7-E: stage-2 LLM rationale for the dedup decision. Stored on the
+    # Stage-2 LLM rationale for the dedup decision. Stored on the
     # session row so the UI can render "why was this marked duplicate?"
     # without needing a separate join.
     dedup_rationale: str | None = None
@@ -127,7 +127,7 @@ class Session(BaseModel):
         return base
 
     # ------------------------------------------------------------------
-    # P8-C: app-overridable session id minting hook.
+    # App-overridable session id minting hook.
     # ------------------------------------------------------------------
     @classmethod
     def id_format(cls, *, seq: int) -> str:

@@ -195,7 +195,7 @@ def wrap_tool(
             if action == "approve":
                 from langgraph.types import interrupt
 
-                # P4-I: persist a ``pending_approval`` ToolCall row BEFORE
+                # Persist a ``pending_approval`` ToolCall row BEFORE
                 # raising GraphInterrupt so the approval-timeout watchdog
                 # has a record to scan. ``ts`` is the moment the human
                 # approval window opened. Stored args mirror the post-
@@ -267,8 +267,8 @@ def wrap_tool(
                         )
                     return {"rejected": True, "rationale": rationale}
                 if verdict_str == "timeout":
-                    # P4-I: the approval window expired. Do NOT run the
-                    # tool; mark the audit row ``status="timeout"`` so
+                    # The approval window expired. Do NOT run the tool;
+                    # mark the audit row ``status="timeout"`` so
                     # downstream consumers (UI, retraining) can
                     # distinguish operator-initiated rejections from
                     # automatic timeouts.
@@ -325,8 +325,8 @@ def wrap_tool(
             if action == "approve":
                 from langgraph.types import interrupt
 
-                # P4-I: persist a ``pending_approval`` audit row BEFORE
-                # the GraphInterrupt fires so the watchdog can spot stale
+                # Persist a ``pending_approval`` audit row BEFORE the
+                # GraphInterrupt fires so the watchdog can spot stale
                 # approvals. See the sync ``_run`` mirror for details.
                 pending_args = dict(kwargs) if kwargs else {"args": list(args)}
                 existing_idx = _find_existing_pending_index(

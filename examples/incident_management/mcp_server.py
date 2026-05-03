@@ -29,9 +29,8 @@ def normalize_severity(
 class IncidentMCPServer:
     """FastMCP server bound to a single :class:`SessionStore` (+ optional :class:`HistoryStore`).
 
-    P2-J: replaces the legacy ``IncidentRepository`` facade with the
-    granular components. ``history`` is optional — only the
-    ``lookup_similar_incidents`` tool needs it.
+    Holds the active ``SessionStore`` and an optional ``HistoryStore``;
+    only the ``lookup_similar_incidents`` tool needs the latter.
     """
     store: SessionStore | None = None
     history: HistoryStore | None = None

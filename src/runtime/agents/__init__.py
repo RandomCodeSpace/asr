@@ -1,7 +1,6 @@
 """Per-kind agent factories.
 
-Phase 6 split the single ``make_agent_node`` into one module per
-:attr:`runtime.skill.Skill.kind`:
+One module per :attr:`runtime.skill.Skill.kind`:
 
 * :mod:`runtime.agents.responsive`  — today's LLM agent (a LangGraph node).
 * :mod:`runtime.agents.supervisor`  — no-LLM router (a LangGraph node).

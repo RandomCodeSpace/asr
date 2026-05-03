@@ -1,4 +1,4 @@
-"""Tests for ``effective_action`` (P4-B).
+"""Tests for ``effective_action``.
 
 The resolver is a PURE function: given a tool name, the live session's
 environment, and a ``GatewayConfig``, return one of:

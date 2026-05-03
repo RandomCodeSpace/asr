@@ -1,7 +1,6 @@
-"""Behavioural tests for SessionStore (replaces the old JSON IncidentStore tests).
+"""Behavioural tests for SessionStore.
 
-P2-J: rewritten off the deleted ``IncidentRepository`` shim — exercise
-``SessionStore`` directly with the example ``IncidentState``.
+Exercises ``SessionStore`` directly with the example ``IncidentState``.
 """
 import pytest
 

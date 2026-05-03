@@ -1,10 +1,10 @@
-"""Trigger registry — declarative session-start surface (Phase 5).
+"""Trigger registry — declarative session-start surface.
 
 Generalizes session-start beyond the hand-coded ``POST /investigate``
-route. After Phase 5 the framework can fire ``Orchestrator.start_session``
-from three first-party transports (``api``, ``webhook``, ``schedule``)
-and any number of plugin-defined transports — all driven by the
-``triggers:`` block in app config.
+route. The framework fires ``Orchestrator.start_session`` from three
+first-party transports (``api``, ``webhook``, ``schedule``) and any
+number of plugin-defined transports — all driven by the ``triggers:``
+block in app config.
 
 Public surface:
     from runtime.triggers import (

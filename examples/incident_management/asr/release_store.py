@@ -1,4 +1,4 @@
-"""L5 Release Context — filesystem backend (Phase 9 — 9c).
+"""L5 Release Context — filesystem backend.
 
 Read-only thin class over a single JSON file:
 

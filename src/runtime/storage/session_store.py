@@ -6,13 +6,12 @@ vector write-through (``_persist_vector``, ``_add_vector``,
 ``_refresh_vector``) and the row<->model converters shared with
 ``HistoryStore``.
 
-P2-C parametrises the class as ``Generic[StateT]`` and routes row
-hydration through ``self._state_cls(...)`` so apps can plug in their own
-``Session`` subclass via ``RuntimeConfig.state_class``. P2-J collapses
-the legacy ``runtime.incident.Incident`` model into ``runtime.state.Session``
-+ app-specific subclasses; the row schema remains incident-shaped, but
-unused fields are dropped via Pydantic's default ``extra='ignore'``
-when a narrower ``state_cls`` is supplied.
+The class is parametrised as ``Generic[StateT]`` and routes row
+hydration through ``self._state_cls(...)`` so apps can plug in their
+own ``Session`` subclass via ``RuntimeConfig.state_class``. The row
+schema remains incident-shaped, but unused fields are dropped via
+Pydantic's default ``extra='ignore'`` when a narrower ``state_cls`` is
+supplied.
 """
 from __future__ import annotations
 import json
@@ -30,11 +29,11 @@ from sqlalchemy.orm import Session as SqlSession
 from runtime.state import AgentRun, Session, TokenUsage, ToolCall
 from runtime.storage.models import IncidentRow
 
-# P8-C: the legacy ``INC-YYYYMMDD-NNN`` pattern stays here for
-# back-compat validation against on-disk rows minted before the
-# ``Session.id_format`` hook landed. New rows are validated by
-# ``_SESSION_ID_RE`` which accepts any ``PREFIX-YYYYMMDD-NNN`` shape
-# the app's ``id_format`` may emit (e.g. ``CR-...`` for code-review).
+# The legacy ``INC-YYYYMMDD-NNN`` pattern stays here for back-compat
+# validation against on-disk rows minted before the ``Session.id_format``
+# hook existed. New rows are validated by ``_SESSION_ID_RE`` which
+# accepts any ``PREFIX-YYYYMMDD-NNN`` shape the app's ``id_format`` may
+# emit (e.g. ``CR-...`` for code-review).
 _INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
 _SESSION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-\d{8}-\d{3}$")
 
@@ -135,9 +134,9 @@ class SessionStore(Generic[StateT]):
     def _next_id(self, session: SqlSession) -> str:
         """Mint a new session id via ``state_cls.id_format(seq=...)``.
 
-        P8-C: the per-app id format lives on the ``Session`` subclass so
-        each app picks its own prefix (``INC-`` for incidents, ``CR-``
-        for code-review, anything else custom apps want). The store still
+        The per-app id format lives on the ``Session`` subclass so each
+        app picks its own prefix (``INC-`` for incidents, ``CR-`` for
+        code-review, anything else custom apps want). The store still
         owns the monotonic sequence — it scans for prior rows whose id
         starts with the same ``PREFIX-YYYYMMDD-`` stem and returns
         ``max(seq) + 1``.
@@ -258,10 +257,10 @@ class SessionStore(Generic[StateT]):
                     include_duplicates: bool = False) -> list[StateT]:
         """Most-recent sessions first.
 
-        P7-G: ``include_duplicates`` defaults to ``False`` so the main
-        UI list stays clean of the long tail of dedup'd sessions. The UI
-        opts in via ``include_duplicates=True`` to render the
-        collapsed-duplicates row.
+        ``include_duplicates`` defaults to ``False`` so the main UI list
+        stays clean of the long tail of dedup'd sessions. The UI opts in
+        via ``include_duplicates=True`` to render the collapsed-
+        duplicates row.
         """
         with SqlSession(self.engine) as session:
             stmt = select(IncidentRow)
@@ -278,7 +277,7 @@ class SessionStore(Generic[StateT]):
     def list_children(self, parent_session_id: str) -> list[StateT]:
         """Return all sessions whose ``parent_session_id`` equals the given id.
 
-        P7-G: powers the parent-session detail pane "children" section.
+        Powers the parent-session detail pane "children" section.
         Soft-deleted children are excluded; ordering is oldest-first so
         the UI shows them in the order they were flagged.
         """
@@ -295,7 +294,7 @@ class SessionStore(Generic[StateT]):
     def un_duplicate(self, session_id: str, *,
                      retracted_by: str | None = None,
                      note: str | None = None) -> StateT:
-        """Retract a duplicate flag (P7-H).
+        """Retract a duplicate flag.
 
         Behaviour (one transaction):
           * Loads the row; raises ``FileNotFoundError`` if missing.
@@ -388,7 +387,7 @@ class SessionStore(Generic[StateT]):
 
     # ---------- mapping helpers ----------
     #
-    # P8-J: round-trip is driven by ``state_cls.model_fields`` so any
+    # Round-trip is driven by ``state_cls.model_fields`` so any
     # ``Session`` subclass — incident-shaped, code-review-shaped, or
     # whatever a future app brings — round-trips losslessly. The
     # ``IncidentRow`` schema keeps its incident-shaped typed columns
@@ -473,7 +472,7 @@ class SessionStore(Generic[StateT]):
         if "resolution" in model_fields:
             kwargs["resolution"] = _deserialize_resolution(row.resolution)
 
-        # P8-J: merge in any non-typed-column fields from ``extra_fields``.
+        # Merge in any non-typed-column fields from ``extra_fields``.
         # Pydantic's ``extra='ignore'`` will drop any keys the state
         # class doesn't declare (e.g. legacy fields written by an older
         # binary), keeping the round-trip robust.
@@ -559,11 +558,11 @@ class SessionStore(Generic[StateT]):
             "input_tokens": inc.token_usage.input_tokens,
             "output_tokens": inc.token_usage.output_tokens,
             "total_tokens": inc.token_usage.total_tokens,
-            # P7-A/E: dedup linkage + rationale columns. ``getattr`` so
-            # bare ``Session`` instances (without the framework's P7
-            # fields) round-trip with NULL.
+            # Dedup linkage + rationale columns. ``getattr`` so bare
+            # ``Session`` instances (without the dedup fields) round-
+            # trip with NULL.
             "parent_session_id": getattr(inc, "parent_session_id", None),
             "dedup_rationale": getattr(inc, "dedup_rationale", None),
-            # P8-J: everything not covered by a typed column.
+            # Everything not covered by a typed column.
             "extra_fields": extra or None,
         }

@@ -1,4 +1,4 @@
-"""Phase 3 multi-session integration tests (P3-K).
+"""Multi-session integration tests.
 
 Exercises ``OrchestratorService`` end-to-end: parallel session starts via
 the public API, registry visibility while running, persisted-state
@@ -122,7 +122,7 @@ def _wait_for_all_complete(service, sids, timeout: float = 30.0) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# P3-K — three concurrent sessions
+# Three concurrent sessions
 # ---------------------------------------------------------------------------
 
 

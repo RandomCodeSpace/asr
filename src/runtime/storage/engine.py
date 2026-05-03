@@ -4,7 +4,7 @@ Sync engine for SQLite (dev) or Postgres (prod). No vector-extension
 loading — vectors live in a separate LangChain VectorStore (see
 :mod:`orchestrator.storage.vector`, landed in M3).
 
-P2-FIX: when the metadata store and the LangGraph ``AsyncSqliteSaver``
+When the metadata store and the LangGraph ``AsyncSqliteSaver``
 checkpointer share a SQLite file, two writers contend on the same DB.
 SQLite's default ``BEGIN DEFERRED`` transaction acquires SHARED on the
 first read and only escalates to RESERVED on the first write — and the

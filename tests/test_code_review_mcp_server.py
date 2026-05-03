@@ -1,18 +1,11 @@
 """MCP-server tests for ``examples/code_review/mcp_server.py``.
 
-Covers P8-E: tool registration, ``add_review_finding`` appends to the
+Covers tool registration, ``add_review_finding`` appends to the
 session, and ``set_recommendation`` persists across reload.
 
-Note on the store fixture: the framework's
-:class:`runtime.storage.session_store.SessionStore` is incident-shaped —
-its row schema does not (yet) round-trip ``CodeReviewState``-specific
-fields like ``pr`` / ``review_findings`` / ``overall_recommendation``.
-Wiring those into the row schema is the job of the deferred P8-J /
-P8-K framework changes. Until then, these tests use a small in-memory
-store that satisfies the same ``load`` / ``save`` contract the MCP
-server depends on without touching SQLAlchemy. This keeps the tests
-focused on the example's own behaviour rather than framework gaps the
-plan explicitly calls out as out-of-scope for P8-D/E/F/G.
+These tests use a small in-memory store that satisfies the ``load`` /
+``save`` contract the MCP server depends on without touching
+SQLAlchemy.
 """
 from __future__ import annotations
 

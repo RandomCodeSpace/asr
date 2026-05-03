@@ -1,4 +1,4 @@
-"""Supervisor agent kind — no-LLM router (P6-D).
+"""Supervisor agent kind — no-LLM router.
 
 A supervisor skill is a LangGraph node that:
 
@@ -16,11 +16,10 @@ A supervisor skill is a LangGraph node that:
 The recursion depth is tracked in :class:`runtime.graph.GraphState`'s
 ``dispatch_depth`` field; if a supervisor would exceed
 ``skill.max_dispatch_depth`` the node aborts with a clean error
-instead of recursing forever (R1).
+instead of recursing forever.
 
 This is **not** a fan-out implementation; we always pick a single
-target. Multi-target ``Send()`` is left for a future phase per the
-non-goal in §5 of the plan.
+target. Multi-target ``Send()`` is intentionally not supported.
 """
 from __future__ import annotations
 
@@ -86,13 +85,13 @@ def log_supervisor_dispatch(
     rule_matched: str | None,
     payload_size: int,
 ) -> None:
-    """Emit one structured ``supervisor_dispatch`` log entry (P6-H).
+    """Emit one structured ``supervisor_dispatch`` log entry.
 
     Operators wanting an end-to-end audit join ``agent_runs`` and the
     log stream by ``incident_id``. The audit trail is deliberately a
     different stream from ``agent_runs`` because supervisors don't burn
     tokens — bloating ``agents_run`` with router rows is a known trap
-    we explicitly avoid (R3).
+    we explicitly avoid.
     """
     record = {
         "event": "supervisor_dispatch",
@@ -195,7 +194,7 @@ def make_supervisor_node(
     llm: BaseChatModel | None = None,
     framework_cfg: Any | None = None,
 ):
-    """Build the supervisor LangGraph node (P6-D, P9-9h).
+    """Build the supervisor LangGraph node.
 
     Pure routing: no ``AgentRun`` row, no tool execution, no token
     accounting beyond what the optional LLM call itself reports. The
@@ -205,12 +204,12 @@ def make_supervisor_node(
     The optional ``llm`` is only used when ``skill.dispatch_strategy``
     is ``"llm"``. Callers using ``"rule"`` may pass ``None``.
 
-    P9-9h — when ``skill.runner`` is set, the dotted-path callable is
-    resolved at build time and invoked at the start of each node call
-    BEFORE the routing dispatch. The runner gets the live ``GraphState``
-    and the optional ``framework_cfg`` and may return ``None`` (continue
-    with the routing table) or a dict patch that gets merged into state.
-    A patch carrying ``"next_route"`` short-circuits the routing table
+    When ``skill.runner`` is set, the dotted-path callable is resolved
+    at build time and invoked at the start of each node call BEFORE the
+    routing dispatch. The runner gets the live ``GraphState`` and the
+    optional ``framework_cfg`` and may return ``None`` (continue with
+    the routing table) or a dict patch that gets merged into state. A
+    patch carrying ``"next_route"`` short-circuits the routing table
     entirely (use ``"__end__"`` to terminate the graph).
     """
     # Local import to avoid the circular runtime.graph -> runtime.agents
@@ -243,8 +242,8 @@ def make_supervisor_node(
 
     async def node(state: GraphState) -> dict:
         sess: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-        # ``dispatch_depth`` is an extension field on GraphState
-        # (Phase-6); start at 0 and increment per supervisor entry.
+        # ``dispatch_depth`` is an extension field on GraphState; start
+        # at 0 and increment per supervisor entry.
         depth = int(state.get("dispatch_depth") or 0) + 1
         if depth > skill.max_dispatch_depth:
             logger.warning(
@@ -262,7 +261,7 @@ def make_supervisor_node(
                 ),
             }
 
-        # ----- P9-9h: app-supplied runner hook ------------------------
+        # ----- App-supplied runner hook -------------------------------
         runner_patch: dict[str, Any] = {}
         if runner is not None:
             # Build a thin proxy so the runner can reach intake_context
@@ -349,7 +348,7 @@ def make_supervisor_node(
             else:
                 target = _llm_pick_target(skill=skill, llm=llm, incident=sess)
 
-        # Audit: one structured log entry per dispatch (R3).
+        # Audit: one structured log entry per dispatch.
         try:
             payload_size = len(json.dumps(sess.model_dump(), default=str))
         except Exception:  # noqa: BLE001 — defensive; size is a hint

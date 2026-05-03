@@ -9,8 +9,8 @@ Like ``SessionStore``, ``HistoryStore`` is parametrised on ``StateT`` so
 that find_similar / load surface the configured app state class rather
 than the framework default.
 
-P2-E: ``find_similar`` accepts an arbitrary ``filter_kwargs`` mapping —
-keys must correspond to ``IncidentRow`` columns. This decouples the
+``find_similar`` accepts an arbitrary ``filter_kwargs`` mapping — keys
+must correspond to ``IncidentRow`` columns. This decouples the
 framework from incident-specific filter dimensions: apps with a
 ``severity``-only schema, or a multi-tenant ``tenant_id`` schema, or
 anything else, build their filter on the fly.
@@ -70,7 +70,7 @@ class HistoryStore(Generic[StateT]):
         self.distance_strategy = distance_strategy
         # Private converter helper. We never call its mutating methods.
         # ``state_cls=None`` lets SessionStore pick its own default
-        # (``runtime.state.Session`` post-P2-J).
+        # (``runtime.state.Session``).
         ss_kwargs: dict[str, Any] = {
             "engine": engine, "embedder": None, "vector_store": None,
             "distance_strategy": distance_strategy,

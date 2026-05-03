@@ -1,4 +1,4 @@
-"""P7-G/H tests — retraction API + dedup_retractions audit table.
+"""Tests — retraction API + dedup_retractions audit table.
 
 Covers:
   * :class:`SessionStore.un_duplicate` happy path + 409 / 404 conditions.

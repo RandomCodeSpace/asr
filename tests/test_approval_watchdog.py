@@ -1,4 +1,4 @@
-"""Tests for the P4-I pending-approval timeout watchdog.
+"""Tests for the pending-approval timeout watchdog.
 
 The watchdog scans active sessions for ``pending_approval`` ToolCall
 rows older than the configured ``approval_timeout_seconds`` and

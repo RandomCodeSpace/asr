@@ -1,4 +1,4 @@
-"""P9-9m-sliver — UI panel sanity checks.
+"""UI panel sanity checks.
 
 Two non-Streamlit tests:
 
@@ -18,8 +18,8 @@ def test_ui_module_imports_cleanly() -> None:
     import examples.incident_management.ui as ui  # noqa: F401
     # The renderer for the new panel exists.
     assert hasattr(ui, "_render_hypothesis_trail_block")
-    # The Approval Inbox renderer (P4-H) is still present after the
-    # P9-9m additions.
+    # The Approval Inbox renderer is still present after the
+    # hypothesis-trail panel additions.
     assert hasattr(ui, "_render_pending_approvals_block")
 
 

@@ -46,21 +46,20 @@ class IncidentRow(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # P7-A: dedup linkage. NULL by default; set when this session is
+    # Dedup linkage. NULL by default; set when this session is
     # confirmed as a duplicate of a prior closed session. Indexed so
     # ``list_children(parent)`` is fast.
     parent_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    # P7-E: stage-2 LLM rationale persisted on the row so the UI can
-    # surface "why was this flagged?" without a separate decisions
-    # table. Mirror of ``Session.dedup_rationale``.
+    # Stage-2 LLM rationale persisted on the row so the UI can surface
+    # "why was this flagged?" without a separate decisions table.
+    # Mirror of ``Session.dedup_rationale``.
     dedup_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # P8-J: bag for any state-class field that does not have a typed
-    # column above. ``SessionStore`` walks ``state_cls.model_fields``
-    # and routes unknown fields here on save; ``_row_to_session``
-    # merges them back into the model on load. Additive: legacy rows
-    # written before this column existed have ``NULL`` and round-trip
-    # cleanly.
+    # Bag for any state-class field that does not have a typed column
+    # above. ``SessionStore`` walks ``state_cls.model_fields`` and
+    # routes unknown fields here on save; ``_row_to_session`` merges
+    # them back into the model on load. Additive: legacy rows written
+    # before this column existed have ``NULL`` and round-trip cleanly.
     extra_fields: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
@@ -74,7 +73,7 @@ class IncidentRow(Base):
     )
 
 
-# P7-H: append-only audit log of dedup retractions. No FK to ``incidents``
+# Append-only audit log of dedup retractions. No FK to ``incidents``
 # so retraction history survives session deletion. Indexed on
 # ``session_id`` for the parent detail pane lookup.
 class DedupRetractionRow(Base):

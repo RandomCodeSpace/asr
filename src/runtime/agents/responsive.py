@@ -12,9 +12,9 @@ A responsive skill is a LangGraph node that:
 This module owns only the node-factory entrypoint
 (``make_agent_node``); the implementation reuses helpers in
 :mod:`runtime.graph` so existing call sites and the gate node continue
-to work unchanged. The split exists so Phase-6 supervisor and monitor
-factories live alongside it under :mod:`runtime.agents` rather than
-piling more kinds into ``graph.py``.
+to work unchanged. Supervisor and monitor factories live alongside it
+under :mod:`runtime.agents` rather than piling more kinds into
+``graph.py``.
 """
 from __future__ import annotations
 
@@ -53,12 +53,11 @@ def make_agent_node(
     ``{success, failed, needs_input}`` default is used so older callers and
     tests keep working.
 
-    ``gateway_cfg`` (P4-F) is the optional risk-rated tool gateway config.
+    ``gateway_cfg`` is the optional risk-rated tool gateway config.
     When supplied, every ``BaseTool`` in ``tools`` is wrapped via
     :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so the
-    closure captures the live ``Session`` per agent invocation — the
-    R2 mitigation in the Phase-4 plan. When ``None``, tools are passed
-    through untouched (back-compat).
+    closure captures the live ``Session`` per agent invocation. When
+    ``None``, tools are passed through untouched.
     """
     # Imported lazily to avoid an import cycle: ``runtime.graph`` depends
     # on this module via ``_build_agent_nodes``, but the helpers used
@@ -83,7 +82,7 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
-        # P4-F: wrap tools per-invocation so each wrap closes over the
+        # Wrap tools per-invocation so each wrap closes over the
         # live ``Session`` for this run.
         if gateway_cfg is not None:
             run_tools = [

@@ -1,8 +1,9 @@
 """Tests for runtime.service.OrchestratorService.
 
-P3-A: singleton + start/shutdown lifecycle.
-P3-B: cross-thread ``submit()`` / ``submit_and_wait()``.
-P3-C: shared MCP client pool with per-server ``asyncio.Lock``.
+Covers:
+- singleton + start/shutdown lifecycle.
+- cross-thread ``submit()`` / ``submit_and_wait()``.
+- shared MCP client pool with per-server ``asyncio.Lock``.
 """
 from __future__ import annotations
 
@@ -152,7 +153,7 @@ def _reset_singleton():
 
 
 # ---------------------------------------------------------------------------
-# P3-A — lifecycle
+# Lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -232,7 +233,7 @@ def test_service_no_zombie_thread_after_shutdown(cfg):
 
 
 # ---------------------------------------------------------------------------
-# P3-B — sync→async submit bridge
+# Sync→async submit bridge
 # ---------------------------------------------------------------------------
 
 
@@ -322,7 +323,7 @@ def test_service_thread_safe_concurrent_submits(service):
 
 
 # ---------------------------------------------------------------------------
-# P3-C — shared MCP client pool with per-server lock
+# Shared MCP client pool with per-server lock
 # ---------------------------------------------------------------------------
 
 
@@ -422,7 +423,7 @@ def test_mcp_pool_torn_down_on_shutdown(cfg_with_inproc_mcp):
 
 
 # ---------------------------------------------------------------------------
-# P3-D — per-session task scheduling
+# Per-session task scheduling
 # ---------------------------------------------------------------------------
 
 
@@ -435,7 +436,7 @@ def test_start_session_returns_id_immediately(service_full):
         submitter={"id": "u1", "team": "platform"},
     )
     assert isinstance(sid, str)
-    # Phase 2's IncidentRow ids follow ``INC-YYYYMMDD-NNN``.
+    # IncidentRow ids follow ``INC-YYYYMMDD-NNN``.
     assert sid.startswith("INC-")
 
 
@@ -500,7 +501,7 @@ def test_start_session_registry_evicts_on_completion(service_full):
 
 
 # ---------------------------------------------------------------------------
-# P3-E — active-session registry snapshot accessor
+# Active-session registry snapshot accessor
 # ---------------------------------------------------------------------------
 
 
@@ -583,7 +584,7 @@ def test_list_active_sessions_works_before_first_session(cfg_full):
 
 
 # ---------------------------------------------------------------------------
-# P3-F — stop_session: cancel in-flight task + mark status=stopped
+# stop_session: cancel in-flight task + mark status=stopped
 # ---------------------------------------------------------------------------
 
 
@@ -673,13 +674,12 @@ def test_stop_session_before_any_session_is_noop(cfg_full):
 
 
 # ---------------------------------------------------------------------------
-# P3-G — concurrent-session cap (fail-fast)
+# Concurrent-session cap (fail-fast)
 # ---------------------------------------------------------------------------
 
 
 def test_runtime_config_default_cap_is_8():
-    """Default RuntimeConfig.max_concurrent_sessions is 8 — the
-    framework default the plan calls out (R5)."""
+    """Default RuntimeConfig.max_concurrent_sessions is 8."""
     from runtime.config import RuntimeConfig
 
     assert RuntimeConfig().max_concurrent_sessions == 8

@@ -25,7 +25,7 @@ IncidentStatus = Literal[
     "awaiting_input",
     "stopped",
     "deleted",
-    # P7-B: terminal status set by the dedup pipeline when stage-2 LLM
+    # Terminal status set by the dedup pipeline when stage-2 LLM
     # confirms this session is a duplicate of a prior closed session.
     # Non-destructive: the row stays queryable with ``parent_session_id``
     # pointing at the original. Retraction (``POST /sessions/{id}/un-duplicate``)
@@ -53,8 +53,8 @@ class IncidentState(Session):
     embedding: list[float] | None = None
     resolution: Any = None
 
-    # P9-9a: ASR memory-layer slots (L2 KG, L5 Release, L7 Playbooks).
-    # Round-tripped via P8-J ``extra_fields`` — no row schema change needed.
+    # ASR memory-layer slots (L2 KG, L5 Release, L7 Playbooks).
+    # Round-tripped via ``extra_fields`` — no row schema change needed.
     memory: MemoryLayerState = Field(default_factory=MemoryLayerState)
 
     # Override the framework agent-input hook with the incident-shaped
@@ -79,7 +79,7 @@ class IncidentState(Session):
             )
         return base
 
-    # P8-C: explicit override of the framework id_format hook so the
+    # Explicit override of the framework id_format hook so the
     # incident-management app continues to mint ``INC-YYYYMMDD-NNN``
     # ids regardless of any future change to the framework default.
     @classmethod

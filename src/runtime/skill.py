@@ -241,19 +241,19 @@ class Skill(BaseModel):
     dispatch_prompt: str | None = None
     dispatch_rules: list[DispatchRule] = Field(default_factory=list)
     max_dispatch_depth: int = 3
-    # P9-9h: optional dotted-path extension hook for app-specific
-    # supervisor logic (e.g. memory-layer hydration, single-active-
-    # investigation gates). The runner is invoked BEFORE the dispatch
-    # table and may either mutate state or short-circuit to ``__end__``.
-    # Resolved at skill-load time so misconfigured YAML fails fast.
+    # Optional dotted-path extension hook for app-specific supervisor
+    # logic (e.g. memory-layer hydration, single-active-investigation
+    # gates). The runner is invoked BEFORE the dispatch table and may
+    # either mutate state or short-circuit to ``__end__``. Resolved at
+    # skill-load time so misconfigured YAML fails fast.
     runner: str | None = None
 
     # ----- monitor (out-of-band, scheduled) -----
     schedule: str | None = None             # cron expression
     observe: list[str] = Field(default_factory=list)  # tool names
     emit_signal_when: str | None = None     # safe-eval expression
-    trigger_target: str | None = None       # P5 trigger name
-    tick_timeout_seconds: float = 30.0      # per-tick timeout (R6)
+    trigger_target: str | None = None       # trigger registry name
+    tick_timeout_seconds: float = 30.0      # per-tick timeout
 
     @field_validator("tools")
     @classmethod
@@ -287,7 +287,7 @@ class Skill(BaseModel):
 
     @model_validator(mode="after")
     def _validate_kind_shape(self) -> "Skill":
-        """Per-kind field-shape validation (P6-B).
+        """Per-kind field-shape validation.
 
         Each kind has a strict allow-list of fields. Anything from
         another kind raises ValueError naming the offending field and

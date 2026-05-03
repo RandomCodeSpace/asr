@@ -1,11 +1,11 @@
-"""P8-L: incident-management + code-review run side-by-side.
+"""Incident-management + code-review run side-by-side.
 
 The decisive proof that the framework is generic: two ``SessionStore``
 instances, each parametrised on a different ``Session`` subclass,
 coexist without:
 
-* colliding on the session id space (P8-C ``id_format`` hook),
-* losing typed fields on round-trip (P8-J ``extra_fields`` JSON column),
+* colliding on the session id space (``id_format`` hook),
+* losing typed fields on round-trip (``extra_fields`` JSON column),
 * leaking domain shapes into each other (e.g. an incident's ``reporter``
   showing up on a code-review state).
 
@@ -62,7 +62,7 @@ def test_state_resolver_handles_both_apps():
 
 
 # ---------------------------------------------------------------------------
-# P8-C: each app mints its own id format, so the two id spaces cannot
+# Each app mints its own id format, so the two id spaces cannot
 # collide even if both stores share a metadata DB.
 # ---------------------------------------------------------------------------
 def test_each_app_mints_its_own_id_format(incident_store, code_review_store):
@@ -99,7 +99,7 @@ def test_each_app_mints_its_own_id_format(incident_store, code_review_store):
 
 
 # ---------------------------------------------------------------------------
-# P8-J: each store round-trips its own typed fields without leaking the
+# Each store round-trips its own typed fields without leaking the
 # other app's domain shape.
 # ---------------------------------------------------------------------------
 def test_two_stores_round_trip_independently(incident_store, code_review_store):
@@ -178,11 +178,11 @@ def test_two_stores_round_trip_independently(incident_store, code_review_store):
 
 
 # ---------------------------------------------------------------------------
-# P8-J negative: a code-review session id is rejected by an incident
-# store (and vice-versa) only when the row genuinely doesn't exist —
-# both stores happily *accept* either id shape via the relaxed
-# ``_SESSION_ID_RE`` validator. This guards against accidentally
-# tightening that regex back to ``INC-only``.
+# A code-review session id is rejected by an incident store (and
+# vice-versa) only when the row genuinely doesn't exist — both stores
+# happily *accept* either id shape via the relaxed ``_SESSION_ID_RE``
+# validator. This guards against accidentally tightening that regex
+# back to ``INC-only``.
 # ---------------------------------------------------------------------------
 def test_id_format_validator_accepts_both_prefixes(
     incident_store, code_review_store

@@ -10,7 +10,7 @@ itself; this transport never sees it.
 
 Drift / accuracy: APScheduler in-process is good for ±1 minute under
 normal load. Tighter SLOs need an external scheduler (Celery beat,
-k8s CronJob) — out of scope for Phase 5.
+k8s CronJob) — not supported here.
 """
 from __future__ import annotations
 

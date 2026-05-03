@@ -143,7 +143,7 @@ RiskLevel = Literal["low", "medium", "high"]
 
 
 class ProdOverrides(BaseModel):
-    """Per-environment HITL tightening rules for the gateway (P4-E).
+    """Per-environment HITL tightening rules for the gateway.
 
     When the live ``Session.environment`` is in ``prod_environments`` AND
     the tool name matches one of the globs in ``resolution_trigger_tools``,
@@ -161,7 +161,7 @@ class ProdOverrides(BaseModel):
 
 
 class GatewayConfig(BaseModel):
-    """Risk-rated tool gateway configuration (P4-A).
+    """Risk-rated tool gateway configuration.
 
     ``policy`` maps a tool name to a declared risk level. The level drives
     the hybrid HITL action:
@@ -181,8 +181,8 @@ class GatewayConfig(BaseModel):
     policy: dict[str, RiskLevel] = Field(default_factory=dict)
     notify_channel: str | None = None
     prod_overrides: ProdOverrides | None = None
-    # P4-I: pending-approval timeout (seconds). When a high-risk tool
-    # call enters ``interrupt()`` and the operator never returns, the
+    # Pending-approval timeout (seconds). When a high-risk tool call
+    # enters ``interrupt()`` and the operator never returns, the
     # session sits in ``awaiting_input`` indefinitely and counts against
     # ``OrchestratorService.max_concurrent_sessions`` — eventually
     # leaking the slot. The :class:`runtime.tools.approval_watchdog`
@@ -224,16 +224,15 @@ class RuntimeConfig(BaseModel):
     # Apps that don't expose environments leave this unset; the
     # endpoint then returns an empty list.
     environments_provider_path: str | None = None
-    # P3-G: hard cap on concurrent in-flight sessions a single
+    # Hard cap on concurrent in-flight sessions a single
     # ``OrchestratorService`` will run. ``start_session`` raises
     # ``SessionCapExceeded`` once the registry holds this many entries
     # — fail fast, do not queue. Tune per deployment; the default is
     # generous enough for an interactive desk while keeping a single
     # process from saturating MCP transports.
     max_concurrent_sessions: int = 8
-    # P4-A: optional risk-rated tool gateway. When ``None``, the gateway
-    # is bypassed entirely and tools execute as before — preserving
-    # Phase-3 behaviour for callers that have not opted in.
+    # Optional risk-rated tool gateway. When ``None``, the gateway is
+    # bypassed entirely and tools execute as before.
     gateway: GatewayConfig | None = None
 
 
@@ -242,10 +241,7 @@ class RuntimeConfig(BaseModel):
 # framework reads at runtime. Apps compose this inside their own
 # ``AppConfig`` (``IncidentAppConfig``, ``CodeReviewAppConfig``) and
 # expose a no-arg provider via ``RuntimeConfig.framework_app_config_path``.
-# This shape is the post-merge code-review's #1 architectural fix —
-# it kills the four ``examples.incident_management.config`` imports
-# that used to leak out of ``runtime/`` and bake one app's defaults
-# into every app's graph.
+# Keeps app-specific config modules out of ``runtime/`` imports.
 # ---------------------------------------------------------------------------
 
 
@@ -316,12 +312,12 @@ class AppConfig(BaseModel):
     paths: Paths = Field(default_factory=Paths)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
-    # P5-A: declarative trigger registry. Each entry is one
-    # transport-flavoured ``TriggerConfig`` (api/webhook/schedule/plugin).
-    # Typed as ``list[Any]`` because Pydantic v2's discriminated-union
-    # binding pulls in the trigger module at import time, which would
-    # introduce a circular import. The ``_coerce_triggers`` validator
-    # below promotes raw dicts to the proper TriggerConfig variants.
+    # Declarative trigger registry. Each entry is one transport-flavoured
+    # ``TriggerConfig`` (api/webhook/schedule/plugin). Typed as
+    # ``list[Any]`` because Pydantic v2's discriminated-union binding
+    # pulls in the trigger module at import time, which would introduce
+    # a circular import. The ``_coerce_triggers`` validator below
+    # promotes raw dicts to the proper TriggerConfig variants.
     triggers: list[Any] = Field(default_factory=list)
 
     @model_validator(mode="after")

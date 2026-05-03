@@ -1,9 +1,9 @@
-"""Smoke tests for the IncidentAppConfig moved out of runtime.config.
+"""Smoke tests for the IncidentAppConfig.
 
-P1-E moves the incident-flavored knobs (similarity threshold, intervention
+The incident-flavored knobs (similarity threshold, intervention
 confidence threshold, escalation roster, environments, severity aliases)
-out of ``runtime.config.AppConfig`` into ``examples.incident_management.config``.
-These tests pin the new surface.
+live on ``examples.incident_management.config`` rather than
+``runtime.config.AppConfig``. These tests pin that surface.
 """
 from __future__ import annotations
 

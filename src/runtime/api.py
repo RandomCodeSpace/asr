@@ -11,11 +11,10 @@ The shutdown hook calls ``service.shutdown()`` which cancels in-flight
 session tasks, closes MCP clients, joins the background loop thread, and
 resets the process-singleton.
 
-Phase 3 layers:
-  - P3-H: ``POST /sessions``, ``GET /sessions``, ``DELETE /sessions/{id}``
-    delegate to ``OrchestratorService``. The legacy ``POST /investigate``
-    is preserved as a deprecated alias and now delegates to the same
-    long-lived service so old clients keep working.
+``POST /sessions``, ``GET /sessions``, ``DELETE /sessions/{id}`` delegate
+to ``OrchestratorService``. The legacy ``POST /investigate`` is preserved
+as a deprecated alias and delegates to the same long-lived service so
+old clients keep working.
 
 The module-level ``get_app()`` is a no-arg factory suitable for
 ``uvicorn --factory``: it reads ``ASR_CONFIG`` (default
@@ -79,7 +78,7 @@ class ResumeRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# P3-H: multi-session schemas
+# Multi-session schemas
 # ---------------------------------------------------------------------------
 
 
@@ -106,7 +105,7 @@ class SessionStatus(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# P4-G: HITL approval schemas (risk-rated tool gateway)
+# HITL approval schemas (risk-rated tool gateway)
 # ---------------------------------------------------------------------------
 
 
@@ -139,10 +138,10 @@ def _make_lifespan(cfg: AppConfig):
     Constructs the :class:`runtime.service.OrchestratorService` singleton,
     starts its background loop, eagerly builds the underlying
     :class:`runtime.orchestrator.Orchestrator` (so legacy routes that
-    expect ``app.state.orchestrator`` keep working), and (P5-B) builds
-    the :class:`runtime.triggers.TriggerRegistry` from
-    ``cfg.triggers``. The webhook router is mounted on the FastAPI app
-    here; APScheduler is started by the schedule transport's ``start``.
+    expect ``app.state.orchestrator`` keep working), and builds the
+    :class:`runtime.triggers.TriggerRegistry` from ``cfg.triggers``. The
+    webhook router is mounted on the FastAPI app here; APScheduler is
+    started by the schedule transport's ``start``.
 
     On shutdown, the registry's ``stop_all`` runs first (drains
     APScheduler), then ``service.shutdown()`` tears the orchestrator down.
@@ -175,7 +174,7 @@ def _make_lifespan(cfg: AppConfig):
         )
 
         # ------------------------------------------------------------
-        # P5-B: build & start the trigger registry
+        # Build & start the trigger registry
         # ------------------------------------------------------------
         plugin_transports = getattr(app.state, "plugin_transports", None)
 
@@ -273,7 +272,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     async def investigate(req: InvestigateRequest, request: Request) -> InvestigateResponse:
         """Legacy alias for ``POST /sessions`` — kept for back-compat.
 
-        .. deprecated:: P3-H
+        .. deprecated::
             Prefer ``POST /sessions``. This route now delegates to
             :meth:`OrchestratorService.start_session` so old clients keep
             working with the long-lived service backing.
@@ -292,8 +291,8 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 },
             )
         except Exception as e:  # noqa: BLE001
-            # P3-G's ``SessionCapExceeded`` may not be importable yet at
-            # code-load time. Class-name match avoids the hard import.
+            # ``SessionCapExceeded`` is matched by class name to avoid a
+            # hard import dependency at module-load time.
             if e.__class__.__name__ == "SessionCapExceeded":
                 raise HTTPException(status_code=429, detail=str(e)) from e
             raise
@@ -333,7 +332,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
         return StreamingResponse(_events(), media_type="text/event-stream")
 
     # ------------------------------------------------------------------
-    # P3-H: multi-session endpoints
+    # Multi-session endpoints
     # ------------------------------------------------------------------
 
     @fastapi_app.post(
@@ -347,9 +346,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         """Start a new long-running session. Returns ``201 {session_id}``.
 
         Returns ``429`` if the configured concurrent-session cap is hit
-        (raised by ``OrchestratorService.start_session`` once P3-F+G
-        lands). The exception class is matched by name so this handler
-        does not depend on the in-flight P3-F+G import surface.
+        (raised by ``OrchestratorService.start_session``). The exception
+        class is matched by name so this handler does not depend on a
+        hard import.
         """
         svc = request.app.state.service
         try:
@@ -371,7 +370,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
         return [SessionStatus(**row) for row in svc.list_active_sessions()]
 
     # ------------------------------------------------------------------
-    # P4-G: HITL approval endpoints (risk-rated tool gateway)
+    # HITL approval endpoints (risk-rated tool gateway)
     # ------------------------------------------------------------------
 
     @fastapi_app.get(
@@ -432,9 +431,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         """Resolve a pending tool approval by resuming the paused graph.
 
         Resumes via ``Command(resume={decision, approver, rationale})``
-        against the session's thread_id. The wrap_tool closure (P4-C)
-        reads the resume value and either runs the tool (``approve``)
-        or short-circuits with ``status="rejected"`` (``reject``).
+        against the session's thread_id. The wrap_tool closure reads the
+        resume value and either runs the tool (``approve``) or short-
+        circuits with ``status="rejected"`` (``reject``).
         """
         svc = request.app.state.service
         orch = request.app.state.orchestrator
@@ -482,23 +481,21 @@ def build_app(cfg: AppConfig) -> FastAPI:
     ) -> Response:
         """Cancel an in-flight session and evict its registry entry.
 
-        ``stop_session`` is added by parallel task P3-F. If it has not
-        landed yet, return ``501 Not Implemented`` with a clear message
-        rather than crashing — keeps tests deterministic during the
-        rolling merge.
+        Returns ``501 Not Implemented`` when the service does not expose
+        ``stop_session`` rather than crashing.
         """
         svc = request.app.state.service
         if not hasattr(svc, "stop_session"):
             raise HTTPException(
                 status_code=501,
-                detail="stop_session not available; P3-F pending",
+                detail="stop_session not available",
             )
         try:
             svc.stop_session(session_id)
         except Exception as e:  # noqa: BLE001
-            # Translate a "session not found" condition into 404 if the
-            # parallel agent's stop_session uses a recognisable
-            # exception. Otherwise re-raise.
+            # Translate a "session not found" condition into 404 when
+            # the underlying error class is recognisable. Otherwise
+            # re-raise.
             name = e.__class__.__name__
             if name in {"KeyError", "SessionNotFound"}:
                 raise HTTPException(status_code=404, detail=str(e)) from e

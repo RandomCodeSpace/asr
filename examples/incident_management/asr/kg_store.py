@@ -1,4 +1,4 @@
-"""L2 Knowledge Graph — filesystem backend (Phase 9 — 9b-FS).
+"""L2 Knowledge Graph — filesystem backend.
 
 Read-only thin class over two JSON files on disk:
 

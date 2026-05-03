@@ -32,8 +32,8 @@ def test_supervisor_skill_with_explicit_runner_keeps_it() -> None:
 
 
 def test_responsive_skill_runner_field_still_forbidden() -> None:
-    """The runner field is supervisor-only (P9-9h). Responsive skills
-    must not default — they must reject the field outright."""
+    """The runner field is supervisor-only. Responsive skills must not
+    default — they must reject the field outright."""
     with pytest.raises(Exception):
         Skill.model_validate({
             "name": "broken",

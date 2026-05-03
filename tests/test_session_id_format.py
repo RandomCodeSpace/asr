@@ -1,4 +1,4 @@
-"""P8-C: ``Session.id_format()`` classmethod hook.
+"""``Session.id_format()`` classmethod hook.
 
 Each app's state subclass mints its own session id format so the
 framework's ``SessionStore._next_id`` is no longer hard-coded to the

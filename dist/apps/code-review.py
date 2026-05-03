@@ -145,7 +145,7 @@ Sync engine for SQLite (dev) or Postgres (prod). No vector-extension
 loading — vectors live in a separate LangChain VectorStore (see
 :mod:`orchestrator.storage.vector`, landed in M3).
 
-P2-FIX: when the metadata store and the LangGraph ``AsyncSqliteSaver``
+When the metadata store and the LangGraph ``AsyncSqliteSaver``
 checkpointer share a SQLite file, two writers contend on the same DB.
 SQLite's default ``BEGIN DEFERRED`` transaction acquires SHARED on the
 first read and only escalates to RESERVED on the first write — and the
@@ -216,8 +216,8 @@ Like ``SessionStore``, ``HistoryStore`` is parametrised on ``StateT`` so
 that find_similar / load surface the configured app state class rather
 than the framework default.
 
-P2-E: ``find_similar`` accepts an arbitrary ``filter_kwargs`` mapping —
-keys must correspond to ``IncidentRow`` columns. This decouples the
+``find_similar`` accepts an arbitrary ``filter_kwargs`` mapping — keys
+must correspond to ``IncidentRow`` columns. This decouples the
 framework from incident-specific filter dimensions: apps with a
 ``severity``-only schema, or a multi-tenant ``tenant_id`` schema, or
 anything else, build their filter on the fly.
@@ -244,13 +244,12 @@ vector write-through (``_persist_vector``, ``_add_vector``,
 ``_refresh_vector``) and the row<->model converters shared with
 ``HistoryStore``.
 
-P2-C parametrises the class as ``Generic[StateT]`` and routes row
-hydration through ``self._state_cls(...)`` so apps can plug in their own
-``Session`` subclass via ``RuntimeConfig.state_class``. P2-J collapses
-the legacy ``runtime.incident.Incident`` model into ``runtime.state.Session``
-+ app-specific subclasses; the row schema remains incident-shaped, but
-unused fields are dropped via Pydantic's default ``extra='ignore'``
-when a narrower ``state_cls`` is supplied.
+The class is parametrised as ``Generic[StateT]`` and routes row
+hydration through ``self._state_cls(...)`` so apps can plug in their
+own ``Session`` subclass via ``RuntimeConfig.state_class``. The row
+schema remains incident-shaped, but unused fields are dropped via
+Pydantic's default ``extra='ignore'`` when a narrower ``state_cls`` is
+supplied.
 """
 
 import json
@@ -262,11 +261,11 @@ from sqlalchemy.orm import Session as SqlSession
 
 
 
-# P8-C: the legacy ``INC-YYYYMMDD-NNN`` pattern stays here for
-# back-compat validation against on-disk rows minted before the
-# ``Session.id_format`` hook landed. New rows are validated by
-# ``_SESSION_ID_RE`` which accepts any ``PREFIX-YYYYMMDD-NNN`` shape
-# the app's ``id_format`` may emit (e.g. ``CR-...`` for code-review).
+# The legacy ``INC-YYYYMMDD-NNN`` pattern stays here for back-compat
+# validation against on-disk rows minted before the ``Session.id_format``
+# hook existed. New rows are validated by ``_SESSION_ID_RE`` which
+# accepts any ``PREFIX-YYYYMMDD-NNN`` shape the app's ``id_format`` may
+# emit (e.g. ``CR-...`` for code-review).
 # ----- imports for runtime/mcp_servers/observability.py -----
 """FastMCP server: observability mock tools."""
 
@@ -328,7 +327,7 @@ from langgraph.graph import StateGraph, END
 
 
 # ----- imports for runtime/checkpointer_postgres.py -----
-"""Postgres checkpointer wrapper (P2-G).
+"""Postgres checkpointer wrapper.
 
 Loaded only when ``cfg.storage.metadata.url`` resolves to a Postgres
 URL. Uses a *separate* :class:`psycopg_pool.AsyncConnectionPool` (not
@@ -356,9 +355,9 @@ connection pool is created so the two paths never deadlock:
 - SQLite: dedicated ``aiosqlite.Connection`` with ``PRAGMA journal_mode=WAL``
   so the SQLAlchemy session pool and the checkpoint saver can both write
   to the same on-disk file without blocking each other.
-- Postgres: a separate ``psycopg_pool.AsyncConnectionPool`` (filled in
-  P2-G) rather than reusing SQLAlchemy's pool, so checkpointer writes
-  don't contend with metadata writes on the same connection.
+- Postgres: a separate ``psycopg_pool.AsyncConnectionPool`` rather than
+  reusing SQLAlchemy's pool, so checkpointer writes don't contend with
+  metadata writes on the same connection.
 
 The factory is async because the orchestrator drives the graph through
 async ``ainvoke`` / ``astream_events`` — and LangGraph's async Pregel
@@ -543,7 +542,7 @@ itself; this transport never sees it.
 
 Drift / accuracy: APScheduler in-process is good for ±1 minute under
 normal load. Tighter SLOs need an external scheduler (Celery beat,
-k8s CronJob) — out of scope for Phase 5.
+k8s CronJob) — not supported here.
 """
 
 
@@ -718,11 +717,10 @@ The shutdown hook calls ``service.shutdown()`` which cancels in-flight
 session tasks, closes MCP clients, joins the background loop thread, and
 resets the process-singleton.
 
-Phase 3 layers:
-  - P3-H: ``POST /sessions``, ``GET /sessions``, ``DELETE /sessions/{id}``
-    delegate to ``OrchestratorService``. The legacy ``POST /investigate``
-    is preserved as a deprecated alias and now delegates to the same
-    long-lived service so old clients keep working.
+``POST /sessions``, ``GET /sessions``, ``DELETE /sessions/{id}`` delegate
+to ``OrchestratorService``. The legacy ``POST /investigate`` is preserved
+as a deprecated alias and delegates to the same long-lived service so
+old clients keep working.
 
 The module-level ``get_app()`` is a no-arg factory suitable for
 ``uvicorn --factory``: it reads ``ASR_CONFIG`` (default
@@ -738,7 +736,7 @@ from fastapi.responses import StreamingResponse
 
 
 # ----- imports for runtime/api_dedup.py -----
-"""Dedup retraction HTTP routes (P7-H).
+"""Dedup retraction HTTP routes.
 
 Exposes ``register_dedup_routes(app, *, store_provider)`` — a side-car
 router so we don't need to inline these routes in ``runtime.api``. The
@@ -949,7 +947,7 @@ RiskLevel = Literal["low", "medium", "high"]
 
 
 class ProdOverrides(BaseModel):
-    """Per-environment HITL tightening rules for the gateway (P4-E).
+    """Per-environment HITL tightening rules for the gateway.
 
     When the live ``Session.environment`` is in ``prod_environments`` AND
     the tool name matches one of the globs in ``resolution_trigger_tools``,
@@ -967,7 +965,7 @@ class ProdOverrides(BaseModel):
 
 
 class GatewayConfig(BaseModel):
-    """Risk-rated tool gateway configuration (P4-A).
+    """Risk-rated tool gateway configuration.
 
     ``policy`` maps a tool name to a declared risk level. The level drives
     the hybrid HITL action:
@@ -987,8 +985,8 @@ class GatewayConfig(BaseModel):
     policy: dict[str, RiskLevel] = Field(default_factory=dict)
     notify_channel: str | None = None
     prod_overrides: ProdOverrides | None = None
-    # P4-I: pending-approval timeout (seconds). When a high-risk tool
-    # call enters ``interrupt()`` and the operator never returns, the
+    # Pending-approval timeout (seconds). When a high-risk tool call
+    # enters ``interrupt()`` and the operator never returns, the
     # session sits in ``awaiting_input`` indefinitely and counts against
     # ``OrchestratorService.max_concurrent_sessions`` — eventually
     # leaking the slot. The :class:`runtime.tools.approval_watchdog`
@@ -1030,16 +1028,15 @@ class RuntimeConfig(BaseModel):
     # Apps that don't expose environments leave this unset; the
     # endpoint then returns an empty list.
     environments_provider_path: str | None = None
-    # P3-G: hard cap on concurrent in-flight sessions a single
+    # Hard cap on concurrent in-flight sessions a single
     # ``OrchestratorService`` will run. ``start_session`` raises
     # ``SessionCapExceeded`` once the registry holds this many entries
     # — fail fast, do not queue. Tune per deployment; the default is
     # generous enough for an interactive desk while keeping a single
     # process from saturating MCP transports.
     max_concurrent_sessions: int = 8
-    # P4-A: optional risk-rated tool gateway. When ``None``, the gateway
-    # is bypassed entirely and tools execute as before — preserving
-    # Phase-3 behaviour for callers that have not opted in.
+    # Optional risk-rated tool gateway. When ``None``, the gateway is
+    # bypassed entirely and tools execute as before.
     gateway: GatewayConfig | None = None
 
 
@@ -1048,10 +1045,7 @@ class RuntimeConfig(BaseModel):
 # framework reads at runtime. Apps compose this inside their own
 # ``AppConfig`` (``IncidentAppConfig``, ``CodeReviewAppConfig``) and
 # expose a no-arg provider via ``RuntimeConfig.framework_app_config_path``.
-# This shape is the post-merge code-review's #1 architectural fix —
-# it kills the four ``examples.incident_management.config`` imports
-# that used to leak out of ``runtime/`` and bake one app's defaults
-# into every app's graph.
+# Keeps app-specific config modules out of ``runtime/`` imports.
 # ---------------------------------------------------------------------------
 
 
@@ -1122,12 +1116,12 @@ class AppConfig(BaseModel):
     paths: Paths = Field(default_factory=Paths)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
-    # P5-A: declarative trigger registry. Each entry is one
-    # transport-flavoured ``TriggerConfig`` (api/webhook/schedule/plugin).
-    # Typed as ``list[Any]`` because Pydantic v2's discriminated-union
-    # binding pulls in the trigger module at import time, which would
-    # introduce a circular import. The ``_coerce_triggers`` validator
-    # below promotes raw dicts to the proper TriggerConfig variants.
+    # Declarative trigger registry. Each entry is one transport-flavoured
+    # ``TriggerConfig`` (api/webhook/schedule/plugin). Typed as
+    # ``list[Any]`` because Pydantic v2's discriminated-union binding
+    # pulls in the trigger module at import time, which would introduce
+    # a circular import. The ``_coerce_triggers`` validator below
+    # promotes raw dicts to the proper TriggerConfig variants.
     triggers: list[Any] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -1199,7 +1193,7 @@ def load_config(path: str | Path) -> AppConfig:
 _UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-# P4-D: per-call audit metadata for the risk-rated tool gateway.
+# Per-call audit metadata for the risk-rated tool gateway.
 ToolRisk = Literal["low", "medium", "high"]
 ToolStatus = Literal[
     "executed",                 # auto / legacy default
@@ -1217,10 +1211,10 @@ class ToolCall(BaseModel):
     args: dict
     result: dict | str | list | int | float | bool | None
     ts: str
-    # P4-D: audit fields for the risk-rated gateway. All optional and
+    # Audit fields for the risk-rated gateway. All optional and
     # default-permissive so legacy rows in the JSON column hydrate with
     # ``status="executed"`` and the rest of the fields ``None`` —
-    # preserving back-compat with Phase-1 / Phase-3 incidents.
+    # preserving back-compat with older sessions.
     risk: ToolRisk | None = None
     status: ToolStatus = "executed"
     approver: str | None = None
@@ -1263,12 +1257,12 @@ class Session(BaseModel):
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
-    # P7-A: dedup linkage. NULL by default; set when this session is
+    # Dedup linkage. NULL by default; set when this session is
     # confirmed as a duplicate of a prior closed session. The value is
     # the prior session's id; the link is non-destructive — both
     # sessions remain queryable. See ``runtime.dedup``.
     parent_session_id: str | None = None
-    # P7-E: stage-2 LLM rationale for the dedup decision. Stored on the
+    # Stage-2 LLM rationale for the dedup decision. Stored on the
     # session row so the UI can render "why was this marked duplicate?"
     # without needing a separate join.
     dedup_rationale: str | None = None
@@ -1305,7 +1299,7 @@ class Session(BaseModel):
         return base
 
     # ------------------------------------------------------------------
-    # P8-C: app-overridable session id minting hook.
+    # App-overridable session id minting hook.
     # ------------------------------------------------------------------
     @classmethod
     def id_format(cls, *, seq: int) -> str:
@@ -1602,19 +1596,19 @@ class Skill(BaseModel):
     dispatch_prompt: str | None = None
     dispatch_rules: list[DispatchRule] = Field(default_factory=list)
     max_dispatch_depth: int = 3
-    # P9-9h: optional dotted-path extension hook for app-specific
-    # supervisor logic (e.g. memory-layer hydration, single-active-
-    # investigation gates). The runner is invoked BEFORE the dispatch
-    # table and may either mutate state or short-circuit to ``__end__``.
-    # Resolved at skill-load time so misconfigured YAML fails fast.
+    # Optional dotted-path extension hook for app-specific supervisor
+    # logic (e.g. memory-layer hydration, single-active-investigation
+    # gates). The runner is invoked BEFORE the dispatch table and may
+    # either mutate state or short-circuit to ``__end__``. Resolved at
+    # skill-load time so misconfigured YAML fails fast.
     runner: str | None = None
 
     # ----- monitor (out-of-band, scheduled) -----
     schedule: str | None = None             # cron expression
     observe: list[str] = Field(default_factory=list)  # tool names
     emit_signal_when: str | None = None     # safe-eval expression
-    trigger_target: str | None = None       # P5 trigger name
-    tick_timeout_seconds: float = 30.0      # per-tick timeout (R6)
+    trigger_target: str | None = None       # trigger registry name
+    tick_timeout_seconds: float = 30.0      # per-tick timeout
 
     @field_validator("tools")
     @classmethod
@@ -1648,7 +1642,7 @@ class Skill(BaseModel):
 
     @model_validator(mode="after")
     def _validate_kind_shape(self) -> "Skill":
-        """Per-kind field-shape validation (P6-B).
+        """Per-kind field-shape validation.
 
         Each kind has a strict allow-list of fields. Anything from
         another kind raises ValueError naming the offending field and
@@ -2049,21 +2043,20 @@ class IncidentRow(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # P7-A: dedup linkage. NULL by default; set when this session is
+    # Dedup linkage. NULL by default; set when this session is
     # confirmed as a duplicate of a prior closed session. Indexed so
     # ``list_children(parent)`` is fast.
     parent_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    # P7-E: stage-2 LLM rationale persisted on the row so the UI can
-    # surface "why was this flagged?" without a separate decisions
-    # table. Mirror of ``Session.dedup_rationale``.
+    # Stage-2 LLM rationale persisted on the row so the UI can surface
+    # "why was this flagged?" without a separate decisions table.
+    # Mirror of ``Session.dedup_rationale``.
     dedup_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # P8-J: bag for any state-class field that does not have a typed
-    # column above. ``SessionStore`` walks ``state_cls.model_fields``
-    # and routes unknown fields here on save; ``_row_to_session``
-    # merges them back into the model on load. Additive: legacy rows
-    # written before this column existed have ``NULL`` and round-trip
-    # cleanly.
+    # Bag for any state-class field that does not have a typed column
+    # above. ``SessionStore`` walks ``state_cls.model_fields`` and
+    # routes unknown fields here on save; ``_row_to_session`` merges
+    # them back into the model on load. Additive: legacy rows written
+    # before this column existed have ``NULL`` and round-trip cleanly.
     extra_fields: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
@@ -2077,7 +2070,7 @@ class IncidentRow(Base):
     )
 
 
-# P7-H: append-only audit log of dedup retractions. No FK to ``incidents``
+# Append-only audit log of dedup retractions. No FK to ``incidents``
 # so retraction history survives session deletion. Indexed on
 # ``session_id`` for the parent detail pane lookup.
 class DedupRetractionRow(Base):
@@ -2349,7 +2342,7 @@ class HistoryStore(Generic[StateT]):
         self.distance_strategy = distance_strategy
         # Private converter helper. We never call its mutating methods.
         # ``state_cls=None`` lets SessionStore pick its own default
-        # (``runtime.state.Session`` post-P2-J).
+        # (``runtime.state.Session``).
         ss_kwargs: dict[str, Any] = {
             "engine": engine, "embedder": None, "vector_store": None,
             "distance_strategy": distance_strategy,
@@ -2589,9 +2582,9 @@ class SessionStore(Generic[StateT]):
     def _next_id(self, session: SqlSession) -> str:
         """Mint a new session id via ``state_cls.id_format(seq=...)``.
 
-        P8-C: the per-app id format lives on the ``Session`` subclass so
-        each app picks its own prefix (``INC-`` for incidents, ``CR-``
-        for code-review, anything else custom apps want). The store still
+        The per-app id format lives on the ``Session`` subclass so each
+        app picks its own prefix (``INC-`` for incidents, ``CR-`` for
+        code-review, anything else custom apps want). The store still
         owns the monotonic sequence — it scans for prior rows whose id
         starts with the same ``PREFIX-YYYYMMDD-`` stem and returns
         ``max(seq) + 1``.
@@ -2712,10 +2705,10 @@ class SessionStore(Generic[StateT]):
                     include_duplicates: bool = False) -> list[StateT]:
         """Most-recent sessions first.
 
-        P7-G: ``include_duplicates`` defaults to ``False`` so the main
-        UI list stays clean of the long tail of dedup'd sessions. The UI
-        opts in via ``include_duplicates=True`` to render the
-        collapsed-duplicates row.
+        ``include_duplicates`` defaults to ``False`` so the main UI list
+        stays clean of the long tail of dedup'd sessions. The UI opts in
+        via ``include_duplicates=True`` to render the collapsed-
+        duplicates row.
         """
         with SqlSession(self.engine) as session:
             stmt = select(IncidentRow)
@@ -2732,7 +2725,7 @@ class SessionStore(Generic[StateT]):
     def list_children(self, parent_session_id: str) -> list[StateT]:
         """Return all sessions whose ``parent_session_id`` equals the given id.
 
-        P7-G: powers the parent-session detail pane "children" section.
+        Powers the parent-session detail pane "children" section.
         Soft-deleted children are excluded; ordering is oldest-first so
         the UI shows them in the order they were flagged.
         """
@@ -2749,7 +2742,7 @@ class SessionStore(Generic[StateT]):
     def un_duplicate(self, session_id: str, *,
                      retracted_by: str | None = None,
                      note: str | None = None) -> StateT:
-        """Retract a duplicate flag (P7-H).
+        """Retract a duplicate flag.
 
         Behaviour (one transaction):
           * Loads the row; raises ``FileNotFoundError`` if missing.
@@ -2842,7 +2835,7 @@ class SessionStore(Generic[StateT]):
 
     # ---------- mapping helpers ----------
     #
-    # P8-J: round-trip is driven by ``state_cls.model_fields`` so any
+    # Round-trip is driven by ``state_cls.model_fields`` so any
     # ``Session`` subclass — incident-shaped, code-review-shaped, or
     # whatever a future app brings — round-trips losslessly. The
     # ``IncidentRow`` schema keeps its incident-shaped typed columns
@@ -2927,7 +2920,7 @@ class SessionStore(Generic[StateT]):
         if "resolution" in model_fields:
             kwargs["resolution"] = _deserialize_resolution(row.resolution)
 
-        # P8-J: merge in any non-typed-column fields from ``extra_fields``.
+        # Merge in any non-typed-column fields from ``extra_fields``.
         # Pydantic's ``extra='ignore'`` will drop any keys the state
         # class doesn't declare (e.g. legacy fields written by an older
         # binary), keeping the round-trip robust.
@@ -3013,12 +3006,12 @@ class SessionStore(Generic[StateT]):
             "input_tokens": inc.token_usage.input_tokens,
             "output_tokens": inc.token_usage.output_tokens,
             "total_tokens": inc.token_usage.total_tokens,
-            # P7-A/E: dedup linkage + rationale columns. ``getattr`` so
-            # bare ``Session`` instances (without the framework's P7
-            # fields) round-trip with NULL.
+            # Dedup linkage + rationale columns. ``getattr`` so bare
+            # ``Session`` instances (without the dedup fields) round-
+            # trip with NULL.
             "parent_session_id": getattr(inc, "parent_session_id", None),
             "dedup_rationale": getattr(inc, "dedup_rationale", None),
-            # P8-J: everything not covered by a typed column.
+            # Everything not covered by a typed column.
             "extra_fields": extra or None,
         }
 
@@ -3254,7 +3247,7 @@ def build_fastmcp_client(server_cfg: MCPServerConfig):
     Returned client is not yet attached to any exit stack — the caller is
     responsible for ``await stack.enter_async_context(client)``. Used by
     :class:`runtime.service.OrchestratorService` to populate the
-    process-singleton MCP client pool (P3-C); the legacy per-orchestrator
+    process-singleton MCP client pool; the legacy per-orchestrator
     loaders below stay as-is.
     """
     from fastmcp import Client
@@ -3455,11 +3448,11 @@ class GraphState(TypedDict, total=False):
     next_route: str | None
     last_agent: str | None
     gated_target: str | None  # set by gate node; the downstream target if gate passes
-    # P6-D: depth counter for supervisor recursion (R1). The supervisor
-    # node bumps it on entry and aborts at ``skill.max_dispatch_depth``.
-    # Carrying it on graph state — rather than stashing it on the
-    # session — keeps audit fields off the session and the depth check
-    # cheap (no store reload).
+    # Depth counter for supervisor recursion. The supervisor node bumps
+    # it on entry and aborts at ``skill.max_dispatch_depth``. Carrying
+    # it on graph state — rather than stashing it on the session —
+    # keeps audit fields off the session and the depth check cheap
+    # (no store reload).
     dispatch_depth: int | None
     error: str | None
 
@@ -3721,12 +3714,11 @@ def make_agent_node(
     ``{success, failed, needs_input}`` default is used so older callers and
     tests keep working.
 
-    ``gateway_cfg`` (P4-F) is the optional risk-rated tool gateway config.
+    ``gateway_cfg`` is the optional risk-rated tool gateway config.
     When supplied, every ``BaseTool`` in ``tools`` is wrapped via
-    :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so the
-    closure captures the live ``Session`` per agent invocation — the
-    R2 mitigation in the Phase-4 plan. When ``None``, tools are passed
-    through untouched (back-compat).
+    :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so
+    the closure captures the live ``Session`` per agent invocation.
+    When ``None``, tools are passed through untouched.
     """
 
     async def node(state: GraphState) -> dict:
@@ -3734,11 +3726,10 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
-        # P4-F: wrap tools per-invocation so each wrap closes over the
-        # live ``Session`` for this run (mitigation R2 in the Phase-4
-        # plan). When the gateway is unconfigured, the original tools
-        # pass through untouched and ``create_react_agent`` sees the
-        # exact same surface as pre-Phase-4.
+        # Wrap tools per-invocation so each wrap closes over the live
+        # ``Session`` for this run. When the gateway is unconfigured,
+        # the original tools pass through untouched and
+        # ``create_react_agent`` sees the same surface as before.
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
@@ -3973,7 +3964,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
                        registry: ToolRegistry) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
 
-    P6-C: dispatches on ``skill.kind``:
+    Dispatches on ``skill.kind``:
 
     * ``responsive`` — builds a ReAct LLM node via :func:`make_agent_node`
       (today's path).
@@ -4091,8 +4082,8 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
     so the underlying FastMCP transports stay alive for the lifetime of the
     compiled graph.
 
-    ``checkpointer`` (P2-F/G) is an optional :class:`BaseCheckpointSaver`
-    that LangGraph uses for durable per-thread state. When ``None``, the
+    ``checkpointer`` is an optional :class:`BaseCheckpointSaver` that
+    LangGraph uses for durable per-thread state. When ``None``, the
     graph compiles without one (back-compat for the few callers that
     build a graph outside the orchestrator, e.g. unit tests).
 
@@ -4245,7 +4236,7 @@ async def make_checkpointer(
     Branches on the URL scheme:
 
     - ``sqlite:`` -> :class:`langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver`
-    - ``postgresql:`` / ``postgres:`` -> Postgres path (P2-G)
+    - ``postgresql:`` / ``postgres:`` -> Postgres path
 
     Returns ``(saver, cleanup)``. ``cleanup`` is an async callable that
     closes the dedicated connection / pool; the caller is expected to
@@ -4297,8 +4288,8 @@ async def make_checkpointer(
         return saver, conn.close
 
     if url.startswith("postgresql:") or url.startswith("postgres:"):
-        # Filled in P2-G. Imported lazily so SQLite-only deploys don't
-        # need psycopg_pool installed.
+        # Imported lazily so SQLite-only deploys don't need psycopg_pool
+        # installed.
 
 
         return await make_postgres_checkpointer(url)
@@ -4756,7 +4747,7 @@ class APITransport(TriggerTransport):
     """No-op transport that holds the ``api`` configs.
 
     Future: when the legacy ``POST /investigate`` route is removed, this
-    class can mount its own router. For Phase 5 it exists as a marker.
+    class can mount its own router. Today it exists as a marker.
     """
 
     def __init__(self, configs: list[APITriggerConfig]) -> None:
@@ -5235,7 +5226,7 @@ StateT = TypeVar("StateT", bound=BaseModel)
 
 
 # ---------------------------------------------------------------------------
-# Config (P7-C)
+# Config
 # ---------------------------------------------------------------------------
 
 
@@ -5247,7 +5238,7 @@ class DedupScope(BaseModel):
 
 
 class DedupConfig(BaseModel):
-    """Configuration for the two-stage dedup pipeline (P7-C).
+    """Configuration for the two-stage dedup pipeline.
 
     All numeric thresholds are inclusive at the lower bound (``>=``),
     so a candidate hitting exactly ``stage1_threshold`` is considered.
@@ -5294,7 +5285,7 @@ class DedupConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Decision schema (P7-E)
+# Decision schema
 # ---------------------------------------------------------------------------
 
 
@@ -5337,7 +5328,7 @@ class _Stage2Outcome(enum.Enum):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 prompt (P7-E)
+# Stage 2 prompt
 # ---------------------------------------------------------------------------
 
 
@@ -5374,9 +5365,9 @@ def _parse_decision_tagged(
     """Parse the LLM's text into a ``DedupDecision`` with a failure tag.
 
     Returns ``(decision, None)`` on success, ``(None, exc)`` on any
-    parse / validation failure (P7-E: "treat as not-duplicate, do not
-    retry — budget protection"). Empty input is also a parse failure
-    so the pipeline can surface model-stopped-responding as a signal.
+    parse / validation failure ("treat as not-duplicate, do not retry —
+    budget protection"). Empty input is also a parse failure so the
+    pipeline can surface model-stopped-responding as a signal.
 
     Emits a structured ``warning`` log on any failure with fields a
     log aggregator can pick up via the LogRecord ``extra`` namespace:
@@ -5442,7 +5433,7 @@ def _parse_decision(raw: str) -> DedupDecision | None:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline (P7-D)
+# Pipeline
 # ---------------------------------------------------------------------------
 
 
@@ -5959,30 +5950,30 @@ class Orchestrator(Generic[StateT]):
                  dedup_pipeline: "DedupPipeline | None" = None):
         self.cfg = cfg
         self.store = store
-        # P7-F: optional two-stage dedup pipeline. Built in ``create``
-        # only when the resolved DedupConfig has ``enabled=True``;
-        # otherwise ``None`` so the lifecycle hook is a no-op.
+        # Optional two-stage dedup pipeline. Built in ``create`` only
+        # when the resolved DedupConfig has ``enabled=True``; otherwise
+        # ``None`` so the lifecycle hook is a no-op.
         self.dedup_pipeline = dedup_pipeline
-        # P2-J: split the legacy ``IncidentRepository`` facade into the
-        # active ``SessionStore`` (CRUD) plus a separate read-only
-        # ``HistoryStore`` (similarity search). Both share the same
-        # engine and vector store; ``history`` is optional for callers
-        # that don't need similarity lookups.
+        # The active ``SessionStore`` (CRUD) plus a separate read-only
+        # ``HistoryStore`` (similarity search) share the same engine and
+        # vector store; ``history`` is optional for callers that don't
+        # need similarity lookups.
         self.history = history
         self.skills = skills
         self.registry = registry
-        # P2-I: a single compiled graph drives both fresh runs and
-        # resume-from-interrupt. Resumes go through ``ainvoke`` /
+        # A single compiled graph drives both fresh runs and resume-
+        # from-interrupt. Resumes go through ``ainvoke`` /
         # ``astream_events`` with ``Command(resume=...)`` against the
         # same ``thread_id`` — the checkpointer rehydrates the paused
-        # state. The bespoke resume sub-graph is gone.
+        # state.
         self.graph = graph
         self._exit_stack = exit_stack
         self.state_cls = state_cls
-        # P2-F/G: durable LangGraph checkpointer keyed off the same metadata
-        # URL as the relational store. ``checkpointer`` is the saver; the
-        # ``checkpointer_close`` callable is invoked from ``aclose`` so the
-        # underlying connection / pool is released on orchestrator shutdown.
+        # Durable LangGraph checkpointer keyed off the same metadata URL
+        # as the relational store. ``checkpointer`` is the saver; the
+        # ``checkpointer_close`` callable is invoked from ``aclose`` so
+        # the underlying connection / pool is released on orchestrator
+        # shutdown.
         self.checkpointer = checkpointer
         self._checkpointer_close = checkpointer_close
         # Cross-cutting domain-flavored knobs (confidence threshold,
@@ -6010,8 +6001,8 @@ class Orchestrator(Generic[StateT]):
             resolved_state_cls: Type[BaseModel] = resolve_state_class(
                 cfg.runtime.state_class
             )
-            # P2-FIX: SQLite concurrency PRAGMAs (WAL, busy_timeout,
-            # synchronous=NORMAL) and ``BEGIN IMMEDIATE`` are now installed
+            # SQLite concurrency PRAGMAs (WAL, busy_timeout,
+            # synchronous=NORMAL) and ``BEGIN IMMEDIATE`` are installed
             # inside ``build_engine`` so any caller (orchestrator, tests,
             # ad-hoc scripts) gets a saver-friendly engine without
             # duplicating the connect-event hook.
@@ -6023,10 +6014,10 @@ class Orchestrator(Generic[StateT]):
             Base.metadata.create_all(engine)
             embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
             vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
-            # P2-J: build SessionStore (CRUD) and HistoryStore (similarity)
-            # directly. The legacy ``IncidentRepository`` facade is gone.
-            # ``state_class`` is resolved via the runtime resolver; when an
-            # app doesn't set it the bare ``Session`` is used.
+            # Build SessionStore (CRUD) and HistoryStore (similarity)
+            # directly. ``state_class`` is resolved via the runtime
+            # resolver; when an app doesn't set it the bare ``Session``
+            # is used.
             repo_state_cls: Type[BaseModel] = resolved_state_cls
             store = SessionStore(
                 engine=engine,
@@ -6106,13 +6097,13 @@ class Orchestrator(Generic[StateT]):
                                       registry=registry,
                                       checkpointer=checkpointer,
                                       framework_cfg=framework_cfg)
-            # P7-F: build the dedup pipeline iff the app has opted in
-            # AND the configured stage 2 model resolves in the LLM
-            # registry. When the registry doesn't include the configured
-            # model (e.g. CI uses ``LLMConfig.stub()``), dedup is
-            # silently treated as off so unrelated tests don't need to
-            # know about Phase 7. Production deployments with a real
-            # registry hit the strict validation path.
+            # Build the dedup pipeline iff the app has opted in AND the
+            # configured stage 2 model resolves in the LLM registry.
+            # When the registry doesn't include the configured model
+            # (e.g. CI uses ``LLMConfig.stub()``), dedup is silently
+            # treated as off so unrelated tests don't need to know
+            # about it. Production deployments with a real registry hit
+            # the strict validation path.
             #
             # The DedupConfig comes through a generic provider hook
             # (``RuntimeConfig.dedup_config_path``) — the runtime never
@@ -6142,9 +6133,9 @@ class Orchestrator(Generic[StateT]):
             # because the pipeline is built after graph construction.
             if dedup_pipeline is not None:
                 framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
-            # P2-I: no resume graph anymore — resume runs through the
-            # main graph via ``Command(resume=...)`` against the same
-            # thread_id, with the checkpointer rehydrates paused state.
+            # No bespoke resume graph — resume runs through the main
+            # graph via ``Command(resume=...)`` against the same
+            # thread_id, with the checkpointer rehydrating paused state.
             return cls(cfg, store, skills, registry, graph,
                        stack, framework_cfg=framework_cfg,
                        state_cls=repo_state_cls,
@@ -6236,7 +6227,7 @@ class Orchestrator(Generic[StateT]):
         return self.store.load(incident_id).model_dump()
 
     def get_incident(self, incident_id: str) -> dict:
-        """Deprecated alias for ``get_session`` — remove in Phase 2."""
+        """Deprecated alias for ``get_session``."""
         return self.get_session(incident_id)
 
     def list_recent_sessions(self, limit: int = 20) -> list[dict]:
@@ -6244,7 +6235,7 @@ class Orchestrator(Generic[StateT]):
         return [i.model_dump() for i in self.store.list_recent(limit)]
 
     def list_recent_incidents(self, limit: int = 20) -> list[dict]:
-        """Deprecated alias for ``list_recent_sessions`` — remove in Phase 2."""
+        """Deprecated alias for ``list_recent_sessions``."""
         return self.list_recent_sessions(limit)
 
     def delete_session(self, incident_id: str) -> dict:
@@ -6252,11 +6243,11 @@ class Orchestrator(Generic[StateT]):
         return self.store.delete(incident_id).model_dump()
 
     def delete_incident(self, incident_id: str) -> dict:
-        """Deprecated alias for ``delete_session`` — remove in Phase 2."""
+        """Deprecated alias for ``delete_session``."""
         return self.delete_session(incident_id)
 
     async def _run_dedup_check(self, inc) -> bool:
-        """Run the ``dedup_check`` lifecycle hook (P7-F).
+        """Run the ``dedup_check`` lifecycle hook.
 
         Returns ``True`` iff the session was confirmed as a duplicate
         and marked accordingly — callers should skip the agent graph in
@@ -6326,16 +6317,16 @@ class Orchestrator(Generic[StateT]):
         Passing both a generic kwarg and its legacy partner raises
         ``TypeError``.
 
-        ``trigger`` (P5-I) is the optional provenance record from
+        ``trigger`` is the optional provenance record from
         :mod:`runtime.triggers`. When supplied, ``name``/``transport``/
         ``target_app`` are written to ``inc.findings['trigger']`` for
         post-hoc audit; the orchestrator does not branch on its
         contents.
 
-        P7-F: if the dedup pipeline is configured and stage 2 confirms
-        a duplicate of a prior closed session, the new session is
-        marked ``status="duplicate"`` with ``parent_session_id`` set
-        and the agent graph is skipped entirely.
+        If the dedup pipeline is configured and stage 2 confirms a
+        duplicate of a prior closed session, the new session is marked
+        ``status="duplicate"`` with ``parent_session_id`` set and the
+        agent graph is skipped entirely.
         """
         state_overrides = _coerce_state_overrides(state_overrides, environment)
         submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
@@ -6352,7 +6343,7 @@ class Orchestrator(Generic[StateT]):
                 "received_at": trigger.received_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             self.store.save(inc)
-        # P7-F: dedup_check before the graph fires.
+        # dedup_check before the graph fires.
         if await self._run_dedup_check(inc):
             return inc.id
         await self.graph.ainvoke(
@@ -6365,7 +6356,7 @@ class Orchestrator(Generic[StateT]):
     async def start_investigation(self, *, query: str, environment: str,
                                   reporter_id: str = "user-mock",
                                   reporter_team: str = "platform") -> str:
-        """Deprecated alias for ``start_session`` — remove in Phase 2.
+        """Deprecated alias for ``start_session``.
 
         Coerces the legacy positional surface into the generic
         ``submitter`` + ``state_overrides`` kwargs so the runtime
@@ -6396,7 +6387,7 @@ class Orchestrator(Generic[StateT]):
         )
         yield {"event": "investigation_started", "incident_id": inc.id,
                "ts": _event_ts()}
-        # P7-F: dedup_check before the graph fires. Surface a one-shot
+        # dedup_check before the graph fires. Surface a one-shot
         # ``dedup_matched`` event so the UI can render the "marked
         # duplicate" banner without polling.
         if await self._run_dedup_check(inc):
@@ -6418,7 +6409,7 @@ class Orchestrator(Generic[StateT]):
                                    reporter_id: str = "user-mock",
                                    reporter_team: str = "platform"
                                    ) -> AsyncIterator[dict]:
-        """Deprecated alias for ``stream_session`` — remove in Phase 2.
+        """Deprecated alias for ``stream_session``.
 
         Forwards the legacy positional surface into ``stream_session``;
         the underlying flow already coerces the reporter pair into
@@ -6509,16 +6500,16 @@ class Orchestrator(Generic[StateT]):
 
     async def resume_investigation(self, incident_id: str,
                                    decision: dict) -> AsyncIterator[dict]:
-        """Deprecated alias for ``resume_session`` — remove in Phase 2."""
+        """Deprecated alias for ``resume_session``."""
         async for event in self.resume_session(incident_id, decision):
             yield event
 
     async def _resume_with_input(self, incident_id: str, inc, decision: dict):
-        """Handle the resume_with_input action via P2-I.
+        """Handle the resume_with_input action.
 
         Drives the *same* compiled graph with ``Command(resume=user_text)``
         against the paused thread_id. The checkpointer rehydrates the
-        suspended gate node; the gate body (P2-H) appends the input to
+        suspended gate node; the gate body appends the input to
         ``session.user_inputs``, clears ``pending_intervention``, and
         falls through to the gated downstream target. On failure the
         intervention payload is restored so the UI can reprompt.
@@ -6527,7 +6518,7 @@ class Orchestrator(Generic[StateT]):
         if not user_text:
             raise ValueError("resume_with_input requires a non-empty 'input'")
         # Snapshot the intervention payload BEFORE we hand off to the
-        # graph. The gate's post-resume continuation (P2-H) clears it on
+        # graph. The gate's post-resume continuation clears it on
         # the way out; if the downstream graph blows up we restore from
         # this snapshot so the UI can reprompt the user.
         saved_pi = inc.pending_intervention
@@ -6633,7 +6624,7 @@ class ResumeRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# P3-H: multi-session schemas
+# Multi-session schemas
 # ---------------------------------------------------------------------------
 
 
@@ -6660,7 +6651,7 @@ class SessionStatus(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# P4-G: HITL approval schemas (risk-rated tool gateway)
+# HITL approval schemas (risk-rated tool gateway)
 # ---------------------------------------------------------------------------
 
 
@@ -6693,10 +6684,10 @@ def _make_lifespan(cfg: AppConfig):
     Constructs the :class:`runtime.service.OrchestratorService` singleton,
     starts its background loop, eagerly builds the underlying
     :class:`runtime.orchestrator.Orchestrator` (so legacy routes that
-    expect ``app.state.orchestrator`` keep working), and (P5-B) builds
-    the :class:`runtime.triggers.TriggerRegistry` from
-    ``cfg.triggers``. The webhook router is mounted on the FastAPI app
-    here; APScheduler is started by the schedule transport's ``start``.
+    expect ``app.state.orchestrator`` keep working), and builds the
+    :class:`runtime.triggers.TriggerRegistry` from ``cfg.triggers``. The
+    webhook router is mounted on the FastAPI app here; APScheduler is
+    started by the schedule transport's ``start``.
 
     On shutdown, the registry's ``stop_all`` runs first (drains
     APScheduler), then ``service.shutdown()`` tears the orchestrator down.
@@ -6729,7 +6720,7 @@ def _make_lifespan(cfg: AppConfig):
         )
 
         # ------------------------------------------------------------
-        # P5-B: build & start the trigger registry
+        # Build & start the trigger registry
         # ------------------------------------------------------------
         plugin_transports = getattr(app.state, "plugin_transports", None)
 
@@ -6827,7 +6818,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     async def investigate(req: InvestigateRequest, request: Request) -> InvestigateResponse:
         """Legacy alias for ``POST /sessions`` — kept for back-compat.
 
-        .. deprecated:: P3-H
+        .. deprecated::
             Prefer ``POST /sessions``. This route now delegates to
             :meth:`OrchestratorService.start_session` so old clients keep
             working with the long-lived service backing.
@@ -6846,8 +6837,8 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 },
             )
         except Exception as e:  # noqa: BLE001
-            # P3-G's ``SessionCapExceeded`` may not be importable yet at
-            # code-load time. Class-name match avoids the hard import.
+            # ``SessionCapExceeded`` is matched by class name to avoid a
+            # hard import dependency at module-load time.
             if e.__class__.__name__ == "SessionCapExceeded":
                 raise HTTPException(status_code=429, detail=str(e)) from e
             raise
@@ -6887,7 +6878,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
         return StreamingResponse(_events(), media_type="text/event-stream")
 
     # ------------------------------------------------------------------
-    # P3-H: multi-session endpoints
+    # Multi-session endpoints
     # ------------------------------------------------------------------
 
     @fastapi_app.post(
@@ -6901,9 +6892,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         """Start a new long-running session. Returns ``201 {session_id}``.
 
         Returns ``429`` if the configured concurrent-session cap is hit
-        (raised by ``OrchestratorService.start_session`` once P3-F+G
-        lands). The exception class is matched by name so this handler
-        does not depend on the in-flight P3-F+G import surface.
+        (raised by ``OrchestratorService.start_session``). The exception
+        class is matched by name so this handler does not depend on a
+        hard import.
         """
         svc = request.app.state.service
         try:
@@ -6925,7 +6916,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
         return [SessionStatus(**row) for row in svc.list_active_sessions()]
 
     # ------------------------------------------------------------------
-    # P4-G: HITL approval endpoints (risk-rated tool gateway)
+    # HITL approval endpoints (risk-rated tool gateway)
     # ------------------------------------------------------------------
 
     @fastapi_app.get(
@@ -6986,9 +6977,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         """Resolve a pending tool approval by resuming the paused graph.
 
         Resumes via ``Command(resume={decision, approver, rationale})``
-        against the session's thread_id. The wrap_tool closure (P4-C)
-        reads the resume value and either runs the tool (``approve``)
-        or short-circuits with ``status="rejected"`` (``reject``).
+        against the session's thread_id. The wrap_tool closure reads the
+        resume value and either runs the tool (``approve``) or short-
+        circuits with ``status="rejected"`` (``reject``).
         """
         svc = request.app.state.service
         orch = request.app.state.orchestrator
@@ -7036,23 +7027,21 @@ def build_app(cfg: AppConfig) -> FastAPI:
     ) -> Response:
         """Cancel an in-flight session and evict its registry entry.
 
-        ``stop_session`` is added by parallel task P3-F. If it has not
-        landed yet, return ``501 Not Implemented`` with a clear message
-        rather than crashing — keeps tests deterministic during the
-        rolling merge.
+        Returns ``501 Not Implemented`` when the service does not expose
+        ``stop_session`` rather than crashing.
         """
         svc = request.app.state.service
         if not hasattr(svc, "stop_session"):
             raise HTTPException(
                 status_code=501,
-                detail="stop_session not available; P3-F pending",
+                detail="stop_session not available",
             )
         try:
             svc.stop_session(session_id)
         except Exception as e:  # noqa: BLE001
-            # Translate a "session not found" condition into 404 if the
-            # parallel agent's stop_session uses a recognisable
-            # exception. Otherwise re-raise.
+            # Translate a "session not found" condition into 404 when
+            # the underlying error class is recognisable. Otherwise
+            # re-raise.
             name = e.__class__.__name__
             if name in {"KeyError", "SessionNotFound"}:
                 raise HTTPException(status_code=404, detail=str(e)) from e
@@ -7084,8 +7073,8 @@ class UnDuplicateRequest(BaseModel):
     """Request body for the retraction endpoint.
 
     Both fields are optional. ``retracted_by`` is self-claimed (the
-    framework does not authenticate the operator id at P7); ``note`` is
-    free text persisted on the audit row.
+    framework does not authenticate the operator id); ``note`` is free
+    text persisted on the audit row.
     """
 
     retracted_by: str | None = None
@@ -7331,8 +7320,8 @@ class CodeReviewState(Session):
             )
         return base
 
-    # P8-C: code-review has its own id namespace so two apps running
-    # against the same metadata DB cannot collide on session ids.
+    # Code-review has its own id namespace so two apps running against
+    # the same metadata DB cannot collide on session ids.
     # ``CR-YYYYMMDD-NNN`` mirrors the incident shape but keeps the
     # prefix distinct.
     @classmethod

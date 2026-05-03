@@ -1,6 +1,6 @@
 """Smoke tests for scripts/build_single_file.py outputs.
 
-P1-L: the bundler emits three artifacts:
+The bundler emits three artifacts:
 
 - ``dist/app.py`` — runtime-only (framework) bundle.
 - ``dist/apps/incident-management.py`` — runtime + incident-management example

@@ -17,7 +17,7 @@ class APITransport(TriggerTransport):
     """No-op transport that holds the ``api`` configs.
 
     Future: when the legacy ``POST /investigate`` route is removed, this
-    class can mount its own router. For Phase 5 it exists as a marker.
+    class can mount its own router. Today it exists as a marker.
     """
 
     def __init__(self, configs: list[APITriggerConfig]) -> None:

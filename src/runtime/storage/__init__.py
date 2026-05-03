@@ -8,8 +8,7 @@ Public surface
 - ``build_embedder``     — LangChain ``Embeddings`` factory.
 - ``Base``, ``IncidentRow``, ``SessionRow`` — declarative model + generic alias.
 
-P2-J removed the ``IncidentRepository`` facade; callers now consume
-``SessionStore`` and ``HistoryStore`` directly.
+Callers consume ``SessionStore`` and ``HistoryStore`` directly.
 """
 from runtime.storage.engine import build_engine
 from runtime.storage.embeddings import build_embedder

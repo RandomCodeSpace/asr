@@ -1,6 +1,6 @@
 """Streamlit UI — 2 tabs + always-on sidebar with recent INCs.
 
-Lives at ``examples/incident_management/ui.py`` post-P1-J. Run via:
+Run via::
 
     python -m examples.incident_management
 
@@ -47,7 +47,7 @@ CONFIG_PATH = Path("config/config.yaml")
 
 
 # ---------------------------------------------------------------------------
-# P3-I/J — multi-session live state
+# Multi-session live state
 # ---------------------------------------------------------------------------
 
 # Statuses that mean the run is still in flight and the detail view should
@@ -106,9 +106,9 @@ def _make_repository(cfg: AppConfig,
                      app_cfg: IncidentAppConfig) -> SessionStore:
     """Build a SessionStore from config — mirrors Orchestrator.create logic.
 
-    Post P2-J: returns the active CRUD ``SessionStore`` only. The UI does
-    not need similarity search; if a future view does, build a
-    ``HistoryStore`` alongside.
+    Returns the active CRUD ``SessionStore`` only. The UI does not need
+    similarity search; if a future view does, build a ``HistoryStore``
+    alongside.
     """
     from runtime.config import MetadataConfig
     default_url = MetadataConfig().url
@@ -378,7 +378,7 @@ def render_sidebar(store: SessionStore,
     """
     with st.sidebar:
         # ------------------------------------------------------------
-        # P3-I — In-flight section (live)
+        # In-flight section (live)
         # ------------------------------------------------------------
         active: list[dict] = []
         if service is not None:
@@ -764,9 +764,9 @@ def _submit_approval_via_service(
 
     Drives ``Command(resume={...})`` on the persistent service loop so
     we reuse the live FastMCP transports + SQLAlchemy engine — same
-    contract as ``POST /sessions/{sid}/approvals/{tool_call_id}``
-    (P4-G). Streamlit reruns will re-fetch the row and the wrap_tool
-    audit (status="approved" / "rejected") will be visible.
+    contract as ``POST /sessions/{sid}/approvals/{tool_call_id}``.
+    Streamlit reruns will re-fetch the row and the wrap_tool audit
+    (status="approved" / "rejected") will be visible.
     """
     from langgraph.types import Command
 
@@ -795,7 +795,7 @@ def _submit_approval_via_service(
 
 def _is_hypothesis_trail(value) -> bool:
     """Return True when value is a non-empty list of dicts shaped like a
-    triage hypothesis-loop trail (P9-9i).
+    triage hypothesis-loop trail.
 
     Each entry must carry ``iteration`` + ``hypothesis``; ``score`` and
     ``rationale`` are recommended but not required.
@@ -810,7 +810,7 @@ def _is_hypothesis_trail(value) -> bool:
 
 
 def _render_hypothesis_trail_block(inc: dict) -> None:
-    """Render the ### Hypothesis Trail panel (P9-9m).
+    """Render the ### Hypothesis Trail panel.
 
     Reads-only view over the triage agent's per-iteration trail. The
     triage skill writes a list of ``{iteration, hypothesis, score,
@@ -861,7 +861,7 @@ def _render_hypothesis_trail_block(inc: dict) -> None:
 
 def _render_pending_approvals_block(inc: dict, inc_id: str) -> None:
     """Render the ### Pending Approvals section for high-risk tool calls
-    paused on the gateway's HITL approval handshake (P4-H).
+    paused on the gateway's HITL approval handshake.
 
     Iterates ``tool_calls`` looking for entries with
     ``status="pending_approval"``. Each pending row gets a small card
@@ -934,14 +934,14 @@ def render_incident_detail(store: SessionStore,
         _render_incident_summary_meta(inc)
         if inc.get("status") == "awaiting_input" and inc.get("pending_intervention"):
             _render_intervention_block(inc, inc_id, agent_names)
-        # P4-H: pending tool-approval cards (risk-rated gateway HITL).
+        # Pending tool-approval cards (risk-rated gateway HITL).
         # Rendered above the agents/tool-calls blocks so a paused
         # approval is the first action surface the operator sees.
         _render_pending_approvals_block(inc, inc_id)
-        # P9-9m: triage hypothesis-loop audit. Collapsed by default so
-        # the agents/findings blocks stay the primary read; the trail
-        # is one click away when an operator wants to audit how the
-        # triage hypothesis converged.
+        # Triage hypothesis-loop audit. Collapsed by default so the
+        # agents/findings blocks stay the primary read; the trail is
+        # one click away when an operator wants to audit how the triage
+        # hypothesis converged.
         _render_hypothesis_trail_block(inc)
         _render_agents_run_block(inc)
         _render_findings_block(inc)
@@ -950,7 +950,7 @@ def render_incident_detail(store: SessionStore,
         with st.expander("Raw JSON"):
             st.json(inc)
 
-    # P3-J — auto-poll while the session is in flight. The 1.5s nap is a
+    # Auto-poll while the session is in flight. The 1.5s nap is a
     # cooperative throttle: it blocks the script-runner thread, so the
     # next ``st.rerun()`` lands on a quiescent rerun cycle. Tests can
     # disable polling by setting ``st.session_state["_disable_poll"] = True``
@@ -1227,9 +1227,9 @@ def main() -> None:
     app_cfg = load_incident_app_config()
     store = _make_repository(cfg, app_cfg)
 
-    # P3-I — process-singleton background service for the in-flight
-    # session list. ``_get_service`` returns ``None`` when called outside
-    # a Streamlit script context (e.g. importability tests), in which
+    # Process-singleton background service for the in-flight session
+    # list. ``_get_service`` returns ``None`` when called outside a
+    # Streamlit script context (e.g. importability tests), in which
     # case the sidebar simply omits the in-flight section.
     service = _get_service(cfg)
 

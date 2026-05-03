@@ -1,4 +1,4 @@
-"""ASR supervisor router — hydration + single-active-investigation gate (P9-9h).
+"""ASR supervisor router — hydration + single-active-investigation gate.
 
 The framework ships a generic ``kind: supervisor`` agent kind in
 :mod:`runtime.agents.supervisor` that handles pure dispatch routing.
@@ -13,7 +13,7 @@ responsive agent runs:
 2. **Single-active-investigation gate** — if another in-flight session
    is already investigating the same component set, the new session is
    tagged ``status="duplicate"`` with ``parent_session_id=<active>``
-   and routed straight to ``__end__``. This reuses the P7 dedup linkage
+   and routed straight to ``__end__``. Reuses the dedup linkage
    primitives (``parent_session_id`` field on ``Session``) instead of
    rolling a new field.
 
@@ -32,7 +32,7 @@ Inputs:
 * ``incident``: an :class:`IncidentState` (or any ``Session``-shaped
   pydantic model with the incident-management fields).
 * ``kg_store`` / ``release_store`` / ``playbook_store``: read-only
-  filesystem stores (Phase 9 9b/9c/9d).
+  filesystem stores.
 * ``active_sessions``: callable returning a list of in-flight session
   dicts (matches the ``OrchestratorService.list_active_sessions``
   shape — ``[{"session_id", "status", "started_at", "current_agent"}, …]``).
@@ -371,7 +371,7 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Framework supervisor-runner adapter (P9-9h)
+# Framework supervisor-runner adapter
 # ---------------------------------------------------------------------------
 #
 # The framework's ``runtime.agents.supervisor.make_supervisor_node`` accepts

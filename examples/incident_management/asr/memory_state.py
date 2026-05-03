@@ -1,15 +1,13 @@
 """ASR memory-layer slots that ride on ``IncidentState.memory``.
 
-Phase 9 sub-phase 9a. Each layer in the ASR.md §3 7-layer model that
-the MVP slice exercises (L2 / L5 / L7) gets a small pydantic model
-here so an investigation can attach the context it fetched from that
-layer to the session state. The whole bundle round-trips losslessly
-through the framework's P8-J ``extra_fields`` mechanism — no row
-schema changes are needed.
+Each layer in the ASR.md §3 7-layer model that the MVP slice exercises
+(L2 / L5 / L7) gets a small pydantic model here so an investigation
+can attach the context it fetched from that layer to the session
+state. The whole bundle round-trips losslessly through the framework's
+``extra_fields`` mechanism — no row schema changes are needed.
 
-Read-only by construction in this batch: agents will *consume* these
-slots once 9b/9c/9d wire the stores in. Mutation via MCP tools is
-9e-9g territory.
+Read-only by construction: agents *consume* these slots; mutation via
+MCP tools is not exposed.
 """
 from __future__ import annotations
 
@@ -62,9 +60,9 @@ class MemoryLayerState(BaseModel):
     """Container for the memory-layer slots attached to ``IncidentState``.
 
     The whole object is optional / empty by default so legacy sessions
-    written before Phase 9 round-trip cleanly: the field hydrates to
-    a default ``MemoryLayerState`` even when ``extra_fields`` is
-    missing the key entirely.
+    written before this field existed round-trip cleanly: the field
+    hydrates to a default ``MemoryLayerState`` even when
+    ``extra_fields`` is missing the key entirely.
     """
 
     model_config = ConfigDict(extra="forbid")

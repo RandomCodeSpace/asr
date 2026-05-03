@@ -1,4 +1,4 @@
-"""Postgres checkpointer wrapper (P2-G).
+"""Postgres checkpointer wrapper.
 
 Loaded only when ``cfg.storage.metadata.url`` resolves to a Postgres
 URL. Uses a *separate* :class:`psycopg_pool.AsyncConnectionPool` (not

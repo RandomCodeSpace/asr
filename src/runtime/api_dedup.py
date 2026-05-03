@@ -1,4 +1,4 @@
-"""Dedup retraction HTTP routes (P7-H).
+"""Dedup retraction HTTP routes.
 
 Exposes ``register_dedup_routes(app, *, store_provider)`` — a side-car
 router so we don't need to inline these routes in ``runtime.api``. The
@@ -29,8 +29,8 @@ class UnDuplicateRequest(BaseModel):
     """Request body for the retraction endpoint.
 
     Both fields are optional. ``retracted_by`` is self-claimed (the
-    framework does not authenticate the operator id at P7); ``note`` is
-    free text persisted on the audit row.
+    framework does not authenticate the operator id); ``note`` is free
+    text persisted on the audit row.
     """
 
     retracted_by: str | None = None

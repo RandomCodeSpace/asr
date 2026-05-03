@@ -122,11 +122,11 @@ class GraphState(TypedDict, total=False):
     next_route: str | None
     last_agent: str | None
     gated_target: str | None  # set by gate node; the downstream target if gate passes
-    # P6-D: depth counter for supervisor recursion (R1). The supervisor
-    # node bumps it on entry and aborts at ``skill.max_dispatch_depth``.
-    # Carrying it on graph state — rather than stashing it on the
-    # session — keeps audit fields off the session and the depth check
-    # cheap (no store reload).
+    # Depth counter for supervisor recursion. The supervisor node bumps
+    # it on entry and aborts at ``skill.max_dispatch_depth``. Carrying
+    # it on graph state — rather than stashing it on the session —
+    # keeps audit fields off the session and the depth check cheap
+    # (no store reload).
     dispatch_depth: int | None
     error: str | None
 
@@ -388,12 +388,11 @@ def make_agent_node(
     ``{success, failed, needs_input}`` default is used so older callers and
     tests keep working.
 
-    ``gateway_cfg`` (P4-F) is the optional risk-rated tool gateway config.
+    ``gateway_cfg`` is the optional risk-rated tool gateway config.
     When supplied, every ``BaseTool`` in ``tools`` is wrapped via
-    :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so the
-    closure captures the live ``Session`` per agent invocation — the
-    R2 mitigation in the Phase-4 plan. When ``None``, tools are passed
-    through untouched (back-compat).
+    :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so
+    the closure captures the live ``Session`` per agent invocation.
+    When ``None``, tools are passed through untouched.
     """
 
     async def node(state: GraphState) -> dict:
@@ -401,11 +400,10 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
-        # P4-F: wrap tools per-invocation so each wrap closes over the
-        # live ``Session`` for this run (mitigation R2 in the Phase-4
-        # plan). When the gateway is unconfigured, the original tools
-        # pass through untouched and ``create_react_agent`` sees the
-        # exact same surface as pre-Phase-4.
+        # Wrap tools per-invocation so each wrap closes over the live
+        # ``Session`` for this run. When the gateway is unconfigured,
+        # the original tools pass through untouched and
+        # ``create_react_agent`` sees the same surface as before.
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
@@ -640,7 +638,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
                        registry: ToolRegistry) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
 
-    P6-C: dispatches on ``skill.kind``:
+    Dispatches on ``skill.kind``:
 
     * ``responsive`` — builds a ReAct LLM node via :func:`make_agent_node`
       (today's path).
@@ -758,8 +756,8 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
     so the underlying FastMCP transports stay alive for the lifetime of the
     compiled graph.
 
-    ``checkpointer`` (P2-F/G) is an optional :class:`BaseCheckpointSaver`
-    that LangGraph uses for durable per-thread state. When ``None``, the
+    ``checkpointer`` is an optional :class:`BaseCheckpointSaver` that
+    LangGraph uses for durable per-thread state. When ``None``, the
     graph compiles without one (back-compat for the few callers that
     build a graph outside the orchestrator, e.g. unit tests).
 

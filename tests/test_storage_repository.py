@@ -1,8 +1,7 @@
 """SessionStore CRUD tests against file-based SQLite + stub embedder.
 
-P2-J: rewritten off the deleted ``IncidentRepository`` shim. The active
-CRUD surface lives directly on ``SessionStore``; tests use the example
-``IncidentState`` so the row schema's domain fields round-trip.
+The active CRUD surface lives on ``SessionStore``; tests use the
+example ``IncidentState`` so the row schema's domain fields round-trip.
 """
 from __future__ import annotations
 import pytest

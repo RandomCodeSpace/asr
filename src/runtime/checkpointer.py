@@ -8,9 +8,9 @@ connection pool is created so the two paths never deadlock:
 - SQLite: dedicated ``aiosqlite.Connection`` with ``PRAGMA journal_mode=WAL``
   so the SQLAlchemy session pool and the checkpoint saver can both write
   to the same on-disk file without blocking each other.
-- Postgres: a separate ``psycopg_pool.AsyncConnectionPool`` (filled in
-  P2-G) rather than reusing SQLAlchemy's pool, so checkpointer writes
-  don't contend with metadata writes on the same connection.
+- Postgres: a separate ``psycopg_pool.AsyncConnectionPool`` rather than
+  reusing SQLAlchemy's pool, so checkpointer writes don't contend with
+  metadata writes on the same connection.
 
 The factory is async because the orchestrator drives the graph through
 async ``ainvoke`` / ``astream_events`` — and LangGraph's async Pregel
@@ -73,7 +73,7 @@ async def make_checkpointer(
     Branches on the URL scheme:
 
     - ``sqlite:`` -> :class:`langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver`
-    - ``postgresql:`` / ``postgres:`` -> Postgres path (P2-G)
+    - ``postgresql:`` / ``postgres:`` -> Postgres path
 
     Returns ``(saver, cleanup)``. ``cleanup`` is an async callable that
     closes the dedicated connection / pool; the caller is expected to
@@ -125,8 +125,8 @@ async def make_checkpointer(
         return saver, conn.close
 
     if url.startswith("postgresql:") or url.startswith("postgres:"):
-        # Filled in P2-G. Imported lazily so SQLite-only deploys don't
-        # need psycopg_pool installed.
+        # Imported lazily so SQLite-only deploys don't need psycopg_pool
+        # installed.
         from runtime.checkpointer_postgres import make_postgres_checkpointer
 
         return await make_postgres_checkpointer(url)

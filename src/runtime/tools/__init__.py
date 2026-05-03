@@ -1,9 +1,9 @@
-"""Risk-rated tool gateway (Phase 4).
+"""Risk-rated tool gateway.
 
 Public surface:
 
-  * ``effective_action``      -- pure resolver (P4-B)
-  * ``wrap_tool``             -- BaseTool wrapper factory (P4-C)
+  * ``effective_action``      -- pure resolver
+  * ``wrap_tool``             -- BaseTool wrapper factory
   * ``GatewayAction``         -- ``Literal["auto", "notify", "approve"]``
 """
 from runtime.tools.gateway import GatewayAction, effective_action, wrap_tool
