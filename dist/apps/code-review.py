@@ -1052,6 +1052,9 @@ class FrameworkAppConfig(BaseModel):
     escalation_teams: list[str] = Field(default_factory=list)
     severity_aliases: dict[str, str] = Field(default_factory=dict)
     dedup_system_prompt: str = _DEFAULT_DEDUP_SYSTEM_PROMPT
+    # Intake runner knobs: forwarded into IntakeContext at graph-build time.
+    intake_top_k: int = 3
+    intake_similarity_threshold: float = 0.7
 
 
 def resolve_framework_app_config(
@@ -1691,14 +1694,18 @@ class Skill(BaseModel):
                 f"skill {self.name!r} (kind=supervisor) requires a non-empty "
                 f"subordinates list"
             )
-        if self.runner is not None:
-            # Resolve at skill-load time so a typo in YAML surfaces here,
-            # not in the middle of a session. The resolver itself raises
-            # ``ValueError`` with a helpful message — bubble that up.
-            _resolve_dotted_callable(
-                self.runner,
-                source=f"skill {self.name!r} runner",
-            )
+        if self.runner is None:
+            # Default every supervisor to the framework intake runner
+            # (similarity retrieval + dedup gate). Apps override by
+            # setting ``runner:`` in YAML.
+            self.runner = "runtime.intake:default_intake_runner"
+        # Resolve at skill-load time so a typo in YAML surfaces here,
+        # not in the middle of a session. The resolver itself raises
+        # ``ValueError`` with a helpful message — bubble that up.
+        _resolve_dotted_callable(
+            self.runner,
+            source=f"skill {self.name!r} runner",
+        )
         if self.dispatch_strategy == "llm" and not self.dispatch_prompt:
             raise ValueError(
                 f"skill {self.name!r} (kind=supervisor, strategy=llm) requires "
@@ -4191,8 +4198,13 @@ def _sqlite_path_from_url(url: str) -> str:
     if path.startswith("//"):
         # sqlite:////abs/path -> urlparse path "//abs/path" -> "/abs/path"
         return path[1:]
-    # sqlite:///x -> urlparse path "/x". sqlite3 accepts both absolute
-    # and relative; tests use absolute via tmp_path.
+    # sqlite:///<rel> -> urlparse path "/<rel>". SQLAlchemy treats this
+    # as a path *relative* to CWD; strip the leading slash so the helper
+    # agrees (otherwise mkdir tries the filesystem root). Tests pass
+    # absolute paths via tmp_path which composes to the four-slash form
+    # above, so this branch only matters for the relative case.
+    if path.startswith("/"):
+        return path[1:]
     return path
 
 
@@ -5617,6 +5629,7 @@ if TYPE_CHECKING:
 
 
 
+
 from langgraph.types import Command
 
 
@@ -5888,6 +5901,20 @@ class Orchestrator(Generic[StateT]):
                 similarity_threshold=framework_cfg.similarity_threshold,
                 distance_strategy=cfg.storage.vector.distance_strategy,
             )
+            # Attach intake_context onto framework_cfg so supervisor nodes can
+            # reach the live stores via app_cfg.intake_context. FrameworkAppConfig
+            # is a Pydantic model; use object.__setattr__ to set a runtime
+            # attribute without triggering Pydantic's frozen-model guard.
+            object.__setattr__(
+                framework_cfg,
+                "intake_context",
+                IntakeContext(
+                    history_store=history,
+                    dedup_pipeline=None,  # dedup_pipeline built below; patched after
+                    top_k=framework_cfg.intake_top_k,
+                    similarity_threshold=framework_cfg.intake_similarity_threshold,
+                ),
+            )
             # Configure incident_management state via importlib so we hit the
             # *same* module instance the MCP loader will import. In the
             # single-file dist bundle a direct ``set_state`` call would
@@ -5965,6 +5992,11 @@ class Orchestrator(Generic[StateT]):
                         model_factory=_factory,
                         framework_cfg=framework_cfg,
                     )
+            # Backfill dedup_pipeline into the IntakeContext now that it is built.
+            # The IntakeContext was constructed with dedup_pipeline=None above
+            # because the pipeline is built after graph construction.
+            if dedup_pipeline is not None:
+                framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
             # P2-I: no resume graph anymore — resume runs through the
             # main graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrates paused state.

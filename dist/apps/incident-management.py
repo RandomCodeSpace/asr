@@ -1289,6 +1289,9 @@ class FrameworkAppConfig(BaseModel):
     escalation_teams: list[str] = Field(default_factory=list)
     severity_aliases: dict[str, str] = Field(default_factory=dict)
     dedup_system_prompt: str = _DEFAULT_DEDUP_SYSTEM_PROMPT
+    # Intake runner knobs: forwarded into IntakeContext at graph-build time.
+    intake_top_k: int = 3
+    intake_similarity_threshold: float = 0.7
 
 
 def resolve_framework_app_config(
@@ -1928,14 +1931,18 @@ class Skill(BaseModel):
                 f"skill {self.name!r} (kind=supervisor) requires a non-empty "
                 f"subordinates list"
             )
-        if self.runner is not None:
-            # Resolve at skill-load time so a typo in YAML surfaces here,
-            # not in the middle of a session. The resolver itself raises
-            # ``ValueError`` with a helpful message — bubble that up.
-            _resolve_dotted_callable(
-                self.runner,
-                source=f"skill {self.name!r} runner",
-            )
+        if self.runner is None:
+            # Default every supervisor to the framework intake runner
+            # (similarity retrieval + dedup gate). Apps override by
+            # setting ``runner:`` in YAML.
+            self.runner = "runtime.intake:default_intake_runner"
+        # Resolve at skill-load time so a typo in YAML surfaces here,
+        # not in the middle of a session. The resolver itself raises
+        # ``ValueError`` with a helpful message — bubble that up.
+        _resolve_dotted_callable(
+            self.runner,
+            source=f"skill {self.name!r} runner",
+        )
         if self.dispatch_strategy == "llm" and not self.dispatch_prompt:
             raise ValueError(
                 f"skill {self.name!r} (kind=supervisor, strategy=llm) requires "
@@ -4428,8 +4435,13 @@ def _sqlite_path_from_url(url: str) -> str:
     if path.startswith("//"):
         # sqlite:////abs/path -> urlparse path "//abs/path" -> "/abs/path"
         return path[1:]
-    # sqlite:///x -> urlparse path "/x". sqlite3 accepts both absolute
-    # and relative; tests use absolute via tmp_path.
+    # sqlite:///<rel> -> urlparse path "/<rel>". SQLAlchemy treats this
+    # as a path *relative* to CWD; strip the leading slash so the helper
+    # agrees (otherwise mkdir tries the filesystem root). Tests pass
+    # absolute paths via tmp_path which composes to the four-slash form
+    # above, so this branch only matters for the relative case.
+    if path.startswith("/"):
+        return path[1:]
     return path
 
 
@@ -5854,6 +5866,7 @@ if TYPE_CHECKING:
 
 
 
+
 from langgraph.types import Command
 
 
@@ -6125,6 +6138,20 @@ class Orchestrator(Generic[StateT]):
                 similarity_threshold=framework_cfg.similarity_threshold,
                 distance_strategy=cfg.storage.vector.distance_strategy,
             )
+            # Attach intake_context onto framework_cfg so supervisor nodes can
+            # reach the live stores via app_cfg.intake_context. FrameworkAppConfig
+            # is a Pydantic model; use object.__setattr__ to set a runtime
+            # attribute without triggering Pydantic's frozen-model guard.
+            object.__setattr__(
+                framework_cfg,
+                "intake_context",
+                IntakeContext(
+                    history_store=history,
+                    dedup_pipeline=None,  # dedup_pipeline built below; patched after
+                    top_k=framework_cfg.intake_top_k,
+                    similarity_threshold=framework_cfg.intake_similarity_threshold,
+                ),
+            )
             # Configure incident_management state via importlib so we hit the
             # *same* module instance the MCP loader will import. In the
             # single-file dist bundle a direct ``set_state`` call would
@@ -6202,6 +6229,11 @@ class Orchestrator(Generic[StateT]):
                         model_factory=_factory,
                         framework_cfg=framework_cfg,
                     )
+            # Backfill dedup_pipeline into the IntakeContext now that it is built.
+            # The IntakeContext was constructed with dedup_pipeline=None above
+            # because the pipeline is built after graph construction.
+            if dedup_pipeline is not None:
+                framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
             # P2-I: no resume graph anymore — resume runs through the
             # main graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrates paused state.
@@ -8026,7 +8058,7 @@ __all__ = [
 # a ``runner`` extension point: a callable invoked at supervisor-node entry
 # that may mutate ``GraphState`` and/or short-circuit to ``"__end__"``. The
 # functions below adapt :func:`hydrate_and_gate` to that contract so the
-# asr_supervisor skill actually exercises the hydration + dup-gate logic
+# intake skill actually exercises the hydration + dup-gate logic
 # inside the live graph, instead of leaving it to be called only from
 # unit tests.
 #
@@ -8114,30 +8146,60 @@ def make_hydrate_runner(
     return _runner
 
 
+
+def make_default_supervisor_runner(
+    *,
+    kg_store: KGStore,
+    release_store: ReleaseStore,
+    playbook_store: PlaybookStore,
+    get_active_sessions: Callable[[], list[dict[str, Any]]] | None = None,
+    component_lookup: Callable[[str], list[str]] | None = None,
+) -> Callable[..., dict[str, Any] | None]:
+    """Compose framework default_intake_runner + ASR memory hydration.
+
+    Framework default runs first (similarity retrieval + dedup gate).
+    If it short-circuits via ``next_route='__end__'`` (duplicate), the
+    ASR hydration is skipped — the duplicate session ends without
+    paying for KG/playbook lookups.
+    """
+    asr_runner = make_hydrate_runner(
+        kg_store=kg_store,
+        release_store=release_store,
+        playbook_store=playbook_store,
+        get_active_sessions=get_active_sessions,
+        component_lookup=component_lookup,
+    )
+    return compose_runners(default_intake_runner, asr_runner)
+
+
+# Build the default runner exactly once at import time so per-call
+# overhead is just a closure invocation. Constructor stays cheap:
+# the stores read seed JSON lazily on first access.
+_BUILT_DEFAULT_RUNNER = make_default_supervisor_runner(
+    kg_store=KGStore(_DEFAULT_SEEDS / "kg"),
+    release_store=ReleaseStore(_DEFAULT_SEEDS / "releases"),
+    playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
+    get_active_sessions=lambda: [],
+)
+
+
 def default_supervisor_runner(
     state: Any, *, app_cfg: Any | None = None,
 ) -> dict[str, Any] | None:
     """Module-level runner the YAML can wire in via dotted path.
 
     Anchored on the bundled seed directory (``seeds/kg``,
-    ``seeds/releases``, ``seeds/playbooks``) so the asr_supervisor
+    ``seeds/releases``, ``seeds/playbooks``) so the intake
     skill works out of the box. Real deployments should construct
-    their own runner via :func:`make_hydrate_runner` and register it
-    with their app's skill loader.
+    their own runner via :func:`make_default_supervisor_runner` and
+    register it with their app's skill loader.
+
+    Composition: framework ``default_intake_runner`` (similarity
+    retrieval + dedup gate) runs first; ASR memory hydration follows.
+    If the framework short-circuits (``next_route='__end__'``), the
+    hydration step is skipped.
     """
-    runner = _BUILT_DEFAULT_RUNNER
-    return runner(state, app_cfg=app_cfg)
-
-
-# Build the default runner exactly once at import time so per-call
-# overhead is just a closure invocation. Constructor stays cheap:
-# the stores read seed JSON lazily on first access.
-_BUILT_DEFAULT_RUNNER = make_hydrate_runner(
-    kg_store=KGStore(_DEFAULT_SEEDS / "kg"),
-    release_store=ReleaseStore(_DEFAULT_SEEDS / "releases"),
-    playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
-    get_active_sessions=lambda: [],
-)
+    return _BUILT_DEFAULT_RUNNER(state, app_cfg=app_cfg)
 
 # ====== module: examples/incident_management/asr/hypothesis_loop.py ======
 
