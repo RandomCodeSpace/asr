@@ -1,21 +1,19 @@
 """App-level config for the incident-management example.
 
-Holds the incident-flavored knobs (similarity threshold, intervention
-confidence threshold, escalation roster, environments, severity aliases)
-that the framework's generic ``runtime.config.AppConfig`` does not
-carry.
-
-The framework reads these via ``load_incident_app_config()``; tests that
-need to override values can either write a temporary YAML file and pass
-its path, or monkey-patch the loader to return a stubbed config.
+The framework reads incident-flavored knobs (similarity threshold,
+intervention confidence threshold, escalation roster, severity aliases,
+dedup pipeline, environments) generically via ``FrameworkAppConfig`` and
+``RuntimeConfig.{dedup,environments}_provider_path``. This module owns
+the YAML <-> ``FrameworkAppConfig`` lift plus the provider hooks
+referenced from ``config/code_review.runtime.yaml`` /
+``config/config.yaml``; the runtime never imports ``IncidentAppConfig``
+because that class no longer exists.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
 
 from runtime.config import FrameworkAppConfig
 from runtime.dedup import DedupConfig
@@ -54,7 +52,22 @@ _INCIDENT_ESCALATION_TEAMS: list[str] = [
 ]
 
 
-def _default_incident_framework_cfg() -> FrameworkAppConfig:
+_INCIDENT_ENVIRONMENTS: list[str] = ["production", "staging", "dev", "local"]
+
+
+_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "incident_management.yaml"
+)
+
+
+def _read_yaml(path: str | Path | None) -> dict:
+    p = Path(path) if path else _DEFAULT_PATH
+    if not p.exists():
+        return {}
+    return yaml.safe_load(p.read_text()) or {}
+
+
+def _default_framework_cfg() -> FrameworkAppConfig:
     """Default ``FrameworkAppConfig`` populated with incident-tuned values."""
     return FrameworkAppConfig(
         confidence_threshold=0.75,
@@ -65,92 +78,26 @@ def _default_incident_framework_cfg() -> FrameworkAppConfig:
     )
 
 
-class IncidentAppConfig(BaseModel):
-    """Domain-level configuration for the incident-management app.
+def load_app_config(path: str | Path | None = None) -> FrameworkAppConfig:
+    """Load the incident app YAML and return a ``FrameworkAppConfig``.
 
-    Defaults are tuned to match the values currently shipped in
-    ``config/config.yaml`` (notably ``similarity_threshold=0.2``, which
-    is the operative default — the old framework default of 0.85 was
-    masked by the YAML override and was never actually used).
-
-    The cross-cutting fields the framework reads
+    The YAML may carry framework-flavored keys at the top level
     (``confidence_threshold``, ``similarity_threshold``,
-    ``escalation_teams``, ``severity_aliases``,
-    ``dedup_system_prompt``) live on a composed
-    :class:`runtime.config.FrameworkAppConfig` accessible via
-    ``IncidentAppConfig().framework``. The flat top-level attributes
-    are kept as read-through proxies for back-compat with existing
-    callers.
+    ``escalation_teams``, ``severity_aliases``, ``dedup_system_prompt``,
+    ``ui``) and/or under a ``framework:`` block; both are folded into
+    the returned ``FrameworkAppConfig``. Domain-specific top-level keys
+    (``dedup``, ``environments``, ``store_path``, ``similarity_method``)
+    are ignored here — they are surfaced via the dedicated provider
+    hooks below. Falls back to ``_default_framework_cfg()`` when the
+    file is missing.
     """
+    raw = _read_yaml(path)
+    if not raw:
+        return _default_framework_cfg()
 
-    framework: FrameworkAppConfig = Field(
-        default_factory=_default_incident_framework_cfg,
-    )
-
-    store_path: str = "incidents"
-    similarity_method: Literal["keyword", "embedding"] = "keyword"
-    environments: list[str] = Field(
-        default_factory=lambda: ["production", "staging", "dev", "local"],
-    )
-    # Optional two-stage dedup pipeline. Off-by-default at the
-    # framework level via ``DedupConfig.enabled=False``; the bundled
-    # YAML for the incident-management example opts in. ``None`` means
-    # "framework default" (off).
-    dedup: DedupConfig | None = None
-
-    # ------------------------------------------------------------------
-    # Read-through proxies for the framework-level fields. Existing
-    # callers (UI, MCP server, tests) read these as flat attributes;
-    # the runtime now reads them off ``self.framework`` directly.
-    # ------------------------------------------------------------------
-    @property
-    def similarity_threshold(self) -> float:
-        return self.framework.similarity_threshold
-
-    @property
-    def confidence_threshold(self) -> float:
-        return self.framework.confidence_threshold
-
-    @property
-    def escalation_teams(self) -> list[str]:
-        return self.framework.escalation_teams
-
-    @property
-    def severity_aliases(self) -> dict[str, str]:
-        return self.framework.severity_aliases
-
-
-_DEFAULT_PATH = (
-    Path(__file__).resolve().parents[2] / "config" / "incident_management.yaml"
-)
-
-
-def load_incident_app_config(
-    path: str | Path | None = None,
-) -> IncidentAppConfig:
-    """Load the incident app config from ``path`` (or the example default).
-
-    Falls back to a fully-defaulted ``IncidentAppConfig`` when the file is
-    missing — this keeps unit tests deterministic without forcing every
-    ``AppConfig(...)``-constructed test to also create an app config file.
-
-    Top-level YAML keys that match the legacy flat shape
-    (``confidence_threshold``, ``similarity_threshold``,
-    ``escalation_teams``, ``severity_aliases``) are folded into the
-    composed :class:`FrameworkAppConfig` automatically so existing
-    config.yaml files keep loading.
-    """
-    p = Path(path) if path else _DEFAULT_PATH
-    if not p.exists():
-        return IncidentAppConfig()
-    raw = yaml.safe_load(p.read_text()) or {}
-
-    # Back-compat: lift flat top-level keys that now live on the
-    # composed FrameworkAppConfig.
     fw_kwargs: dict[str, object] = {}
     if "framework" in raw:
-        fw_block = raw.pop("framework") or {}
-        fw_kwargs.update(fw_block)
+        fw_kwargs.update(raw.get("framework") or {})
     for legacy_key in (
         "confidence_threshold",
         "similarity_threshold",
@@ -160,40 +107,46 @@ def load_incident_app_config(
         "ui",
     ):
         if legacy_key in raw:
-            fw_kwargs[legacy_key] = raw.pop(legacy_key)
-    if fw_kwargs:
-        # Start from the incident defaults, then overlay user values.
-        defaults = _default_incident_framework_cfg()
-        merged = defaults.model_dump()
-        merged.update(fw_kwargs)
-        raw["framework"] = FrameworkAppConfig(**merged)
-    return IncidentAppConfig(**raw)
+            fw_kwargs[legacy_key] = raw[legacy_key]
+
+    defaults = _default_framework_cfg()
+    if not fw_kwargs:
+        return defaults
+    merged = defaults.model_dump()
+    merged.update(fw_kwargs)
+    return FrameworkAppConfig(**merged)
+
+
+# ---------------------------------------------------------------------------
+# Provider hooks referenced from ``config/config.yaml``'s ``runtime:`` block.
+# The runtime resolves these dotted paths into no-arg callables so it
+# never imports ``examples.incident_management.config`` directly.
+# ---------------------------------------------------------------------------
 
 
 def framework_app_config_provider() -> FrameworkAppConfig:
-    """Provider hook referenced from ``RuntimeConfig.framework_app_config_path``.
-
-    Returns the same :class:`FrameworkAppConfig` view the loaded
-    :class:`IncidentAppConfig` exposes via ``.framework`` — the runtime
-    reads this directly without ever importing ``IncidentAppConfig``.
-    """
-    return load_incident_app_config().framework
+    """Provider for ``RuntimeConfig.framework_app_config_path``."""
+    return load_app_config()
 
 
 def dedup_config_provider() -> DedupConfig | None:
-    """Provider hook referenced from ``RuntimeConfig.dedup_config_path``.
+    """Provider for ``RuntimeConfig.dedup_config_path``.
 
     Returns the configured dedup pipeline shape (or ``None`` when the
-    bundled config disables it) so the runtime can build the pipeline
-    without importing ``IncidentAppConfig``.
+    bundled YAML disables it) so the runtime can build the pipeline
+    without importing an app-specific config module.
     """
-    return load_incident_app_config().dedup
+    raw = _read_yaml(None)
+    block = raw.get("dedup")
+    if block is None:
+        return None
+    return DedupConfig(**block)
 
 
 def environments_provider() -> list[str]:
-    """Provider hook for ``RuntimeConfig.environments_provider_path``.
-
-    Returns the incident-management environments roster the
-    ``GET /environments`` endpoint surfaces to UI clients.
-    """
-    return list(load_incident_app_config().environments)
+    """Provider for ``RuntimeConfig.environments_provider_path``."""
+    raw = _read_yaml(None)
+    envs = raw.get("environments")
+    if envs is None:
+        return list(_INCIDENT_ENVIRONMENTS)
+    return list(envs)

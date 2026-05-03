@@ -25,11 +25,16 @@ def test_code_review_state_has_domain_fields():
 
 
 def test_code_review_app_config_defaults():
-    from examples.code_review.config import CodeReviewAppConfig
-    cfg = CodeReviewAppConfig()
+    """The code-review YAML loader returns a framework-shaped config.
+
+    Domain-only knobs (``severity_categories``, ``auto_request_changes_on``,
+    ``repos_in_scope``, ``review_max_diff_kb``, ``similarity_method``) are
+    no longer mirrored on a typed BaseModel — they live in the YAML and
+    the example-internal mcp_server / skills read them off the file.
+    """
+    from examples.code_review.config import load_app_config
+    cfg = load_app_config()
     assert cfg.similarity_threshold == 0.3
-    assert "critical" in cfg.auto_request_changes_on
-    assert cfg.review_max_diff_kb == 500
 
 
 def test_code_review_skills_dir_exists():

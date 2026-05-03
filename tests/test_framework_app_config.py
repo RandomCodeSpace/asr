@@ -104,14 +104,13 @@ def test_resolver_rejects_provider_returning_wrong_type(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_incident_app_config_composes_framework():
+def test_incident_loader_returns_framework_app_config():
     from examples.incident_management.config import (
-        IncidentAppConfig,
         framework_app_config_provider,
+        load_app_config,
     )
 
-    app = IncidentAppConfig()
-    fw = app.framework
+    fw = load_app_config()
     assert isinstance(fw, FrameworkAppConfig)
     # Incident-tuned values land on the framework layer.
     assert fw.confidence_threshold == 0.75
@@ -122,14 +121,13 @@ def test_incident_app_config_composes_framework():
     assert via_provider.severity_aliases == fw.severity_aliases
 
 
-def test_code_review_app_config_composes_framework():
+def test_code_review_loader_returns_framework_app_config():
     from examples.code_review.config import (
-        CodeReviewAppConfig,
         framework_app_config_provider,
+        load_app_config,
     )
 
-    app = CodeReviewAppConfig()
-    fw = app.framework
+    fw = load_app_config()
     assert isinstance(fw, FrameworkAppConfig)
     via_provider = framework_app_config_provider()
     assert isinstance(via_provider, FrameworkAppConfig)
@@ -161,13 +159,11 @@ def test_code_review_framework_cfg_differs_from_incident():
 
 
 def test_code_review_yaml_round_trips_through_loader():
-    """The bundled code-review YAML loads cleanly via the back-compat
-    lift path (legacy flat keys lifted into the composed FrameworkAppConfig)."""
-    from examples.code_review.config import load_code_review_app_config
+    """The bundled code-review YAML loads cleanly via the lift path
+    (legacy flat keys lifted into the returned FrameworkAppConfig)."""
+    from examples.code_review.config import load_app_config
 
-    cfg = load_code_review_app_config()
-    # YAML sets similarity_threshold=0.3; lift folds it onto
-    # framework.similarity_threshold and the property proxy keeps
-    # the legacy attribute access working.
+    cfg = load_app_config()
+    # YAML sets similarity_threshold=0.3; the lift folds it onto
+    # FrameworkAppConfig.similarity_threshold.
     assert cfg.similarity_threshold == 0.3
-    assert cfg.framework.similarity_threshold == 0.3

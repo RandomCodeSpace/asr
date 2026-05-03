@@ -363,8 +363,8 @@ def build_ui() -> None:
     """Build dist/ui.py — Streamlit UI only; imports from sibling app module.
 
     Designed to sit alongside ``dist/apps/incident-management.py`` (renamed
-    to ``app.py`` at deploy time), since the UI imports incident-app symbols
-    like ``IncidentAppConfig`` and ``load_incident_app_config`` that live in
+    to ``app.py`` at deploy time), since the UI imports app-config symbols
+    (``load_app_config``, ``framework_app_config_provider``) that live in
     the example app, not the framework runtime.
     """
     OUT_UI.parent.mkdir(parents=True, exist_ok=True)

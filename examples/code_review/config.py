@@ -1,8 +1,13 @@
-"""Code-review app config."""
+"""Code-review app config.
+
+Mirrors the incident-management module: provides the YAML
+<-> ``FrameworkAppConfig`` lift plus provider hooks the runtime
+resolves via ``RuntimeConfig.framework_app_config_path``. The runtime
+never imports this module directly.
+"""
 from __future__ import annotations
 from pathlib import Path
-from typing import Literal
-from pydantic import BaseModel, Field
+
 import yaml
 
 from runtime.config import FrameworkAppConfig
@@ -17,7 +22,31 @@ _CODE_REVIEW_DEDUP_SYSTEM_PROMPT = (
 )
 
 
-def _default_code_review_framework_cfg() -> FrameworkAppConfig:
+_CODE_REVIEW_SEVERITY_ALIASES: dict[str, str] = {
+    "info": "info",
+    "warning": "warning",
+    "warn": "warning",
+    "error": "error",
+    "err": "error",
+    "critical": "critical",
+    "crit": "critical",
+    "blocker": "critical",
+}
+
+
+_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "code_review.yaml"
+)
+
+
+def _read_yaml(path: str | Path | None) -> dict:
+    p = Path(path) if path else _DEFAULT_PATH
+    if not p.exists():
+        return {}
+    return yaml.safe_load(p.read_text()) or {}
+
+
+def _default_framework_cfg() -> FrameworkAppConfig:
     """Default ``FrameworkAppConfig`` for the code-review app.
 
     Reviewers don't have a paging roster the way the incident-management
@@ -30,59 +59,30 @@ def _default_code_review_framework_cfg() -> FrameworkAppConfig:
         confidence_threshold=0.7,
         similarity_threshold=0.3,
         escalation_teams=[],
-        severity_aliases={
-            "info": "info",
-            "warning": "warning",
-            "warn": "warning",
-            "error": "error",
-            "err": "error",
-            "critical": "critical",
-            "crit": "critical",
-            "blocker": "critical",
-        },
+        severity_aliases=dict(_CODE_REVIEW_SEVERITY_ALIASES),
         dedup_system_prompt=_CODE_REVIEW_DEDUP_SYSTEM_PROMPT,
     )
 
 
-class CodeReviewAppConfig(BaseModel):
-    """All code-review app keys."""
-    framework: FrameworkAppConfig = Field(
-        default_factory=_default_code_review_framework_cfg,
-    )
+def load_app_config(path: str | Path | None = None) -> FrameworkAppConfig:
+    """Load the code-review YAML and return a ``FrameworkAppConfig``.
 
-    similarity_method: Literal["keyword", "embedding"] = "keyword"
-    severity_categories: list[str] = Field(
-        default_factory=lambda: ["info", "warning", "error", "critical"]
-    )
-    auto_request_changes_on: list[str] = Field(
-        default_factory=lambda: ["critical", "error"]
-    )
-    repos_in_scope: list[str] = Field(default_factory=list)
-    review_max_diff_kb: int = 500
+    Same lift semantics as the incident-management loader: top-level
+    framework-flavored keys (and an optional ``framework:`` block, and
+    a ``ui:`` block) merge into the returned ``FrameworkAppConfig``.
+    Domain-only knobs (``severity_categories``, ``auto_request_changes_on``,
+    ``repos_in_scope``, ``review_max_diff_kb``, ``similarity_method``)
+    are intentionally not surfaced through this loader; they are
+    example-internal and read directly off the YAML by the code-review
+    MCP server / skills if needed.
+    """
+    raw = _read_yaml(path)
+    if not raw:
+        return _default_framework_cfg()
 
-    @property
-    def similarity_threshold(self) -> float:
-        return self.framework.similarity_threshold
-
-
-_DEFAULT_PATH = (
-    Path(__file__).resolve().parents[2] / "config" / "code_review.yaml"
-)
-
-
-def load_code_review_app_config(path: str | Path | None = None) -> CodeReviewAppConfig:
-    p = Path(path) if path else _DEFAULT_PATH
-    if not p.exists():
-        return CodeReviewAppConfig()
-    raw = yaml.safe_load(p.read_text()) or {}
-    # Back-compat: lift flat top-level framework keys
-    # (similarity_threshold, confidence_threshold, escalation_teams,
-    # severity_aliases, dedup_system_prompt) into the composed
-    # FrameworkAppConfig.
     fw_kwargs: dict[str, object] = {}
     if "framework" in raw:
-        fw_block = raw.pop("framework") or {}
-        fw_kwargs.update(fw_block)
+        fw_kwargs.update(raw.get("framework") or {})
     for legacy_key in (
         "confidence_threshold",
         "similarity_threshold",
@@ -92,20 +92,16 @@ def load_code_review_app_config(path: str | Path | None = None) -> CodeReviewApp
         "ui",
     ):
         if legacy_key in raw:
-            fw_kwargs[legacy_key] = raw.pop(legacy_key)
-    if fw_kwargs:
-        defaults = _default_code_review_framework_cfg()
-        merged = defaults.model_dump()
-        merged.update(fw_kwargs)
-        raw["framework"] = FrameworkAppConfig(**merged)
-    return CodeReviewAppConfig(**raw)
+            fw_kwargs[legacy_key] = raw[legacy_key]
+
+    defaults = _default_framework_cfg()
+    if not fw_kwargs:
+        return defaults
+    merged = defaults.model_dump()
+    merged.update(fw_kwargs)
+    return FrameworkAppConfig(**merged)
 
 
 def framework_app_config_provider() -> FrameworkAppConfig:
-    """Provider hook referenced from ``RuntimeConfig.framework_app_config_path``.
-
-    Returns the framework view embedded in ``CodeReviewAppConfig`` so
-    the runtime reads code-review-tuned values without importing
-    ``CodeReviewAppConfig``.
-    """
-    return load_code_review_app_config().framework
+    """Provider for ``RuntimeConfig.framework_app_config_path``."""
+    return load_app_config()

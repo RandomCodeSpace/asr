@@ -10,7 +10,7 @@ from fastmcp import FastMCP
 
 from runtime.storage.history_store import HistoryStore
 from runtime.storage.session_store import SessionStore
-from examples.incident_management.config import load_incident_app_config
+from examples.incident_management.config import load_app_config
 
 
 def normalize_severity(
@@ -35,7 +35,7 @@ class IncidentMCPServer:
     store: SessionStore | None = None
     history: HistoryStore | None = None
     severity_aliases: dict[str, str] = field(
-        default_factory=lambda: load_incident_app_config().severity_aliases
+        default_factory=lambda: load_app_config().severity_aliases
     )
     mcp: FastMCP = field(init=False)
 
