@@ -35,11 +35,10 @@ from pathlib import Path
 
 RUNTIME_ROOT = Path("src/runtime")
 EXAMPLES_ROOT = Path("examples")
-# The UI lives at examples/incident_management/ui.py.
-# ui/streamlit_app.py is a one-line back-compat shim that re-exports it,
-# which strips to nothing under the bundler's intra-import rewrite — so
-# read the canonical source directly.
-UI = Path("examples/incident_management/ui.py")
+# The generic UI lives at src/runtime/ui.py — config-driven badges
+# and detail fields keep the shell domain-agnostic so a single bundle
+# can ship beside any app entry-point.
+UI = Path("src/runtime/ui.py")
 OUT_APP = Path("dist/app.py")
 OUT_UI = Path("dist/ui.py")
 OUT_INCIDENT_APP = Path("dist/apps/incident-management.py")
@@ -92,6 +91,14 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # for kind=supervisor skills. Bundled before orchestrator/api/skill so
     # the dotted-path resolver finds default_intake_runner.
     (RUNTIME_ROOT, "intake.py"),
+    # Generic memory layers (ASR L2/L5/L7). Lifted from
+    # examples/incident_management/asr in Wave 1 of the strip-down.
+    # ``memory_state`` (L2/L5/L7 pydantic slots) is referenced by the
+    # three stores so it must come first; lifted in Wave 1.B as
+    # ``runtime.memory.session_state``.
+    (RUNTIME_ROOT, "memory/knowledge_graph.py"),
+    (RUNTIME_ROOT, "memory/release_context.py"),
+    (RUNTIME_ROOT, "memory/playbook_store.py"),
     (RUNTIME_ROOT, "orchestrator.py"),
     (RUNTIME_ROOT, "api.py"),
     # Retraction routes are a side-car router so they don't bloat
@@ -106,15 +113,12 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 #
 # ``asr/memory_state.py`` is imported by ``state.py`` so it must come
 # first. The three filesystem-backed stores (KG / Release / Playbook)
-# live in the bundle so app code can reach them. supervisor_node +
-# hypothesis_loop + resolution_helpers are pure-Python helpers consumed
-# by the asr_supervisor / triage / resolution skills; they depend on
-# the four memory-layer modules above so are ordered after them.
+# were lifted to ``runtime.memory`` in Wave 1.A and are now bundled in
+# RUNTIME_MODULE_ORDER above. supervisor_node + hypothesis_loop +
+# resolution_helpers are pure-Python helpers consumed by the
+# asr_supervisor / triage / resolution skills.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
     (EXAMPLES_ROOT, "incident_management/asr/memory_state.py"),
-    (EXAMPLES_ROOT, "incident_management/asr/kg_store.py"),
-    (EXAMPLES_ROOT, "incident_management/asr/release_store.py"),
-    (EXAMPLES_ROOT, "incident_management/asr/playbook_store.py"),
     (EXAMPLES_ROOT, "incident_management/asr/supervisor_node.py"),
     (EXAMPLES_ROOT, "incident_management/asr/hypothesis_loop.py"),
     (EXAMPLES_ROOT, "incident_management/asr/resolution_helpers.py"),
@@ -390,10 +394,14 @@ def build_ui() -> None:
 
 
 def main() -> None:
+    # ``build_ui()`` produces the framework-only UI bundle and reads
+    # exclusively from ``src/runtime/``, so it stays green even when an
+    # example-app source tree is mid-rename. Run it first so dist/ui.py
+    # is always emitted regardless of the per-app build outcome.
     build_runtime_app()
+    build_ui()
     build_incident_app()
     build_code_review_app()
-    build_ui()
 
 
 if __name__ == "__main__":

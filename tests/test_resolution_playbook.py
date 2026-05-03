@@ -21,7 +21,7 @@ from pathlib import Path
 
 
 from examples.incident_management.asr.memory_state import L7PlaybookSuggestion
-from examples.incident_management.asr.playbook_store import PlaybookStore
+from runtime.memory.playbook_store import PlaybookStore
 from examples.incident_management.asr.resolution_helpers import (
     playbook_to_tool_calls,
     top_playbook,

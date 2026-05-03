@@ -1,6 +1,6 @@
 """L2 Knowledge Graph filesystem backend.
 
-Pin tests for ``KGStore``. Cover both the bundled seed fallback (used
+Pin tests for ``KnowledgeGraphStore``. Cover both the bundled seed fallback (used
 when ``incidents/kg/`` is empty) and a tmp_path-driven custom graph
 that exercises the read API in isolation.
 """
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from examples.incident_management.asr.kg_store import KGStore
+from runtime.memory.knowledge_graph import KnowledgeGraphStore
 from examples.incident_management.asr.memory_state import L2KGContext
 
 
@@ -20,7 +20,7 @@ from examples.incident_management.asr.memory_state import L2KGContext
 
 def test_seed_fallback_loads_when_root_empty(tmp_path: Path) -> None:
     """Empty ``incidents/kg/`` should fall back to the bundled seed."""
-    store = KGStore(tmp_path)  # nothing in tmp_path
+    store = KnowledgeGraphStore(tmp_path)  # nothing in tmp_path
     components = store.list_components()
     assert len(components) >= 5
     ids = {c["id"] for c in components}
@@ -28,7 +28,7 @@ def test_seed_fallback_loads_when_root_empty(tmp_path: Path) -> None:
 
 
 def test_seed_edges_use_only_valid_kinds(tmp_path: Path) -> None:
-    store = KGStore(tmp_path)
+    store = KnowledgeGraphStore(tmp_path)
     valid = {"calls", "deploys", "reads", "writes"}
     for e in store.list_edges():
         assert e["kind"] in valid
@@ -38,7 +38,7 @@ def test_seed_edges_use_only_valid_kinds(tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def custom_kg(tmp_path: Path) -> KGStore:
+def custom_kg(tmp_path: Path) -> KnowledgeGraphStore:
     components = [
         {"id": "a", "name": "alpha-service", "owner": "team-a",
          "criticality": "tier-2", "environment": "production"},
@@ -58,21 +58,21 @@ def custom_kg(tmp_path: Path) -> KGStore:
     ]
     (tmp_path / "components.json").write_text(json.dumps(components))
     (tmp_path / "edges.json").write_text(json.dumps(edges))
-    return KGStore(tmp_path)
+    return KnowledgeGraphStore(tmp_path)
 
 
-def test_get_component_round_trip(custom_kg: KGStore) -> None:
+def test_get_component_round_trip(custom_kg: KnowledgeGraphStore) -> None:
     assert custom_kg.get_component("a")["name"] == "alpha-service"
     assert custom_kg.get_component("missing") is None
 
 
-def test_invalid_edge_kind_dropped(custom_kg: KGStore) -> None:
+def test_invalid_edge_kind_dropped(custom_kg: KnowledgeGraphStore) -> None:
     assert all(e["kind"] in {"calls", "deploys", "reads", "writes"}
                for e in custom_kg.list_edges())
     assert len(custom_kg.list_edges()) == 3
 
 
-def test_find_by_name_case_insensitive_substring(custom_kg: KGStore) -> None:
+def test_find_by_name_case_insensitive_substring(custom_kg: KnowledgeGraphStore) -> None:
     matches = custom_kg.find_by_name("BETA")
     assert len(matches) == 1
     assert matches[0]["id"] == "b"
@@ -80,32 +80,32 @@ def test_find_by_name_case_insensitive_substring(custom_kg: KGStore) -> None:
     assert custom_kg.find_by_name("") == []
 
 
-def test_neighbors_one_hop(custom_kg: KGStore) -> None:
+def test_neighbors_one_hop(custom_kg: KnowledgeGraphStore) -> None:
     n = custom_kg.neighbors("b", hops=1)
     # b connects to a (in-edge calls), c (writes), d (reads)
     assert n == {"a", "c", "d"}
 
 
-def test_neighbors_filtered_by_kind(custom_kg: KGStore) -> None:
+def test_neighbors_filtered_by_kind(custom_kg: KnowledgeGraphStore) -> None:
     n = custom_kg.neighbors("b", kinds={"writes"}, hops=1)
     assert n == {"c"}
 
 
-def test_neighbors_two_hop(custom_kg: KGStore) -> None:
+def test_neighbors_two_hop(custom_kg: KnowledgeGraphStore) -> None:
     n = custom_kg.neighbors("a", hops=2)
     # a -> b at hop 1; b -> {c, d} at hop 2.
     assert n == {"b", "c", "d"}
 
 
-def test_neighbors_unknown_node_returns_empty(custom_kg: KGStore) -> None:
+def test_neighbors_unknown_node_returns_empty(custom_kg: KnowledgeGraphStore) -> None:
     assert custom_kg.neighbors("zzz", hops=2) == set()
 
 
-def test_neighbors_zero_hops_empty(custom_kg: KGStore) -> None:
+def test_neighbors_zero_hops_empty(custom_kg: KnowledgeGraphStore) -> None:
     assert custom_kg.neighbors("a", hops=0) == set()
 
 
-def test_subgraph_returns_l2kgcontext(custom_kg: KGStore) -> None:
+def test_subgraph_returns_l2kgcontext(custom_kg: KnowledgeGraphStore) -> None:
     ctx = custom_kg.subgraph({"b"}, hops=1)
     assert isinstance(ctx, L2KGContext)
     assert ctx.components == ["b"]
@@ -118,7 +118,7 @@ def test_subgraph_returns_l2kgcontext(custom_kg: KGStore) -> None:
     assert {"a", "b", "c", "d"} <= raw_node_ids
 
 
-def test_subgraph_multi_seed(custom_kg: KGStore) -> None:
+def test_subgraph_multi_seed(custom_kg: KnowledgeGraphStore) -> None:
     ctx = custom_kg.subgraph({"b", "c"}, hops=1)
     assert sorted(ctx.components) == ["b", "c"]
     # ``a`` is upstream of b; b is in seeds so the b->c edge is internal,
@@ -127,6 +127,6 @@ def test_subgraph_multi_seed(custom_kg: KGStore) -> None:
     assert ctx.downstream == ["d"]
 
 
-def test_subgraph_unknown_seed_filtered(custom_kg: KGStore) -> None:
+def test_subgraph_unknown_seed_filtered(custom_kg: KnowledgeGraphStore) -> None:
     ctx = custom_kg.subgraph({"b", "ghost"}, hops=1)
     assert ctx.components == ["b"]

@@ -20,15 +20,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.incident_management.asr.kg_store import KGStore
+from runtime.memory.knowledge_graph import KnowledgeGraphStore
 from examples.incident_management.asr.memory_state import (
     L2KGContext,
     L5ReleaseContext,
     L7PlaybookSuggestion,
     MemoryLayerState,
 )
-from examples.incident_management.asr.playbook_store import PlaybookStore
-from examples.incident_management.asr.release_store import ReleaseStore
+from runtime.memory.playbook_store import PlaybookStore
+from runtime.memory.release_context import ReleaseContextStore
 from examples.incident_management.asr.supervisor_node import (
     extract_components,
     find_active_duplicate,
@@ -52,8 +52,8 @@ def asr_dir() -> Path:
 def stores(tmp_path: Path, asr_dir: Path) -> dict:
     """Store trio anchored on a tmp root that falls back to bundled seeds."""
     return {
-        "kg": KGStore(tmp_path / "kg"),
-        "release": ReleaseStore(tmp_path / "releases"),
+        "kg": KnowledgeGraphStore(tmp_path / "kg"),
+        "release": ReleaseContextStore(tmp_path / "releases"),
         "playbook": PlaybookStore(tmp_path / "playbooks"),
     }
 
@@ -96,7 +96,7 @@ def test_extract_components_matches_by_name_substring(tmp_path: Path) -> None:
     edges: list[dict] = []
     (tmp_path / "components.json").write_text(json.dumps(components))
     (tmp_path / "edges.json").write_text(json.dumps(edges))
-    kg = KGStore(tmp_path)
+    kg = KnowledgeGraphStore(tmp_path)
     # ``alpha`` is the friendly name token; should match by name.
     assert extract_components("alpha is throwing 500s", kg) == ["alpha"]
 
@@ -337,17 +337,17 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
     and stamps duplicate metadata before the graph terminates."""
     from runtime.agents.supervisor import make_supervisor_node
     from examples.incident_management.asr import supervisor_node as sn
-    from examples.incident_management.asr.kg_store import KGStore
-    from examples.incident_management.asr.playbook_store import PlaybookStore
-    from examples.incident_management.asr.release_store import ReleaseStore
+    from runtime.memory.knowledge_graph import KnowledgeGraphStore
+    from runtime.memory.playbook_store import PlaybookStore
+    from runtime.memory.release_context import ReleaseContextStore
     from examples.incident_management.state import IncidentState, Reporter
 
     # Build a runner whose live active-session list contains an
     # in-flight investigation against ``payments``. Patch the module's
     # default runner singleton so the YAML-resolved hook picks it up.
     swap = sn.make_hydrate_runner(
-        kg_store=KGStore(sn._DEFAULT_SEEDS / "kg"),
-        release_store=ReleaseStore(sn._DEFAULT_SEEDS / "releases"),
+        kg_store=KnowledgeGraphStore(sn._DEFAULT_SEEDS / "kg"),
+        release_store=ReleaseContextStore(sn._DEFAULT_SEEDS / "releases"),
         playbook_store=PlaybookStore(sn._DEFAULT_SEEDS / "playbooks"),
         get_active_sessions=lambda: [
             {"session_id": "INC-OTHER", "status": "in_progress"},

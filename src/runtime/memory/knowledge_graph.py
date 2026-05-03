@@ -33,7 +33,7 @@ _VALID_EDGE_KINDS: frozenset[str] = frozenset(
 _SEED_ROOT = Path(__file__).parent / "seeds" / "kg"
 
 
-class KGStore:
+class KnowledgeGraphStore:
     """Filesystem-backed L2 Knowledge Graph reader."""
 
     def __init__(self, root: Path) -> None:

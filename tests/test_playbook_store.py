@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from examples.incident_management.asr.memory_state import L7PlaybookSuggestion
-from examples.incident_management.asr.playbook_store import PlaybookStore
+from runtime.memory.playbook_store import PlaybookStore
 
 
 # ---- Seed fallback ------------------------------------------------------

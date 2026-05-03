@@ -1,6 +1,6 @@
 """L5 Release Context store.
 
-Pin tests for ``ReleaseStore``. Cover seed fallback, sort order,
+Pin tests for ``ReleaseContextStore``. Cover seed fallback, sort order,
 service filtering, the symmetric correlation window, and the
 ``L5ReleaseContext`` assembly used by the triage agent.
 """
@@ -13,14 +13,14 @@ from pathlib import Path
 import pytest
 
 from examples.incident_management.asr.memory_state import L5ReleaseContext
-from examples.incident_management.asr.release_store import ReleaseStore
+from runtime.memory.release_context import ReleaseContextStore
 
 
 # ---- Seed fallback ------------------------------------------------------
 
 
 def test_seed_fallback_loads_when_root_empty(tmp_path: Path) -> None:
-    store = ReleaseStore(tmp_path)
+    store = ReleaseContextStore(tmp_path)
     all_releases = store.list_all()
     assert len(all_releases) >= 4
     services = {r["service"] for r in all_releases}
@@ -28,7 +28,7 @@ def test_seed_fallback_loads_when_root_empty(tmp_path: Path) -> None:
 
 
 def test_releases_sorted_descending_by_deployed_at(tmp_path: Path) -> None:
-    store = ReleaseStore(tmp_path)
+    store = ReleaseContextStore(tmp_path)
     timestamps = [r["deployed_at"] for r in store.list_all()]
     assert timestamps == sorted(timestamps, reverse=True)
 
@@ -37,7 +37,7 @@ def test_releases_sorted_descending_by_deployed_at(tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> ReleaseStore:
+def store(tmp_path: Path) -> ReleaseContextStore:
     """Anchor every release on a known timestamp so tests are deterministic.
 
     Reference incident time: 2026-05-03T10:00:00Z.
@@ -88,10 +88,10 @@ def store(tmp_path: Path) -> ReleaseStore:
         },
     ]
     (tmp_path / "recent.json").write_text(json.dumps(records))
-    return ReleaseStore(tmp_path)
+    return ReleaseContextStore(tmp_path)
 
 
-def test_malformed_records_are_dropped(store: ReleaseStore) -> None:
+def test_malformed_records_are_dropped(store: ReleaseContextStore) -> None:
     ids = {r["id"] for r in store.list_all()}
     assert "broken" not in ids
 
@@ -122,7 +122,7 @@ def test_recent_for_service_respects_hours(tmp_path: Path) -> None:
         },
     ]
     (tmp_path / "recent.json").write_text(json.dumps(records))
-    store = ReleaseStore(tmp_path)
+    store = ReleaseContextStore(tmp_path)
 
     fresh = store.recent_for_service("payments", hours=24)
     assert {r["id"] for r in fresh} == {"fresh"}
@@ -132,7 +132,7 @@ def test_recent_for_service_respects_hours(tmp_path: Path) -> None:
 
 
 def test_suspect_at_window_filters_by_service_and_time(
-    store: ReleaseStore,
+    store: ReleaseContextStore,
 ) -> None:
     incident_at = datetime(2026, 5, 3, 10, 0, 0, tzinfo=timezone.utc)
     suspects = store.suspect_at(
@@ -145,7 +145,7 @@ def test_suspect_at_window_filters_by_service_and_time(
     assert suspects == ["ledger-in-window", "pay-in-window"]
 
 
-def test_suspect_at_excludes_other_services(store: ReleaseStore) -> None:
+def test_suspect_at_excludes_other_services(store: ReleaseContextStore) -> None:
     incident_at = datetime(2026, 5, 3, 10, 0, 0, tzinfo=timezone.utc)
     suspects = store.suspect_at(
         services=["payments"],
@@ -155,7 +155,7 @@ def test_suspect_at_excludes_other_services(store: ReleaseStore) -> None:
     assert suspects == ["pay-in-window"]
 
 
-def test_suspect_at_zero_window_returns_empty(store: ReleaseStore) -> None:
+def test_suspect_at_zero_window_returns_empty(store: ReleaseContextStore) -> None:
     incident_at = datetime(2026, 5, 3, 10, 0, 0, tzinfo=timezone.utc)
     assert store.suspect_at(
         services=["payments"], at=incident_at, window_minutes=0
@@ -163,7 +163,7 @@ def test_suspect_at_zero_window_returns_empty(store: ReleaseStore) -> None:
 
 
 def test_suspect_at_naive_datetime_is_treated_as_utc(
-    store: ReleaseStore,
+    store: ReleaseContextStore,
 ) -> None:
     incident_at = datetime(2026, 5, 3, 10, 0, 0)  # naive
     suspects = store.suspect_at(
@@ -172,7 +172,7 @@ def test_suspect_at_naive_datetime_is_treated_as_utc(
     assert suspects == ["pay-in-window"]
 
 
-def test_context_returns_l5releasecontext(store: ReleaseStore) -> None:
+def test_context_returns_l5releasecontext(store: ReleaseContextStore) -> None:
     incident_at = datetime(2026, 5, 3, 10, 0, 0, tzinfo=timezone.utc)
     ctx = store.context(["payments", "ledger"], incident_at)
     assert isinstance(ctx, L5ReleaseContext)
@@ -187,7 +187,7 @@ def test_context_returns_l5releasecontext(store: ReleaseStore) -> None:
     )
 
 
-def test_context_unknown_service_yields_empty(store: ReleaseStore) -> None:
+def test_context_unknown_service_yields_empty(store: ReleaseContextStore) -> None:
     incident_at = datetime(2026, 5, 3, 10, 0, 0, tzinfo=timezone.utc)
     ctx = store.context(["nonexistent"], incident_at)
     assert ctx.recent_releases == []

@@ -60,15 +60,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypedDict
 
-from examples.incident_management.asr.kg_store import KGStore
+from runtime.memory.knowledge_graph import KnowledgeGraphStore
 from examples.incident_management.asr.memory_state import (
     L2KGContext,
     L5ReleaseContext,
     L7PlaybookSuggestion,
     MemoryLayerState,
 )
-from examples.incident_management.asr.playbook_store import PlaybookStore
-from examples.incident_management.asr.release_store import ReleaseStore
+from runtime.memory.playbook_store import PlaybookStore
+from runtime.memory.release_context import ReleaseContextStore
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ _TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{2,}")
 # ---------------------------------------------------------------------------
 
 
-def extract_components(query: str, kg_store: KGStore) -> list[str]:
+def extract_components(query: str, kg_store: KnowledgeGraphStore) -> list[str]:
     """Return component ids referenced by ``query`` (heuristic, deterministic).
 
     Strategy:
@@ -218,11 +218,11 @@ def find_active_duplicate(
 
 def _service_names_for_components(
     components: list[str],
-    kg_store: KGStore,
+    kg_store: KnowledgeGraphStore,
 ) -> list[str]:
     """Map component ids → service names for the L5 release lookup.
 
-    ``ReleaseStore.context`` matches on the ``service`` field of each
+    ``ReleaseContextStore.context`` matches on the ``service`` field of each
     release record, which is conventionally the component's KG ``id``
     (e.g. ``"payments"``) — but if a component records a distinct
     ``service`` field that's preferred. Falls back to the id.
@@ -244,7 +244,7 @@ def _signals_for_match(
     *,
     query: str,
     components: list[str],
-    kg_store: KGStore,
+    kg_store: KnowledgeGraphStore,
 ) -> dict[str, Any]:
     """Build the signal dict for :meth:`PlaybookStore.match`.
 
@@ -277,8 +277,8 @@ def _signals_for_match(
 def hydrate_and_gate(
     *,
     incident: Any,
-    kg_store: KGStore,
-    release_store: ReleaseStore,
+    kg_store: KnowledgeGraphStore,
+    release_store: ReleaseContextStore,
     playbook_store: PlaybookStore,
     active_sessions: list[dict[str, Any]] | None = None,
     incident_at: datetime | None = None,
@@ -395,13 +395,15 @@ __all__ = [
 # ``next_route``) so the framework supervisor merge logic stays simple.
 
 
-_DEFAULT_SEEDS = Path(__file__).parent / "seeds"
+from runtime.memory import knowledge_graph as _knowledge_graph_mod  # noqa: E402
+
+_DEFAULT_SEEDS = Path(_knowledge_graph_mod.__file__).parent / "seeds"
 
 
 def make_hydrate_runner(
     *,
-    kg_store: KGStore,
-    release_store: ReleaseStore,
+    kg_store: KnowledgeGraphStore,
+    release_store: ReleaseContextStore,
     playbook_store: PlaybookStore,
     get_active_sessions: Callable[[], list[dict[str, Any]]] | None = None,
     component_lookup: Callable[[str], list[str]] | None = None,
@@ -471,8 +473,8 @@ from runtime.intake import compose_runners, default_intake_runner  # noqa: E402
 
 def make_default_supervisor_runner(
     *,
-    kg_store: KGStore,
-    release_store: ReleaseStore,
+    kg_store: KnowledgeGraphStore,
+    release_store: ReleaseContextStore,
     playbook_store: PlaybookStore,
     get_active_sessions: Callable[[], list[dict[str, Any]]] | None = None,
     component_lookup: Callable[[str], list[str]] | None = None,
@@ -498,8 +500,8 @@ def make_default_supervisor_runner(
 # overhead is just a closure invocation. Constructor stays cheap:
 # the stores read seed JSON lazily on first access.
 _BUILT_DEFAULT_RUNNER = make_default_supervisor_runner(
-    kg_store=KGStore(_DEFAULT_SEEDS / "kg"),
-    release_store=ReleaseStore(_DEFAULT_SEEDS / "releases"),
+    kg_store=KnowledgeGraphStore(_DEFAULT_SEEDS / "kg"),
+    release_store=ReleaseContextStore(_DEFAULT_SEEDS / "releases"),
     playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
     get_active_sessions=lambda: [],
 )

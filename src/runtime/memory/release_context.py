@@ -39,7 +39,7 @@ def _parse_iso(ts: str) -> datetime:
     return dt
 
 
-class ReleaseStore:
+class ReleaseContextStore:
     """Filesystem-backed L5 Release Context reader."""
 
     def __init__(self, root: Path) -> None:
@@ -113,7 +113,7 @@ class ReleaseStore:
         of ``at``.
 
         The window is symmetric around ``at`` so a release shipped right
-        before *or* right after the incident start is surfaced — useful
+        before *or* right after that anchor time is surfaced — useful
         for both "deploy caused it" and "deploy is the rollback" cases.
         Returns release ids sorted by ``deployed_at`` descending.
         """
