@@ -3,7 +3,7 @@ storage:
     url: "sqlite:///incidents/incidents.db"
   vector:
     backend: faiss
-    path: "incidents/faiss"
+    path: "/tmp/asr-faiss"
     collection_name: "incidents"
     distance_strategy: cosine
 llm:
