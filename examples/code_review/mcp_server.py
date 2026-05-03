@@ -6,7 +6,7 @@ import this module.
 Mirrors the shape of ``examples/incident_management/mcp_server.py``:
 
 - a ``CodeReviewMCPServer`` dataclass that wraps a :class:`FastMCP` and is
-  bound to a ``SessionStore[CodeReviewState]``;
+  bound to a ``SessionStore[Session]``;
 - a module-level default ``mcp`` export so the framework's MCP loader can
   discover the server by name;
 - a ``set_state(...)`` shim that wires the default server to a concrete
@@ -18,6 +18,11 @@ The diff fetcher is a stub — it reads JSON fixtures from
 ``tests/fixtures/code_review/<repo>/<number>.json`` if present, else
 synthesises a tiny diff. Real GitHub fetching is out of scope for the
 P8 example app.
+
+Code-review-specific session data lives in ``Session.extra_fields``
+under the keys ``pr`` (dict mirroring the legacy ``PullRequest`` shape),
+``review_findings`` (list of finding dicts), ``overall_recommendation``
+and ``review_summary``.
 """
 from __future__ import annotations
 
@@ -27,8 +32,8 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from runtime.state import Session
 from runtime.storage.session_store import SessionStore
-from examples.code_review.state import CodeReviewState, ReviewFinding
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +90,7 @@ def _load_fixture_diff(fixtures_dir: Path, repo: str, number: int) -> dict | Non
 
 @dataclass
 class CodeReviewMCPServer:
-    """FastMCP server bound to a single ``SessionStore[CodeReviewState]``.
+    """FastMCP server bound to a single ``SessionStore[Session]``.
 
     ``store`` may be ``None`` until ``configure(store=...)`` is called —
     this matches the incident-management server, which lets the
@@ -96,7 +101,7 @@ class CodeReviewMCPServer:
     accidentally read committed fixtures.
     """
 
-    store: SessionStore[CodeReviewState] | None = None
+    store: SessionStore[Session] | None = None
     fixtures_dir: Path = field(default_factory=lambda: _DEFAULT_FIXTURES_DIR)
     mcp: FastMCP = field(init=False)
 
@@ -109,14 +114,14 @@ class CodeReviewMCPServer:
     def configure(
         self,
         *,
-        store: SessionStore[CodeReviewState],
+        store: SessionStore[Session],
         fixtures_dir: Path | str | None = None,
     ) -> None:
         self.store = store
         if fixtures_dir is not None:
             self.fixtures_dir = Path(fixtures_dir)
 
-    def _require_store(self) -> SessionStore[CodeReviewState]:
+    def _require_store(self) -> SessionStore[Session]:
         if self.store is None:
             raise RuntimeError(
                 "code_review server not initialized — call configure() "
@@ -155,20 +160,32 @@ class CodeReviewMCPServer:
         message: str,
         suggestion: str | None = None,
     ) -> dict:
-        """Append a ``ReviewFinding`` to the session's ``review_findings`` list."""
+        """Append a finding dict to the session's ``review_findings`` list.
+
+        The finding lives in ``Session.extra_fields["review_findings"]``
+        as a plain JSON-friendly dict (matches the legacy
+        ``ReviewFinding`` schema). Severity is validated against the
+        same Literal set the old Pydantic model enforced.
+        """
+        if severity not in {"info", "warning", "error", "critical"}:
+            raise ValueError(
+                f"severity must be info/warning/error/critical; "
+                f"got {severity!r}"
+            )
         store = self._require_store()
         session = store.load(session_id)
-        finding = ReviewFinding(
-            severity=severity,  # type: ignore[arg-type]  # pydantic validates Literal
-            file=file,
-            line=line,
-            category=category,
-            message=message,
-            suggestion=suggestion,
-        )
-        session.review_findings.append(finding)
+        finding = {
+            "severity": severity,
+            "file": file,
+            "line": line,
+            "category": category,
+            "message": message,
+            "suggestion": suggestion,
+        }
+        findings = session.extra_fields.setdefault("review_findings", [])
+        findings.append(finding)
         store.save(session)
-        return {"ok": True, "findings_count": len(session.review_findings)}
+        return {"ok": True, "findings_count": len(findings)}
 
     async def _tool_set_recommendation(
         self,
@@ -184,8 +201,8 @@ class CodeReviewMCPServer:
             )
         store = self._require_store()
         session = store.load(session_id)
-        session.overall_recommendation = recommendation  # type: ignore[assignment]
-        session.review_summary = summary
+        session.extra_fields["overall_recommendation"] = recommendation
+        session.extra_fields["review_summary"] = summary
         store.save(session)
         return {
             "ok": True,
@@ -204,7 +221,7 @@ mcp = _default_server.mcp
 
 def set_state(
     *,
-    store: SessionStore[CodeReviewState],
+    store: SessionStore[Session],
     fixtures_dir: Path | str | None = None,
 ) -> None:
     """Configure the default ``CodeReviewMCPServer`` instance."""

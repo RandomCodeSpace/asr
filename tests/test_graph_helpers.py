@@ -29,10 +29,14 @@ def test_route_from_skill_no_routes_raises():
 
 
 def test_recorder_appends_agent_run_and_tool_calls():
-    from examples.incident_management.state import IncidentState, Reporter
-    inc = IncidentState(
+    from runtime.state import Session
+    inc = Session(
         id="INC-1", status="new", created_at="t", updated_at="t",
-        query="q", environment="dev", reporter=Reporter(id="u", team="t"),
+        extra_fields={
+            "query": "q",
+            "environment": "dev",
+            "reporter": {"id": "u", "team": "t"},
+        },
     )
     rec = AgentRunRecorder(agent="intake", incident=inc)
     rec.start()
