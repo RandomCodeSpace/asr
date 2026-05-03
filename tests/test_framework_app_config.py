@@ -1,9 +1,11 @@
-"""Tests for ``runtime.config.FrameworkAppConfig`` (post-merge refactor).
+"""Tests for ``runtime.config.FrameworkAppConfig``.
 
-Pins the generic, framework-level cross-cutting config shape that
-replaces the four ``examples.incident_management.config`` imports the
-runtime used to make. Apps compose this inside their own AppConfig and
-expose a no-arg provider via ``RuntimeConfig.framework_app_config_path``.
+Pins the generic, framework-level cross-cutting config shape. Apps
+configure these knobs under the ``framework:`` block of their YAML
+which AppConfig binds directly; the legacy
+``RuntimeConfig.framework_app_config_path`` provider-callable
+indirection has been removed (apps no longer ship a per-app
+``config.py``).
 """
 from __future__ import annotations
 
@@ -58,25 +60,31 @@ def test_resolver_rejects_malformed_path():
         resolve_framework_app_config("not_a_dotted_path")
 
 
-def test_resolver_resolves_incident_provider():
-    """The incident-management example must expose a working provider."""
-    cfg = resolve_framework_app_config(
-        "examples.incident_management.config:framework_app_config_provider"
-    )
-    assert isinstance(cfg, FrameworkAppConfig)
-    assert cfg.confidence_threshold == 0.75
-    assert "platform-oncall" in cfg.escalation_teams
-    assert cfg.severity_aliases["sev1"] == "high"
+def test_incident_yaml_loads_into_framework_block():
+    """The bundled incident-management YAML's ``framework:`` block
+    binds straight onto ``AppConfig.framework``."""
+    from pathlib import Path
+
+    import yaml
+
+    raw = yaml.safe_load(Path("config/incident_management.yaml").read_text())
+    fw = FrameworkAppConfig(**(raw.get("framework") or {}))
+    assert fw.confidence_threshold == 0.75
+    assert "platform-oncall" in fw.escalation_teams
+    assert fw.severity_aliases["sev1"] == "high"
 
 
-def test_resolver_resolves_code_review_provider():
-    """Code-review example must expose a working provider — different from incident."""
-    cfg = resolve_framework_app_config(
-        "examples.code_review.config:framework_app_config_provider"
-    )
-    assert isinstance(cfg, FrameworkAppConfig)
-    # code-review has its own roster — must not be incident's roster.
-    assert "platform-oncall" not in cfg.escalation_teams
+def test_code_review_yaml_loads_into_framework_block():
+    """Code-review YAML's ``framework:`` block produces a different
+    ``FrameworkAppConfig`` than the incident YAML's — no leakage."""
+    from pathlib import Path
+
+    import yaml
+
+    raw = yaml.safe_load(Path("config/code_review.yaml").read_text())
+    fw = FrameworkAppConfig(**(raw.get("framework") or {}))
+    assert fw.escalation_teams == []
+    assert "platform-oncall" not in fw.escalation_teams
 
 
 def test_resolver_rejects_provider_returning_wrong_type(tmp_path, monkeypatch):
@@ -104,45 +112,19 @@ def test_resolver_rejects_provider_returning_wrong_type(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_incident_loader_returns_framework_app_config():
-    from examples.incident_management.config import (
-        framework_app_config_provider,
-        load_app_config,
-    )
+def test_app_yamls_do_not_leak_into_each_other():
+    """Each app's bundled YAML produces its own tuned
+    ``FrameworkAppConfig`` — no cross-pollination. Catches the
+    original bug where the runtime baked in incident defaults
+    irrespective of the loaded app."""
+    from pathlib import Path
 
-    fw = load_app_config()
-    assert isinstance(fw, FrameworkAppConfig)
-    # Incident-tuned values land on the framework layer.
-    assert fw.confidence_threshold == 0.75
-    assert "platform-oncall" in fw.escalation_teams
-    # Provider returns the same shape.
-    via_provider = framework_app_config_provider()
-    assert via_provider.escalation_teams == fw.escalation_teams
-    assert via_provider.severity_aliases == fw.severity_aliases
+    import yaml
 
-
-def test_code_review_loader_returns_framework_app_config():
-    from examples.code_review.config import (
-        framework_app_config_provider,
-        load_app_config,
-    )
-
-    fw = load_app_config()
-    assert isinstance(fw, FrameworkAppConfig)
-    via_provider = framework_app_config_provider()
-    assert isinstance(via_provider, FrameworkAppConfig)
-
-
-def test_code_review_framework_cfg_differs_from_incident():
-    """Each app's provider returns its own tuned values — the runtime
-    must never mix them up. Catches the original bug: graph baking in
-    incident defaults via load_incident_app_config()."""
-    inc = resolve_framework_app_config(
-        "examples.incident_management.config:framework_app_config_provider"
-    )
-    cr = resolve_framework_app_config(
-        "examples.code_review.config:framework_app_config_provider"
-    )
+    inc_raw = yaml.safe_load(Path("config/incident_management.yaml").read_text())
+    cr_raw = yaml.safe_load(Path("config/code_review.yaml").read_text())
+    inc = FrameworkAppConfig(**(inc_raw.get("framework") or {}))
+    cr = FrameworkAppConfig(**(cr_raw.get("framework") or {}))
     # Different rosters — incident has on-call teams, code-review has
     # an empty default (apps that wire up code-owners override via YAML).
     assert "platform-oncall" in inc.escalation_teams
@@ -156,14 +138,3 @@ def test_code_review_framework_cfg_differs_from_incident():
     # Dedup prompts are tuned to each domain.
     assert "incident" in inc.dedup_system_prompt.lower()
     assert "pull-request" in cr.dedup_system_prompt.lower()
-
-
-def test_code_review_yaml_round_trips_through_loader():
-    """The bundled code-review YAML loads cleanly via the lift path
-    (legacy flat keys lifted into the returned FrameworkAppConfig)."""
-    from examples.code_review.config import load_app_config
-
-    cfg = load_app_config()
-    # YAML sets similarity_threshold=0.3; the lift folds it onto
-    # FrameworkAppConfig.similarity_threshold.
-    assert cfg.similarity_threshold == 0.3

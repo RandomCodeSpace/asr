@@ -121,15 +121,15 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 # stores and active-session lookup.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
     (EXAMPLES_ROOT, "incident_management/runners.py"),
-    (EXAMPLES_ROOT, "incident_management/config.py"),
     (EXAMPLES_ROOT, "incident_management/mcp_server.py"),
 ]
 
 # Code-review app modules — same shape as the incident bundle but
 # pulls from ``examples/code_review/`` so a second self-contained app
-# bundle drops out of the same build script.
+# bundle drops out of the same build script. Per-app ``config.py``
+# files were removed in the framework/dedup/environments YAML
+# migration; cross-cutting knobs now live on AppConfig directly.
 CODE_REVIEW_APP_MODULE_ORDER: list[tuple[Path, str]] = [
-    (EXAMPLES_ROOT, "code_review/config.py"),
     (EXAMPLES_ROOT, "code_review/mcp_server.py"),
 ]
 

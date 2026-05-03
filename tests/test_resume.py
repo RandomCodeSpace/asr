@@ -2,7 +2,8 @@
 import pytest
 
 from runtime.config import (
-    AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths, RuntimeConfig,
+    AppConfig, FrameworkAppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths,
+    RuntimeConfig,
 )
 from runtime.state import AgentRun
 from runtime.orchestrator import Orchestrator
@@ -27,16 +28,16 @@ def cfg(tmp_path):
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
-        # confidence_threshold + escalation_teams now come from a
-        # FrameworkAppConfig provider (FrameworkAppConfig refactor).
-        # Wire the incident-management provider so the resume_session
-        # escalate action can validate against the incident roster.
-        runtime=RuntimeConfig(
-            state_class=None,
-            framework_app_config_path=(
-                "examples.incident_management.config:framework_app_config_provider"
-            ),
+        # confidence_threshold + escalation_teams come from
+        # AppConfig.framework — read directly off the YAML at runtime;
+        # tests construct an in-memory FrameworkAppConfig with the
+        # incident roster so the resume_session escalate action can
+        # validate against it.
+        framework=FrameworkAppConfig(
+            confidence_threshold=0.75,
+            escalation_teams=["platform-oncall", "data-oncall", "security-oncall"],
         ),
+        runtime=RuntimeConfig(state_class=None),
     )
 
 

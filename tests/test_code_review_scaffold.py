@@ -9,16 +9,22 @@ typed-state-class deletion.
 
 
 def test_code_review_app_config_defaults():
-    """The code-review YAML loader returns a framework-shaped config.
+    """The bundled code-review YAML carries framework knobs under the
+    ``framework:`` block which AppConfig binds directly.
 
     Domain-only knobs (``severity_categories``, ``auto_request_changes_on``,
     ``repos_in_scope``, ``review_max_diff_kb``, ``similarity_method``) are
-    no longer mirrored on a typed BaseModel — they live in the YAML and
-    the example-internal mcp_server / skills read them off the file.
+    not modelled on AppConfig — they live as raw YAML the
+    example-internal mcp_server / skills read off the file directly.
     """
-    from examples.code_review.config import load_app_config
-    cfg = load_app_config()
-    assert cfg.similarity_threshold == 0.3
+    from pathlib import Path
+
+    import yaml
+
+    raw = yaml.safe_load(Path("config/code_review.yaml").read_text())
+    framework = raw.get("framework") or {}
+    # The framework knob round-trips through the YAML's ``framework:`` block.
+    assert framework.get("similarity_threshold") == 0.3
 
 
 def test_code_review_skills_dir_exists():

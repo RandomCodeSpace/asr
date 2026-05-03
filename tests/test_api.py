@@ -25,15 +25,11 @@ def cfg(tmp_path):
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
-        runtime=RuntimeConfig(
-            state_class=None,
-            # Wire the incident-management environments provider so
-            # GET /environments returns the bundled roster (api.py no
-            # longer imports IncidentAppConfig directly post-merge).
-            environments_provider_path=(
-                "examples.incident_management.config:environments_provider"
-            ),
-        ),
+        # GET /environments reads ``AppConfig.environments`` directly;
+        # populate it inline so the test doesn't depend on a per-app
+        # config module.
+        environments=["production", "staging", "dev", "local"],
+        runtime=RuntimeConfig(state_class=None),
     )
 
 

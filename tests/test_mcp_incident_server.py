@@ -26,13 +26,25 @@ def _make_repo(tmp_path, *, similarity_threshold: float = 0.3):
 def setup_store(tmp_path):
     # Reset severity_aliases to the YAML-loaded default — protects this
     # test from sibling tests that may have configured the module-level
-    # _default_server with a different alias set.
-    from examples.incident_management.config import load_app_config
+    # _default_server with a different alias set. Reads aliases directly
+    # off the bundled config/incident_management.yaml ``framework:``
+    # block so the test doesn't depend on per-app Python loaders.
+    from pathlib import Path
+
+    import yaml
+
+    yaml_path = (
+        Path(__file__).resolve().parent.parent
+        / "config"
+        / "incident_management.yaml"
+    )
+    raw = yaml.safe_load(yaml_path.read_text())
+    severity_aliases = dict((raw.get("framework") or {}).get("severity_aliases") or {})
     store, history = _make_repo(tmp_path)
     set_state(
         store=store,
         history=history,
-        severity_aliases=dict(load_app_config().severity_aliases),
+        severity_aliases=severity_aliases,
     )
     yield store
 

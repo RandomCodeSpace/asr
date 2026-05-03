@@ -36,8 +36,26 @@ paths:
   incidents_dir: code_reviews
 orchestrator:
   entry_agent: intake
+# Cross-cutting framework knobs read directly off AppConfig.framework.
+framework:
+  confidence_threshold: 0.7
+  similarity_threshold: 0.3
+  escalation_teams: []
+  severity_aliases:
+    info: info
+    warning: warning
+    warn: warning
+    error: error
+    err: error
+    critical: critical
+    crit: critical
+    blocker: critical
+  dedup_system_prompt: >-
+    You are deduplicating pull-request reviews. Two reviews are
+    duplicates only if they cover the same repository, the same
+    branch/commit range, and surface overlapping findings. Return a
+    single JSON object: {"is_duplicate": bool, "confidence":
+    float in [0,1], "rationale": "1-2 sentences"}.
+
 runtime:
   state_class: null  # bare runtime.state.Session — app data in extra_fields
-  # Generic provider hooks — runtime never imports
-  # CodeReviewAppConfig directly.
-  framework_app_config_path: examples.code_review.config:framework_app_config_provider

@@ -67,6 +67,63 @@ mcp:
 paths:
   skills_dir: examples/incident_management/skills
   incidents_dir: incidents
+
+# Cross-cutting framework knobs the runtime reads off
+# ``AppConfig.framework`` directly. Mirrors what
+# ``config/incident_management.yaml`` carries — kept here so the
+# bundled deployment config is self-contained.
+framework:
+  confidence_threshold: 0.75
+  similarity_threshold: 0.2
+  escalation_teams:
+    - platform-oncall
+    - data-oncall
+    - security-oncall
+  severity_aliases:
+    sev1: high
+    sev2: high
+    p1: high
+    p2: high
+    critical: high
+    urgent: high
+    high: high
+    sev3: medium
+    p3: medium
+    moderate: medium
+    medium: medium
+    sev4: low
+    p4: low
+    info: low
+    informational: low
+    low: low
+  dedup_system_prompt: >-
+    You are deduplicating incident reports for an SRE platform. Two
+    reports are duplicates only if they describe the same root cause
+    AND the same service/environment AND overlap in time-of-occurrence.
+    Surface-level keyword overlap is NOT enough. Respond with a single
+    JSON object matching this schema: {"is_duplicate": bool,
+    "confidence": float in [0,1], "rationale": "1-2 sentences"}.
+
+# Environments roster surfaced on the UI selector and GET /environments.
+environments:
+  - production
+  - staging
+  - dev
+  - local
+
+# Two-stage dedup pipeline. Apps that don't want it omit the block.
+dedup:
+  enabled: true
+  stage1_threshold: 0.6
+  stage1_top_k: 5
+  stage2_top_k: 3
+  stage2_model: cheap
+  stage2_min_confidence: 0.7
+  run_at: post_intake
+  scope:
+    same_environment: true
+    only_closed: true
+
 # orchestrator: omitted — framework defaults apply (entry_agent='intake').
 # Override here only if you want to point the entry at a different skill.
 runtime:
@@ -75,17 +132,7 @@ runtime:
   # Apps swapping in a different state class point this at their own
   # ``Session`` subclass.
   state_class: null  # bare runtime.state.Session — app data in extra_fields
-  # Cross-cutting framework knobs (confidence threshold, escalation
-  # roster, severity aliases, dedup prompt) come from a no-arg
-  # provider the example app exposes. Lets the runtime read them
-  # without ever importing IncidentAppConfig.
-  framework_app_config_path: examples.incident_management.config:framework_app_config_provider
-  # Two-stage dedup pipeline shape. The provider returns ``None`` when
-  # the bundled example app's YAML disables it.
-  dedup_config_path: examples.incident_management.config:dedup_config_provider
-  # Environments roster surfaced on GET /environments.
-  environments_provider_path: examples.incident_management.config:environments_provider
-  # P9-9k: Risk-rated tool gateway with prod-HITL override.
+  # Risk-rated tool gateway with prod-HITL override.
   # ``policy`` declares per-tool risk tiers; tools absent default to ``low``.
   # ``prod_overrides`` forces ``require-approval`` regardless of the tier
   # whenever the live session's environment is in ``prod_environments``
