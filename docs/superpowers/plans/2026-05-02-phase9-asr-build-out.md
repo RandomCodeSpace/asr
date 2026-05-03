@@ -563,3 +563,16 @@ Block until then on:
 - User confirmation of the prod-HITL override contract on P4 (§5 + §6).
 
 *End of Phase 9 plan.*
+
+---
+
+## Post-Phase-9 generalisation (2026-05-03)
+
+Phase 9-h's supervisor framework hook (`Skill.runner`) was generalised one
+step further: the framework now ships `runtime.intake.default_intake_runner`
+as the default runner for any `kind: supervisor` skill, doing similarity
+retrieval (`HistoryStore.find_similar`) and dedup gating. ASR's
+`default_supervisor_runner` is now a composition of that framework default
+plus L2/L5/L7 memory hydration. The `asr_supervisor` skill was renamed to
+`intake`, replacing the legacy LLM-driven intake skill. See
+`docs/superpowers/plans/2026-05-03-framework-intake-extraction.md`.

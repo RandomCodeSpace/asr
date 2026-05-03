@@ -378,7 +378,7 @@ __all__ = [
 # a ``runner`` extension point: a callable invoked at supervisor-node entry
 # that may mutate ``GraphState`` and/or short-circuit to ``"__end__"``. The
 # functions below adapt :func:`hydrate_and_gate` to that contract so the
-# asr_supervisor skill actually exercises the hydration + dup-gate logic
+# intake skill actually exercises the hydration + dup-gate logic
 # inside the live graph, instead of leaving it to be called only from
 # unit tests.
 #
@@ -511,7 +511,7 @@ def default_supervisor_runner(
     """Module-level runner the YAML can wire in via dotted path.
 
     Anchored on the bundled seed directory (``seeds/kg``,
-    ``seeds/releases``, ``seeds/playbooks``) so the asr_supervisor
+    ``seeds/releases``, ``seeds/playbooks``) so the intake
     skill works out of the box. Real deployments should construct
     their own runner via :func:`make_default_supervisor_runner` and
     register it with their app's skill loader.
