@@ -9,7 +9,7 @@ Tests for ``examples.incident_management.asr.supervisor_node``. Covers:
   with ``status="duplicate"`` and ``parent_session_id`` stamped.
 * ``hydrate_and_gate`` — empty / unknown component query degrades
   gracefully (no L2/L5 hydration, empty L7, route stays ``triage``).
-* The asr_supervisor skill YAML loads cleanly under ``load_skill``.
+* The intake skill YAML loads cleanly under ``load_skill``.
 """
 from __future__ import annotations
 
@@ -269,14 +269,14 @@ def test_find_active_duplicate_permissive_fallback() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_asr_supervisor_skill_yaml_loads(tmp_path: Path) -> None:
-    """The shipped asr_supervisor/config.yaml round-trips through the loader."""
+def test_intake_skill_yaml_loads(tmp_path: Path) -> None:
+    """The shipped intake/config.yaml round-trips through the loader."""
     skill_dir = (
         Path(__file__).parent.parent
-        / "examples" / "incident_management" / "skills" / "asr_supervisor"
+        / "examples" / "incident_management" / "skills" / "intake"
     )
     skill = load_skill(skill_dir)
-    assert skill.name == "asr_supervisor"
+    assert skill.name == "intake"
     assert skill.kind == "supervisor"
     assert "triage" in skill.subordinates
     assert skill.dispatch_strategy == "rule"
@@ -289,13 +289,13 @@ def test_asr_supervisor_skill_yaml_loads(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Framework integration: asr_supervisor runs through make_supervisor_node
+# Framework integration: intake runs through make_supervisor_node
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_full_graph_routes_through_default_runner() -> None:
-    """End-to-end: asr_supervisor skill + framework supervisor node →
+    """End-to-end: intake skill + framework supervisor node →
     runner fires, hydration populates ``IncidentState.memory``, route
     lands on triage."""
     from runtime.agents.supervisor import make_supervisor_node
@@ -303,7 +303,7 @@ async def test_full_graph_routes_through_default_runner() -> None:
 
     skill_dir = (
         Path(__file__).parent.parent
-        / "examples" / "incident_management" / "skills" / "asr_supervisor"
+        / "examples" / "incident_management" / "skills" / "intake"
     )
     skill = load_skill(skill_dir)
     node = make_supervisor_node(skill=skill)
@@ -322,7 +322,7 @@ async def test_full_graph_routes_through_default_runner() -> None:
 
     # Routed to triage (no duplicate gate fires — empty active list).
     assert out["next_route"] == "triage"
-    assert out["last_agent"] == "asr_supervisor"
+    assert out["last_agent"] == "intake"
     assert out["error"] is None
 
     # Hydration ran: memory layers populated for the payments component.
@@ -358,7 +358,7 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
 
     skill_dir = (
         Path(__file__).parent.parent
-        / "examples" / "incident_management" / "skills" / "asr_supervisor"
+        / "examples" / "incident_management" / "skills" / "intake"
     )
     skill = load_skill(skill_dir)
     node = make_supervisor_node(skill=skill)

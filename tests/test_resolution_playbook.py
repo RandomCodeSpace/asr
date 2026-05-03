@@ -207,8 +207,8 @@ def test_config_yaml_loads_with_locked_gateway_block(monkeypatch) -> None:
     ) == "approve"
 
 
-def test_config_yaml_entry_agent_is_asr_supervisor(monkeypatch) -> None:
-    """Locks in the P9-9h decision: asr_supervisor is the entry agent."""
+def test_config_yaml_entry_agent_is_intake(monkeypatch) -> None:
+    """Framework default 'intake' is the entry agent — no override needed."""
     monkeypatch.setenv("OLLAMA_API_KEY", "x")
     monkeypatch.setenv("AZURE_ENDPOINT", "https://x.test")
     monkeypatch.setenv("AZURE_OPENAI_KEY", "x")
@@ -216,4 +216,4 @@ def test_config_yaml_entry_agent_is_asr_supervisor(monkeypatch) -> None:
     monkeypatch.setenv("EXT_TOKEN", "x")
     cfg_path = Path(__file__).parent.parent / "config" / "config.yaml"
     cfg = load_config(cfg_path)
-    assert cfg.orchestrator.entry_agent == "asr_supervisor"
+    assert cfg.orchestrator.entry_agent == "intake"
