@@ -139,6 +139,10 @@ def test_extra_fields_column_is_additive_for_legacy_rows(engine):
     assert isinstance(loaded, Session)
     assert loaded.id == "INC-20260503-001"
     assert loaded.status == "resolved"
-    # Bare ``Session`` doesn't surface incident-shaped typed columns;
-    # the row still carries them for back-compat indexing.
-    assert loaded.extra_fields == {}
+    # Bare ``Session`` surfaces typed-column data via ``extra_fields``
+    # so apps that drop their typed Session subclass still see the
+    # legacy row's domain fields.
+    assert loaded.extra_fields["query"] == "legacy"
+    assert loaded.extra_fields["environment"] == "production"
+    assert loaded.extra_fields["reporter"] == {"id": "bob", "team": "ops"}
+    assert loaded.extra_fields["summary"] == "legacy"

@@ -119,7 +119,7 @@ async def test_state_overrides_applied_to_session(cfg):
             state_overrides={"environment": "staging"},
         )
         inc = orch.store.load(sid)
-        assert inc.environment == "staging"
+        assert inc.extra_fields.get("environment") == "staging"
     finally:
         await orch.aclose()
 
@@ -137,7 +137,7 @@ async def test_legacy_environment_kwarg_still_works_with_warning(cfg):
                 query="db pool", environment="dev",
             )
         inc = orch.store.load(sid)
-        assert inc.environment == "dev"
+        assert inc.extra_fields.get("environment") == "dev"
         assert any(
             issubclass(item.category, DeprecationWarning)
             and "environment" in str(item.message)

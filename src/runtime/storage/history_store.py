@@ -188,13 +188,20 @@ class HistoryStore(Generic[StateT]):
             if getattr(i, "status", None) == status_filter
             and getattr(i, "deleted_at", None) is None
         ]
+        def _ef(i, key, default=""):
+            """Read a field from typed attribute first, then extra_fields."""
+            val = getattr(i, key, None)
+            if val:
+                return val
+            return (getattr(i, "extra_fields", None) or {}).get(key, default)
+
         candidates = [
             {
                 "id": i.id,
                 "text": " ".join(filter(None, [
-                    getattr(i, "query", "") or "",
-                    getattr(i, "summary", "") or "",
-                    " ".join(getattr(i, "tags", []) or []),
+                    _ef(i, "query", "") or "",
+                    _ef(i, "summary", "") or "",
+                    " ".join(_ef(i, "tags", []) or []),
                 ])),
                 "incident": i,
             }

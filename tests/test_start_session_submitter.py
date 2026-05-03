@@ -122,8 +122,8 @@ def test_submitter_dict_passes_through(service_full):
             submitter={"id": "alice", "team": "payments"},
         )
     inc = _load_row(service_full, sid)
-    assert inc.reporter.id == "alice"
-    assert inc.reporter.team == "payments"
+    assert inc.extra_fields["reporter"]["id"] == "alice"
+    assert inc.extra_fields["reporter"]["team"] == "payments"
 
 
 def test_legacy_reporter_kwargs_coerced_with_deprecation_warning(service_full):
@@ -145,8 +145,8 @@ def test_legacy_reporter_kwargs_coerced_with_deprecation_warning(service_full):
     )
     assert "reporter_id" in str(deprecations[0].message)
     inc = _load_row(service_full, sid)
-    assert inc.reporter.id == "bob"
-    assert inc.reporter.team == "dba"
+    assert inc.extra_fields["reporter"]["id"] == "bob"
+    assert inc.extra_fields["reporter"]["team"] == "dba"
 
 
 def test_both_submitter_and_legacy_raises_type_error(service_full):
@@ -178,5 +178,5 @@ def test_neither_kwarg_uses_defaults(service_full):
             query="x", state_overrides={"environment": "dev"},
         )
     inc = _load_row(service_full, sid)
-    assert inc.reporter.id == "user-mock"
-    assert inc.reporter.team == "platform"
+    assert inc.extra_fields["reporter"]["id"] == "user-mock"
+    assert inc.extra_fields["reporter"]["team"] == "platform"

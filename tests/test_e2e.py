@@ -58,8 +58,8 @@ async def test_full_flow_short_circuits_on_known_match(tmp_path, monkeypatch):
             reporter_id="u", reporter_team="t",
         )
         seed.status = "resolved"
-        seed.summary = "api latency spike production"
-        seed.resolution = "scaled api up (applied 2026-04-29T10:00:00Z)"
+        seed.extra_fields["summary"] = "api latency spike production"
+        seed.extra_fields["resolution"] = "scaled api up (applied 2026-04-29T10:00:00Z)"
         orch.store.save(seed)
 
         # Force the intake stub to call lookup_similar_incidents and then create_incident.

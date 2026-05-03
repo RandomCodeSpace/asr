@@ -2686,13 +2686,20 @@ class HistoryStore(Generic[StateT]):
             if getattr(i, "status", None) == status_filter
             and getattr(i, "deleted_at", None) is None
         ]
+        def _ef(i, key, default=""):
+            """Read a field from typed attribute first, then extra_fields."""
+            val = getattr(i, key, None)
+            if val:
+                return val
+            return (getattr(i, "extra_fields", None) or {}).get(key, default)
+
         candidates = [
             {
                 "id": i.id,
                 "text": " ".join(filter(None, [
-                    getattr(i, "query", "") or "",
-                    getattr(i, "summary", "") or "",
-                    " ".join(getattr(i, "tags", []) or []),
+                    _ef(i, "query", "") or "",
+                    _ef(i, "summary", "") or "",
+                    " ".join(_ef(i, "tags", []) or []),
                 ])),
                 "incident": i,
             }
@@ -2722,13 +2729,16 @@ StateT = TypeVar("StateT", bound=BaseModel)
 def _embed_source(inc: BaseModel) -> str:
     """Produce the text that represents a session in the vector store.
 
-    Uses ``query`` (when present on the state subclass) so that
-    ``find_similar(query=inc.query)`` retrieves the same vector. Bare
-    ``Session`` instances without a ``query`` attribute fall through to
-    an empty string and are not vectorised — apps that want vector
-    similarity must extend ``Session`` with a ``query``-shaped field.
+    Reads ``query`` from a typed field on a Session subclass first; for
+    bare ``runtime.state.Session`` instances, falls back to
+    ``extra_fields["query"]``. Returns "" only when neither carries a
+    value — those rows aren't vectorised.
     """
-    return (getattr(inc, "query", "") or "").strip()
+    typed = (getattr(inc, "query", "") or "").strip()
+    if typed:
+        return typed
+    extras = getattr(inc, "extra_fields", None) or {}
+    return str(extras.get("query") or "").strip()
 
 
 def _embed_source_from_row(row: "IncidentRow") -> str:
@@ -3077,6 +3087,9 @@ class SessionStore(Generic[StateT]):
         "agents_run", "tool_calls", "findings", "token_usage",
         "pending_intervention", "user_inputs",
         "parent_session_id", "dedup_rationale",
+        # ``extra_fields`` is the bag itself — round-tripped via the
+        # JSON column directly, never nested inside the bag.
+        "extra_fields",
     })
 
     # Incident-shaped typed columns the row carries for back-compat
@@ -3150,11 +3163,67 @@ class SessionStore(Generic[StateT]):
         # Pydantic's ``extra='ignore'`` will drop any keys the state
         # class doesn't declare (e.g. legacy fields written by an older
         # binary), keeping the round-trip robust.
-        extra = row.extra_fields or {}
+        extra = dict(row.extra_fields or {})
+
+        # Route typed-column values into extra_fields when the state
+        # class does NOT declare a typed Python field AND the column
+        # actually has data. This lets a bare ``runtime.state.Session``
+        # surface domain values (severity, environment, query…) via
+        # ``state.extra_fields`` without the app needing a Session
+        # subclass.
+        typed_to_extra: dict[str, object] = {}
+        if "query" not in model_fields and row.query:
+            typed_to_extra["query"] = row.query
+        if "environment" not in model_fields and row.environment:
+            typed_to_extra["environment"] = row.environment
+        if "reporter" not in model_fields and (row.reporter_id or row.reporter_team):
+            typed_to_extra["reporter"] = {
+                "id": row.reporter_id or "", "team": row.reporter_team or "",
+            }
+        if "summary" not in model_fields and row.summary:
+            typed_to_extra["summary"] = row.summary
+        if "severity" not in model_fields and row.severity:
+            typed_to_extra["severity"] = row.severity
+        if "category" not in model_fields and row.category:
+            typed_to_extra["category"] = row.category
+        if "matched_prior_inc" not in model_fields and row.matched_prior_inc:
+            typed_to_extra["matched_prior_inc"] = row.matched_prior_inc
+        if "tags" not in model_fields and row.tags:
+            typed_to_extra["tags"] = list(row.tags)
+        if "resolution" not in model_fields and row.resolution:
+            typed_to_extra["resolution"] = _deserialize_resolution(row.resolution)
+
+        # Fan extra_fields keys out as top-level kwargs for subclasses
+        # that declare typed fields for them. Pydantic's ``extra=ignore``
+        # silently drops keys the subclass doesn't declare — we re-stash
+        # those into the bare ``extra_fields`` kwarg below so the data
+        # survives.
         for k, v in extra.items():
             if k in self._STATE_TOP_LEVEL_FIELDS:
                 continue  # handled above
             kwargs[k] = v
+
+        # If the state class itself has an ``extra_fields`` field
+        # (Session and any subclass that opts in), pass the row's
+        # extra_fields content + typed-column-derived values through as
+        # a single dict. Subclass-specific typed fields are handled by
+        # the fan-out above; bare Session collects everything here.
+        if "extra_fields" in model_fields:
+            merged_extras: dict[str, object] = {}
+            # 1. Typed-column values (when the subclass doesn't declare them)
+            merged_extras.update(typed_to_extra)
+            # 2. Row's extra_fields JSON column (subclass-specific
+            # fields go to top-level kwargs above; whatever the subclass
+            # doesn't declare lives only here)
+            for k, v in extra.items():
+                if k in self._STATE_TOP_LEVEL_FIELDS:
+                    continue
+                if k in model_fields:
+                    # Subclass declared this as a typed field — it's
+                    # already routed via top-level kwargs.
+                    continue
+                merged_extras[k] = v
+            kwargs["extra_fields"] = merged_extras
 
         return self._state_cls(**kwargs)
 
@@ -3166,13 +3235,27 @@ class SessionStore(Generic[StateT]):
         present on the row schema) lands in ``extra_fields`` JSON.
         """
         model_fields = type(inc).model_fields
-        # Apps may pass either a ``Session`` subclass with the full
-        # incident-shaped fields (round-trip identity) or a narrower
-        # state. Use ``getattr`` so narrower states default safely.
-        reporter = getattr(inc, "reporter", None)
-        reporter_id = getattr(reporter, "id", None) if reporter is not None else None
-        reporter_team = getattr(reporter, "team", None) if reporter is not None else None
-        resolution = getattr(inc, "resolution", None)
+        # Apps may pass either a Session subclass with the full
+        # incident-shaped fields (round-trip identity) or a bare
+        # Session whose app data lives in ``extra_fields``. Helper
+        # ``_field`` reads from a typed attribute first, then falls back
+        # to extra_fields[key] — so both subclass and bare-Session paths
+        # round-trip cleanly through the typed columns.
+        bare_extra = getattr(inc, "extra_fields", {}) or {}
+
+        def _field(name: str, default=None):
+            if name in model_fields:
+                return getattr(inc, name, default)
+            return bare_extra.get(name, default)
+
+        reporter = _field("reporter", None)
+        if isinstance(reporter, dict):
+            reporter_id = reporter.get("id")
+            reporter_team = reporter.get("team")
+        else:
+            reporter_id = getattr(reporter, "id", None) if reporter is not None else None
+            reporter_team = getattr(reporter, "team", None) if reporter is not None else None
+        resolution = _field("resolution", None)
 
         # Build ``extra_fields``: every state-class field that is *not*
         # a top-level Session field and *not* one of the incident-shaped
@@ -3211,19 +3294,19 @@ class SessionStore(Generic[StateT]):
             "created_at": _parse_iso(inc.created_at),
             "updated_at": _parse_iso(inc.updated_at),
             "deleted_at": _parse_iso(inc.deleted_at) if inc.deleted_at else None,
-            "query": getattr(inc, "query", "") or "",
-            "environment": getattr(inc, "environment", "") or "",
+            "query": _field("query", "") or "",
+            "environment": _field("environment", "") or "",
             "reporter_id": reporter_id or "",
             "reporter_team": reporter_team or "",
-            "summary": getattr(inc, "summary", "") or "",
-            "severity": getattr(inc, "severity", None),
-            "category": getattr(inc, "category", None),
-            "matched_prior_inc": getattr(inc, "matched_prior_inc", None),
+            "summary": _field("summary", "") or "",
+            "severity": _field("severity", None),
+            "category": _field("category", None),
+            "matched_prior_inc": _field("matched_prior_inc", None),
             "resolution": (
                 resolution if resolution is None or isinstance(resolution, str)
                 else json.dumps(resolution)
             ),
-            "tags": list(getattr(inc, "tags", []) or []),
+            "tags": list(_field("tags", []) or []),
             "agents_run": [a.model_dump(mode="json") for a in inc.agents_run],
             "tool_calls": [t.model_dump(mode="json") for t in inc.tool_calls],
             "findings": dict(inc.findings),
@@ -3237,8 +3320,11 @@ class SessionStore(Generic[StateT]):
             # trip with NULL.
             "parent_session_id": getattr(inc, "parent_session_id", None),
             "dedup_rationale": getattr(inc, "dedup_rationale", None),
-            # Everything not covered by a typed column.
-            "extra_fields": extra or None,
+            # Everything not covered by a typed column. Subclass fields
+            # come from the loop above; bare-Session callers stash app
+            # data in ``state.extra_fields`` directly. Merge both, with
+            # subclass fields taking precedence (parity with load path).
+            "extra_fields": ({**bare_extra, **extra}) or None,
         }
 
 # ====== module: runtime/mcp_servers/observability.py ======
