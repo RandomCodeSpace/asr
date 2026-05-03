@@ -931,7 +931,7 @@ status flip via :meth:`SessionStore.un_duplicate`.
 from fastapi import FastAPI, HTTPException
 
 
-# ----- imports for examples/incident_management/asr/supervisor_node.py -----
+# ----- imports for examples/incident_management/runners.py -----
 """ASR supervisor router — hydration + single-active-investigation gate.
 
 The framework ships a generic ``kind: supervisor`` agent kind in
@@ -8298,7 +8298,7 @@ def register_dedup_routes(
             note=payload.note,
         )
 
-# ====== module: examples/incident_management/asr/supervisor_node.py ======
+# ====== module: examples/incident_management/runners.py ======
 
 logger = logging.getLogger(__name__)
 

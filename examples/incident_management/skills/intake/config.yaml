@@ -3,7 +3,7 @@ kind: supervisor
 subordinates:
   - triage
 dispatch_strategy: rule
-runner: examples.incident_management.asr.supervisor_node:default_supervisor_runner
+runner: examples.incident_management.runners:default_supervisor_runner
 dispatch_rules:
   - when: "True"
     target: triage
