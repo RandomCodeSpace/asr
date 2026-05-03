@@ -14,7 +14,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session as SqlSession
 
-from examples.incident_management.state import IncidentState
 from runtime.api_dedup import register_dedup_routes
 from runtime.storage.models import Base, DedupRetractionRow
 from runtime.storage.session_store import SessionStore
@@ -35,7 +34,7 @@ def engine(tmp_path):
 
 @pytest.fixture()
 def store(engine):
-    return SessionStore(engine=engine, state_cls=IncidentState)
+    return SessionStore(engine=engine)
 
 
 @pytest.fixture()

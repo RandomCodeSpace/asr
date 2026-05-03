@@ -1,10 +1,12 @@
 """Behavioural tests for SessionStore.
 
-Exercises ``SessionStore`` directly with the example ``IncidentState``.
+Exercises ``SessionStore`` directly against the framework-default
+``Session``. The row schema still carries the legacy incident-shaped
+typed columns for back-compat indexing; the Python state object stays
+``Session``-shaped.
 """
 import pytest
 
-from examples.incident_management.state import IncidentState
 from runtime.config import EmbeddingConfig, MetadataConfig, ProviderConfig
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.engine import build_engine
@@ -19,7 +21,7 @@ def _make_repo(tmp_path) -> SessionStore:
         EmbeddingConfig(provider="s", model="x", dim=1024),
         {"s": ProviderConfig(kind="stub")},
     )
-    return SessionStore(engine=eng, state_cls=IncidentState, embedder=embedder)
+    return SessionStore(engine=eng, embedder=embedder)
 
 
 @pytest.fixture
@@ -40,10 +42,10 @@ def test_create_assigns_sequential_ids(store):
 
 def test_save_roundtrip(store):
     inc = store.create(query="Q", environment="prod", reporter_id="u", reporter_team="t")
-    inc.summary = "updated"
+    inc.status = "resolved"
     store.save(inc)
     loaded = store.load(inc.id)
-    assert loaded.summary == "updated"
+    assert loaded.status == "resolved"
 
 
 def test_list_recent_returns_newest_first(store):

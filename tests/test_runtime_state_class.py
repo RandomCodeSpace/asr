@@ -25,8 +25,8 @@ def test_runtime_config_defaults_to_none_state_class():
 def test_runtime_config_accepts_dotted_path():
     from runtime.config import RuntimeConfig
 
-    cfg = RuntimeConfig(state_class="examples.incident_management.state.IncidentState")
-    assert cfg.state_class == "examples.incident_management.state.IncidentState"
+    cfg = RuntimeConfig(state_class="runtime.state.Session")
+    assert cfg.state_class == "runtime.state.Session"
 
 
 def test_app_config_has_runtime_block_with_default():
@@ -43,9 +43,9 @@ def test_app_config_accepts_runtime_state_class():
     app = AppConfig(
         llm=LLMConfig(),
         mcp=MCPConfig(),
-        runtime={"state_class": "examples.incident_management.state.IncidentState"},
+        runtime={"state_class": "runtime.state.Session"},
     )
-    assert app.runtime.state_class == "examples.incident_management.state.IncidentState"
+    assert app.runtime.state_class == "runtime.state.Session"
 
 
 def test_load_config_picks_up_runtime_block(tmp_path):
@@ -62,13 +62,13 @@ def test_load_config_picks_up_runtime_block(tmp_path):
                 },
                 "mcp": {"servers": []},
                 "runtime": {
-                    "state_class": "examples.incident_management.state.IncidentState"
+                    "state_class": "runtime.state.Session"
                 },
             }
         )
     )
     cfg = load_config(yaml_path)
-    assert cfg.runtime.state_class == "examples.incident_management.state.IncidentState"
+    assert cfg.runtime.state_class == "runtime.state.Session"
 
 
 # ---------- resolve_state_class ----------
@@ -94,14 +94,16 @@ def test_resolve_state_class_resolves_runtime_session_path():
     assert resolve_state_class("runtime.state.Session") is Session
 
 
-def test_resolve_state_class_resolves_incident_state():
-    from examples.incident_management.state import IncidentState
+def test_resolve_state_class_resolves_session_subclass():
+    """Resolver returns the class object for any importable Session subclass."""
+    from runtime.state import Session
     from runtime.state_resolver import resolve_state_class
 
-    assert (
-        resolve_state_class("examples.incident_management.state.IncidentState")
-        is IncidentState
-    )
+    # The resolver should return the class object for an importable
+    # ``Session`` subclass referenced by dotted path. Use the framework
+    # ``Session`` itself as the canonical resolvable target — apps that
+    # ship their own subclass plug it in via the same dotted-path API.
+    assert resolve_state_class("runtime.state.Session") is Session
 
 
 def test_resolve_state_class_rejects_non_session_subclass():
@@ -146,12 +148,23 @@ def engine(tmp_path):
     return e
 
 
+class _FlaggedSession(__import__("runtime.state", fromlist=["Session"]).Session):
+    """Tiny ``Session`` subclass used to exercise ``state_cls`` plumbing.
+
+    Surfaces ``query`` + ``environment`` so ``HistoryStore.find_similar``
+    (keyword path) has indexable text and the
+    ``filter_kwargs={"environment": ...}`` predicate matches.
+    """
+
+    query: str = ""
+    environment: str = ""
+
+
 def test_session_store_accepts_state_cls(engine):
-    from examples.incident_management.state import IncidentState
     from runtime.storage.session_store import SessionStore
 
-    store = SessionStore(engine=engine, state_cls=IncidentState)
-    assert store._state_cls is IncidentState
+    store = SessionStore(engine=engine, state_cls=_FlaggedSession)
+    assert store._state_cls is _FlaggedSession
 
 
 def test_session_store_default_state_cls_is_session(engine):
@@ -166,44 +179,35 @@ def test_session_store_default_state_cls_is_session(engine):
 
 
 def test_session_store_hydrates_to_configured_state_cls(engine):
-    """Round-trip: a custom ``IncidentState`` subclass survives create -> load."""
-    from examples.incident_management.state import IncidentState
+    """Round-trip: a custom ``Session`` subclass survives create -> load."""
     from runtime.storage.session_store import SessionStore
 
-    class FlaggedIncident(IncidentState):
-        pass
-
-    store = SessionStore(engine=engine, state_cls=FlaggedIncident)
+    store = SessionStore(engine=engine, state_cls=_FlaggedSession)
     inc = store.create(
         query="payments latency",
         environment="production",
         reporter_id="u",
         reporter_team="t",
     )
-    assert isinstance(inc, FlaggedIncident)
+    assert isinstance(inc, _FlaggedSession)
     loaded = store.load(inc.id)
-    assert isinstance(loaded, FlaggedIncident)
+    assert isinstance(loaded, _FlaggedSession)
     assert loaded.id == inc.id
 
 
 def test_history_store_accepts_state_cls(engine):
-    from examples.incident_management.state import IncidentState
     from runtime.storage.history_store import HistoryStore
 
-    h = HistoryStore(engine=engine, state_cls=IncidentState)
-    assert h._converter._state_cls is IncidentState
+    h = HistoryStore(engine=engine, state_cls=_FlaggedSession)
+    assert h._converter._state_cls is _FlaggedSession
 
 
 def test_history_store_threads_state_cls_through_to_converter(engine):
-    from examples.incident_management.state import IncidentState
     from runtime.storage.history_store import HistoryStore
     from runtime.storage.session_store import SessionStore
 
-    class FlaggedIncident(IncidentState):
-        pass
-
     # Seed with the SessionStore using the custom class.
-    store = SessionStore(engine=engine, state_cls=FlaggedIncident)
+    store = SessionStore(engine=engine, state_cls=_FlaggedSession)
     seeded = store.create(
         query="payments timeout upstream",
         environment="production",
@@ -211,7 +215,6 @@ def test_history_store_threads_state_cls_through_to_converter(engine):
         reporter_team="t",
     )
     seeded.status = "resolved"
-    seeded.summary = "restarted payments service"
     store.save(seeded)
 
     h = HistoryStore(
@@ -219,7 +222,7 @@ def test_history_store_threads_state_cls_through_to_converter(engine):
         embedder=None,
         vector_store=None,
         similarity_threshold=0.3,
-        state_cls=FlaggedIncident,
+        state_cls=_FlaggedSession,
     )
     results = h.find_similar(
         query="payments timeout",
@@ -227,9 +230,9 @@ def test_history_store_threads_state_cls_through_to_converter(engine):
         status_filter="resolved",
         limit=5,
     )
-    assert results, "expected keyword fallback to surface seeded incident"
+    assert results, "expected keyword fallback to surface seeded session"
     inc, _score = results[0]
-    assert isinstance(inc, FlaggedIncident)
+    assert isinstance(inc, _FlaggedSession)
 
 
 def test_orchestrator_class_is_generic():

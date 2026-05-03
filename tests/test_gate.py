@@ -3,7 +3,6 @@ import pytest
 from pytest import approx
 
 
-from examples.incident_management.state import IncidentState
 from runtime.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MetadataConfig, ProviderConfig
 from runtime.config import FrameworkAppConfig
 from runtime.graph import (
@@ -25,7 +24,7 @@ def _make_repo(tmp_path):
         EmbeddingConfig(provider="s", model="x", dim=1024),
         {"s": ProviderConfig(kind="stub")},
     )
-    return SessionStore(engine=eng, state_cls=IncidentState, embedder=embedder)
+    return SessionStore(engine=eng, embedder=embedder)
 
 
 def _cfg(threshold: float = 0.75) -> AppConfig:

@@ -35,6 +35,24 @@ from examples.incident_management.asr.supervisor_node import (
     hydrate_and_gate,
 )
 from runtime.skill import load_skill
+from runtime.state import Session as _Session
+
+
+class _AsrIncidentSession(_Session):
+    """Tiny ``Session`` subclass that surfaces the incident-shaped
+    attributes the ASR supervisor inspects (``query``, ``memory``).
+
+    The framework default ``Session`` keeps these in ``extra_fields`` —
+    but the supervisor node was authored against typed attributes, so we
+    keep them typed locally for these integration tests. The legacy
+    typed-state-class wiring (``examples.incident_management.state``) is
+    intentionally not imported here so that Wave C can delete that
+    module without breaking these tests.
+    """
+
+    query: str = ""
+    environment: str = ""
+    memory: MemoryLayerState | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -296,10 +314,9 @@ def test_intake_skill_yaml_loads(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_full_graph_routes_through_default_runner() -> None:
     """End-to-end: intake skill + framework supervisor node →
-    runner fires, hydration populates ``IncidentState.memory``, route
+    runner fires, hydration populates ``session.memory``, route
     lands on triage."""
     from runtime.agents.supervisor import make_supervisor_node
-    from examples.incident_management.state import IncidentState, Reporter
 
     skill_dir = (
         Path(__file__).parent.parent
@@ -308,14 +325,13 @@ async def test_full_graph_routes_through_default_runner() -> None:
     skill = load_skill(skill_dir)
     node = make_supervisor_node(skill=skill)
 
-    incident = IncidentState(
+    incident = _AsrIncidentSession(
         id="INC-20260503-001",
         status="new",
         created_at="2026-05-03T00:00:00Z",
         updated_at="2026-05-03T00:00:00Z",
         query="payments service p99 latency spike",
         environment="prod",
-        reporter=Reporter(id="op-1", team="sre"),
     )
 
     out = await node({"session": incident, "dispatch_depth": 0})
@@ -340,7 +356,6 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
     from runtime.memory.knowledge_graph import KnowledgeGraphStore
     from runtime.memory.playbook_store import PlaybookStore
     from runtime.memory.release_context import ReleaseContextStore
-    from examples.incident_management.state import IncidentState, Reporter
 
     # Build a runner whose live active-session list contains an
     # in-flight investigation against ``payments``. Patch the module's
@@ -363,14 +378,13 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
     skill = load_skill(skill_dir)
     node = make_supervisor_node(skill=skill)
 
-    incident = IncidentState(
+    incident = _AsrIncidentSession(
         id="INC-20260503-002",
         status="new",
         created_at="2026-05-03T00:00:00Z",
         updated_at="2026-05-03T00:00:00Z",
         query="payments p99 spike",
         environment="prod",
-        reporter=Reporter(id="op-1", team="sre"),
     )
 
     out = await node({"session": incident, "dispatch_depth": 0})
@@ -387,16 +401,14 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _make_incident() -> "IncidentState":  # noqa: F821 — string forward ref, imported in body
-    from examples.incident_management.state import IncidentState, Reporter
-    return IncidentState(
+def _make_incident() -> _AsrIncidentSession:
+    return _AsrIncidentSession(
         id="INC-20260503-007",
         status="new",
         created_at="2026-05-03T00:00:00Z",
         updated_at="2026-05-03T00:00:00Z",
         query="payments service p99 latency spike",
         environment="prod",
-        reporter=Reporter(id="op-1", team="sre"),
     )
 
 

@@ -1,9 +1,8 @@
 """Tests for the "duplicate" status + parent_session_id linkage.
 
 Covers:
-  * The ``IncidentStatus`` literal exposes ``"duplicate"``.
-  * ``IncidentState`` accepts and round-trips the new ``parent_session_id``
-    and ``dedup_rationale`` fields.
+  * ``Session`` accepts and round-trips the ``parent_session_id`` and
+    ``dedup_rationale`` fields.
   * ``SessionStore.list_recent`` filters out duplicates by default and
     surfaces them when ``include_duplicates=True``.
   * ``SessionStore.list_children`` returns the linked-list of duplicates
@@ -11,12 +10,9 @@ Covers:
 """
 from __future__ import annotations
 
-import typing
-
 import pytest
 from sqlalchemy import create_engine
 
-from examples.incident_management.state import IncidentState, IncidentStatus
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore
 
@@ -31,11 +27,7 @@ def engine(tmp_path):
 
 @pytest.fixture()
 def store(engine):
-    return SessionStore(engine=engine, state_cls=IncidentState)
-
-
-def test_duplicate_in_incident_status_literal():
-    assert "duplicate" in typing.get_args(IncidentStatus)
+    return SessionStore(engine=engine)
 
 
 def test_session_round_trip_with_dedup_fields(store):

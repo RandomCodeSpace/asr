@@ -1,59 +1,12 @@
-"""Tests for examples/incident_management/state.py."""
-import re
-import typing
+"""Tests for examples/incident_management runtime surface (UI / MCP / skills).
 
-
-def test_incident_state_importable():
-    from examples.incident_management.state import IncidentState  # noqa: F401
-
-
-def test_incident_state_inherits_session():
-    from runtime.state import Session
-    from examples.incident_management.state import IncidentState
-
-    assert issubclass(IncidentState, Session)
-
-
-def test_incident_state_has_domain_fields():
-    from examples.incident_management.state import IncidentState, Reporter
-
-    inc = IncidentState(
-        id="INC-20260502-001",
-        status="new",
-        created_at="2026-05-02T00:00:00Z",
-        updated_at="2026-05-02T00:00:00Z",
-        query="latency spike in payments",
-        environment="production",
-        reporter=Reporter(id="user-1", team="platform"),
-    )
-    assert inc.environment == "production"
-    assert inc.severity is None
-    assert inc.tags == []
-
-
-def test_incident_status_values():
-    from examples.incident_management.state import IncidentStatus
-
-    expected = {
-        "new",
-        "in_progress",
-        "matched",
-        "resolved",
-        "escalated",
-        "awaiting_input",
-        "stopped",
-        "deleted",
-        # Dedup pipeline terminal status.
-        "duplicate",
-    }
-    assert set(typing.get_args(IncidentStatus)) == expected
-
-
-def test_id_format_validation():
-    from examples.incident_management.state import _INC_ID_RE
-
-    assert re.match(_INC_ID_RE, "INC-20260502-001")
-    assert not re.match(_INC_ID_RE, "SESSION-001")
+Typed-subclass behaviour for ``IncidentState`` (pydantic field defaults,
+``IncidentStatus`` literal, ``_INC_ID_RE`` regex) was removed when the
+migration to ``Session.extra_fields`` rendered the typed subclass
+redundant. The remaining tests pin runtime-side surfaces — UI imports,
+MCP server tool inventory, skills directory layout — that survive the
+typed-subclass deletion.
+"""
 
 
 def test_incident_mcp_server_importable_from_example():

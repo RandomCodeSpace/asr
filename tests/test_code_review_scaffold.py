@@ -1,27 +1,11 @@
-"""Tests for examples/code_review scaffold."""
+"""Tests for examples/code_review scaffold.
 
-
-def test_code_review_state_importable():
-    from examples.code_review.state import CodeReviewState  # noqa: F401
-
-
-def test_code_review_state_inherits_session():
-    from runtime.state import Session
-    from examples.code_review.state import CodeReviewState
-    assert issubclass(CodeReviewState, Session)
-
-
-def test_code_review_state_has_domain_fields():
-    from examples.code_review.state import CodeReviewState, PullRequest
-    s = CodeReviewState(
-        id="CR-2026-001", status="new",
-        created_at="2026-05-03T00:00:00Z", updated_at="2026-05-03T00:00:00Z",
-        pr=PullRequest(repo="org/repo", number=42, title="Fix",
-                       author="alice", base_sha="abc", head_sha="def"),
-    )
-    assert s.pr.number == 42
-    assert s.review_findings == []
-    assert s.overall_recommendation is None
+The typed ``CodeReviewState`` / ``PullRequest`` pydantic shape is gone:
+code-review session data now rides through ``Session.extra_fields`` like
+every other app. What remains here is the framework-shaped config
+loader contract and the skills-directory layout — both survive the
+typed-state-class deletion.
+"""
 
 
 def test_code_review_app_config_defaults():
@@ -45,11 +29,3 @@ def test_code_review_skills_dir_exists():
     assert (skills / "intake").is_dir()
     assert (skills / "analyzer").is_dir()
     assert (skills / "recommender").is_dir()
-
-
-def test_code_review_uses_runtime_state_no_runtime_import():
-    """Verify the example only imports runtime.state, not runtime.incident or other domain types."""
-    state_text = open("examples/code_review/state.py").read()
-    assert "from runtime.state import" in state_text
-    assert "incident_management" not in state_text
-    assert "from runtime.incident" not in state_text

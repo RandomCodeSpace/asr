@@ -1,7 +1,6 @@
 from contextlib import AsyncExitStack
 import pytest
 
-from examples.incident_management.state import IncidentState
 from runtime.config import EmbeddingConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
 from runtime.mcp_loader import load_tools, ToolRegistry
 from examples.incident_management.mcp_server import set_state as set_inc_state
@@ -19,8 +18,8 @@ def _make_repo(tmp_path):
         EmbeddingConfig(provider="s", model="x", dim=1024),
         {"s": ProviderConfig(kind="stub")},
     )
-    store = SessionStore(engine=eng, state_cls=IncidentState, embedder=embedder)
-    history = HistoryStore(engine=eng, state_cls=IncidentState, embedder=embedder,
+    store = SessionStore(engine=eng, embedder=embedder)
+    history = HistoryStore(engine=eng, embedder=embedder,
                            similarity_threshold=0.5)
     return store, history
 

@@ -27,7 +27,29 @@ from runtime.config import (
     RuntimeConfig,
     StorageConfig,
 )
+from pydantic import BaseModel
+
 from runtime.service import OrchestratorService, SessionCapExceeded
+from runtime.state import Session
+
+
+class _Reporter(BaseModel):
+    id: str = ""
+    team: str = ""
+
+
+class _IncidentLikeSession(Session):
+    """Session subclass that preserves the incident-shaped fields the
+    orchestrator's MCP servers and storage layer reach for via
+    ``getattr``. Without these declared on the state class, the
+    storage layer's ``_incident_to_row_dict`` writes back empty strings
+    for ``query`` / ``reporter_id`` / ``reporter_team`` on every
+    ``save()``, clobbering what ``store.create()`` initially persisted.
+    """
+
+    query: str = ""
+    environment: str = ""
+    reporter: _Reporter | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +103,7 @@ def cfg(tmp_path):
             incidents_dir=str(tmp_path),
         ),
         runtime=RuntimeConfig(
-            state_class="examples.incident_management.state.IncidentState",
+            state_class=f"{_IncidentLikeSession.__module__}.{_IncidentLikeSession.__qualname__}",
         ),
     )
 
@@ -177,24 +199,35 @@ def test_sessions_dont_cross_contaminate(service):
     # Read each row back through the orchestrator's store. We don't
     # assert on tool_calls / agents_run length (the stub graph's exact
     # trace is implementation-detail), only that no row was overwritten
-    # by another session and that each carries its own session_id +
-    # reporter — proof of zero cross-contamination.
+    # by another session and that each carries its own session_id —
+    # proof of zero cross-contamination. The incident-shaped query /
+    # reporter values still ride to the row's typed columns via
+    # ``store.create()`` but, with the framework-default ``Session``
+    # state_cls, they aren't surfaced as Python attributes; verify
+    # the values directly off the underlying ``IncidentRow``.
+    from sqlalchemy.orm import Session as SqlSession
+
+    from runtime.storage.models import IncidentRow
+
     orch = service._orch
     assert orch is not None, "orchestrator was never built"
     for i, sid in enumerate(sids):
-        inc = orch.store.load(sid)
-        assert inc.id == sid, f"row {sid} loaded with wrong id {inc.id}"
-        assert inc.query == f"unique-payload-{i}", (
-            f"session {sid} has wrong query: {inc.query!r}"
+        sess = orch.store.load(sid)
+        assert sess.id == sid, f"row {sid} loaded with wrong id {sess.id}"
+        with SqlSession(orch.store.engine) as db_sess:
+            row = db_sess.get(IncidentRow, sid)
+        assert row is not None
+        assert row.query == f"unique-payload-{i}", (
+            f"session {sid} has wrong query: {row.query!r}"
         )
-        assert inc.reporter.id == f"u{i}", (
-            f"session {sid} has wrong reporter: {inc.reporter.id!r}"
+        assert row.reporter_id == f"u{i}", (
+            f"session {sid} has wrong reporter: {row.reporter_id!r}"
         )
         # Each session must own its own agents_run / tool_calls lists —
         # the lists are per-row, never shared. Type check only; the
         # exact counts depend on the stub graph trajectory.
-        assert isinstance(inc.agents_run, list)
-        assert isinstance(inc.tool_calls, list)
+        assert isinstance(sess.agents_run, list)
+        assert isinstance(sess.tool_calls, list)
 
 
 def test_cap_blocks_when_full(cfg):

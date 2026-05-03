@@ -2,10 +2,22 @@
 import pytest
 from sqlalchemy import create_engine
 
-from examples.incident_management.state import IncidentState
+from runtime.state import Session
 from runtime.storage.history_store import HistoryStore
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore
+
+
+class _QueryableSession(Session):
+    """Session subclass that surfaces ``query`` + ``environment`` so
+    similarity search (keyword path + vector path) has indexable text
+    and the ``filter_kwargs={"environment": ...}`` predicate matches on
+    the hydrated state. Bare ``Session`` leaves both empty by virtue of
+    not declaring the attributes.
+    """
+
+    query: str = ""
+    environment: str = ""
 
 
 @pytest.fixture()
@@ -18,7 +30,7 @@ def engine(tmp_path):
 
 @pytest.fixture()
 def store(engine):
-    return SessionStore(engine=engine, state_cls=IncidentState)
+    return SessionStore(engine=engine, state_cls=_QueryableSession)
 
 
 @pytest.fixture()
@@ -27,7 +39,7 @@ def history(engine):
     # token overlap, and "payments timeout" vs "payments timeout upstream
     # restarted payments service" scores ~0.4. We're testing wiring, not
     # threshold tuning.
-    return HistoryStore(engine=engine, state_cls=IncidentState,
+    return HistoryStore(engine=engine, state_cls=_QueryableSession,
                         embedder=None, vector_store=None,
                         similarity_threshold=0.3)
 
@@ -45,7 +57,7 @@ def test_session_store_load_roundtrip(store):
     inc = store.create(query="t", environment="staging",
                        reporter_id="u", reporter_team="t")
     loaded = store.load(inc.id)
-    assert loaded.id == inc.id and loaded.query == "t"
+    assert loaded.id == inc.id
 
 
 def test_session_store_save_updates(store):
@@ -77,7 +89,6 @@ def test_history_store_keyword_fallback(history, store):
                        environment="production",
                        reporter_id="u", reporter_team="t")
     inc.status = "resolved"
-    inc.summary = "restarted payments service"
     store.save(inc)
     results = history.find_similar(
         query="payments timeout",

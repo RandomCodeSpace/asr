@@ -10,16 +10,30 @@ Active CRUD lives on ``SessionStore``; similarity lookups on
 from __future__ import annotations
 import pytest
 
-from examples.incident_management.state import IncidentState
 from runtime.config import (
     EmbeddingConfig, MetadataConfig, ProviderConfig, VectorConfig,
 )
+from runtime.state import Session
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.engine import build_engine
 from runtime.storage.history_store import HistoryStore
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore
 from runtime.storage.vector import build_vector_store
+
+
+class _QueryableSession(Session):
+    """Minimal ``Session`` subclass with the incident-shaped attributes
+    (``query``, ``environment``) the vector + keyword similarity paths
+    introspect via ``getattr`` on the loaded state instance.
+
+    Bare ``Session`` returns empty text from ``_embed_source`` and the
+    keyword candidates loop, so similarity tests need a subclass that
+    surfaces these attributes for hydration.
+    """
+
+    query: str = ""
+    environment: str = ""
 
 
 @pytest.fixture
@@ -39,13 +53,13 @@ def stores(tmp_path):
         embedder,
     )
     store = SessionStore(
-        engine=eng, state_cls=IncidentState,
+        engine=eng, state_cls=_QueryableSession,
         embedder=embedder, vector_store=vs,
         vector_path=vec_path, vector_index_name="t",
         distance_strategy="cosine",
     )
     history = HistoryStore(
-        engine=eng, state_cls=IncidentState,
+        engine=eng, state_cls=_QueryableSession,
         embedder=embedder, vector_store=vs,
         distance_strategy="cosine", similarity_threshold=0.0,
     )
@@ -57,8 +71,6 @@ def test_find_similar_returns_self_first(stores):
     a = store.create(query="redis OOMKill in payments", environment="production",
                      reporter_id="u", reporter_team="t")
     a.status = "resolved"
-    a.summary = "redis OOM"
-    a.resolution = "raise memory"
     store.save(a)
     store.create(query="ssh down on bastion", environment="production",
                  reporter_id="u", reporter_team="t")  # noise
@@ -98,13 +110,12 @@ def test_find_similar_excludes_unresolved(stores):
 def test_find_similar_keyword_fallback_when_no_embedder(tmp_path):
     eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/k.db"))
     Base.metadata.create_all(eng)
-    store = SessionStore(engine=eng, state_cls=IncidentState, embedder=None)
-    history = HistoryStore(engine=eng, state_cls=IncidentState, embedder=None,
+    store = SessionStore(engine=eng, state_cls=_QueryableSession, embedder=None)
+    history = HistoryStore(engine=eng, state_cls=_QueryableSession, embedder=None,
                            similarity_threshold=0.0)
     a = store.create(query="redis OOM", environment="production",
                      reporter_id="u", reporter_team="t")
     a.status = "resolved"
-    a.summary = "redis OOM"
     store.save(a)
     hits = history.find_similar(query="redis OOM",
                                 filter_kwargs={"environment": "production"})

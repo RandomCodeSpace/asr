@@ -1,11 +1,12 @@
-"""``IncidentState.memory`` round-trips through ``SessionStore``.
+"""ASR memory-layer state round-trips through ``SessionStore.extra_fields``.
 
-The ASR memory-layer slot ``memory: MemoryLayerState`` lives on
-``IncidentState`` but has no typed column on ``IncidentRow``; it rides
-through the ``extra_fields`` JSON bag. These tests pin both the
-default-empty shape and the populated round-trip so future schema work
-doesn't silently drop sub-graph / release / playbook context off the
-session.
+The ASR memory-layer slot used to live as ``IncidentState.memory`` (a
+typed ``MemoryLayerState`` field on the incident subclass). Post the
+``Session.extra_fields`` migration, the same payload rides through the
+generic ``extra_fields`` JSON bag on the framework-default ``Session``;
+these tests pin both the schema-shape contract on ``MemoryLayerState``
+and the round-trip semantics so future schema work doesn't silently
+drop sub-graph / release / playbook context off the session.
 """
 from __future__ import annotations
 
@@ -17,8 +18,8 @@ from runtime.memory.session_state import (
     L7PlaybookSuggestion,
     MemoryLayerState,
 )
-from examples.incident_management.state import IncidentState, Reporter
 from runtime.config import MetadataConfig
+from runtime.state import Session
 from runtime.storage.engine import build_engine
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore
@@ -65,51 +66,36 @@ def test_l7_playbook_suggestion_score_bounds():
         L7PlaybookSuggestion(playbook_id="pb-1", score=-0.1)
 
 
-def test_incident_state_default_memory_is_empty():
-    inc = IncidentState(
-        id="INC-20260503-099",
-        status="new",
-        created_at="2026-05-03T00:00:00Z",
-        updated_at="2026-05-03T00:00:00Z",
-        query="boot",
-        environment="staging",
-        reporter=Reporter(id="u", team="t"),
-    )
-    assert isinstance(inc.memory, MemoryLayerState)
-    assert inc.memory.l2_kg is None
-    assert inc.memory.l5_release is None
-    assert inc.memory.l7_playbooks == []
-
-
 # ---- Round-trip through SessionStore (extra_fields) -------------------
 
 
 def test_default_memory_round_trips_through_session_store(engine):
-    store = SessionStore[IncidentState](engine=engine, state_cls=IncidentState)
-    inc = store.create(
+    store = SessionStore(engine=engine)
+    sess = store.create(
         query="payments slow",
         environment="production",
         reporter_id="alice",
         reporter_team="payments",
     )
-    store.save(inc)
+    sess.extra_fields["memory"] = MemoryLayerState().model_dump(mode="json")
+    store.save(sess)
 
-    loaded = store.load(inc.id)
-    assert isinstance(loaded.memory, MemoryLayerState)
-    assert loaded.memory.l2_kg is None
-    assert loaded.memory.l5_release is None
-    assert loaded.memory.l7_playbooks == []
+    loaded = store.load(sess.id)
+    memory = MemoryLayerState.model_validate(loaded.extra_fields["memory"])
+    assert memory.l2_kg is None
+    assert memory.l5_release is None
+    assert memory.l7_playbooks == []
 
 
 def test_populated_memory_round_trips_through_session_store(engine):
-    store = SessionStore[IncidentState](engine=engine, state_cls=IncidentState)
-    inc = store.create(
+    store = SessionStore(engine=engine)
+    sess = store.create(
         query="payments p99 spike",
         environment="production",
         reporter_id="alice",
         reporter_team="payments",
     )
-    inc.memory = MemoryLayerState(
+    memory = MemoryLayerState(
         l2_kg=L2KGContext(
             components=["payments"],
             upstream=["api-gateway"],
@@ -136,25 +122,27 @@ def test_populated_memory_round_trips_through_session_store(engine):
             )
         ],
     )
-    store.save(inc)
+    sess.extra_fields["memory"] = memory.model_dump(mode="json")
+    store.save(sess)
 
-    loaded = store.load(inc.id)
-    assert isinstance(loaded.memory, MemoryLayerState)
-    assert loaded.memory.l2_kg is not None
-    assert loaded.memory.l2_kg.components == ["payments"]
-    assert loaded.memory.l2_kg.upstream == ["api-gateway"]
-    assert sorted(loaded.memory.l2_kg.downstream) == [
+    loaded = store.load(sess.id)
+    assert isinstance(loaded, Session)
+    rehydrated = MemoryLayerState.model_validate(loaded.extra_fields["memory"])
+    assert rehydrated.l2_kg is not None
+    assert rehydrated.l2_kg.components == ["payments"]
+    assert rehydrated.l2_kg.upstream == ["api-gateway"]
+    assert sorted(rehydrated.l2_kg.downstream) == [
         "kafka",
         "postgres-payments",
     ]
-    assert loaded.memory.l2_kg.raw == {"nodes": 3, "edges": 2}
+    assert rehydrated.l2_kg.raw == {"nodes": 3, "edges": 2}
 
-    assert loaded.memory.l5_release is not None
-    assert loaded.memory.l5_release.suspect_releases == ["rel-1"]
-    assert loaded.memory.l5_release.recent_releases[0]["sha"] == "abc123"
+    assert rehydrated.l5_release is not None
+    assert rehydrated.l5_release.suspect_releases == ["rel-1"]
+    assert rehydrated.l5_release.recent_releases[0]["sha"] == "abc123"
 
-    assert len(loaded.memory.l7_playbooks) == 1
-    pb = loaded.memory.l7_playbooks[0]
+    assert len(rehydrated.l7_playbooks) == 1
+    pb = rehydrated.l7_playbooks[0]
     assert pb.playbook_id == "pb-payments-latency"
     assert pb.score == 0.75
     assert "service=payments" in pb.matched_signals

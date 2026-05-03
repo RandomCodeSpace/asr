@@ -1,12 +1,13 @@
 """SessionStore CRUD tests against file-based SQLite + stub embedder.
 
-The active CRUD surface lives on ``SessionStore``; tests use the
-example ``IncidentState`` so the row schema's domain fields round-trip.
+The active CRUD surface lives on ``SessionStore``. Tests use the
+framework default ``Session`` state class — the row schema still
+carries the (now-legacy) incident-shaped typed columns for back-compat,
+but the Python state object only sees what ``Session`` declares.
 """
 from __future__ import annotations
 import pytest
 
-from examples.incident_management.state import IncidentState
 from runtime.config import MetadataConfig
 from runtime.storage.engine import build_engine
 from runtime.storage.models import Base
@@ -18,7 +19,7 @@ def repo(tmp_path):
     db = tmp_path / "test.db"
     eng = build_engine(MetadataConfig(url=f"sqlite:///{db}"))
     Base.metadata.create_all(eng)
-    return SessionStore(engine=eng, state_cls=IncidentState)
+    return SessionStore(engine=eng)
 
 
 def test_create_assigns_id_and_persists(repo):
@@ -26,9 +27,7 @@ def test_create_assigns_id_and_persists(repo):
                       reporter_id="u1", reporter_team="platform")
     assert inc.id.startswith("INC-")
     loaded = repo.load(inc.id)
-    assert loaded.query == "redis OOM"
-    assert loaded.environment == "production"
-    assert loaded.reporter.id == "u1"
+    assert loaded.id == inc.id
     assert loaded.status == "new"
 
 
@@ -43,8 +42,6 @@ def test_create_id_sequence(repo):
 def test_save_round_trip_preserves_nested(repo):
     from runtime.state import AgentRun, ToolCall, TokenUsage
     inc = repo.create(query="q", environment="dev", reporter_id="u", reporter_team="t")
-    inc.summary = "edited"
-    inc.tags = ["redis", "oom"]
     inc.findings = {"triage": {"k": "v"}}
     inc.agents_run.append(AgentRun(agent="intake", started_at=inc.created_at,
                                    ended_at=inc.created_at, summary="ok",
@@ -53,8 +50,6 @@ def test_save_round_trip_preserves_nested(repo):
                                    ts=inc.created_at))
     repo.save(inc)
     loaded = repo.load(inc.id)
-    assert loaded.summary == "edited"
-    assert loaded.tags == ["redis", "oom"]
     assert loaded.findings == {"triage": {"k": "v"}}
     assert len(loaded.agents_run) == 1
     assert len(loaded.tool_calls) == 1
