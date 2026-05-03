@@ -1,9 +1,29 @@
-similarity_threshold: 0.3
 similarity_method: keyword
 severity_categories: [info, warning, error, critical]
 auto_request_changes_on: [critical, error]
 repos_in_scope: []
 review_max_diff_kb: 500
+
+# Cross-cutting framework knobs the runtime consumes directly.
+framework:
+  confidence_threshold: 0.7
+  similarity_threshold: 0.3
+  escalation_teams: []
+  severity_aliases:
+    info: info
+    warning: warning
+    warn: warning
+    error: error
+    err: error
+    critical: critical
+    crit: critical
+    blocker: critical
+  dedup_system_prompt: >-
+    You are deduplicating pull-request reviews. Two reviews are
+    duplicates only if they cover the same repository, the same
+    branch/commit range, and surface overlapping findings. Return a
+    single JSON object: {"is_duplicate": bool, "confidence":
+    float in [0,1], "rationale": "1-2 sentences"}.
 
 # UI rendering knobs surfaced to the generic runtime/ui.py shell.
 # Severity badges follow the code-review vocabulary; detail fields

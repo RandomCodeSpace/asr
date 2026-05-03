@@ -1,39 +1,53 @@
 # App-level config for the incident-management example.
 #
-# Mirrors the IncidentAppConfig defaults so load_incident_app_config()
-# returns a fully-populated config in environments where this file is
-# present (the framework loader falls back to defaults when missing).
+# Carries the cross-cutting framework knobs (similarity thresholds,
+# confidence threshold, escalation roster, severity aliases, dedup
+# system prompt) directly under ``framework:`` so the runtime can read
+# them via ``AppConfig.framework`` without resolving an app-side
+# provider callable. ``environments`` and ``dedup`` are top-level for
+# the same reason.
 
 store_path: incidents
-similarity_threshold: 0.2
 similarity_method: keyword
-confidence_threshold: 0.75
-escalation_teams:
-  - platform-oncall
-  - data-oncall
-  - security-oncall
+
+# Cross-cutting framework knobs the runtime consumes directly.
+framework:
+  confidence_threshold: 0.75
+  similarity_threshold: 0.2
+  escalation_teams:
+    - platform-oncall
+    - data-oncall
+    - security-oncall
+  severity_aliases:
+    sev1: high
+    sev2: high
+    p1: high
+    p2: high
+    critical: high
+    urgent: high
+    high: high
+    sev3: medium
+    p3: medium
+    moderate: medium
+    medium: medium
+    sev4: low
+    p4: low
+    info: low
+    informational: low
+    low: low
+  dedup_system_prompt: >-
+    You are deduplicating incident reports for an SRE platform. Two
+    reports are duplicates only if they describe the same root cause
+    AND the same service/environment AND overlap in time-of-occurrence.
+    Surface-level keyword overlap is NOT enough. Respond with a single
+    JSON object matching this schema: {"is_duplicate": bool,
+    "confidence": float in [0,1], "rationale": "1-2 sentences"}.
+
 environments:
   - production
   - staging
   - dev
   - local
-severity_aliases:
-  sev1: high
-  sev2: high
-  p1: high
-  p2: high
-  critical: high
-  urgent: high
-  high: high
-  sev3: medium
-  p3: medium
-  moderate: medium
-  medium: medium
-  sev4: low
-  p4: low
-  info: low
-  informational: low
-  low: low
 
 # P7-C: two-stage dedup pipeline. The example app opts in here; the
 # framework default (no `dedup` key) is off.
