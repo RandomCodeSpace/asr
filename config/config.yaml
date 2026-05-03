@@ -1,6 +1,6 @@
 storage:
   metadata:
-    url: "sqlite:///incidents/incidents.db"
+    url: "sqlite:////tmp/asr.db"
   vector:
     backend: faiss
     path: "/tmp/asr-faiss"
