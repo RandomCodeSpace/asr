@@ -23,11 +23,9 @@ htmlcov/
 # scripts/build_single_file.py.
 
 # --- Runtime data (user-specific, not source) ------------------------
-incidents/*.json
-incidents/*.db
-incidents/*.db-journal
-incidents/faiss/
-!incidents/.gitkeep
+# SQLite metadata DB and FAISS vector index live under /tmp by default
+# (see config/config.yaml). The incidents/ directory was removed; if a
+# config still references it, the path is the user's responsibility.
 
 # --- Secrets ---------------------------------------------------------
 .env

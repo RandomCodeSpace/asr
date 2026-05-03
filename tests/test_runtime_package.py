@@ -158,13 +158,19 @@ def test_paths_skills_dir_default_is_none():
 
 def test_orchestrator_raises_clear_error_without_skills_dir():
     import pytest
-    from runtime.config import AppConfig, LLMConfig, MCPConfig, Paths
+    from runtime.config import (
+        AppConfig, LLMConfig, MCPConfig, MetadataConfig, Paths, StorageConfig,
+    )
     from runtime.orchestrator import Orchestrator
 
+    # Use an in-memory SQLite so the orchestrator's engine creation step
+    # doesn't depend on a writable on-disk path (incidents/ no longer
+    # exists by default — see commit removing incidents/).
     cfg = AppConfig(
         llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[]),
         paths=Paths(skills_dir=None),
+        storage=StorageConfig(metadata=MetadataConfig(url="sqlite:///:memory:")),
     )
     import asyncio
     with pytest.raises(RuntimeError, match="skills_dir"):
