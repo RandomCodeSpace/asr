@@ -994,37 +994,12 @@ from typing import Any, Callable, TypedDict
 
 
 
-# ----- imports for examples/incident_management/config.py -----
-"""App-level config for the incident-management example.
-
-The framework reads incident-flavored knobs (similarity threshold,
-intervention confidence threshold, escalation roster, severity aliases,
-dedup pipeline, environments) generically via ``FrameworkAppConfig`` and
-``RuntimeConfig.{dedup,environments}_provider_path``. This module owns
-the YAML <-> ``FrameworkAppConfig`` lift plus the provider hooks
-referenced from ``config/code_review.runtime.yaml`` /
-``config/config.yaml``; the runtime never imports ``IncidentAppConfig``
-because that class no longer exists.
-"""
-
-
-
-
-
-
-
-# The Stage-2 dedup system prompt for the incident-management app.
-# Stays here (rather than on ``DedupConfig``) so that the framework
-# default in ``FrameworkAppConfig.dedup_system_prompt`` can be a
-# generic agent-orchestration prompt while the example app keeps its
-# SRE-specific phrasing.
 # ----- imports for examples/incident_management/mcp_server.py -----
 """FastMCP server: incident_management tools, backed by SessionStore + HistoryStore.
 
 Part of the incident-management example application. Framework code does
 not import this module.
 """
-
 
 
 
@@ -1384,6 +1359,25 @@ class AppConfig(BaseModel):
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    # Cross-cutting framework knobs (confidence threshold, escalation
+    # roster, severity aliases, dedup prompt, intake tuning) read by
+    # the runtime directly off the loaded ``AppConfig`` — no
+    # app-specific provider callable required. Apps configure these
+    # under the ``framework:`` block of their YAML; tests build them
+    # in code via ``FrameworkAppConfig(...)``. Defaults are framework-
+    # neutral so unconfigured apps still validate cleanly.
+    framework: FrameworkAppConfig = Field(default_factory=FrameworkAppConfig)
+    # Two-stage dedup pipeline shape. Typed as ``Any`` because
+    # ``DedupConfig`` lives in ``runtime.dedup`` and importing it here
+    # would introduce a circular import (``runtime.dedup`` ->
+    # ``runtime.config``). The ``_coerce_dedup`` validator below
+    # promotes a raw dict (the YAML shape) to a real ``DedupConfig``;
+    # callers reading ``cfg.dedup`` get the typed object.
+    dedup: Any | None = None
+    # App-specific environments roster surfaced on the UI's
+    # ``GET /environments`` endpoint and the env selector. Empty list
+    # means "this app doesn't expose environments".
+    environments: list[str] = Field(default_factory=list)
     # Declarative trigger registry. Each entry is one transport-flavoured
     # ``TriggerConfig`` (api/webhook/schedule/plugin). Typed as
     # ``list[Any]`` because Pydantic v2's discriminated-union binding
@@ -1391,6 +1385,23 @@ class AppConfig(BaseModel):
     # a circular import. The ``_coerce_triggers`` validator below
     # promotes raw dicts to the proper TriggerConfig variants.
     triggers: list[Any] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _coerce_dedup(self) -> "AppConfig":
+        # Lazy import to avoid the circular dep with ``runtime.dedup``
+        # (which imports things that re-import ``runtime.config``).
+
+        if self.dedup is None:
+            return self
+        if isinstance(self.dedup, DedupConfig):
+            return self
+        if isinstance(self.dedup, dict):
+            self.__dict__["dedup"] = DedupConfig(**self.dedup)
+            return self
+        raise ValueError(
+            f"app.dedup must be a DedupConfig or dict; got "
+            f"{type(self.dedup).__name__}"
+        )
 
     @model_validator(mode="after")
     def _coerce_triggers(self) -> "AppConfig":
@@ -4459,9 +4470,15 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
             f"(known: {sorted(skills.keys())})"
         )
     if framework_cfg is None:
-        framework_cfg = resolve_framework_app_config(
-            getattr(cfg.runtime, "framework_app_config_path", None),
-        )
+        # Prefer the YAML-driven ``AppConfig.framework`` field; fall
+        # back to the legacy provider-callable path for backward
+        # compatibility with deployments that still wire it.
+        if getattr(cfg.runtime, "framework_app_config_path", None) is not None:
+            framework_cfg = resolve_framework_app_config(
+                cfg.runtime.framework_app_config_path,
+            )
+        else:
+            framework_cfg = getattr(cfg, "framework", None) or resolve_framework_app_config(None)
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)
@@ -7127,14 +7144,19 @@ class Orchestrator(Generic[StateT]):
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
-            # Cross-cutting framework knobs come from the dotted-path
-            # provider on RuntimeConfig.framework_app_config_path. When
-            # unset the runtime falls back to a bare FrameworkAppConfig()
-            # so unit tests that build an AppConfig without an app-side
-            # provider keep working.
-            framework_cfg = resolve_framework_app_config(
-                cfg.runtime.framework_app_config_path,
-            )
+            # Cross-cutting framework knobs read directly off
+            # ``AppConfig.framework`` — the YAML carries them under the
+            # ``framework:`` block, no app-specific provider callable.
+            # Falls back to the dotted-path provider for backward
+            # compatibility with deployments that still wire it (the
+            # provider, when set, wins over the YAML default since
+            # historical configs relied on it).
+            if cfg.runtime.framework_app_config_path is not None:
+                framework_cfg = resolve_framework_app_config(
+                    cfg.runtime.framework_app_config_path,
+                )
+            else:
+                framework_cfg = cfg.framework
             # Resolve the app state class once. ``None`` (default) keeps the
             # framework-default ``Session`` shape; apps point this at e.g.
             # ``examples.incident_management.state.IncidentState`` via YAML.
@@ -7245,13 +7267,18 @@ class Orchestrator(Generic[StateT]):
             # about it. Production deployments with a real registry hit
             # the strict validation path.
             #
-            # The DedupConfig comes through a generic provider hook
-            # (``RuntimeConfig.dedup_config_path``) — the runtime never
-            # imports an app-specific config to discover dedup settings.
+            # DedupConfig is now a first-class field on ``AppConfig``
+            # (read from the YAML's top-level ``dedup:`` block). The
+            # legacy provider-callable path is honoured when set so
+            # existing deployments don't break, but the YAML wins for
+            # bare apps.
             dedup_pipeline: DedupPipeline | None = None
-            dedup_cfg: DedupConfig | None = _resolve_dedup_config(
-                cfg.runtime.dedup_config_path,
-            )
+            if cfg.runtime.dedup_config_path is not None:
+                dedup_cfg: DedupConfig | None = _resolve_dedup_config(
+                    cfg.runtime.dedup_config_path,
+                )
+            else:
+                dedup_cfg = cfg.dedup
             if dedup_cfg is not None and dedup_cfg.enabled:
                 if dedup_cfg.stage2_model in cfg.llm.models:
                     _llm_cfg_capture = cfg.llm
@@ -7853,11 +7880,15 @@ def _make_lifespan(cfg: AppConfig):
         app.state.orchestrator = orch
         # Environments roster is app-specific (incident-management has
         # production/staging/dev/local; code-review doesn't expose one).
-        # Resolve via the generic provider hook so the runtime never
-        # imports an app config module.
-        app.state.environments = _resolve_environments(
-            getattr(cfg.runtime, "environments_provider_path", None),
-        )
+        # Read it from the YAML's top-level ``environments:`` block;
+        # fall back to the legacy ``environments_provider_path`` callable
+        # for deployments that still wire it.
+        if cfg.environments:
+            app.state.environments = list(cfg.environments)
+        else:
+            app.state.environments = _resolve_environments(
+                getattr(cfg.runtime, "environments_provider_path", None),
+            )
 
         # ------------------------------------------------------------
         # Build & start the trigger registry
@@ -8753,135 +8784,6 @@ def default_supervisor_runner(
     """
     return _BUILT_DEFAULT_RUNNER(state, app_cfg=app_cfg)
 
-# ====== module: examples/incident_management/config.py ======
-
-_INCIDENT_DEDUP_SYSTEM_PROMPT = (
-    "You are deduplicating incident reports for an SRE platform. "
-    "Two reports are duplicates only if they describe the same root cause "
-    "AND the same service/environment AND overlap in time-of-occurrence. "
-    "Surface-level keyword overlap is NOT enough. "
-    "Respond with a single JSON object matching this schema: "
-    '{"is_duplicate": bool, "confidence": float in [0,1], "rationale": '
-    '"1-2 sentences"}.'
-)
-
-
-_INCIDENT_SEVERITY_ALIASES: dict[str, str] = {
-    "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
-    "critical": "high", "urgent": "high", "high": "high",
-    "sev3": "medium", "p3": "medium", "moderate": "medium",
-    "medium": "medium",
-    "sev4": "low", "p4": "low", "info": "low",
-    "informational": "low", "low": "low",
-}
-
-
-_INCIDENT_ESCALATION_TEAMS: list[str] = [
-    "platform-oncall",
-    "data-oncall",
-    "security-oncall",
-]
-
-
-_INCIDENT_ENVIRONMENTS: list[str] = ["production", "staging", "dev", "local"]
-
-
-_DEFAULT_PATH = (
-    Path(__file__).resolve().parents[2] / "config" / "incident_management.yaml"
-)
-
-
-def _read_yaml(path: str | Path | None) -> dict:
-    p = Path(path) if path else _DEFAULT_PATH
-    if not p.exists():
-        return {}
-    return yaml.safe_load(p.read_text()) or {}
-
-
-def _default_framework_cfg() -> FrameworkAppConfig:
-    """Default ``FrameworkAppConfig`` populated with incident-tuned values."""
-    return FrameworkAppConfig(
-        confidence_threshold=0.75,
-        similarity_threshold=0.2,
-        escalation_teams=list(_INCIDENT_ESCALATION_TEAMS),
-        severity_aliases=dict(_INCIDENT_SEVERITY_ALIASES),
-        dedup_system_prompt=_INCIDENT_DEDUP_SYSTEM_PROMPT,
-    )
-
-
-def load_app_config(path: str | Path | None = None) -> FrameworkAppConfig:
-    """Load the incident app YAML and return a ``FrameworkAppConfig``.
-
-    The YAML may carry framework-flavored keys at the top level
-    (``confidence_threshold``, ``similarity_threshold``,
-    ``escalation_teams``, ``severity_aliases``, ``dedup_system_prompt``,
-    ``ui``) and/or under a ``framework:`` block; both are folded into
-    the returned ``FrameworkAppConfig``. Domain-specific top-level keys
-    (``dedup``, ``environments``, ``store_path``, ``similarity_method``)
-    are ignored here — they are surfaced via the dedicated provider
-    hooks below. Falls back to ``_default_framework_cfg()`` when the
-    file is missing.
-    """
-    raw = _read_yaml(path)
-    if not raw:
-        return _default_framework_cfg()
-
-    fw_kwargs: dict[str, object] = {}
-    if "framework" in raw:
-        fw_kwargs.update(raw.get("framework") or {})
-    for legacy_key in (
-        "confidence_threshold",
-        "similarity_threshold",
-        "escalation_teams",
-        "severity_aliases",
-        "dedup_system_prompt",
-        "ui",
-    ):
-        if legacy_key in raw:
-            fw_kwargs[legacy_key] = raw[legacy_key]
-
-    defaults = _default_framework_cfg()
-    if not fw_kwargs:
-        return defaults
-    merged = defaults.model_dump()
-    merged.update(fw_kwargs)
-    return FrameworkAppConfig(**merged)
-
-
-# ---------------------------------------------------------------------------
-# Provider hooks referenced from ``config/config.yaml``'s ``runtime:`` block.
-# The runtime resolves these dotted paths into no-arg callables so it
-# never imports ``examples.incident_management.config`` directly.
-# ---------------------------------------------------------------------------
-
-
-def framework_app_config_provider() -> FrameworkAppConfig:
-    """Provider for ``RuntimeConfig.framework_app_config_path``."""
-    return load_app_config()
-
-
-def dedup_config_provider() -> DedupConfig | None:
-    """Provider for ``RuntimeConfig.dedup_config_path``.
-
-    Returns the configured dedup pipeline shape (or ``None`` when the
-    bundled YAML disables it) so the runtime can build the pipeline
-    without importing an app-specific config module.
-    """
-    raw = _read_yaml(None)
-    block = raw.get("dedup")
-    if block is None:
-        return None
-    return DedupConfig(**block)
-
-
-def environments_provider() -> list[str]:
-    """Provider for ``RuntimeConfig.environments_provider_path``."""
-    raw = _read_yaml(None)
-    envs = raw.get("environments")
-    if envs is None:
-        return list(_INCIDENT_ENVIRONMENTS)
-    return list(envs)
-
 # ====== module: examples/incident_management/mcp_server.py ======
 
 def normalize_severity(
@@ -8905,9 +8807,12 @@ class IncidentMCPServer:
     """
     store: SessionStore | None = None
     history: HistoryStore | None = None
-    severity_aliases: dict[str, str] = field(
-        default_factory=lambda: load_app_config().severity_aliases
-    )
+    # Severity aliases are injected via ``set_state``/``configure``
+    # at process bootstrap; the orchestrator passes
+    # ``framework_cfg.severity_aliases`` (read off
+    # ``AppConfig.framework`` in the YAML). Bare default of ``{}``
+    # keeps direct dataclass construction working in unit tests.
+    severity_aliases: dict[str, str] = field(default_factory=dict)
     mcp: FastMCP = field(init=False)
 
     def __post_init__(self) -> None:

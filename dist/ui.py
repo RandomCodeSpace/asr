@@ -49,13 +49,16 @@ CONFIG_PATH = Path(os.environ.get("APP_CONFIG", "config/config.yaml"))
 
 
 def _load_app_cfg(cfg: AppConfig) -> FrameworkAppConfig:
-    """Resolve the application's :class:`FrameworkAppConfig` provider.
+    """Resolve the application's :class:`FrameworkAppConfig`.
 
-    Falls back to a bare ``FrameworkAppConfig()`` if the YAML doesn't
-    register one. Centralised here so the UI never imports an
-    app-specific config module.
+    Reads ``AppConfig.framework`` directly off the YAML; falls back
+    to the legacy ``framework_app_config_path`` provider for
+    deployments that still wire it. Centralised here so the UI never
+    imports an app-specific config module.
     """
-    return resolve_framework_app_config(cfg.runtime.framework_app_config_path)
+    if cfg.runtime.framework_app_config_path is not None:
+        return resolve_framework_app_config(cfg.runtime.framework_app_config_path)
+    return cfg.framework
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +170,14 @@ def _load_metadata_dicts(
 
 
 def _resolve_environments(cfg: AppConfig) -> list[str]:
-    """Resolve the ``runtime.environments_provider_path`` provider, if set."""
+    """Resolve the app's environments roster.
+
+    Prefers the YAML-driven ``AppConfig.environments`` list; falls
+    back to the legacy ``RuntimeConfig.environments_provider_path``
+    callable for deployments that still wire it.
+    """
+    if cfg.environments:
+        return list(cfg.environments)
     dotted = cfg.runtime.environments_provider_path
     if not dotted:
         return []
