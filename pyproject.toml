@@ -56,7 +56,7 @@ packages = ["src/runtime", "examples"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --cov=src/orchestrator --cov-report=term-missing --cov-report=xml"
+addopts = "-v --cov=src/runtime --cov-report=term-missing --cov-report=xml"
 pythonpath = ["src", "."]
 
 [tool.ruff]
