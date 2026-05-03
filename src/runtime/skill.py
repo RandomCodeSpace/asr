@@ -354,14 +354,18 @@ class Skill(BaseModel):
                 f"skill {self.name!r} (kind=supervisor) requires a non-empty "
                 f"subordinates list"
             )
-        if self.runner is not None:
-            # Resolve at skill-load time so a typo in YAML surfaces here,
-            # not in the middle of a session. The resolver itself raises
-            # ``ValueError`` with a helpful message — bubble that up.
-            _resolve_dotted_callable(
-                self.runner,
-                source=f"skill {self.name!r} runner",
-            )
+        if self.runner is None:
+            # Default every supervisor to the framework intake runner
+            # (similarity retrieval + dedup gate). Apps override by
+            # setting ``runner:`` in YAML.
+            self.runner = "runtime.intake:default_intake_runner"
+        # Resolve at skill-load time so a typo in YAML surfaces here,
+        # not in the middle of a session. The resolver itself raises
+        # ``ValueError`` with a helpful message — bubble that up.
+        _resolve_dotted_callable(
+            self.runner,
+            source=f"skill {self.name!r} runner",
+        )
         if self.dispatch_strategy == "llm" and not self.dispatch_prompt:
             raise ValueError(
                 f"skill {self.name!r} (kind=supervisor, strategy=llm) requires "
