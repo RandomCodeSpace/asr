@@ -305,6 +305,46 @@ def resolve_framework_app_config(
     return cfg
 
 
+class UIBadge(BaseModel):
+    """One badge entry — label + Streamlit color."""
+    label: str
+    color: str  # streamlit-allowed: red|orange|yellow|blue|green|violet|gray|primary
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
+class UIDetailField(BaseModel):
+    """A configured detail-pane field. ``key`` is a dotted path resolved
+    against ``Session.extra_fields`` (or the session dict itself)."""
+    key: str
+    label: str
+    section: str = "summary"  # "summary" | "metrics" | "meta"
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
+class UIConfig(BaseModel):
+    """App-driven UI rendering knobs. Keeps the generic Streamlit shell
+    in ``runtime/ui.py`` agnostic of any specific domain — colors, labels,
+    and tag prefixes come from YAML.
+
+    ``badges`` is a 2-level dict: ``{field_name: {value: UIBadge}}``.
+    Example: ``{"status": {"open": {"label": "OPEN", "color": "red"}}}``.
+
+    ``detail_fields`` lists fields the detail pane renders, in order.
+    Each entry may target a section (``summary``/``metrics``/``meta``).
+
+    ``tags`` is an opaque key->tag-string map the UI consults for
+    cross-skill signals (e.g. ``prior_match_supported`` -> the literal
+    tag a skill emits).
+    """
+    badges: dict[str, dict[str, UIBadge]] = Field(default_factory=dict)
+    detail_fields: list[UIDetailField] = Field(default_factory=list)
+    tags: dict[str, str] = Field(default_factory=dict)
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
@@ -312,6 +352,7 @@ class AppConfig(BaseModel):
     paths: Paths = Field(default_factory=Paths)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    ui: UIConfig = Field(default_factory=UIConfig)
     # Declarative trigger registry. Each entry is one transport-flavoured
     # ``TriggerConfig`` (api/webhook/schedule/plugin). Typed as
     # ``list[Any]`` because Pydantic v2's discriminated-union binding
