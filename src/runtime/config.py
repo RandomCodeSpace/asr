@@ -253,58 +253,6 @@ _DEFAULT_DEDUP_SYSTEM_PROMPT = (
 )
 
 
-class FrameworkAppConfig(BaseModel):
-    """Generic application-supplied knobs the framework reads at runtime.
-
-    Apps compose this inside their own AppConfig and surface it via
-    a no-arg provider callable referenced by
-    ``RuntimeConfig.framework_app_config_path``. The framework never
-    imports app-specific config modules; it only reads these fields.
-    """
-
-    confidence_threshold: float = 0.75
-    similarity_threshold: float = 0.2
-    escalation_teams: list[str] = Field(default_factory=list)
-    severity_aliases: dict[str, str] = Field(default_factory=dict)
-    dedup_system_prompt: str = _DEFAULT_DEDUP_SYSTEM_PROMPT
-    # Intake runner knobs: forwarded into IntakeContext at graph-build time.
-    intake_top_k: int = 3
-    intake_similarity_threshold: float = 0.7
-
-
-def resolve_framework_app_config(
-    dotted: str | None,
-) -> FrameworkAppConfig:
-    """Resolve a ``module:callable`` provider into a ``FrameworkAppConfig``.
-
-    Returns a bare ``FrameworkAppConfig()`` when ``dotted`` is ``None``.
-    Raises ``ValueError`` for malformed paths and ``ImportError`` /
-    ``AttributeError`` propagate from the underlying resolution so that
-    misconfiguration fails loud at boot.
-
-    The provider must be a no-arg callable returning a
-    ``FrameworkAppConfig``; anything else raises ``TypeError``.
-    """
-    if dotted is None:
-        return FrameworkAppConfig()
-    if ":" not in dotted:
-        raise ValueError(
-            f"framework_app_config_path={dotted!r} must be in "
-            "'module.path:callable' form"
-        )
-    module_name, _, attr = dotted.partition(":")
-    import importlib
-    mod = importlib.import_module(module_name)
-    provider = getattr(mod, attr)
-    cfg = provider()
-    if not isinstance(cfg, FrameworkAppConfig):
-        raise TypeError(
-            f"provider {dotted!r} returned {type(cfg).__name__}; "
-            "expected FrameworkAppConfig"
-        )
-    return cfg
-
-
 class UIBadge(BaseModel):
     """One badge entry — label + Streamlit color."""
     label: str
@@ -343,6 +291,63 @@ class UIConfig(BaseModel):
     tags: dict[str, str] = Field(default_factory=dict)
 
     model_config = {"frozen": True, "extra": "forbid"}
+
+
+class FrameworkAppConfig(BaseModel):
+    """Generic application-supplied knobs the framework reads at runtime.
+
+    Apps compose this inside their own AppConfig and surface it via
+    a no-arg provider callable referenced by
+    ``RuntimeConfig.framework_app_config_path``. The framework never
+    imports app-specific config modules; it only reads these fields.
+    """
+
+    confidence_threshold: float = 0.75
+    similarity_threshold: float = 0.2
+    escalation_teams: list[str] = Field(default_factory=list)
+    severity_aliases: dict[str, str] = Field(default_factory=dict)
+    dedup_system_prompt: str = _DEFAULT_DEDUP_SYSTEM_PROMPT
+    # Intake runner knobs: forwarded into IntakeContext at graph-build time.
+    intake_top_k: int = 3
+    intake_similarity_threshold: float = 0.7
+    # UI rendering knobs surfaced to the generic runtime UI. Mirrors
+    # AppConfig.ui — the FrameworkAppConfig provider can either copy
+    # AppConfig.ui or supply its own. Defaults to empty so apps that
+    # don't render with the generic UI pay nothing.
+    ui: UIConfig = Field(default_factory=UIConfig)
+
+
+def resolve_framework_app_config(
+    dotted: str | None,
+) -> FrameworkAppConfig:
+    """Resolve a ``module:callable`` provider into a ``FrameworkAppConfig``.
+
+    Returns a bare ``FrameworkAppConfig()`` when ``dotted`` is ``None``.
+    Raises ``ValueError`` for malformed paths and ``ImportError`` /
+    ``AttributeError`` propagate from the underlying resolution so that
+    misconfiguration fails loud at boot.
+
+    The provider must be a no-arg callable returning a
+    ``FrameworkAppConfig``; anything else raises ``TypeError``.
+    """
+    if dotted is None:
+        return FrameworkAppConfig()
+    if ":" not in dotted:
+        raise ValueError(
+            f"framework_app_config_path={dotted!r} must be in "
+            "'module.path:callable' form"
+        )
+    module_name, _, attr = dotted.partition(":")
+    import importlib
+    mod = importlib.import_module(module_name)
+    provider = getattr(mod, attr)
+    cfg = provider()
+    if not isinstance(cfg, FrameworkAppConfig):
+        raise TypeError(
+            f"provider {dotted!r} returned {type(cfg).__name__}; "
+            "expected FrameworkAppConfig"
+        )
+    return cfg
 
 
 class AppConfig(BaseModel):
