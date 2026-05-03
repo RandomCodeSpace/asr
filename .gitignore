@@ -26,6 +26,7 @@ htmlcov/
 incidents/*.json
 incidents/*.db
 incidents/*.db-journal
+incidents/faiss/
 !incidents/.gitkeep
 
 # --- Secrets ---------------------------------------------------------
