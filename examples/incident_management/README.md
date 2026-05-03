@@ -5,10 +5,12 @@ The flagship example app for the `runtime` framework. Demonstrates how to layer 
 ## Run
 
 ```bash
-python -m examples.incident_management
+python -m runtime --config config/incident_management.yaml
 ```
 
-This launches the Streamlit UI for incident triage and resolution.
+That boots the long-lived orchestrator service against this app's
+config. The Streamlit UI ships separately under `ui/streamlit_app.py`
+(`streamlit run ui/streamlit_app.py`) and binds to the same service.
 
 ## Architecture
 
@@ -199,7 +201,7 @@ The framework is genuinely generic — Phase 8 lifted every domain-specific assu
 | `config.py` / `config.yaml` | Your `AppConfig` subclass for app-specific tunables | Loaded by your own loader; framework doesn't touch it |
 | `mcp_server.py` | Your domain MCP tools | `mcp.servers[*].module` |
 | `skills/<name>/{config,system}.{yaml,md}` | Per-skill prompt + tool wiring | `paths.skills_dir` |
-| `__main__.py` + `ui.py` | Streamlit entry point | run via `python -m examples.<your_app>` |
+| (none) | Entry point lives in the framework: `python -m runtime --config config/<your_app>.yaml` | n/a |
 
 **Round-trip:** any field you declare on your `Session` subclass that is *not* an incident-shaped typed column on `IncidentRow` (`query`, `environment`, `severity`, `tags`, ...) lands in the row's `extra_fields` JSON column on save and is hydrated back via `state_cls.model_fields` on load (P8-J). You don't need to touch the framework's row schema or converters.
 

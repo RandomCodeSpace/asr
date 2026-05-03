@@ -60,10 +60,16 @@ def test_example_ui_importable():
     assert spec is not None, "runtime.ui must be importable"
 
 
-def test_example_main_module_importable():
+def test_runtime_main_module_importable():
+    """Generic runtime entry-point is the only ``__main__`` now.
+
+    The per-app ``__main__.py`` files were dropped — apps boot via
+    ``python -m runtime --config config/<app>.yaml`` against the
+    framework module instead.
+    """
     import importlib.util
-    spec = importlib.util.find_spec("examples.incident_management.__main__")
-    assert spec is not None, "examples.incident_management.__main__ must be importable"
+    spec = importlib.util.find_spec("runtime.__main__")
+    assert spec is not None, "runtime.__main__ must be importable"
 
 
 # ---------------------------------------------------------------------------

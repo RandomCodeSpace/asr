@@ -1,6 +1,10 @@
-"""Backward-compat shim. The UI now lives at:
-    examples/incident_management/ui.py
+"""Streamlit entry point. The UI body lives at ``runtime/ui.py`` and
+is config-driven (badges, detail fields, list filters), so a single
+shell renders any app whose config it loads.
 
-Run via: ``python -m examples.incident_management``.
+Run via: ``streamlit run ui/streamlit_app.py``.
+
+The long-lived orchestrator service boots separately via
+``python -m runtime --config config/<app>.yaml``.
 """
-from examples.incident_management.ui import *  # noqa: F401,F403
+from runtime.ui import *  # noqa: F401,F403

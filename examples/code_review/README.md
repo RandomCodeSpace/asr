@@ -5,10 +5,14 @@ Second example app for the `runtime` framework. Built in Phase 8 to *prove* the 
 ## Run
 
 ```bash
-python -m examples.code_review
+python -m runtime --config config/code_review.yaml
 ```
 
-Launches the Streamlit UI for browsing in-flight and historical PR reviews.
+Boots the long-lived orchestrator service against this app's config.
+The Streamlit UI is the framework's generic shell at
+`ui/streamlit_app.py` (`streamlit run ui/streamlit_app.py`) — it
+duck-types on `Session.extra_fields` for code-review rows and renders
+them in the same accordion shell the incident app uses.
 
 ## Architecture
 
