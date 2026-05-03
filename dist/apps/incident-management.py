@@ -931,60 +931,24 @@ status flip via :meth:`SessionStore.un_duplicate`.
 from fastapi import FastAPI, HTTPException
 
 
-# ----- imports for examples/incident_management/runners.py -----
-"""ASR supervisor router — hydration + single-active-investigation gate.
+# ----- imports for examples/incident_management/mcp_server.py -----
+"""MCP tools + supervisor runner for the incident-management example app.
 
-The framework ships a generic ``kind: supervisor`` agent kind in
-:mod:`runtime.agents.supervisor` that handles pure dispatch routing.
-ASR's investigation graph needs two extra behaviours BEFORE the first
-responsive agent runs:
+This module ships two things that together form the incident-management
+example application's Python surface:
 
-1. **Memory-layer hydration** — fetch L2 KG / L5 Release / L7 Playbook
-   context for the affected services and stamp it onto
-   ``IncidentState.memory`` so downstream agents can read without an
-   extra round-trip to disk.
+1. **MCP tools** — :class:`IncidentMCPServer` exposes
+   ``lookup_similar_incidents``, ``create_incident`` and
+   ``update_incident`` over FastMCP, backed by
+   :class:`SessionStore` + :class:`HistoryStore`.
+2. **Supervisor runner** — :func:`default_supervisor_runner` (and the
+   :func:`make_default_supervisor_runner` factory) wires the framework's
+   intake hydration + dedup gate to the per-app L2 KG / L5 Release /
+   L7 Playbook stores. The intake skill YAML references the runner by
+   dotted path so the live graph picks up incident-management-specific
+   memory hydration.
 
-2. **Single-active-investigation gate** — if another in-flight session
-   is already investigating the same component set, the new session is
-   tagged ``status="duplicate"`` with ``parent_session_id=<active>``
-   and routed straight to ``__end__``. Reuses the dedup linkage
-   primitives (``parent_session_id`` field on ``Session``) instead of
-   rolling a new field.
-
-The helper here is a pure async callable: given an :class:`IncidentState`
-and the configured stores + an active-session lister, it returns a
-shape-checked decision dict. It does NOT mutate state in place — the
-caller is responsible for persistence. This keeps the helper trivially
-unit-testable and reusable from both:
-
-- the unit tests in ``tests/test_asr_supervisor_node.py``;
-- a future graph-level integration once the framework grows an
-  example-app extension hook.
-
-Inputs:
-
-* ``incident``: an :class:`IncidentState` (or any ``Session``-shaped
-  pydantic model with the incident-management fields).
-* ``kg_store`` / ``release_store`` / ``playbook_store``: read-only
-  filesystem stores.
-* ``active_sessions``: callable returning a list of in-flight session
-  dicts (matches the ``OrchestratorService.list_active_sessions``
-  shape — ``[{"session_id", "status", "started_at", "current_agent"}, …]``).
-  Pluggable so tests don't need a live service.
-* ``incident_at``: optional ``datetime`` anchor for the L5 release
-  window. Defaults to ``datetime.utcnow()``.
-
-Outputs (a ``SupervisorDecision`` dict):
-
-* ``route``: ``"triage"`` (fresh) or ``"__end__"`` (duplicate).
-* ``memory``: a fully-populated :class:`MemoryLayerState` for the
-  caller to persist on ``IncidentState.memory``.
-* ``status``: the terminal status to stamp — ``"duplicate"`` when the
-  gate fires, otherwise ``None`` (caller leaves status untouched).
-* ``parent_session_id``: the active session id when gated, else
-  ``None``.
-* ``components``: the component ids extracted from the query (kept on
-  the decision so the caller can audit log without re-deriving).
+Framework code does not import this module.
 """
 
 
@@ -994,12 +958,6 @@ from typing import Any, Callable, TypedDict
 
 
 
-# ----- imports for examples/incident_management/mcp_server.py -----
-"""FastMCP server: incident_management tools, backed by SessionStore + HistoryStore.
-
-Part of the incident-management example application. Framework code does
-not import this module.
-"""
 
 
 
@@ -8329,7 +8287,7 @@ def register_dedup_routes(
             note=payload.note,
         )
 
-# ====== module: examples/incident_management/runners.py ======
+# ====== module: examples/incident_management/mcp_server.py ======
 
 logger = logging.getLogger(__name__)
 
@@ -8363,10 +8321,13 @@ _NON_TERMINAL_STATUSES: frozenset[str] = frozenset({
 })
 
 
-# Cheap regex: keep alnum + underscore + dash tokens of length ≥ 3. We
+# Cheap regex: keep alnum + underscore + dash tokens of length >= 3. We
 # lowercase before matching components by name. Good enough for the
 # MVP — semantic component-extraction is a 9d-vector / future task.
 _TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{2,}")
+
+
+_DEFAULT_SEEDS = Path(_knowledge_graph_mod.__file__).parent / "seeds"
 
 
 # ---------------------------------------------------------------------------
@@ -8401,7 +8362,7 @@ def extract_components(query: str, kg_store: KnowledgeGraphStore) -> list[str]:
         cid = str(comp.get("id") or "").lower()
         cname = str(comp.get("name") or "").lower()
         # Exact id token match takes precedence; fall back to substring
-        # on name for the friendlier "payments service" → "payments"
+        # on name for the friendlier "payments service" -> "payments"
         # case in user-supplied prose.
         if cid and cid in tokens:
             matched.append(comp["id"])
@@ -8481,7 +8442,7 @@ def _service_names_for_components(
     components: list[str],
     kg_store: KnowledgeGraphStore,
 ) -> list[str]:
-    """Map component ids → service names for the L5 release lookup.
+    """Map component ids -> service names for the L5 release lookup.
 
     ``ReleaseContextStore.context`` matches on the ``service`` field of each
     release record, which is conventionally the component's KG ``id``
@@ -8621,16 +8582,6 @@ def hydrate_and_gate(
     )
 
 
-__all__ = [
-    "SupervisorDecision",
-    "default_supervisor_runner",
-    "extract_components",
-    "find_active_duplicate",
-    "hydrate_and_gate",
-    "make_hydrate_runner",
-]
-
-
 # ---------------------------------------------------------------------------
 # Framework supervisor-runner adapter
 # ---------------------------------------------------------------------------
@@ -8654,9 +8605,6 @@ __all__ = [
 #
 # We keep the runner returns minimal (``session`` + optional
 # ``next_route``) so the framework supervisor merge logic stays simple.
-
-
-_DEFAULT_SEEDS = Path(_knowledge_graph_mod.__file__).parent / "seeds"
 
 
 def make_hydrate_runner(
@@ -8729,7 +8677,6 @@ def make_hydrate_runner(
     return _runner
 
 
-
 def make_default_supervisor_runner(
     *,
     kg_store: KnowledgeGraphStore,
@@ -8784,7 +8731,11 @@ def default_supervisor_runner(
     """
     return _BUILT_DEFAULT_RUNNER(state, app_cfg=app_cfg)
 
-# ====== module: examples/incident_management/mcp_server.py ======
+
+# ---------------------------------------------------------------------------
+# MCP tool helpers
+# ---------------------------------------------------------------------------
+
 
 def normalize_severity(
     value: str | None,
@@ -8977,3 +8928,21 @@ async def create_incident(query: str, environment: str,
 
 async def update_incident(incident_id: str, patch: dict) -> dict:
     return await _default_server._tool_update_incident(incident_id, patch)
+
+
+__all__ = [
+    "IncidentMCPServer",
+    "SupervisorDecision",
+    "create_incident",
+    "default_supervisor_runner",
+    "extract_components",
+    "find_active_duplicate",
+    "hydrate_and_gate",
+    "lookup_similar_incidents",
+    "make_default_supervisor_runner",
+    "make_hydrate_runner",
+    "mcp",
+    "normalize_severity",
+    "set_state",
+    "update_incident",
+]

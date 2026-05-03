@@ -116,11 +116,10 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 # All memory-layer foundations (memory_state, KG/Release/Playbook
 # stores, hypothesis_loop, resolution_helpers) were lifted to
 # ``runtime.memory`` in Wave 1 of the strip-down and are bundled in
-# RUNTIME_MODULE_ORDER above. ``runners`` remains as the per-app
-# adapter that wires the framework helpers to incident_management's
-# stores and active-session lookup.
+# RUNTIME_MODULE_ORDER above. The per-app supervisor runner that wires
+# the framework helpers to incident_management's stores + active-session
+# lookup now lives inside ``mcp_server.py``.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
-    (EXAMPLES_ROOT, "incident_management/runners.py"),
     (EXAMPLES_ROOT, "incident_management/mcp_server.py"),
 ]
 

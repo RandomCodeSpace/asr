@@ -1,6 +1,6 @@
 """ASR supervisor node hydration + single-active-investigation gate.
 
-Tests for ``examples.incident_management.runners``. Covers:
+Tests for ``examples.incident_management.mcp_server`` supervisor runner. Covers:
 
 * ``extract_components`` — heuristic component-name extraction from a query.
 * ``hydrate_and_gate`` — L2/L5/L7 hydration populates ``MemoryLayerState``.
@@ -29,7 +29,7 @@ from runtime.memory.session_state import (
 )
 from runtime.memory.playbook_store import PlaybookStore
 from runtime.memory.release_context import ReleaseContextStore
-from examples.incident_management.runners import (
+from examples.incident_management.mcp_server import (
     extract_components,
     find_active_duplicate,
     hydrate_and_gate,
@@ -302,7 +302,7 @@ def test_intake_skill_yaml_loads(tmp_path: Path) -> None:
     # The skill must wire the default supervisor runner so the
     # framework actually invokes hydrate_and_gate at session start.
     assert skill.runner == (
-        "examples.incident_management.runners:default_supervisor_runner"
+        "examples.incident_management.mcp_server:default_supervisor_runner"
     )
 
 
@@ -352,7 +352,7 @@ async def test_full_graph_runner_short_circuits_on_duplicate(monkeypatch) -> Non
     """When the dup gate fires the framework short-circuits to ``__end__``
     and stamps duplicate metadata before the graph terminates."""
     from runtime.agents.supervisor import make_supervisor_node
-    from examples.incident_management import runners as sn
+    from examples.incident_management import mcp_server as sn
     from runtime.memory.knowledge_graph import KnowledgeGraphStore
     from runtime.memory.playbook_store import PlaybookStore
     from runtime.memory.release_context import ReleaseContextStore
@@ -422,7 +422,7 @@ def test_default_supervisor_runner_calls_framework_default_first() -> None:
        because the framework runner did NOT short-circuit.
     """
     from runtime.intake import IntakeContext
-    from examples.incident_management.runners import (
+    from examples.incident_management.mcp_server import (
         default_supervisor_runner,
     )
 
@@ -451,7 +451,7 @@ def test_default_supervisor_runner_skips_hydration_on_short_circuit(monkeypatch)
     next_route so a dedup/duplicate hit skips expensive KG lookups.
     """
     from runtime.intake import compose_runners
-    from examples.incident_management import runners as sn
+    from examples.incident_management import mcp_server as sn
 
     hydration_called = []
 
