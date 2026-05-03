@@ -18,7 +18,7 @@ from examples.incident_management.asr.memory_state import (
     MemoryLayerState,
 )
 from examples.incident_management.state import IncidentState, Reporter
-from orchestrator.config import MetadataConfig
+from runtime.config import MetadataConfig
 from runtime.storage.engine import build_engine
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore

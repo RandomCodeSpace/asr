@@ -3,15 +3,15 @@ import logging
 import pytest
 from pytest import approx
 from examples.incident_management.state import IncidentState
-from orchestrator.config import EmbeddingConfig, MetadataConfig, ProviderConfig
-from orchestrator.graph import GraphState, _decide_from_signal, make_agent_node
+from runtime.config import EmbeddingConfig, MetadataConfig, ProviderConfig
+from runtime.graph import GraphState, _decide_from_signal, make_agent_node
 from runtime.state import TokenUsage
-from orchestrator.skill import Skill, RouteRule
-from orchestrator.llm import StubChatModel
-from orchestrator.storage.embeddings import build_embedder
-from orchestrator.storage.engine import build_engine
-from orchestrator.storage.models import Base
-from orchestrator.storage.session_store import SessionStore
+from runtime.skill import Skill, RouteRule
+from runtime.llm import StubChatModel
+from runtime.storage.embeddings import build_embedder
+from runtime.storage.engine import build_engine
+from runtime.storage.models import Base
+from runtime.storage.session_store import SessionStore
 
 
 def _make_repo(tmp_path):

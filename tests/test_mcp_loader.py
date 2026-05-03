@@ -2,14 +2,14 @@ from contextlib import AsyncExitStack
 import pytest
 
 from examples.incident_management.state import IncidentState
-from orchestrator.config import EmbeddingConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
-from orchestrator.mcp_loader import load_tools, ToolRegistry
+from runtime.config import EmbeddingConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
+from runtime.mcp_loader import load_tools, ToolRegistry
 from examples.incident_management.mcp_server import set_state as set_inc_state
-from orchestrator.storage.embeddings import build_embedder
-from orchestrator.storage.engine import build_engine
-from orchestrator.storage.history_store import HistoryStore
-from orchestrator.storage.models import Base
-from orchestrator.storage.session_store import SessionStore
+from runtime.storage.embeddings import build_embedder
+from runtime.storage.engine import build_engine
+from runtime.storage.history_store import HistoryStore
+from runtime.storage.models import Base
+from runtime.storage.session_store import SessionStore
 
 
 def _make_repo(tmp_path):
@@ -37,12 +37,12 @@ def cfg(tmp_path):
         ),
         MCPServerConfig(
             name="local_observability", transport="in_process",
-            module="orchestrator.mcp_servers.observability",
+            module="runtime.mcp_servers.observability",
             category="observability",
         ),
         MCPServerConfig(
             name="local_user", transport="in_process",
-            module="orchestrator.mcp_servers.user_context",
+            module="runtime.mcp_servers.user_context",
             category="user_context",
         ),
         MCPServerConfig(

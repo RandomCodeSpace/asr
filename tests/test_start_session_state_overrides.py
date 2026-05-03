@@ -40,17 +40,17 @@ def cfg(tmp_path):
             ),
             MCPServerConfig(
                 name="local_obs", transport="in_process",
-                module="orchestrator.mcp_servers.observability",
+                module="runtime.mcp_servers.observability",
                 category="observability",
             ),
             MCPServerConfig(
                 name="local_rem", transport="in_process",
-                module="orchestrator.mcp_servers.remediation",
+                module="runtime.mcp_servers.remediation",
                 category="remediation",
             ),
             MCPServerConfig(
                 name="local_user", transport="in_process",
-                module="orchestrator.mcp_servers.user_context",
+                module="runtime.mcp_servers.user_context",
                 category="user_context",
             ),
         ]),

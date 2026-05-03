@@ -4,7 +4,7 @@ import pytest
 
 
 def test_stub_embeddings_determinism():
-    from orchestrator.storage.embeddings import _StubEmbeddings
+    from runtime.storage.embeddings import _StubEmbeddings
     e = _StubEmbeddings(dim=8)
     a = e.embed_query("hello world")
     b = e.embed_query("hello world")
@@ -16,7 +16,7 @@ def test_stub_embeddings_determinism():
 
 
 def test_stub_embed_documents_returns_list_of_lists():
-    from orchestrator.storage.embeddings import _StubEmbeddings
+    from runtime.storage.embeddings import _StubEmbeddings
     e = _StubEmbeddings(dim=4)
     out = e.embed_documents(["a", "b", "c"])
     assert len(out) == 3
@@ -24,8 +24,8 @@ def test_stub_embed_documents_returns_list_of_lists():
 
 
 def test_build_embedder_stub():
-    from orchestrator.config import EmbeddingConfig, ProviderConfig
-    from orchestrator.storage.embeddings import build_embedder
+    from runtime.config import EmbeddingConfig, ProviderConfig
+    from runtime.storage.embeddings import build_embedder
     cfg = EmbeddingConfig(provider="s", model="x", dim=8)
     providers = {"s": ProviderConfig(kind="stub")}
     e = build_embedder(cfg, providers)
@@ -35,13 +35,13 @@ def test_build_embedder_stub():
 
 
 def test_build_embedder_none_returns_none():
-    from orchestrator.storage.embeddings import build_embedder
+    from runtime.storage.embeddings import build_embedder
     assert build_embedder(None, {}) is None
 
 
 def test_build_embedder_unknown_kind_raises():
-    from orchestrator.config import EmbeddingConfig, ProviderConfig
-    from orchestrator.storage.embeddings import build_embedder
+    from runtime.config import EmbeddingConfig, ProviderConfig
+    from runtime.storage.embeddings import build_embedder
     cfg = EmbeddingConfig(provider="x", model="m")
     bad = ProviderConfig(kind="ollama")
     bad.kind = "nonsense"  # bypass pydantic for the test

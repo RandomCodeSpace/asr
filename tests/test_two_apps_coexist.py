@@ -25,7 +25,7 @@ from examples.code_review.state import (
     ReviewFinding,
 )
 from examples.incident_management.state import IncidentState, Reporter
-from orchestrator.config import MetadataConfig
+from runtime.config import MetadataConfig
 from runtime.state_resolver import resolve_state_class
 from runtime.storage.engine import build_engine
 from runtime.storage.models import Base

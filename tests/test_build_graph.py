@@ -2,16 +2,16 @@ from contextlib import AsyncExitStack
 import pytest
 
 from examples.incident_management.state import IncidentState
-from orchestrator.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
-from orchestrator.mcp_loader import load_tools
+from runtime.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
+from runtime.mcp_loader import load_tools
 from examples.incident_management.mcp_server import set_state as set_inc_state
-from orchestrator.storage.embeddings import build_embedder
-from orchestrator.storage.engine import build_engine
-from orchestrator.storage.history_store import HistoryStore
-from orchestrator.storage.models import Base
-from orchestrator.storage.session_store import SessionStore
-from orchestrator.graph import build_graph, GraphState
-from orchestrator.skill import load_all_skills
+from runtime.storage.embeddings import build_embedder
+from runtime.storage.engine import build_engine
+from runtime.storage.history_store import HistoryStore
+from runtime.storage.models import Base
+from runtime.storage.session_store import SessionStore
+from runtime.graph import build_graph, GraphState
+from runtime.skill import load_all_skills
 
 
 def _make_repo(tmp_path):
@@ -40,13 +40,13 @@ def cfg(tmp_path):
                             module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
-                            module="orchestrator.mcp_servers.observability",
+                            module="runtime.mcp_servers.observability",
                             category="observability"),
             MCPServerConfig(name="local_rem", transport="in_process",
-                            module="orchestrator.mcp_servers.remediation",
+                            module="runtime.mcp_servers.remediation",
                             category="remediation"),
             MCPServerConfig(name="local_user", transport="in_process",
-                            module="orchestrator.mcp_servers.user_context",
+                            module="runtime.mcp_servers.user_context",
                             category="user_context"),
         ]),
     )
@@ -106,7 +106,7 @@ async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
 @pytest.mark.asyncio
 async def test_build_graph_honours_entry_agent_from_config(cfg, tmp_path):
     """Entry node is whichever agent cfg.orchestrator.entry_agent names."""
-    from orchestrator.config import OrchestratorConfig
+    from runtime.config import OrchestratorConfig
     skills = load_all_skills("config/skills")
     store = _make_repo(tmp_path)
     # Override entry to triage.
@@ -167,7 +167,7 @@ async def test_build_graph_inserts_gate_for_gated_route(cfg, tmp_path):
 async def test_build_graph_raises_on_unknown_entry_agent(cfg, tmp_path):
     """Misconfigured entry_agent must raise loudly at build time, not silently
     produce a broken graph."""
-    from orchestrator.config import OrchestratorConfig
+    from runtime.config import OrchestratorConfig
     skills = load_all_skills("config/skills")
     store = _make_repo(tmp_path)
     cfg2 = cfg.model_copy(update={

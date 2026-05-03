@@ -56,7 +56,7 @@ def test_code_review_state_id_format_distinct_from_incident():
 def test_session_store_uses_state_class_id_format(tmp_path):
     """``SessionStore._next_id`` routes through ``state_cls.id_format``."""
     from examples.code_review.state import CodeReviewState
-    from orchestrator.config import MetadataConfig
+    from runtime.config import MetadataConfig
     from runtime.storage.engine import build_engine
     from runtime.storage.models import Base
     from runtime.storage.session_store import SessionStore

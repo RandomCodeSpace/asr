@@ -1,7 +1,7 @@
 import pytest
 from langchain_core.messages import HumanMessage, AIMessage
-from orchestrator.config import LLMConfig, ProviderConfig, ModelConfig
-from orchestrator.llm import StubChatModel, get_embedding, get_llm
+from runtime.config import LLMConfig, ProviderConfig, ModelConfig
+from runtime.llm import StubChatModel, get_embedding, get_llm
 
 
 @pytest.mark.asyncio

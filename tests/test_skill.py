@@ -1,7 +1,7 @@
 import pytest
 import yaml
 from pydantic import ValidationError
-from orchestrator.skill import Skill, RouteRule, load_skill, load_all_skills
+from runtime.skill import Skill, RouteRule, load_skill, load_all_skills
 
 
 _BASE_CONFIG = {
@@ -179,12 +179,12 @@ def test_skill_tools_empty_list_rejected():
 
 
 def test_route_rule_gate_defaults_to_none():
-    from orchestrator.skill import RouteRule
+    from runtime.skill import RouteRule
     r = RouteRule(when="default", next="triage")
     assert r.gate is None
 
 
 def test_route_rule_gate_explicit_value():
-    from orchestrator.skill import RouteRule
+    from runtime.skill import RouteRule
     r = RouteRule(when="success", next="resolution", gate="confidence")
     assert r.gate == "confidence"

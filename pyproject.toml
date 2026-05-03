@@ -51,7 +51,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/orchestrator", "src/runtime", "examples"]
+packages = ["src/runtime", "examples"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

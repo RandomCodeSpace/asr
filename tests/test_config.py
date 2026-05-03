@@ -1,6 +1,6 @@
 import pytest
 from pydantic import ValidationError
-from orchestrator.config import (
+from runtime.config import (
     AppConfig, LLMConfig, ProviderConfig, ModelConfig, EmbeddingConfig,
     MCPServerConfig, MCPConfig,
 )
@@ -111,7 +111,7 @@ def test_orchestrator_default_entry_agent():
 
 
 def test_orchestrator_explicit_entry_agent():
-    from orchestrator.config import OrchestratorConfig
+    from runtime.config import OrchestratorConfig
     cfg = AppConfig(
         llm=LLMConfig.stub(),
         mcp=MCPConfig(),
@@ -121,13 +121,13 @@ def test_orchestrator_explicit_entry_agent():
 
 
 def test_embedding_config_dim_default():
-    from orchestrator.config import EmbeddingConfig
+    from runtime.config import EmbeddingConfig
     e = EmbeddingConfig(provider="p", model="m")
     assert e.dim == 1024
 
 
 def test_storage_metadata_default():
-    from orchestrator.config import AppConfig, LLMConfig, MCPConfig
+    from runtime.config import AppConfig, LLMConfig, MCPConfig
     cfg = AppConfig(llm=LLMConfig.stub(), mcp=MCPConfig())
     assert cfg.storage.metadata.url == "sqlite:///incidents/incidents.db"
     assert cfg.storage.metadata.pool_size == 5
@@ -135,7 +135,7 @@ def test_storage_metadata_default():
 
 
 def test_storage_vector_default():
-    from orchestrator.config import AppConfig, LLMConfig, MCPConfig
+    from runtime.config import AppConfig, LLMConfig, MCPConfig
     cfg = AppConfig(llm=LLMConfig.stub(), mcp=MCPConfig())
     assert cfg.storage.vector.backend == "faiss"
     assert cfg.storage.vector.path == "incidents/faiss"
@@ -144,19 +144,19 @@ def test_storage_vector_default():
 
 
 def test_vector_backend_pgvector():
-    from orchestrator.config import VectorConfig
+    from runtime.config import VectorConfig
     v = VectorConfig(backend="pgvector", collection_name="incidents")
     assert v.backend == "pgvector"
 
 
 def test_vector_backend_none():
-    from orchestrator.config import VectorConfig
+    from runtime.config import VectorConfig
     v = VectorConfig(backend="none")
     assert v.backend == "none"
 
 
 def test_vector_backend_invalid_rejected():
-    from orchestrator.config import VectorConfig
+    from runtime.config import VectorConfig
     import pytest
     with pytest.raises(Exception):
         VectorConfig(backend="qdrant")

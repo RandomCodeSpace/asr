@@ -11,15 +11,15 @@ from __future__ import annotations
 import pytest
 
 from examples.incident_management.state import IncidentState
-from orchestrator.config import (
+from runtime.config import (
     EmbeddingConfig, MetadataConfig, ProviderConfig, VectorConfig,
 )
-from orchestrator.storage.embeddings import build_embedder
-from orchestrator.storage.engine import build_engine
-from orchestrator.storage.history_store import HistoryStore
-from orchestrator.storage.models import Base
-from orchestrator.storage.session_store import SessionStore
-from orchestrator.storage.vector import build_vector_store
+from runtime.storage.embeddings import build_embedder
+from runtime.storage.engine import build_engine
+from runtime.storage.history_store import HistoryStore
+from runtime.storage.models import Base
+from runtime.storage.session_store import SessionStore
+from runtime.storage.vector import build_vector_store
 
 
 @pytest.fixture

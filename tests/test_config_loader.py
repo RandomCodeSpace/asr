@@ -1,6 +1,6 @@
 from pathlib import Path
 import pytest
-from orchestrator.config import load_config
+from runtime.config import load_config
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_config.yaml"
 

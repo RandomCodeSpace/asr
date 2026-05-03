@@ -4,9 +4,9 @@ import pytest
 
 
 def test_create_all_smoke(tmp_path):
-    from orchestrator.config import MetadataConfig
-    from orchestrator.storage.engine import build_engine
-    from orchestrator.storage.models import Base
+    from runtime.config import MetadataConfig
+    from runtime.storage.engine import build_engine
+    from runtime.storage.models import Base
     from sqlalchemy import inspect
     db_url = f"sqlite:///{tmp_path}/test.db"
     eng = build_engine(MetadataConfig(url=db_url))

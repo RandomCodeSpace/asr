@@ -1,7 +1,7 @@
 import pytest
 
-from orchestrator.config import LLMConfig, RuntimeConfig, load_config
-from orchestrator.orchestrator import Orchestrator
+from runtime.config import LLMConfig, RuntimeConfig, load_config
+from runtime.orchestrator import Orchestrator
 
 
 @pytest.mark.asyncio

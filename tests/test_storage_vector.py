@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import pytest
 
-from orchestrator.config import EmbeddingConfig, ProviderConfig, VectorConfig
-from orchestrator.storage.embeddings import build_embedder
+from runtime.config import EmbeddingConfig, ProviderConfig, VectorConfig
+from runtime.storage.embeddings import build_embedder
 
 
 def _stub_embedder(dim: int = 8):
@@ -15,20 +15,20 @@ def _stub_embedder(dim: int = 8):
 
 
 def test_build_vector_store_none():
-    from orchestrator.storage.vector import build_vector_store
+    from runtime.storage.vector import build_vector_store
     cfg = VectorConfig(backend="none")
     assert build_vector_store(cfg, _stub_embedder()) is None
 
 
 def test_build_vector_store_no_embedder_returns_none():
-    from orchestrator.storage.vector import build_vector_store
+    from runtime.storage.vector import build_vector_store
     cfg = VectorConfig(backend="faiss", path="/tmp/x")
     assert build_vector_store(cfg, None) is None
 
 
 def test_build_vector_store_faiss_roundtrip(tmp_path: Path):
     from langchain_core.documents import Document
-    from orchestrator.storage.vector import build_vector_store
+    from runtime.storage.vector import build_vector_store
     cfg = VectorConfig(backend="faiss", path=str(tmp_path / "vs"),
                        collection_name="t", distance_strategy="cosine")
     embedder = _stub_embedder()
@@ -47,7 +47,7 @@ def test_build_vector_store_faiss_roundtrip(tmp_path: Path):
 
 def test_build_vector_store_faiss_delete(tmp_path: Path):
     from langchain_core.documents import Document
-    from orchestrator.storage.vector import build_vector_store
+    from runtime.storage.vector import build_vector_store
     cfg = VectorConfig(backend="faiss", path=str(tmp_path / "vs"),
                        collection_name="t")
     embedder = _stub_embedder()
@@ -64,13 +64,13 @@ def test_build_vector_store_faiss_delete(tmp_path: Path):
 
 
 def test_distance_to_similarity_cosine():
-    from orchestrator.storage.vector import distance_to_similarity
+    from runtime.storage.vector import distance_to_similarity
     assert distance_to_similarity(0.0, "cosine") == 1.0
     assert abs(distance_to_similarity(2.0, "cosine") - (-1.0)) < 1e-6
 
 
 def test_distance_to_similarity_euclidean_monotonic():
-    from orchestrator.storage.vector import distance_to_similarity
+    from runtime.storage.vector import distance_to_similarity
     a = distance_to_similarity(0.0, "euclidean")
     b = distance_to_similarity(1.0, "euclidean")
     c = distance_to_similarity(10.0, "euclidean")
@@ -79,6 +79,6 @@ def test_distance_to_similarity_euclidean_monotonic():
 
 
 def test_distance_to_similarity_unknown_raises():
-    from orchestrator.storage.vector import distance_to_similarity
+    from runtime.storage.vector import distance_to_similarity
     with pytest.raises(ValueError, match="unknown distance strategy"):
         distance_to_similarity(0.5, "manhattan")

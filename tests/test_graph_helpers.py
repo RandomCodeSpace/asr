@@ -1,9 +1,9 @@
 import pytest
-from orchestrator.graph import route_from_skill, AgentRunRecorder
+from runtime.graph import route_from_skill, AgentRunRecorder
 
 
 def test_route_from_skill_matches_known_route():
-    from orchestrator.skill import Skill, RouteRule
+    from runtime.skill import Skill, RouteRule
     s = Skill(
         name="x", description="d",
         routes=[RouteRule(when="matched", next="resolution"),
@@ -15,14 +15,14 @@ def test_route_from_skill_matches_known_route():
 
 
 def test_route_from_skill_unknown_route_falls_back_to_default():
-    from orchestrator.skill import Skill, RouteRule
+    from runtime.skill import Skill, RouteRule
     s = Skill(name="x", description="d",
               routes=[RouteRule(when="default", next="triage")], system_prompt="")
     assert route_from_skill(s, "unknown_signal") == "triage"
 
 
 def test_route_from_skill_no_routes_raises():
-    from orchestrator.skill import Skill
+    from runtime.skill import Skill
     s = Skill(name="x", description="d", routes=[], system_prompt="")
     with pytest.raises(ValueError, match="no routes"):
         route_from_skill(s, "default")

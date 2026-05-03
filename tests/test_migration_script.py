@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from orchestrator.config import (
+from runtime.config import (
     AppConfig, LLMConfig, MCPConfig, MetadataConfig, Paths, StorageConfig,
 )
 

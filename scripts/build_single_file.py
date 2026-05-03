@@ -32,7 +32,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-SRC_ROOT = Path("src/orchestrator")
 RUNTIME_ROOT = Path("src/runtime")
 EXAMPLES_ROOT = Path("examples")
 # Post-P1-J: the UI lives at examples/incident_management/ui.py.
@@ -59,7 +58,6 @@ OUT_CODE_REVIEW_APP = Path("dist/apps/code-review.py")
 #     app bundle, not in the runtime-only bundle).
 RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "config.py"),
-    (SRC_ROOT, "config.py"),  # legacy AppConfig subclass shadows runtime.AppConfig
     (RUNTIME_ROOT, "state.py"),
     (RUNTIME_ROOT, "state_resolver.py"),
     (RUNTIME_ROOT, "similarity.py"),
@@ -95,6 +93,10 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # (DedupConfig, DedupPipeline) are already module-scoped when
     # orchestrator.py executes its imports.
     (RUNTIME_ROOT, "dedup.py"),
+    # 2026-05-03: framework intake runner — used as the default Skill.runner
+    # for kind=supervisor skills. Bundled before orchestrator/api/skill so
+    # the dotted-path resolver finds default_intake_runner.
+    (RUNTIME_ROOT, "intake.py"),
     (RUNTIME_ROOT, "orchestrator.py"),
     (RUNTIME_ROOT, "api.py"),
     # P7-H: retraction routes are a side-car router so they don't bloat

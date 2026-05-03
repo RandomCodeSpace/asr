@@ -90,41 +90,13 @@ def test_runtime_config_no_severity_aliases():
     assert "severity_aliases" not in fields
 
 
-def test_orchestrator_shims_reach_runtime_classes():
-    """All canonical symbols imported via the orchestrator shim must be
-    the same Python objects as those imported via runtime.
-
-    Post-P1-M, ``orchestrator.config`` is a pure star-import shim — the
-    legacy AppConfig subclass is gone, so AppConfig is identity-equal
-    across both packages.
-    """
-    import runtime.config
-    import orchestrator.config
-    assert orchestrator.config.AppConfig is runtime.config.AppConfig
-
-    import runtime.storage.session_store
-    import orchestrator.storage.session_store
-    assert (orchestrator.storage.session_store.SessionStore
-            is runtime.storage.session_store.SessionStore)
-
-    import runtime.graph
-    import orchestrator.graph
-    assert orchestrator.graph.GraphState is runtime.graph.GraphState
-
-    import runtime.skill
-    import orchestrator.skill
-    assert orchestrator.skill.Skill is runtime.skill.Skill
-
-
-def test_orchestrator_shims_still_importable():
-    """All existing orchestrator-prefixed imports used in the test suite
-    keep working through the shim layer.
-    """
-    from orchestrator.config import AppConfig  # noqa: F401
-    from orchestrator.storage.session_store import SessionStore  # noqa: F401
-    from orchestrator.storage.history_store import HistoryStore  # noqa: F401
-    from orchestrator.graph import GraphState  # noqa: F401
-    from orchestrator.orchestrator import Orchestrator  # noqa: F401
+def test_runtime_canonical_imports():
+    """The canonical framework import paths remain stable."""
+    from runtime.config import AppConfig  # noqa: F401
+    from runtime.storage.session_store import SessionStore  # noqa: F401
+    from runtime.storage.history_store import HistoryStore  # noqa: F401
+    from runtime.graph import GraphState  # noqa: F401
+    from runtime.orchestrator import Orchestrator  # noqa: F401
 
 
 # ---------- P2-J: legacy ``runtime.incident`` + ``IncidentRepository`` are gone ----------
@@ -155,7 +127,7 @@ def test_storage_init_does_not_export_incident_repository():
 
 
 def test_orchestrator_storage_init_does_not_export_incident_repository():
-    import orchestrator.storage as s
+    import runtime.storage as s
     assert not hasattr(s, "IncidentRepository"), (
         "IncidentRepository should be removed from orchestrator.storage exports in P2-J"
     )

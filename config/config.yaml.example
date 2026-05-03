@@ -53,15 +53,15 @@ mcp:
       category: incident_management
     - name: local_observability
       transport: in_process
-      module: orchestrator.mcp_servers.observability
+      module: runtime.mcp_servers.observability
       category: observability
     - name: local_remediation
       transport: in_process
-      module: orchestrator.mcp_servers.remediation
+      module: runtime.mcp_servers.remediation
       category: remediation
     - name: local_user_context
       transport: in_process
-      module: orchestrator.mcp_servers.user_context
+      module: runtime.mcp_servers.user_context
       category: user_context
     # Example remote MCP — disabled by default
     - name: external_ticketing

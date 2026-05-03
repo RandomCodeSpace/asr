@@ -1,8 +1,8 @@
 import os
 import pytest
 from langchain_core.messages import HumanMessage
-from orchestrator.config import LLMConfig, ProviderConfig, ModelConfig
-from orchestrator.llm import get_llm
+from runtime.config import LLMConfig, ProviderConfig, ModelConfig
+from runtime.llm import get_llm
 
 
 @pytest.mark.asyncio

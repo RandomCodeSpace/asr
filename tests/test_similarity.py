@@ -1,5 +1,5 @@
 import pytest
-from orchestrator.similarity import KeywordSimilarity, find_similar
+from runtime.similarity import KeywordSimilarity, find_similar
 
 
 def test_keyword_overlap_score():

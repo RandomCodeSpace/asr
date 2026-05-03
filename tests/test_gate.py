@@ -5,18 +5,18 @@ from pytest import approx
 from langgraph.errors import GraphInterrupt
 
 from examples.incident_management.state import IncidentState
-from orchestrator.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MetadataConfig, ProviderConfig
+from runtime.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MetadataConfig, ProviderConfig
 from runtime.config import FrameworkAppConfig
-from orchestrator.graph import (
+from runtime.graph import (
     GraphState, make_agent_node, make_gate_node, _coerce_confidence,
 )
 from runtime.state import AgentRun
-from orchestrator.llm import StubChatModel
-from orchestrator.skill import RouteRule, Skill
-from orchestrator.storage.embeddings import build_embedder
-from orchestrator.storage.engine import build_engine
-from orchestrator.storage.models import Base
-from orchestrator.storage.session_store import SessionStore
+from runtime.llm import StubChatModel
+from runtime.skill import RouteRule, Skill
+from runtime.storage.embeddings import build_embedder
+from runtime.storage.engine import build_engine
+from runtime.storage.models import Base
+from runtime.storage.session_store import SessionStore
 
 
 def _make_repo(tmp_path):

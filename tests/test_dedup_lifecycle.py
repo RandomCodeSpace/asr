@@ -12,10 +12,10 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-from orchestrator.config import (
+from runtime.config import (
     AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths, RuntimeConfig,
 )
-from orchestrator.orchestrator import Orchestrator
+from runtime.orchestrator import Orchestrator
 from runtime.dedup import DedupConfig, DedupDecision, DedupPipeline, DedupResult
 
 
@@ -37,13 +37,13 @@ def cfg(tmp_path):
                             module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
-                            module="orchestrator.mcp_servers.observability",
+                            module="runtime.mcp_servers.observability",
                             category="observability"),
             MCPServerConfig(name="local_rem", transport="in_process",
-                            module="orchestrator.mcp_servers.remediation",
+                            module="runtime.mcp_servers.remediation",
                             category="remediation"),
             MCPServerConfig(name="local_user", transport="in_process",
-                            module="orchestrator.mcp_servers.user_context",
+                            module="runtime.mcp_servers.user_context",
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills",
