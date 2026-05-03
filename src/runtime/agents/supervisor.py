@@ -225,13 +225,21 @@ def make_supervisor_node(
 
     runner: Callable[..., Any] | None = None
     if skill.runner is not None:
-        # Resolved a second time here so a runner that fails to import
-        # at graph-build time still surfaces a clear error. The skill
-        # validator catches most issues at YAML load; this is belt-and-
-        # braces and also gives us the live callable to invoke.
-        runner = _resolve_dotted_callable(
-            skill.runner, source=f"supervisor {skill.name!r} runner"
-        )
+        if callable(skill.runner):
+            # Test stubs and composed runners may supply a live callable
+            # directly rather than a dotted-path string. Access via the
+            # class __dict__ to avoid Python binding it as an instance
+            # method when the skill is a plain object (not a Pydantic model).
+            raw = vars(type(skill)).get("runner", skill.runner)
+            runner = raw if callable(raw) else skill.runner
+        else:
+            # Resolved a second time here so a runner that fails to import
+            # at graph-build time still surfaces a clear error. The skill
+            # validator catches most issues at YAML load; this is belt-and-
+            # braces and also gives us the live callable to invoke.
+            runner = _resolve_dotted_callable(
+                skill.runner, source=f"supervisor {skill.name!r} runner"
+            )
 
     async def node(state: GraphState) -> dict:
         sess: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
@@ -257,8 +265,16 @@ def make_supervisor_node(
         # ----- P9-9h: app-supplied runner hook ------------------------
         runner_patch: dict[str, Any] = {}
         if runner is not None:
+            # Build a thin proxy so the runner can reach intake_context
+            # (and any other framework_cfg attributes) without needing
+            # framework_cfg to be mutable. The proxy exposes intake_context
+            # directly and falls back to framework_cfg for all other attrs.
+            _app_cfg_proxy = type("_RunnerAppCfg", (), {
+                "intake_context": getattr(framework_cfg, "intake_context", None),
+                "__getattr__": lambda self, name: getattr(framework_cfg, name),
+            })()
             try:
-                result = runner(state, app_cfg=framework_cfg)
+                result = runner(state, app_cfg=_app_cfg_proxy)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "supervisor %s: runner %s raised; aborting to __end__",

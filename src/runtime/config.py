@@ -271,6 +271,9 @@ class FrameworkAppConfig(BaseModel):
     escalation_teams: list[str] = Field(default_factory=list)
     severity_aliases: dict[str, str] = Field(default_factory=dict)
     dedup_system_prompt: str = _DEFAULT_DEDUP_SYSTEM_PROMPT
+    # Intake runner knobs: forwarded into IntakeContext at graph-build time.
+    intake_top_k: int = 3
+    intake_similarity_threshold: float = 0.7
 
 
 def resolve_framework_app_config(

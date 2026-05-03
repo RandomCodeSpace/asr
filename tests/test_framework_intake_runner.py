@@ -241,3 +241,45 @@ def test_compose_runners_short_circuits_on_first_route() -> None:
 def test_compose_runners_returns_none_when_all_runners_no_op() -> None:
     composed = compose_runners(lambda *a, **k: None, lambda *a, **k: None)
     assert composed({}) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 6: supervisor node passes intake_context to runner via app_cfg
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock
+
+from runtime.agents.supervisor import make_supervisor_node
+
+
+def test_supervisor_node_passes_intake_context_to_runner() -> None:
+    """The supervisor node must read intake_context off framework_cfg
+    and forward it to the runner via app_cfg, so module-level runners
+    like default_intake_runner can reach the live stores."""
+    history = _StubHistoryStore(hits=[])
+    captured: dict[str, Any] = {}
+
+    def _runner(state, *, app_cfg=None):
+        captured["app_cfg"] = app_cfg
+        return None
+
+    skill = type("Skill", (), {
+        "name": "intake",
+        "kind": "supervisor",
+        "subordinates": ["triage"],
+        "dispatch_strategy": "rule",
+        "dispatch_rules": [],
+        "runner": _runner,
+        "max_dispatch_depth": 2,
+    })()
+    framework_cfg = type("FwkCfg", (), {
+        "intake_context": IntakeContext(history_store=history, dedup_pipeline=None),
+    })()
+
+    node = make_supervisor_node(
+        skill=skill,
+        framework_cfg=framework_cfg,
+    )
+    asyncio.run(node({"session": _mk_session(), "dispatch_depth": 0}))
+
+    assert captured["app_cfg"].intake_context.history_store is history

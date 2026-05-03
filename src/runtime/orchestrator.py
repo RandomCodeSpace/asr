@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     pass
     from runtime.triggers.base import TriggerInfo  # noqa: F401
 from runtime.dedup import DedupConfig, DedupPipeline, DedupResult
+from runtime.intake import IntakeContext
 from runtime.llm import get_llm
 from runtime.skill import load_all_skills, Skill
 from runtime.mcp_loader import load_tools, ToolRegistry
@@ -300,6 +301,20 @@ class Orchestrator(Generic[StateT]):
                 similarity_threshold=framework_cfg.similarity_threshold,
                 distance_strategy=cfg.storage.vector.distance_strategy,
             )
+            # Attach intake_context onto framework_cfg so supervisor nodes can
+            # reach the live stores via app_cfg.intake_context. FrameworkAppConfig
+            # is a Pydantic model; use object.__setattr__ to set a runtime
+            # attribute without triggering Pydantic's frozen-model guard.
+            object.__setattr__(
+                framework_cfg,
+                "intake_context",
+                IntakeContext(
+                    history_store=history,
+                    dedup_pipeline=None,  # dedup_pipeline built below; patched after
+                    top_k=framework_cfg.intake_top_k,
+                    similarity_threshold=framework_cfg.intake_similarity_threshold,
+                ),
+            )
             # Configure incident_management state via importlib so we hit the
             # *same* module instance the MCP loader will import. In the
             # single-file dist bundle a direct ``set_state`` call would
@@ -377,6 +392,11 @@ class Orchestrator(Generic[StateT]):
                         model_factory=_factory,
                         framework_cfg=framework_cfg,
                     )
+            # Backfill dedup_pipeline into the IntakeContext now that it is built.
+            # The IntakeContext was constructed with dedup_pipeline=None above
+            # because the pipeline is built after graph construction.
+            if dedup_pipeline is not None:
+                framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
             # P2-I: no resume graph anymore — resume runs through the
             # main graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrates paused state.

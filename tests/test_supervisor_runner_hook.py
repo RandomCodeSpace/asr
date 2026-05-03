@@ -113,8 +113,8 @@ async def test_supervisor_with_no_runner_uses_routing_table():
     ``status='high'`` should match the first dispatch rule and route
     to ``responder`` — the same expectation P6 tests already cover.
     """
-    skill = _supervisor()  # runner is None
-    assert skill.runner is None
+    skill = _supervisor()  # runner defaults to framework intake runner (Task 5)
+    assert skill.runner == "runtime.intake:default_intake_runner"
     node = make_supervisor_node(skill=skill)
 
     state = {"session": _session(status="high"), "dispatch_depth": 0}
