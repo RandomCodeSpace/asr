@@ -94,6 +94,11 @@ class Session(BaseModel):
     # session row so the UI can render "why was this marked duplicate?"
     # without needing a separate join.
     dedup_rationale: str | None = None
+    # Bag for app-specific session data the framework doesn't touch.
+    # Apps that previously subclassed Session to add typed fields now
+    # store them here. The storage layer round-trips this via the
+    # matching ``IncidentRow.extra_fields`` JSON column.
+    extra_fields: dict[str, Any] = Field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # App-overridable agent-input formatter hook.
