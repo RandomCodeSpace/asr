@@ -1,0 +1,10 @@
+description: Rolls findings into a final approve / request_changes / comment recommendation.
+tools:
+  local: ["set_recommendation"]
+routes:
+  - when: success
+    next: __end__
+  - when: failed
+    next: __end__
+  - when: default
+    next: __end__

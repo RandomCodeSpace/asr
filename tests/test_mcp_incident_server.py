@@ -1,8 +1,11 @@
 import pytest
+
+from examples.incident_management.state import IncidentState
 from orchestrator.config import MetadataConfig
 from orchestrator.storage.engine import build_engine
+from orchestrator.storage.history_store import HistoryStore
 from orchestrator.storage.models import Base
-from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.session_store import SessionStore
 from orchestrator.mcp_servers.incident import (
     set_state, lookup_similar_incidents, create_incident, update_incident,
     IncidentMCPServer,
@@ -10,18 +13,20 @@ from orchestrator.mcp_servers.incident import (
 
 
 def _make_repo(tmp_path, *, similarity_threshold: float = 0.3):
-    """Create a keyword-based repo (no embedder) for fast unit tests."""
+    """Create a keyword-based store + history (no embedder) for fast unit tests."""
     eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
     Base.metadata.create_all(eng)
-    return IncidentRepository(engine=eng, embedder=None,
-                              similarity_threshold=similarity_threshold)
+    store = SessionStore(engine=eng, state_cls=IncidentState, embedder=None)
+    history = HistoryStore(engine=eng, state_cls=IncidentState, embedder=None,
+                           similarity_threshold=similarity_threshold)
+    return store, history
 
 
 @pytest.fixture(autouse=True)
 def setup_store(tmp_path):
-    repo = _make_repo(tmp_path)
-    set_state(repository=repo)
-    yield repo
+    store, history = _make_repo(tmp_path)
+    set_state(store=store, history=history)
+    yield store
 
 
 @pytest.mark.asyncio
@@ -63,15 +68,15 @@ async def test_update_incident_normalizes_severity(setup_store):
 
 @pytest.mark.asyncio
 async def test_two_servers_have_independent_repos(tmp_path):
-    """Two IncidentMCPServer instances must NOT share their repository reference."""
+    """Two IncidentMCPServer instances must NOT share their store/history references."""
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
-    repo_a = _make_repo(tmp_path / "a")
-    repo_b = _make_repo(tmp_path / "b")
+    store_a, history_a = _make_repo(tmp_path / "a")
+    store_b, history_b = _make_repo(tmp_path / "b")
     server_a = IncidentMCPServer()
     server_b = IncidentMCPServer()
-    server_a.configure(repository=repo_a)
-    server_b.configure(repository=repo_b)
+    server_a.configure(store=store_a, history=history_a)
+    server_b.configure(store=store_b, history=history_b)
 
     inc_a = await server_a._tool_create_incident(
         query="a-side", environment="dev", reporter_id="u", reporter_team="t",
@@ -79,9 +84,9 @@ async def test_two_servers_have_independent_repos(tmp_path):
     inc_b = await server_b._tool_create_incident(
         query="b-side", environment="dev", reporter_id="u", reporter_team="t",
     )
-    # Each repo sees only its own INC.
-    ids_a = {i.id for i in repo_a.list_all()}
-    ids_b = {i.id for i in repo_b.list_all()}
+    # Each store sees only its own INC.
+    ids_a = {i.id for i in store_a.list_all()}
+    ids_b = {i.id for i in store_b.list_all()}
     assert ids_a == {inc_a["id"]}
     assert ids_b == {inc_b["id"]}
     # And the FastMCP instances are distinct objects (no shared global server).

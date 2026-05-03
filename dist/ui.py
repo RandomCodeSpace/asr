@@ -1,6 +1,15 @@
 from __future__ import annotations
-# ----- imports for ui/streamlit_app.py -----
-"""Streamlit UI — 2 tabs + always-on sidebar with recent INCs."""
+# ----- imports for examples/incident_management/ui.py -----
+"""Streamlit UI — 2 tabs + always-on sidebar with recent INCs.
+
+Lives at ``examples/incident_management/ui.py`` post-P1-J. Run via:
+
+    python -m examples.incident_management
+
+A backwards-compat shim at ``ui/streamlit_app.py`` re-exports this
+module so legacy ``streamlit run ui/streamlit_app.py`` invocations
+keep working.
+"""
 # Lifecycle note: the Orchestrator owns FastMCP clients tied to a specific
 # asyncio event loop. Streamlit re-runs the script on every interaction and we
 # use `asyncio.run(...)` per call, which creates a fresh loop each time.
@@ -10,12 +19,13 @@ from __future__ import annotations
 # So: build a fresh Orchestrator inside each `asyncio.run` and `aclose` it when
 # done. For pure metadata views (agents/tools) we use `_load_metadata_dicts` —
 # a one-shot fetch that captures plain dicts and disposes the orchestrator.
-# The sidebar uses IncidentRepository directly for sync list/load/delete calls
-# that need no MCP clients. It builds the repo from the same config the
+# The sidebar uses SessionStore directly for sync list/load/delete calls
+# that need no MCP clients. It builds the store from the same config the
 # Orchestrator uses so both share the same SQLite DB.
 
-from app import AppConfig, Base, IncidentRepository, MetadataConfig, Orchestrator, build_embedder, build_engine, build_vector_store, load_config
+from app import AppConfig, Base, IncidentAppConfig, MetadataConfig, Orchestrator, OrchestratorService, SessionStore, build_embedder, build_engine, build_vector_store, load_config, load_incident_app_config, resolve_state_class
 import asyncio
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 import streamlit as st
@@ -28,13 +38,77 @@ import streamlit as st
 
 
 
-# ====== module: ui/streamlit_app.py ======
+
+
+# ====== module: examples/incident_management/ui.py ======
 
 CONFIG_PATH = Path("config/config.yaml")
 
 
-def _make_repository(cfg: AppConfig) -> IncidentRepository:
-    """Build an IncidentRepository from config — mirrors Orchestrator.create logic."""
+# ---------------------------------------------------------------------------
+# P3-I/J — multi-session live state
+# ---------------------------------------------------------------------------
+
+# Statuses that mean the run is still in flight and the detail view should
+# auto-refresh. Anything not in this set is terminal (resolved / escalated /
+# stopped / deleted / matched / new) and the detail pane renders once.
+#
+# The plan-doc names ``running`` as a synonym for ``in_progress``; we accept
+# both so the helper survives any future renaming on the service side
+# (``_ActiveSession.status`` currently mirrors the IncidentStatus literal).
+_POLL_STATUSES: frozenset[str] = frozenset({
+    "running",
+    "in_progress",
+    "awaiting_input",
+})
+
+
+def _should_poll(status: str | None) -> bool:
+    """Return True iff the detail pane should auto-refresh for ``status``.
+
+    Pure function so the polling decision is unit-testable without spinning
+    up a Streamlit runtime. Treat unknown / missing status as terminal —
+    polling forever on bad data is worse than over-eagerly stopping.
+    """
+    if not status:
+        return False
+    return status in _POLL_STATUSES
+
+
+def _get_service(cfg: AppConfig) -> OrchestratorService | None:
+    """Return the process-singleton ``OrchestratorService``, started.
+
+    Wrapped in ``st.cache_resource`` so the background thread + asyncio
+    loop are built exactly once per Streamlit server process and reused
+    across reruns. Returns ``None`` when running outside a Streamlit
+    runtime context (e.g. ``import examples.incident_management.ui``
+    from a test) so the module stays importable headlessly.
+    """
+    try:
+        return _cached_service(cfg)
+    except Exception:
+        # Streamlit's cache decorator raises if invoked without a script
+        # run context. Fall back to building the singleton directly so a
+        # bare ``import`` of this module never crashes.
+        return None
+
+
+@st.cache_resource(ttl=None, show_spinner=False)
+def _cached_service(cfg: AppConfig) -> OrchestratorService:
+    svc = OrchestratorService.get_or_create(cfg)
+    if not svc._thread or not svc._thread.is_alive():
+        svc.start()
+    return svc
+
+
+def _make_repository(cfg: AppConfig,
+                     app_cfg: IncidentAppConfig) -> SessionStore:
+    """Build a SessionStore from config — mirrors Orchestrator.create logic.
+
+    Post P2-J: returns the active CRUD ``SessionStore`` only. The UI does
+    not need similarity search; if a future view does, build a
+    ``HistoryStore`` alongside.
+    """
 
     default_url = MetadataConfig().url
     url = (
@@ -45,19 +119,21 @@ def _make_repository(cfg: AppConfig) -> IncidentRepository:
     Base.metadata.create_all(engine)
     embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
     vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
-    return IncidentRepository(
+    state_cls = resolve_state_class(cfg.runtime.state_class)
+    return SessionStore(
         engine=engine,
+        state_cls=state_cls,
         embedder=embedder,
         vector_store=vector_store,
         vector_path=(cfg.storage.vector.path
                      if cfg.storage.vector.backend == "faiss" else None),
         vector_index_name=cfg.storage.vector.collection_name,
         distance_strategy=cfg.storage.vector.distance_strategy,
-        similarity_threshold=cfg.incidents.similarity_threshold,
     )
 
 
-def _load_metadata_dicts(cfg: AppConfig) -> tuple[list[dict], list[dict], list[str]]:
+def _load_metadata_dicts(cfg: AppConfig,
+                         app_cfg: IncidentAppConfig) -> tuple[list[dict], list[dict], list[str]]:
     """Build a transient orchestrator, snapshot agents/tools/envs, then aclose.
 
     Per-rerun cost is dominated by FastMCP client startup (~100-200ms total for
@@ -66,7 +142,7 @@ def _load_metadata_dicts(cfg: AppConfig) -> tuple[list[dict], list[dict], list[s
     async def _go():
         orch = await Orchestrator.create(cfg)
         try:
-            return orch.list_agents(), orch.list_tools(), list(orch.cfg.environments)
+            return orch.list_agents(), orch.list_tools(), list(app_cfg.environments)
         finally:
             await orch.aclose()
     return asyncio.run(_go())
@@ -174,7 +250,7 @@ def _fmt_tokens_short(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else f"{n}"
 
 
-def _render_inc_row(inc: dict, store: IncidentRepository) -> None:
+def _render_inc_row(inc: dict, store: SessionStore) -> None:
     """One INC row as an expander.
 
     Header shows INC id + env badge + status badge. The body holds
@@ -255,11 +331,74 @@ def _render_inc_row(inc: dict, store: IncidentRepository) -> None:
             st.session_state["selected_incident"] = inc_id
 
 
-def render_sidebar(store: IncidentRepository) -> None:
+def _render_active_row(active: dict) -> None:
+    """One in-flight session as a button row.
+
+    The row reuses the same ``selected_incident`` session-state key as the
+    history rows so clicking flips the detail pane to the live session.
+    The status badge mirrors the same palette as history so the visual
+    grammar stays consistent — ``in_progress`` reads the same colour
+    whether the run is live or finished.
+    """
+    sid = active.get("session_id") or ""
+    status = active.get("status") or ""
+    current = active.get("current_agent") or ""
+    age = _age(active.get("started_at", ""))
+
+    bits = [_badge_md(status, _STATUS_COLOR)]
+    if current:
+        bits.append(f"`{current}`")
+    if age:
+        bits.append(f"`{age}`")
+    label = " ".join([f"`{sid}`"] + bits).strip()
+
+    is_selected = st.session_state.get("selected_incident") == sid
+    btn_type = "primary" if is_selected else "secondary"
+    # Markdown badges don't render inside ``st.button`` labels, so split
+    # the row into a markdown line + a compact "Open" button beneath.
+    st.markdown(label, unsafe_allow_html=True)
+    if st.button("Open", key=f"active_open_{sid}",
+                 type=btn_type, use_container_width=True):
+        st.session_state["selected_incident"] = sid
+        st.rerun()
+
+
+def render_sidebar(store: SessionStore,
+                   service: OrchestratorService | None = None) -> None:
+    """Render the always-on sidebar with two sections: in-flight + history.
+
+    The **In-flight** block reads the live registry from
+    ``OrchestratorService.list_active_sessions`` so concurrent runs show
+    up immediately. The **History** block is unchanged — paginated INCs
+    pulled from ``SessionStore.list_recent`` with a status filter.
+
+    ``service`` is optional so this function stays callable from headless
+    smoke tests / unit tests that don't spin up the orchestrator.
+    """
     with st.sidebar:
+        # ------------------------------------------------------------
+        # P3-I — In-flight section (live)
+        # ------------------------------------------------------------
+        active: list[dict] = []
+        if service is not None:
+            try:
+                active = service.list_active_sessions()
+            except Exception:  # pragma: no cover - defensive
+                # If the loop was stopped or a snapshot timed out, fail
+                # closed: hide the section rather than crash the sidebar.
+                active = []
+        if active:
+            st.markdown("### In-flight")
+            for sess in active:
+                _render_active_row(sess)
+            st.markdown("---")
+
+        # ------------------------------------------------------------
+        # History section (existing)
+        # ------------------------------------------------------------
         head_l, head_r = st.columns([4, 1])
         with head_l:
-            st.markdown("### Recent INCs")
+            st.markdown("### History")
         with head_r:
             if st.button("↻", help="Refresh", type="tertiary",
                          use_container_width=True):
@@ -616,7 +755,161 @@ def _render_tool_calls_block(inc: dict) -> None:
             _render_value(tc.get("result"))
 
 
-def render_incident_detail(store: IncidentRepository,
+def _submit_approval_via_service(
+    cfg: AppConfig, inc_id: str, tool_call_id: str,
+    decision: str, approver: str, rationale: str | None,
+) -> None:
+    """Resolve a pending tool approval through the OrchestratorService bridge.
+
+    Drives ``Command(resume={...})`` on the persistent service loop so
+    we reuse the live FastMCP transports + SQLAlchemy engine — same
+    contract as ``POST /sessions/{sid}/approvals/{tool_call_id}``
+    (P4-G). Streamlit reruns will re-fetch the row and the wrap_tool
+    audit (status="approved" / "rejected") will be visible.
+    """
+    from langgraph.types import Command
+
+    svc = _get_service(cfg)
+    if svc is None:
+        st.error("Orchestrator service is not running; refresh the page.")
+        return
+
+    payload = {
+        "decision": decision,
+        "approver": approver,
+        "rationale": rationale,
+    }
+
+    async def _drive() -> None:
+        # ``_ensure_orchestrator`` is a no-op after the first call; the
+        # shared Orchestrator owns the compiled graph + checkpointer.
+        orch = await svc._ensure_orchestrator()
+        await orch.graph.ainvoke(
+            Command(resume=payload),
+            config=orch._thread_config(inc_id),
+        )
+
+    svc.submit_and_wait(_drive(), timeout=60.0)
+
+
+def _is_hypothesis_trail(value) -> bool:
+    """Return True when value is a non-empty list of dicts shaped like a
+    triage hypothesis-loop trail (P9-9i).
+
+    Each entry must carry ``iteration`` + ``hypothesis``; ``score`` and
+    ``rationale`` are recommended but not required.
+    """
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and isinstance(value[0], dict)
+        and "iteration" in value[0]
+        and "hypothesis" in value[0]
+    )
+
+
+def _render_hypothesis_trail_block(inc: dict) -> None:
+    """Render the ### Hypothesis Trail panel (P9-9m).
+
+    Reads-only view over the triage agent's per-iteration trail. The
+    triage skill writes a list of ``{iteration, hypothesis, score,
+    rationale}`` dicts to ``findings.findings_triage`` (or any finding
+    key whose value matches :func:`_is_hypothesis_trail`); this panel
+    surfaces them as a collapsed accordion so an operator can audit
+    how the hypothesis converged without scrolling through raw JSON.
+
+    No persistent state — pulls everything from ``inc["findings"]``.
+    Renders nothing when no trail is present so legacy incidents stay
+    clean.
+    """
+    findings = inc.get("findings") or {}
+    if not isinstance(findings, dict):
+        return
+
+    trails: list[tuple[str, list[dict]]] = []
+    # Look under both the canonical key (``findings_triage``) and any
+    # other agent finding shaped like a trail — keeps the panel
+    # forward-compatible if other agents adopt the iterative pattern.
+    for agent, value in findings.items():
+        if _is_hypothesis_trail(value):
+            trails.append((agent, value))
+    if not trails:
+        return
+
+    st.markdown("### Hypothesis Trail")
+    for agent, trail in trails:
+        with st.expander(f"`{agent}` — {len(trail)} iteration(s)", expanded=False):
+            for entry in trail:
+                if not isinstance(entry, dict):
+                    continue
+                iteration = entry.get("iteration", "?")
+                hypothesis = entry.get("hypothesis", "_(no hypothesis)_")
+                score = entry.get("score")
+                rationale = entry.get("rationale", "")
+                with st.container(border=True):
+                    score_md = (
+                        f" · score `{score:.2f}`"
+                        if isinstance(score, (int, float))
+                        else ""
+                    )
+                    st.markdown(f"**Iteration {iteration}**{score_md}")
+                    st.markdown(hypothesis)
+                    if rationale:
+                        st.caption(rationale)
+
+
+def _render_pending_approvals_block(inc: dict, inc_id: str) -> None:
+    """Render the ### Pending Approvals section for high-risk tool calls
+    paused on the gateway's HITL approval handshake (P4-H).
+
+    Iterates ``tool_calls`` looking for entries with
+    ``status="pending_approval"``. Each pending row gets a small card
+    with the tool name + args, a free-text rationale input, and two
+    buttons (Approve / Reject) that resolve the pending interrupt via
+    the OrchestratorService bridge.
+    """
+    tool_calls = inc.get("tool_calls", [])
+    pending = [
+        (idx, tc) for idx, tc in enumerate(tool_calls)
+        if (tc.get("status") if isinstance(tc, dict) else None) == "pending_approval"
+    ]
+    if not pending:
+        return
+    cfg = load_config(CONFIG_PATH)
+    st.markdown("### Pending Approvals")
+    for idx, tc in pending:
+        agent = tc.get("agent", "?")
+        tool = tc.get("tool", "?")
+        with st.container(border=True):
+            st.markdown(f"#### 🔒 `{agent}` → `{tool}` (high risk)")
+            st.markdown("**Args:**")
+            st.json(tc.get("args") or {})
+            rationale = st.text_input(
+                "Rationale (optional)",
+                key=f"approval_rationale_{inc_id}_{idx}",
+                placeholder="Why are you approving / rejecting?",
+            )
+            cols = st.columns(2)
+            approve = cols[0].button(
+                "Approve", type="primary",
+                key=f"approval_approve_{inc_id}_{idx}",
+            )
+            reject = cols[1].button(
+                "Reject",
+                key=f"approval_reject_{inc_id}_{idx}",
+            )
+            if approve or reject:
+                decision = "approve" if approve else "reject"
+                _submit_approval_via_service(
+                    cfg, inc_id, str(idx),
+                    decision=decision,
+                    approver="ui-user",
+                    rationale=rationale.strip() or None,
+                )
+                st.rerun()
+
+
+def render_incident_detail(store: SessionStore,
                            agent_names: frozenset[str] = frozenset()) -> None:
     inc_id = st.session_state.get("selected_incident")
     if not inc_id:
@@ -640,12 +933,33 @@ def render_incident_detail(store: IncidentRepository,
         _render_incident_summary_meta(inc)
         if inc.get("status") == "awaiting_input" and inc.get("pending_intervention"):
             _render_intervention_block(inc, inc_id, agent_names)
+        # P4-H: pending tool-approval cards (risk-rated gateway HITL).
+        # Rendered above the agents/tool-calls blocks so a paused
+        # approval is the first action surface the operator sees.
+        _render_pending_approvals_block(inc, inc_id)
+        # P9-9m: triage hypothesis-loop audit. Collapsed by default so
+        # the agents/findings blocks stay the primary read; the trail
+        # is one click away when an operator wants to audit how the
+        # triage hypothesis converged.
+        _render_hypothesis_trail_block(inc)
         _render_agents_run_block(inc)
         _render_findings_block(inc)
         _render_resolution_block(inc)
         _render_tool_calls_block(inc)
         with st.expander("Raw JSON"):
             st.json(inc)
+
+    # P3-J — auto-poll while the session is in flight. The 1.5s nap is a
+    # cooperative throttle: it blocks the script-runner thread, so the
+    # next ``st.rerun()`` lands on a quiescent rerun cycle. Tests can
+    # disable polling by setting ``st.session_state["_disable_poll"] = True``
+    # before calling render to keep unit tests deterministic.
+    if (
+        _should_poll(status)
+        and not st.session_state.get("_disable_poll")
+    ):
+        time.sleep(1.5)
+        st.rerun()
 
 
 def _format_event(ev: dict, agent_names: frozenset[str] = frozenset()) -> str | None:
@@ -738,10 +1052,11 @@ def _render_intervention_block(inc: dict, inc_id: str,
     submit button. On submit, calls `_resume_async` and then reruns.
     """
     cfg = load_config(CONFIG_PATH)
+    app_cfg = load_incident_app_config()
     pi = inc.get("pending_intervention") or {}
     conf = pi.get("confidence")
     threshold = pi.get("threshold", 0.75)
-    teams = pi.get("escalation_teams") or list(cfg.intervention.escalation_teams)
+    teams = pi.get("escalation_teams") or list(app_cfg.escalation_teams)
 
     conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
     summary = (pi.get("summary") or "").strip()
@@ -908,14 +1223,21 @@ def main() -> None:
     st.set_page_config(page_title="ASR — Agent Orchestrator", layout="wide")
     _inject_global_css()
     cfg = load_config(CONFIG_PATH)
-    store = _make_repository(cfg)
+    app_cfg = load_incident_app_config()
+    store = _make_repository(cfg, app_cfg)
+
+    # P3-I — process-singleton background service for the in-flight
+    # session list. ``_get_service`` returns ``None`` when called outside
+    # a Streamlit script context (e.g. importability tests), in which
+    # case the sidebar simply omits the in-flight section.
+    service = _get_service(cfg)
 
     # One-shot snapshot of agent/tool metadata + environments. ~100-200ms per
     # rerun; acceptable, and keeps async resources strictly scoped.
-    agents, tools, environments = _load_metadata_dicts(cfg)
+    agents, tools, environments = _load_metadata_dicts(cfg, app_cfg)
     agent_names: frozenset[str] = frozenset(a["name"] for a in agents)
 
-    render_sidebar(store)
+    render_sidebar(store, service)
 
     tab_investigate, tab_registry = st.tabs(["Investigate", "Agents & Tools"])
 

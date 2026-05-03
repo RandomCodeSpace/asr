@@ -1,0 +1,43 @@
+# Framework-runtime config for the code-review example app.
+#
+# Mirrors config/config.yaml but points the provider hooks at
+# examples.code_review.config:* so a code-review deployment never
+# resolves to the incident-management framework defaults.
+#
+# This file is illustrative — the bundled dist/apps/code-review.py
+# ships with these providers compiled in. The Streamlit UI under
+# examples/code_review/ui.py loads its AppConfig via the same
+# load_config(...) the incident UI uses.
+storage:
+  metadata:
+    url: "sqlite:///code_reviews/code_reviews.db"
+  vector:
+    backend: faiss
+    path: "code_reviews/faiss"
+    collection_name: "code_reviews"
+    distance_strategy: cosine
+llm:
+  default: stub_default
+  providers:
+    stub:
+      kind: stub
+  models:
+    stub_default:
+      provider: stub
+      model: stub-1
+mcp:
+  servers:
+  - name: local_cr
+    transport: in_process
+    module: examples.code_review.mcp_server
+    category: code_review
+paths:
+  skills_dir: examples/code_review/skills
+  incidents_dir: code_reviews
+orchestrator:
+  entry_agent: intake
+runtime:
+  state_class: examples.code_review.state.CodeReviewState
+  # Generic provider hooks — runtime never imports
+  # CodeReviewAppConfig directly.
+  framework_app_config_path: examples.code_review.config:framework_app_config_provider

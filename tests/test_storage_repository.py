@@ -1,19 +1,25 @@
-"""IncidentRepository CRUD tests against file-based SQLite + stub embedder."""
+"""SessionStore CRUD tests against file-based SQLite + stub embedder.
+
+P2-J: rewritten off the deleted ``IncidentRepository`` shim. The active
+CRUD surface lives directly on ``SessionStore``; tests use the example
+``IncidentState`` so the row schema's domain fields round-trip.
+"""
 from __future__ import annotations
 import pytest
 
+from examples.incident_management.state import IncidentState
 from orchestrator.config import MetadataConfig
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
+from orchestrator.storage.session_store import SessionStore
 
 
 @pytest.fixture
 def repo(tmp_path):
-    from orchestrator.storage.repository import IncidentRepository
     db = tmp_path / "test.db"
     eng = build_engine(MetadataConfig(url=f"sqlite:///{db}"))
     Base.metadata.create_all(eng)
-    return IncidentRepository(engine=eng)
+    return SessionStore(engine=eng, state_cls=IncidentState)
 
 
 def test_create_assigns_id_and_persists(repo):
@@ -36,7 +42,7 @@ def test_create_id_sequence(repo):
 
 
 def test_save_round_trip_preserves_nested(repo):
-    from orchestrator.incident import AgentRun, ToolCall, TokenUsage
+    from runtime.state import AgentRun, ToolCall, TokenUsage
     inc = repo.create(query="q", environment="dev", reporter_id="u", reporter_team="t")
     inc.summary = "edited"
     inc.tags = ["redis", "oom"]

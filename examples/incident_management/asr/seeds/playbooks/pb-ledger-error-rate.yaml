@@ -1,0 +1,14 @@
+id: pb-ledger-error-rate
+title: "Ledger service error-rate elevated"
+match_signals:
+  service: ledger
+  metric: error_rate
+  threshold_breach: true
+hypothesis_steps:
+  - "Check kafka emit success rate"
+  - "Check ledger -> postgres connectivity"
+remediation:
+  - tool: rollback_release
+    args:
+      service: ledger
+required_approval: true

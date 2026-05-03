@@ -1,12 +1,15 @@
 from contextlib import AsyncExitStack
 import pytest
+
+from examples.incident_management.state import IncidentState
 from orchestrator.config import EmbeddingConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
 from orchestrator.mcp_loader import load_tools, ToolRegistry
 from orchestrator.mcp_servers.incident import set_state as set_inc_state
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
+from orchestrator.storage.history_store import HistoryStore
 from orchestrator.storage.models import Base
-from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.session_store import SessionStore
 
 
 def _make_repo(tmp_path):
@@ -16,16 +19,20 @@ def _make_repo(tmp_path):
         EmbeddingConfig(provider="s", model="x", dim=1024),
         {"s": ProviderConfig(kind="stub")},
     )
-    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.5)
+    store = SessionStore(engine=eng, state_cls=IncidentState, embedder=embedder)
+    history = HistoryStore(engine=eng, state_cls=IncidentState, embedder=embedder,
+                           similarity_threshold=0.5)
+    return store, history
 
 
 @pytest.fixture
 def cfg(tmp_path):
-    set_inc_state(repository=_make_repo(tmp_path))
+    store, history = _make_repo(tmp_path)
+    set_inc_state(store=store, history=history)
     return MCPConfig(servers=[
         MCPServerConfig(
             name="local_inc", transport="in_process",
-            module="orchestrator.mcp_servers.incident",
+            module="examples.incident_management.mcp_server",
             category="incident_management",
         ),
         MCPServerConfig(

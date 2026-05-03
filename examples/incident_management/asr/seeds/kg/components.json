@@ -1,0 +1,37 @@
+[
+  {
+    "id": "payments",
+    "name": "payments-api",
+    "owner": "payments-team",
+    "criticality": "tier-1",
+    "environment": "production"
+  },
+  {
+    "id": "api-gateway",
+    "name": "api-gateway",
+    "owner": "platform-team",
+    "criticality": "tier-1",
+    "environment": "production"
+  },
+  {
+    "id": "postgres-payments",
+    "name": "postgres-payments",
+    "owner": "data-team",
+    "criticality": "tier-1",
+    "environment": "production"
+  },
+  {
+    "id": "kafka",
+    "name": "kafka-cluster",
+    "owner": "platform-team",
+    "criticality": "tier-2",
+    "environment": "production"
+  },
+  {
+    "id": "ledger",
+    "name": "ledger-service",
+    "owner": "finance-team",
+    "criticality": "tier-1",
+    "environment": "production"
+  }
+]

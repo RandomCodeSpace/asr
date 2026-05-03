@@ -1,24 +1,30 @@
-"""Behavioural tests for IncidentRepository (replaces the old JSON IncidentStore tests)."""
+"""Behavioural tests for SessionStore (replaces the old JSON IncidentStore tests).
+
+P2-J: rewritten off the deleted ``IncidentRepository`` shim — exercise
+``SessionStore`` directly with the example ``IncidentState``.
+"""
 import pytest
+
+from examples.incident_management.state import IncidentState
 from orchestrator.config import EmbeddingConfig, MetadataConfig, ProviderConfig
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
-from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.session_store import SessionStore
 
 
-def _make_repo(tmp_path) -> IncidentRepository:
+def _make_repo(tmp_path) -> SessionStore:
     eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
     Base.metadata.create_all(eng)
     embedder = build_embedder(
         EmbeddingConfig(provider="s", model="x", dim=1024),
         {"s": ProviderConfig(kind="stub")},
     )
-    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.5)
+    return SessionStore(engine=eng, state_cls=IncidentState, embedder=embedder)
 
 
 @pytest.fixture
-def store(tmp_path) -> IncidentRepository:
+def store(tmp_path) -> SessionStore:
     return _make_repo(tmp_path)
 
 

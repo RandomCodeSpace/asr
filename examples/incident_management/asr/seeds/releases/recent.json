@@ -1,0 +1,34 @@
+[
+  {
+    "id": "rel-2026-05-03-payments-01",
+    "service": "payments",
+    "sha": "9f2e1ab",
+    "deployed_at": "2026-05-03T09:45:00Z",
+    "author": "alice",
+    "summary": "tighten p99 timeout on outbound ledger call (15s -> 5s)"
+  },
+  {
+    "id": "rel-2026-05-02-ledger-01",
+    "service": "ledger",
+    "sha": "5cd7a90",
+    "deployed_at": "2026-05-02T18:10:00Z",
+    "author": "bob",
+    "summary": "switch ledger to async kafka emit"
+  },
+  {
+    "id": "rel-2026-05-02-payments-01",
+    "service": "payments",
+    "sha": "0a1b2c3",
+    "deployed_at": "2026-05-02T08:00:00Z",
+    "author": "carol",
+    "summary": "bump payments service to py3.13"
+  },
+  {
+    "id": "rel-2026-04-30-api-gateway-01",
+    "service": "api-gateway",
+    "sha": "deadbee",
+    "deployed_at": "2026-04-30T11:30:00Z",
+    "author": "dan",
+    "summary": "raise upstream connection pool to 256"
+  }
+]

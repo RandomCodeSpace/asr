@@ -1,0 +1,9 @@
+[
+  { "from": "api-gateway", "to": "payments", "kind": "calls" },
+  { "from": "payments", "to": "postgres-payments", "kind": "writes" },
+  { "from": "payments", "to": "postgres-payments", "kind": "reads" },
+  { "from": "payments", "to": "kafka", "kind": "writes" },
+  { "from": "payments", "to": "ledger", "kind": "calls" },
+  { "from": "ledger", "to": "postgres-payments", "kind": "reads" },
+  { "from": "ledger", "to": "kafka", "kind": "writes" }
+]

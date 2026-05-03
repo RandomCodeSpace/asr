@@ -2,15 +2,16 @@ import logging
 
 import pytest
 from pytest import approx
+from examples.incident_management.state import IncidentState
 from orchestrator.config import EmbeddingConfig, MetadataConfig, ProviderConfig
 from orchestrator.graph import GraphState, _decide_from_signal, make_agent_node
-from orchestrator.incident import TokenUsage
+from runtime.state import TokenUsage
 from orchestrator.skill import Skill, RouteRule
 from orchestrator.llm import StubChatModel
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
-from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.session_store import SessionStore
 
 
 def _make_repo(tmp_path):
@@ -20,7 +21,7 @@ def _make_repo(tmp_path):
         EmbeddingConfig(provider="s", model="x", dim=1024),
         {"s": ProviderConfig(kind="stub")},
     )
-    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.5)
+    return SessionStore(engine=eng, state_cls=IncidentState, embedder=embedder)
 
 
 @pytest.fixture
@@ -44,7 +45,7 @@ async def test_agent_node_runs_llm_records_agent_run_and_routes(incident):
         decide_route=lambda inc: "default",
         store=store,
     )
-    out = await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    out = await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     assert out["next_route"] == "triage"
     assert out["last_agent"] == "intake"
     reloaded = store.load(inc.id)
@@ -92,7 +93,7 @@ async def test_agent_node_captures_confidence_from_update_incident(incident):
         decide_route=lambda inc: "default",
         store=store,
     )
-    await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
@@ -132,7 +133,7 @@ async def test_confidence_rejects_bool(incident, caplog):
     inc, store = incident
     node = _build_node_with_confidence_patch(inc, store, conf_value=True)
     with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
-        await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+        await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
@@ -150,7 +151,7 @@ async def test_confidence_rejects_bool(incident, caplog):
 async def test_confidence_coerces_string_labels(incident, label, expected):
     inc, store = incident
     node = _build_node_with_confidence_patch(inc, store, conf_value=label)
-    await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
@@ -163,7 +164,7 @@ async def test_confidence_clamps_out_of_range(incident, caplog, raw, expected):
     inc, store = incident
     node = _build_node_with_confidence_patch(inc, store, conf_value=raw)
     with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
-        await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+        await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
@@ -177,7 +178,7 @@ async def test_confidence_unknown_string_is_none(incident, caplog):
     inc, store = incident
     node = _build_node_with_confidence_patch(inc, store, conf_value="meh")
     with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
-        await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+        await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
@@ -208,7 +209,7 @@ async def test_agent_node_captures_signal_from_update_incident(incident):
         decide_route=lambda inc: "default",
         store=store,
     )
-    await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs and triage_runs[-1].signal == "success"
@@ -241,7 +242,7 @@ async def test_agent_node_signal_normalises_case(incident, raw, expected):
         decide_route=lambda inc: "default",
         store=store,
     )
-    await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+    await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     assert reloaded.agents_run[-1].signal == expected
 
@@ -269,7 +270,7 @@ async def test_agent_node_signal_unknown_string_is_none(incident, caplog):
         store=store,
     )
     with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
-        await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+        await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     assert reloaded.agents_run[-1].signal is None
     assert any("halfway" in rec.getMessage() for rec in caplog.records)
@@ -298,7 +299,7 @@ async def test_agent_node_signal_rejects_bool(incident, caplog):
         store=store,
     )
     with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
-        await node(GraphState(incident=inc, next_route=None, last_agent=None, error=None))
+        await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
     assert reloaded.agents_run[-1].signal is None
     assert any("bool" in rec.getMessage().lower() for rec in caplog.records)
@@ -332,7 +333,7 @@ async def test_agent_node_routes_on_emitted_signal(incident):
         decide_route=_decide_from_signal,
         store=store,
     )
-    out = await node(GraphState(incident=inc, next_route=None,
+    out = await node(GraphState(session=inc, next_route=None,
                                 last_agent=None, error=None))
     assert out["next_route"] == "__end__"
 
@@ -357,6 +358,6 @@ async def test_agent_node_falls_back_to_default_when_no_signal(incident):
         decide_route=_decide_from_signal,
         store=store,
     )
-    out = await node(GraphState(incident=inc, next_route=None,
+    out = await node(GraphState(session=inc, next_route=None,
                                 last_agent=None, error=None))
     assert out["next_route"] == "triage"

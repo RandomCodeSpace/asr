@@ -1,0 +1,11 @@
+description: First-line agent — enriches the just-created INC and checks for known prior resolutions
+kind: responsive
+tools:
+  local: ["lookup_similar_incidents", "get_user_context", "update_incident"]
+routes:
+  - when: success
+    next: triage
+  - when: failed
+    next: __end__
+  - when: default
+    next: triage

@@ -2,9 +2,9 @@
 import pytest
 
 from orchestrator.config import (
-    AppConfig, InterventionConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths,
+    AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths, RuntimeConfig,
 )
-from orchestrator.incident import AgentRun
+from runtime.state import AgentRun
 from orchestrator.orchestrator import Orchestrator
 
 
@@ -14,7 +14,7 @@ def cfg(tmp_path):
         llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[
             MCPServerConfig(name="local_inc", transport="in_process",
-                            module="orchestrator.mcp_servers.incident",
+                            module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
                             module="orchestrator.mcp_servers.observability",
@@ -27,7 +27,16 @@ def cfg(tmp_path):
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
-        intervention=InterventionConfig(confidence_threshold=0.75),
+        # confidence_threshold + escalation_teams now come from a
+        # FrameworkAppConfig provider (FrameworkAppConfig refactor).
+        # Wire the incident-management provider so the resume_session
+        # escalate action can validate against the incident roster.
+        runtime=RuntimeConfig(
+            state_class="examples.incident_management.state.IncidentState",
+            framework_app_config_path=(
+                "examples.incident_management.config:framework_app_config_provider"
+            ),
+        ),
     )
 
 
@@ -167,9 +176,9 @@ async def test_resume_rejects_invalid_team(cfg):
 
 @pytest.mark.asyncio
 async def test_resume_handles_subgraph_exception(cfg, monkeypatch):
-    """If the resume sub-graph raises, the INC must be restored to
-    awaiting_input with its original pending_intervention payload — not left
-    stuck at in_progress with a cleared intervention.
+    """If the resume invocation on the main graph raises, the INC must be
+    restored to awaiting_input with its original pending_intervention
+    payload — not left stuck at in_progress with a cleared intervention.
 
     The orchestrator should yield a ``resume_failed`` event and NOT re-raise.
     """
@@ -179,15 +188,18 @@ async def test_resume_handles_subgraph_exception(cfg, monkeypatch):
         before = orch.store.load(inc_id)
         original_pi = dict(before.pending_intervention)
 
-        # Force the sub-graph to blow up partway through.
+        # Force the resume invocation (Command(resume=...) on the main
+        # graph) to blow up partway through.
         async def _boom(*_args, **_kwargs):
             # Yield nothing and then raise — makes this a proper async generator
-            # that raises on first iteration, simulating a sub-graph failure.
+            # that raises on first iteration, simulating a graph failure.
             if False:  # noqa: SIM210
                 yield  # makes this function an async generator
             raise RuntimeError("apply_fix exploded mid-stream")
 
-        monkeypatch.setattr(orch.resume_graph, "astream_events", _boom)
+        # P2-I: resume now goes through the same compiled graph; patch
+        # orch.graph.astream_events instead of the deleted resume_graph.
+        monkeypatch.setattr(orch.graph, "astream_events", _boom)
 
         events = []
         async for ev in orch.resume_investigation(
@@ -215,35 +227,125 @@ async def test_resume_handles_subgraph_exception(cfg, monkeypatch):
         await orch.aclose()
 
 
+async def _drive_to_interrupt(orch: Orchestrator) -> str:
+    """Start a session and drive it through the graph until the gate's
+    ``interrupt()`` pauses execution. Returns the session id.
+
+    With stub LLMs the deep_investigator never emits a confidence value,
+    so the gate always interrupts on the first call.
+    """
+    sid = await orch.start_investigation(
+        query="payments slow", environment="production",
+    )
+    # The gate dual-write (P2-H) leaves the row in awaiting_input.
+    sess = orch.store.load(sid)
+    assert sess.status == "awaiting_input", (
+        f"expected gate to interrupt; got status={sess.status!r}"
+    )
+    assert sess.pending_intervention is not None
+    return sid
+
+
 @pytest.mark.asyncio
-async def test_resume_with_input_reruns_di_and_resolution(cfg):
-    orch = await Orchestrator.create(cfg)
-    try:
-        inc_id = _seed_paused_incident(orch, di_confidence=0.35)
-        before = orch.store.load(inc_id)
+async def test_resume_uses_command_resume(cfg):
+    """P2-I: resume invokes the same graph via Command(resume=...).
+
+    Drives a fresh investigation to the gate's interrupt, then resumes
+    with operator input. The session should advance past the gate and
+    end no longer awaiting_input.
+    """
+    async with await Orchestrator.create(cfg) as orch:
+        sid = await _drive_to_interrupt(orch)
+        before = orch.store.load(sid)
         n_runs_before = len(before.agents_run)
 
         events = []
         async for ev in orch.resume_investigation(
-            inc_id,
+            sid,
             {"action": "resume_with_input",
              "input": "Operator note: DB pool exhausted at 14:30."},
         ):
             events.append(ev)
 
-        inc = orch.store.load(inc_id)
-        # The user's text was appended to user_inputs and intervention cleared.
-        assert "DB pool exhausted at 14:30." in inc.user_inputs[-1]
-        # At least one new agent_run was appended for the resume (DI re-run).
-        assert len(inc.agents_run) > n_runs_before
-        new_runs = inc.agents_run[n_runs_before:]
-        assert any(r.agent == "deep_investigator" for r in new_runs)
-        # pending_intervention is either cleared (gate passed) or refreshed
-        # (gate paused again). Either way, status reflects the gate's verdict.
-        assert inc.status in {
-            "in_progress", "resolved", "escalated", "awaiting_input",
-        }
+        sess2 = orch.store.load(sid)
+        # Gate's post-resume continuation appended the user input and
+        # cleared pending_intervention (P2-H).
+        assert "DB pool exhausted at 14:30." in sess2.user_inputs[-1]
+        assert sess2.pending_intervention is None
+        assert sess2.status != "awaiting_input"
+        # At least one downstream agent ran after the gate cleared.
+        assert len(sess2.agents_run) >= n_runs_before
         completed = [e for e in events if e["event"] == "resume_completed"]
         assert completed
-    finally:
-        await orch.aclose()
+
+
+def test_orchestrator_has_no_resume_graph_attr():
+    """P2-I: the bespoke resume graph is gone from the source."""
+    import runtime.orchestrator as mod
+    src = open(mod.__file__).read()
+    assert "build_resume_graph" not in src
+    assert "self.resume_graph" not in src
+
+
+def test_graph_module_has_no_build_resume_graph():
+    """P2-I: build_resume_graph is deleted from the graph module."""
+    import runtime.graph as mod
+    src = open(mod.__file__).read()
+    assert "build_resume_graph" not in src
+    assert not hasattr(mod, "build_resume_graph")
+
+
+@pytest.mark.asyncio
+async def test_cold_restart_resume(tmp_path):
+    """P2-L (folded into P2-I): cold-restart resume — checkpointer state
+    survives orchestrator teardown.
+
+    Process 1: start a session, drive to the gate's interrupt, tear down.
+    Process 2: cold-instantiate against the same DB and resume via
+    Command(resume=...). The graph should advance past the gate.
+    """
+    cfg_one = AppConfig(
+        llm=LLMConfig.stub(),
+        mcp=MCPConfig(servers=[
+            MCPServerConfig(name="local_inc", transport="in_process",
+                            module="examples.incident_management.mcp_server",
+                            category="incident_management"),
+            MCPServerConfig(name="local_obs", transport="in_process",
+                            module="orchestrator.mcp_servers.observability",
+                            category="observability"),
+            MCPServerConfig(name="local_rem", transport="in_process",
+                            module="orchestrator.mcp_servers.remediation",
+                            category="remediation"),
+            MCPServerConfig(name="local_user", transport="in_process",
+                            module="orchestrator.mcp_servers.user_context",
+                            category="user_context"),
+        ]),
+        paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
+        runtime=RuntimeConfig(
+            state_class="examples.incident_management.state.IncidentState",
+        ),
+    )
+
+    # --- Process 1: drive into interrupt, then tear down ---
+    async with await Orchestrator.create(cfg_one) as orch1:
+        sid = await _drive_to_interrupt(orch1)
+        # The DB on disk has the row + the langgraph checkpoint.
+
+    # --- Process 2: cold-instantiate against the same DB ---
+    async with await Orchestrator.create(cfg_one) as orch2:
+        # The checkpointer rehydrates the paused thread on resume.
+        events = []
+        async for ev in orch2.resume_investigation(
+            sid,
+            {"action": "resume_with_input", "input": "post-restart note"},
+        ):
+            events.append(ev)
+
+        sess = orch2.store.load(sid)
+        assert "post-restart note" in sess.user_inputs[-1], (
+            "gate must have appended the resume input on the cold-restart side"
+        )
+        assert sess.pending_intervention is None
+        assert sess.status != "awaiting_input"
+        completed = [e for e in events if e["event"] == "resume_completed"]
+        assert completed

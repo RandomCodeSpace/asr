@@ -1,12 +1,15 @@
 from contextlib import AsyncExitStack
 import pytest
+
+from examples.incident_management.state import IncidentState
 from orchestrator.config import AppConfig, EmbeddingConfig, LLMConfig, MCPConfig, MCPServerConfig, MetadataConfig, ProviderConfig
 from orchestrator.mcp_loader import load_tools
 from orchestrator.mcp_servers.incident import set_state as set_inc_state
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
+from orchestrator.storage.history_store import HistoryStore
 from orchestrator.storage.models import Base
-from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.session_store import SessionStore
 from orchestrator.graph import build_graph, GraphState
 from orchestrator.skill import load_all_skills
 
@@ -18,12 +21,18 @@ def _make_repo(tmp_path):
         EmbeddingConfig(provider="s", model="x", dim=1024),
         {"s": ProviderConfig(kind="stub")},
     )
-    return IncidentRepository(engine=eng, embedder=embedder, similarity_threshold=0.5)
+    return SessionStore(engine=eng, state_cls=IncidentState, embedder=embedder)
+
+
+def _make_history(store: SessionStore) -> HistoryStore:
+    return HistoryStore(engine=store.engine, state_cls=IncidentState,
+                        embedder=store.embedder, similarity_threshold=0.5)
 
 
 @pytest.fixture
 def cfg(tmp_path):
-    set_inc_state(repository=_make_repo(tmp_path))
+    store = _make_repo(tmp_path)
+    set_inc_state(store=store, history=_make_history(store))
     return AppConfig(
         llm=LLMConfig.stub(),
         mcp=MCPConfig(servers=[
@@ -58,21 +67,38 @@ async def test_build_graph_compiles_with_4_agents(cfg, tmp_path):
 
 @pytest.mark.asyncio
 async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
+    """End-to-end: graph runs through agents, gate interrupts on low
+    confidence (P2-H), and the row carries pending_intervention. Stub DI
+    never emits a confidence value, so the gate's interrupt() pauses the
+    graph mid-flight rather than reaching resolution.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
     skills = load_all_skills("config/skills")
     store = _make_repo(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
+        # P2-H: the gate calls langgraph.types.interrupt(), which requires a
+        # Pregel checkpointer to capture paused state. Compile with an
+        # InMemorySaver so the gate can interrupt cleanly.
         graph = await build_graph(cfg=cfg, skills=skills, store=store,
-                                  registry=registry)
+                                  registry=registry,
+                                  checkpointer=InMemorySaver())
         inc = store.create(query="api latency in production", environment="production",
                            reporter_id="user-mock", reporter_team="platform")
         final_state = await graph.ainvoke(
-            GraphState(incident=inc, next_route=None, last_agent=None, error=None)
+            GraphState(session=inc, next_route=None, last_agent=None, error=None),
+            config={"configurable": {"thread_id": inc.id}},
         )
-        # Stub DI never emits a confidence value, so the gate halts the graph
-        # before resolution. last_agent is then "gate" (or "intake" on the
-        # known-issue short-circuit path).
-        assert final_state["last_agent"] in {"resolution", "intake", "gate"}
+        # Either the graph reached the gate and interrupted (low/missing
+        # confidence) → __interrupt__ key surfaces; or in the legacy short-
+        # circuit path it ended at intake/resolution.
+        if "__interrupt__" in final_state:
+            # Gate paused: row should reflect awaiting_input + dual-write.
+            reloaded = store.load(inc.id)
+            assert reloaded.status == "awaiting_input"
+            assert reloaded.pending_intervention is not None
+        else:
+            assert final_state["last_agent"] in {"resolution", "intake", "gate"}
         reloaded = store.load(inc.id)
         assert reloaded.agents_run, "expected at least one agent to run"
 

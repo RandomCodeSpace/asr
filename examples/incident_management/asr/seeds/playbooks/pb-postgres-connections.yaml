@@ -1,0 +1,15 @@
+id: pb-postgres-connections
+title: "Postgres connection-pool saturation"
+match_signals:
+  service: postgres-payments
+  metric: pool_utilization
+  threshold_breach: true
+hypothesis_steps:
+  - "Identify long-running queries"
+  - "Check upstream consumer connection counts"
+remediation:
+  - tool: kill_long_queries
+    args:
+      service: postgres-payments
+      threshold_seconds: 30
+required_approval: true

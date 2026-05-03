@@ -1,0 +1,15 @@
+id: pb-payments-latency
+title: "Payments service latency spike"
+match_signals:
+  service: payments
+  metric: p99_latency
+  threshold_breach: true
+hypothesis_steps:
+  - "Check recent payments deploys (L5)"
+  - "Check downstream dependencies (L2)"
+  - "Inspect upstream timeout configs"
+remediation:
+  - tool: restart_service
+    args:
+      service: payments
+required_approval: true

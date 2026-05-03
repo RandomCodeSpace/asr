@@ -17,7 +17,10 @@ def test_build_produces_app_py(tmp_path):
     content = out_path.read_text()
     # Sanity checks — key symbols present (main() lives in ui.py, not app.py)
     assert "class Orchestrator" in content
-    assert "class IncidentRepository" in content
+    # P2-J: ``IncidentRepository`` is gone; ``SessionStore`` and
+    # ``HistoryStore`` are the active surface.
+    assert "class SessionStore" in content
+    assert "class HistoryStore" in content
     assert "def build_app(" in content
     assert "def get_app(" in content  # uvicorn --factory entrypoint
     assert "from orchestrator." not in content, "intra-package imports should be rewritten"

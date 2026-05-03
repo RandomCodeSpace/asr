@@ -1,11 +1,17 @@
+"""Domain-state tests for the example ``IncidentState`` model.
+
+P2-J: rewritten off the deleted ``runtime.incident.Incident``. All
+incident-shaped fields now live on ``examples.incident_management.state.IncidentState``;
+``AgentRun`` lives on ``runtime.state``.
+"""
 import pytest
-from orchestrator.incident import (
-    Incident, Reporter,
-)
+
+from examples.incident_management.state import IncidentState, IncidentStatus, Reporter
+from runtime.state import AgentRun
 
 
 def test_incident_minimal_construction():
-    inc = Incident(
+    inc = IncidentState(
         id="INC-20260430-001",
         status="new",
         created_at="2026-04-30T15:51:00Z",
@@ -24,7 +30,6 @@ def test_incident_minimal_construction():
 
 
 def test_agent_run_confidence_defaults_none():
-    from orchestrator.incident import AgentRun
     run = AgentRun(
         agent="intake", started_at="t1", ended_at="t2", summary="ok",
     )
@@ -33,7 +38,6 @@ def test_agent_run_confidence_defaults_none():
 
 
 def test_agent_run_with_confidence_round_trips():
-    from orchestrator.incident import AgentRun
     run = AgentRun(
         agent="deep_investigator", started_at="t1", ended_at="t2",
         summary="ok", confidence=0.42, confidence_rationale="weak signal",
@@ -44,35 +48,34 @@ def test_agent_run_with_confidence_round_trips():
 
 
 def test_awaiting_input_and_stopped_are_valid_statuses():
-    Incident(
+    IncidentState(
         id="INC-1", status="awaiting_input", created_at="x", updated_at="y",
         query="q", environment="dev", reporter=Reporter(id="u", team="t"),
     )
-    Incident(
+    IncidentState(
         id="INC-2", status="stopped", created_at="x", updated_at="y",
         query="q", environment="dev", reporter=Reporter(id="u", team="t"),
     )
 
 
-def test_status_must_be_valid_enum():
-    import pydantic
-    with pytest.raises(pydantic.ValidationError):
-        Incident(
-            id="INC-1", status="invalid", created_at="x", updated_at="y",
-            query="q", environment="dev", reporter=Reporter(id="u", team="t"),
-        )
-
-
+def test_status_string_accepted():
+    """``Session.status`` is a free-form string (the framework no longer
+    enforces an incident-shaped ``Literal`` enum). The example app applies
+    its own ``IncidentStatus`` ``Literal`` only at the UI layer.
+    """
+    inc = IncidentState(
+        id="INC-1", status="invalid", created_at="x", updated_at="y",
+        query="q", environment="dev", reporter=Reporter(id="u", team="t"),
+    )
+    assert inc.status == "invalid"
 
 
 def test_agent_run_signal_defaults_to_none():
-    from orchestrator.incident import AgentRun
     run = AgentRun(agent="intake", started_at="t0", ended_at="t1", summary="ok")
     assert run.signal is None
 
 
 def test_agent_run_signal_explicit():
-    from orchestrator.incident import AgentRun
     run = AgentRun(agent="intake", started_at="t0", ended_at="t1",
                    summary="ok", signal="success")
     assert run.signal == "success"

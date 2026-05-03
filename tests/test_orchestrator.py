@@ -1,5 +1,5 @@
 import pytest
-from orchestrator.config import AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths
+from orchestrator.config import AppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths, RuntimeConfig
 from orchestrator.orchestrator import Orchestrator
 
 
@@ -22,6 +22,9 @@ def cfg(tmp_path):
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
+        runtime=RuntimeConfig(
+            state_class="examples.incident_management.state.IncidentState",
+        ),
     )
 
 

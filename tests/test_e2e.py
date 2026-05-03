@@ -1,6 +1,6 @@
 import pytest
 
-from orchestrator.config import LLMConfig, load_config
+from orchestrator.config import LLMConfig, RuntimeConfig, load_config
 from orchestrator.orchestrator import Orchestrator
 
 
@@ -15,6 +15,9 @@ async def test_full_flow_no_prior_match(tmp_path, monkeypatch):
     cfg = load_config("config/config.yaml.example")
     cfg.paths.incidents_dir = str(tmp_path)
     cfg.llm = LLMConfig.stub()
+    cfg.runtime = RuntimeConfig(
+        state_class="examples.incident_management.state.IncidentState",
+    )
 
     orch = await Orchestrator.create(cfg)
     try:
@@ -40,7 +43,13 @@ async def test_full_flow_short_circuits_on_known_match(tmp_path, monkeypatch):
     cfg = load_config("config/config.yaml.example")
     cfg.paths.incidents_dir = str(tmp_path)
     cfg.llm = LLMConfig.stub()
-    cfg.incidents.similarity_threshold = 0.2
+    cfg.runtime = RuntimeConfig(
+        state_class="examples.incident_management.state.IncidentState",
+    )
+    # incidents.similarity_threshold (was set to 0.2 here) lives on
+    # IncidentAppConfig now (P1-E). The example app's bundled
+    # examples/incident_management/config.yaml already pins it to 0.2,
+    # which is what load_incident_app_config() returns by default.
 
     orch = await Orchestrator.create(cfg)
     try:

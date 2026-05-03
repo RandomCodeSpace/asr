@@ -1,5 +1,5 @@
 from __future__ import annotations
-# ----- imports for config.py -----
+# ----- imports for runtime/config.py -----
 """Config schemas for the orchestrator."""
 
 import os
@@ -10,17 +10,59 @@ from pydantic import BaseModel, Field, model_validator
 import yaml
 
 
-# ----- imports for incident.py -----
-"""Incident domain model."""
+# ----- imports for orchestrator/config.py -----
+"""Backward-compat shim. Canonical: ``runtime.config``."""
+
+
+# ----- imports for runtime/state.py -----
+"""Generic session model — the framework's unit of work.
+
+A ``Session`` is the in-progress (or archived) record of one agent run.
+Applications extend this via subclassing::
+
+    class IncidentState(Session):
+        environment: str
+        reporter: Reporter
+        ...
+
+``Session`` deliberately contains *no* domain-specific fields. Adding one
+here is a framework regression — domain fields belong in the example
+app's ``state.py``.
+"""
+
+
 
 from pydantic import BaseModel, Field
 
-# ----- imports for similarity.py -----
+# ----- imports for runtime/state_resolver.py -----
+"""Resolve ``RuntimeConfig.state_class`` (a dotted path) to a class object.
+
+The orchestrator calls :func:`resolve_state_class` once at construction
+time and threads the resulting class through the storage layer. Doing the
+import here (rather than relying on type-var introspection at runtime)
+sidesteps PEP 484 generic erasure: ``Orchestrator[IncidentState]`` is
+compiled away by the time we need a callable class.
+
+Errors on:
+
+- A dotted path that does not parse (no ``.`` separator).
+- A module that fails to import.
+- A module that imports but lacks the named attribute.
+- An attribute that is not a subclass of :class:`runtime.state.Session`.
+"""
+
+
+import importlib
+from typing import Type
+
+
+
+# ----- imports for runtime/similarity.py -----
 """Similarity scoring for incident matching."""
 
 from typing import Protocol
 
-# ----- imports for skill.py -----
+# ----- imports for runtime/skill.py -----
 """Skill loader.
 
 Each agent lives in its own subdirectory under ``config/skills/``::
@@ -47,12 +89,28 @@ The final ``system_prompt`` for each agent is::
 
 Structured config is validated through the :class:`Skill` /
 :class:`RouteRule` Pydantic models; markdown content is loaded verbatim.
+
+P6 — Agent kinds
+----------------
+
+Each ``Skill`` declares a ``kind`` discriminator; the loader validates
+per-kind field shape so misconfigured skills fail loudly at startup
+instead of at runtime. Three kinds are supported:
+
+* ``responsive`` — the today-default LLM agent that responds inside a
+  session graph (existing behaviour, preserved by default).
+* ``supervisor`` — a no-LLM router that dispatches work to subordinate
+  agents via LangGraph ``Send()``. No ``AgentRun`` row.
+* ``monitor`` — a long-running observer that runs out-of-band on a
+  schedule, evaluates an emit condition, and fires a Phase-5 trigger.
 """
 
-from pydantic import BaseModel, Field, field_validator
+import ast
+from typing import Any, Callable, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-# ----- imports for llm.py -----
+# ----- imports for runtime/llm.py -----
 """LLM provider abstraction with stub/ollama/azure_openai backends.
 
 Models are resolved by name from ``LLMConfig``. Each named entry binds a
@@ -71,7 +129,7 @@ from pydantic import Field, SecretStr
 
 
 
-# ----- imports for storage/models.py -----
+# ----- imports for runtime/storage/models.py -----
 """SQLAlchemy declarative model for the ``incidents`` table.
 
 Hybrid schema: scalar/queryable fields as columns, nested Pydantic
@@ -84,20 +142,36 @@ from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-# ----- imports for storage/engine.py -----
+# ----- imports for runtime/storage/engine.py -----
 """SQLAlchemy engine factory.
 
 Sync engine for SQLite (dev) or Postgres (prod). No vector-extension
 loading — vectors live in a separate LangChain VectorStore (see
 :mod:`orchestrator.storage.vector`, landed in M3).
+
+P2-FIX: when the metadata store and the LangGraph ``AsyncSqliteSaver``
+checkpointer share a SQLite file, two writers contend on the same DB.
+SQLite's default ``BEGIN DEFERRED`` transaction acquires SHARED on the
+first read and only escalates to RESERVED on the first write — and the
+escalation is **non-retryable** when the connection has already read
+inside the same transaction (busy_timeout does *not* apply). The losing
+writer raises ``database is locked`` immediately. The fix is to start
+write transactions with ``BEGIN IMMEDIATE`` so the RESERVED lock is
+acquired up front, before any reads, and busy_timeout's wait-and-retry
+loop can correctly serialize the two writers. This is the
+SQLAlchemy-recommended pattern for concurrent SQLite writers; see
+https://docs.sqlalchemy.org/en/20/dialects/sqlite.html#serializable-isolation-savepoints-transactional-ddl
 """
 
+from sqlalchemy import event as sa_event
 from sqlalchemy.engine import Engine, create_engine
 from sqlalchemy.pool import NullPool
 
 
-
-# ----- imports for storage/embeddings.py -----
+# Generous timeout: tests can run under load with multiple async writers
+# interleaving on the same DB file. 30s leaves headroom for the slowest
+# checkpointer commit while still failing fast on a true deadlock.
+# ----- imports for runtime/storage/embeddings.py -----
 """LangChain ``Embeddings`` facade + deterministic stub for tests.
 
 Construction is config-driven via :func:`build_embedder`. Provider kind
@@ -111,7 +185,7 @@ import numpy as np
 
 
 
-# ----- imports for storage/vector.py -----
+# ----- imports for runtime/storage/vector.py -----
 """LangChain ``VectorStore`` factory.
 
 Backends
@@ -134,55 +208,84 @@ from langchain_core.vectorstores import VectorStore
 
 
 
-# ----- imports for storage/repository.py -----
-"""SQLAlchemy-backed Incident store.
+# ----- imports for runtime/storage/history_store.py -----
+"""Read-only similarity search over closed sessions.
 
-Public methods mirror the previous JSON ``IncidentStore`` 1:1 so call
-sites in the MCP server and orchestrator change minimally. The repository
-also owns the embedder and vector_store; ``find_similar`` dispatches to
-the vector path when both are present, else falls back to keyword similarity.
+``HistoryStore`` is the read-side companion of ``SessionStore``: it
+operates on the same engine + vector store but never writes. The vector
+path is preferred when both ``vector_store`` and ``embedder`` are
+configured; otherwise it falls back to keyword similarity.
+
+Like ``SessionStore``, ``HistoryStore`` is parametrised on ``StateT`` so
+that find_similar / load surface the configured app state class rather
+than the framework default.
+
+P2-E: ``find_similar`` accepts an arbitrary ``filter_kwargs`` mapping —
+keys must correspond to ``IncidentRow`` columns. This decouples the
+framework from incident-specific filter dimensions: apps with a
+``severity``-only schema, or a multi-tenant ``tenant_id`` schema, or
+anything else, build their filter on the fly.
 """
 
-import json
-from datetime import datetime, timezone
+from typing import Any, Generic, Mapping, Optional, Type, TypeVar
 
-from sqlalchemy import desc, select
+from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 
+# Mirrors the bound on ``SessionStore.StateT`` — kept permissive at
+# ``BaseModel`` so framework code does not need to import the
+# example-app subclass. The resolver in :mod:`runtime.state_resolver`
+# enforces a ``runtime.state.Session`` subclass at config time.
+# ----- imports for runtime/storage/session_store.py -----
+"""Active session lifecycle store.
 
-# ----- imports for mcp_servers/incident.py -----
-"""FastMCP server: incident_management tools, backed by IncidentRepository.
+``SessionStore`` owns the write path for the row schema:
+create, load, save, delete, list_all, list_recent. It also owns the
+vector write-through (``_persist_vector``, ``_add_vector``,
+``_refresh_vector``) and the row<->model converters shared with
+``HistoryStore``.
 
-State scoping
--------------
-Each Orchestrator constructs its own :class:`IncidentMCPServer`, so two
-orchestrators in the same process do not share repository state. The
-module-level ``mcp`` and ``set_state`` symbols are kept as a back-compat
-surface for the MCP loader (``getattr(mod, "mcp")``) and for tests that
-import these names directly.
+P2-C parametrises the class as ``Generic[StateT]`` and routes row
+hydration through ``self._state_cls(...)`` so apps can plug in their own
+``Session`` subclass via ``RuntimeConfig.state_class``. P2-J collapses
+the legacy ``runtime.incident.Incident`` model into ``runtime.state.Session``
++ app-specific subclasses; the row schema remains incident-shaped, but
+unused fields are dropped via Pydantic's default ``extra='ignore'``
+when a narrower ``state_cls`` is supplied.
 """
 
-from dataclasses import dataclass, field
-from fastmcp import FastMCP
+import json
+from datetime import datetime, timezone
+from typing import Generic, Optional, Type, TypeVar
+
+from sqlalchemy import desc, select
+from sqlalchemy.orm import Session as SqlSession
 
 
 
-# ----- imports for mcp_servers/observability.py -----
+# P8-C: the legacy ``INC-YYYYMMDD-NNN`` pattern stays here for
+# back-compat validation against on-disk rows minted before the
+# ``Session.id_format`` hook landed. New rows are validated by
+# ``_SESSION_ID_RE`` which accepts any ``PREFIX-YYYYMMDD-NNN`` shape
+# the app's ``id_format`` may emit (e.g. ``CR-...`` for code-review).
+# ----- imports for runtime/mcp_servers/observability.py -----
 """FastMCP server: observability mock tools."""
 
 from datetime import datetime, timezone, timedelta
+from fastmcp import FastMCP
 
-# ----- imports for mcp_servers/remediation.py -----
+# ----- imports for runtime/mcp_servers/remediation.py -----
 """FastMCP server: remediation mock tools."""
 
 
-# ----- imports for mcp_servers/user_context.py -----
+# ----- imports for runtime/mcp_servers/user_context.py -----
 """FastMCP server: user_context mock tool."""
 
 
-# ----- imports for mcp_loader.py -----
+# ----- imports for runtime/mcp_loader.py -----
 """Load MCP servers (in_process / stdio / http / sse) and build a tool registry.
 
 Each tool is registered by ``(server_name, original_tool_name)`` and its
@@ -203,14 +306,14 @@ flat list of :class:`~langchain_core.tools.BaseTool` via
 # `await stack.enter_async_context(client)`. The caller controls teardown by
 # calling `await stack.aclose()`.
 
-import importlib
 from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 
 
-# ----- imports for graph.py -----
+# ----- imports for runtime/graph.py -----
 """LangGraph state, routing helpers, and node runner."""
 
 import asyncio
@@ -227,29 +330,373 @@ from langgraph.graph import StateGraph, END
 
 
 
-# ----- imports for orchestrator.py -----
+
+# ----- imports for runtime/checkpointer_postgres.py -----
+"""Postgres checkpointer wrapper (P2-G).
+
+Loaded only when ``cfg.storage.metadata.url`` resolves to a Postgres
+URL. Uses a *separate* :class:`psycopg_pool.AsyncConnectionPool` (not
+SQLAlchemy's pool) so the LangGraph checkpoint saver doesn't contend
+with the metadata-store writes on the same connection.
+
+The pool's lifecycle is bound to the orchestrator via the returned
+async cleanup callable; the orchestrator awaits it from ``aclose``.
+"""
+
+
+from typing import Awaitable, Callable, Tuple
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
+
+# ----- imports for runtime/checkpointer.py -----
+"""LangGraph checkpointer factory.
+
+Reuses ``cfg.storage.metadata.url`` so the LangGraph durable-state
+checkpointer and the application metadata store live in the same
+database (one URL to configure, easier ops). Per-backend a *separate*
+connection pool is created so the two paths never deadlock:
+
+- SQLite: dedicated ``aiosqlite.Connection`` with ``PRAGMA journal_mode=WAL``
+  so the SQLAlchemy session pool and the checkpoint saver can both write
+  to the same on-disk file without blocking each other.
+- Postgres: a separate ``psycopg_pool.AsyncConnectionPool`` (filled in
+  P2-G) rather than reusing SQLAlchemy's pool, so checkpointer writes
+  don't contend with metadata writes on the same connection.
+
+The factory is async because the orchestrator drives the graph through
+async ``ainvoke`` / ``astream_events`` — and LangGraph's async Pregel
+loop calls ``aget_tuple`` on the saver, which in turn requires an
+asyncio-friendly DB driver (aiosqlite for SQLite,
+``psycopg_pool.AsyncConnectionPool`` for Postgres).
+
+Returns ``(saver, cleanup)`` where ``cleanup`` is an *async* callable
+that closes the dedicated connection / pool. The caller owns lifecycle
+and must await ``cleanup()`` on shutdown — typically via the
+orchestrator's ``aclose()``.
+"""
+
+
+from urllib.parse import urlparse
+
+
+
+
+# ----- imports for runtime/triggers/base.py -----
+"""ABC and DTOs shared by every trigger transport.
+
+A ``TriggerTransport`` owns the inbound side of one transport flavour
+(api / webhook / schedule / plugin). The lifecycle is exactly two
+async methods so the FastAPI lifespan in ``runtime/api.py`` can sequence
+startup / shutdown deterministically.
+
+A ``TriggerInfo`` is the provenance record attached to every session
+started via a trigger. It rides along through ``Orchestrator.start_session``
+purely for traceability; the orchestrator does not branch on it.
+"""
+
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+# ----- imports for runtime/triggers/config.py -----
+"""Pydantic discriminated union for the ``triggers:`` block in app config.
+
+A ``TriggerConfig`` declares ONE inbound dispatch path. The ``transport``
+literal selects the concrete shape:
+
+    - ``api``      — built-in HTTP route (back-compat with /investigate)
+    - ``webhook``  — third-party POST /triggers/{name}; bearer auth
+    - ``schedule`` — APScheduler in-process cron job
+    - ``plugin``   — entry-point or explicitly-registered custom transport
+
+Validation is fail-fast: bad dotted paths, missing auth env vars, and
+malformed cron strings raise at config load time, never at request time.
+"""
+
+
+from typing import Annotated, Literal, Union
+
+
+# Dotted-path regex used by ``payload_schema`` and ``transform`` fields.
+# Accepts ``a.b.c`` or ``a.b:c`` (the colon form is tolerated for parity
+# with entry-point syntax; ``runtime.triggers.resolve`` normalises both).
+# ----- imports for runtime/triggers/resolve.py -----
+"""Resolve dotted paths to live Python objects at registry init time.
+
+Used to bind ``payload_schema`` (a Pydantic ``BaseModel`` subclass) and
+``transform`` (a callable) declared in YAML. Resolution happens once,
+during ``TriggerRegistry.create`` — never per-request — so a typo
+fails at startup, not at first webhook delivery.
+"""
+
+
+from typing import Any, Callable, Type
+
+
+
+# ----- imports for runtime/triggers/idempotency.py -----
+"""Idempotency-Key dedup store: in-memory LRU + SQLite write-through.
+
+Same DB as session metadata (``storage.metadata.url``); one connection
+pool, one filesystem path, one backup story. SQLite WAL mode (already
+enabled by ``runtime.storage.engine.build_engine``) handles concurrent
+reads from the LRU and the orchestrator.
+
+Cold-restart survival: the LRU is rebuilt on demand; ``get`` falls
+through to SQLite when the LRU misses, so a fresh process still
+returns the cached ``session_id`` for an unexpired ``Idempotency-Key``.
+
+Schema (registered against ``runtime.storage.models.Base`` so
+``Base.metadata.create_all(engine)`` picks it up — no Alembic change
+required, matching the existing P3 pattern):
+
+    trigger_idempotency_keys
+        trigger_name TEXT NOT NULL
+        key          TEXT NOT NULL
+        session_id   TEXT NOT NULL
+        created_at   TIMESTAMP NOT NULL
+        expires_at   TIMESTAMP NOT NULL
+        PRIMARY KEY (trigger_name, key)
+"""
+
+
+import threading
+from collections import OrderedDict
+
+from sqlalchemy import DateTime, String, delete, select
+from sqlalchemy.orm import Mapped, Session as SqlaSession, mapped_column
+
+
+# ----- imports for runtime/triggers/auth.py -----
+"""Bearer auth dependency for webhook trigger routes.
+
+A small FastAPI dependency that compares the inbound ``Authorization``
+header against the env-var named in ``WebhookTriggerConfig.auth_token_env``.
+Constant-time comparison via ``hmac.compare_digest``; missing/bad/wrong
+header all answer ``401``.
+
+Tokens are read once at app startup (when the dependency is built) so
+rotating a secret requires a process restart — same model as every other
+config-derived secret in the runtime.
+"""
+
+
+import hmac
+from typing import Callable
+
+from fastapi import Header, HTTPException, status
+
+
+# ----- imports for runtime/triggers/transports/api.py -----
+"""Built-in ``api`` transport.
+
+The api transport is a no-op lifecycle wrapper — the actual HTTP route
+(``POST /investigate`` and ``POST /sessions``) is mounted directly on
+the FastAPI app for back-compat. Existing in the registry purely so
+operators can list ``api`` triggers in YAML for symmetry, and so the
+provenance ``TriggerInfo.transport == "api"`` is available for sessions
+created via the legacy route.
+"""
+
+
+
+
+
+# ----- imports for runtime/triggers/transports/webhook.py -----
+"""Webhook transport — ``POST /triggers/{name}``.
+
+Mounted by ``runtime/api.py`` during the FastAPI lifespan. Each
+``WebhookTriggerConfig`` becomes one route under the same ``/triggers``
+prefix; per-route bearer auth is wired via ``runtime.triggers.auth``.
+
+Per-request flow:
+
+1. Bearer dep validates ``Authorization: Bearer <token>`` (when configured).
+2. Body parsed against the resolved ``payload_schema`` (Pydantic).
+   Validation failure -> ``422``.
+3. Optional ``Idempotency-Key`` header is forwarded to
+   :meth:`TriggerRegistry.dispatch`. A cache hit returns the existing
+   session id; misses run the full transform + ``start_session`` path.
+4. Transform errors (any exception from the ``transform`` callable)
+   surface as ``422 Unprocessable Entity`` with the exception message;
+   per the plan we do not auto-retry and do not cache the failure.
+5. Success: ``202 Accepted`` with ``{"session_id": "..."}``.
+"""
+
+
+from typing import TYPE_CHECKING, Any, Callable
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from pydantic import ValidationError
+
+
+
+
+# ----- imports for runtime/triggers/transports/schedule.py -----
+"""APScheduler-backed ``schedule`` transport.
+
+Single ``AsyncIOScheduler`` per process, started during FastAPI lifespan
+and stopped on shutdown. Each ``ScheduleTriggerConfig`` becomes one cron
+job that calls ``registry.dispatch(name, payload)`` on fire.
+
+Cron flavour: standard 5-field via ``CronTrigger.from_crontab``. The
+6-field APScheduler-native form is rejected by ``ScheduleTriggerConfig``
+itself; this transport never sees it.
+
+Drift / accuracy: APScheduler in-process is good for ±1 minute under
+normal load. Tighter SLOs need an external scheduler (Celery beat,
+k8s CronJob) — out of scope for Phase 5.
+"""
+
+
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+
+
+# ----- imports for runtime/triggers/transports/plugin.py -----
+"""Documentation hook for plugin trigger transports.
+
+Plugin transports are concrete subclasses of
+:class:`runtime.triggers.base.TriggerTransport` registered via either
+the ``runtime.triggers`` setuptools entry-point group or the
+``plugin_transports={kind: cls}`` kwarg to ``TriggerRegistry.create``.
+
+This module is intentionally lightweight — the contract lives entirely
+in ``base.py``. It exists as a single discoverable entry-point for
+operators reading the source tree.
+
+Example minimal plugin transport::
+
+
+
+    class SQSTransport(TriggerTransport):
+        def __init__(self, config: PluginTriggerConfig) -> None:
+            self._cfg = config
+            self._task = None
+
+        async def start(self, registry):
+            self._task = asyncio.create_task(self._poll(registry))
+
+        async def stop(self):
+            if self._task:
+                self._task.cancel()
+
+        async def _poll(self, registry):
+            ...  # poll SQS, call registry.dispatch(self._cfg.name, payload)
+
+Register via ``pyproject.toml``::
+
+    [project.entry-points."runtime.triggers"]
+    sqs = "myapp.triggers:SQSTransport"
+
+Or explicitly::
+
+    TriggerRegistry.create(
+        configs, start_session_fn=...,
+        plugin_transports={"sqs": SQSTransport},
+    )
+"""
+
+
+
+# ----- imports for runtime/triggers/registry.py -----
+"""TriggerRegistry — owns transport instances and dispatch.
+
+The registry is the single sink every transport calls when it wants to
+fire a session. It:
+
+- Resolves dotted paths (``payload_schema`` / ``transform``) at init time.
+- Holds an :class:`runtime.triggers.idempotency.IdempotencyStore`.
+- Exposes a single async ``dispatch(name, payload, *, idempotency_key=None)``
+  entrypoint that performs:
+
+      transform(payload) -> kwargs
+      orchestrator.start_session(**kwargs, trigger=info)
+
+The registry also owns each transport's lifecycle: ``start_all`` and
+``stop_all`` mirror FastAPI's lifespan handshake.
+
+Plugin transports are merged from two sources:
+
+1. Setuptools entry-points in group ``runtime.triggers``: ``key = kind``,
+   ``value = importable subclass of TriggerTransport``.
+2. Explicit registration via ``plugin_transports={...}`` on
+   :meth:`TriggerRegistry.create`. Explicit wins on key collision.
+"""
+
+
+import importlib.metadata
+from typing import Any, Awaitable, Callable, Type
+
+
+
+
+
+
+# ----- imports for runtime/dedup.py -----
+"""Two-stage dedup pipeline (P7).
+
+Stage 1 — embedding similarity over closed sessions in the same
+environment via :meth:`HistoryStore.find_similar`.
+Stage 2 — LLM confirmation on the top-K candidates with Pydantic-typed
+structured output {is_duplicate, confidence, rationale}.
+
+The pipeline is **framework-level** and never imports the
+incident-management state class (R4 in the Phase-7 plan). Apps inject
+domain-specific text via a ``text_extractor: Callable[[Session], str]``
+callable.
+
+Outcome semantics (locked):
+  * Stage 2 short-circuits on the first confirmed match (R3 cost cap).
+  * Stage 1 ordering already prioritises by similarity; stage 2 honours
+    that order and does not re-rank.
+  * Pipeline is non-mutating — the orchestrator owns mutation. This
+    keeps unit tests simple and supports a future dry-run mode.
+
+The configuration surface lives in :class:`DedupConfig` and is exposed
+to the runtime via a generic provider hook
+(``RuntimeConfig.dedup_config_path``). Framework default is *off*;
+each example app's YAML opts in.
+"""
+
+
+import enum
+from typing import Any, Callable, Generic, Literal, Optional, TYPE_CHECKING, TypeVar
+
+
+# ----- imports for runtime/orchestrator.py -----
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 
-from typing import AsyncIterator
+import warnings
+from typing import AsyncIterator, Generic, Type, TypeVar
 
 
 
 
 
+# ----- imports for runtime/api.py -----
+"""FastAPI app — health, listings, incident, and multi-session endpoints.
 
+``build_app(cfg)`` is sync and constructs the FastAPI instance. The long-lived
+:class:`runtime.service.OrchestratorService` is created during the app's
+startup lifespan and stored on ``app.state.service``; its underlying
+:class:`runtime.orchestrator.Orchestrator` is exposed as
+``app.state.orchestrator`` so legacy routes keep working without
+double-building the FastMCP transports / SQLite engines.
 
+The shutdown hook calls ``service.shutdown()`` which cancels in-flight
+session tasks, closes MCP clients, joins the background loop thread, and
+resets the process-singleton.
 
-
-
-
-# ----- imports for api.py -----
-"""FastAPI app — health, listings, and incident endpoints.
-
-``build_app(cfg)`` is sync and constructs the FastAPI instance. The
-orchestrator (which holds long-lived FastMCP transports) is created during
-the app's startup lifespan and stored on ``app.state.orchestrator``; the
-shutdown hook closes it cleanly. Routes read the orchestrator via
-``app.state``.
+Phase 3 layers:
+  - P3-H: ``POST /sessions``, ``GET /sessions``, ``DELETE /sessions/{id}``
+    delegate to ``OrchestratorService``. The legacy ``POST /investigate``
+    is preserved as a deprecated alias and now delegates to the same
+    long-lived service so old clients keep working.
 
 The module-level ``get_app()`` is a no-arg factory suitable for
 ``uvicorn --factory``: it reads ``ASR_CONFIG`` (default
@@ -259,16 +706,41 @@ The module-level ``get_app()`` is a no-arg factory suitable for
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+
+
+
+# ----- imports for runtime/api_dedup.py -----
+"""Dedup retraction HTTP routes (P7-H).
+
+Exposes ``register_dedup_routes(app, *, store_provider)`` — a side-car
+router so we don't need to inline these routes in ``runtime.api``. The
+caller wires it into the main FastAPI app at lifespan startup; tests
+construct a tiny FastAPI app and register only this router so they
+don't pull in the full lifespan stack.
+
+Endpoint:
+  ``POST /sessions/{session_id}/un-duplicate``
+    Body: ``{"retracted_by": str | None, "note": str | None}``
+    On success: 200 with the updated session.
+    409 when ``status != "duplicate"``.
+    404 when the session id is unknown.
+
+The endpoint never re-runs the agent graph — operators trigger that
+explicitly. The audit row is inserted in the same transaction as the
+status flip via :meth:`SessionStore.un_duplicate`.
+"""
+
+
+from typing import Any, Callable
+
+from fastapi import FastAPI, HTTPException
 
 
 
 
-
-
-# ====== module: orchestrator/config.py ======
+# ====== module: runtime/config.py ======
 
 ProviderKind = Literal["ollama", "azure_openai", "stub"]
 
@@ -361,12 +833,6 @@ class MCPConfig(BaseModel):
     servers: list[MCPServerConfig] = Field(default_factory=list)
 
 
-class IncidentConfig(BaseModel):
-    store_path: str = "incidents"
-    similarity_threshold: float = 0.85
-    similarity_method: Literal["keyword", "embedding"] = "keyword"
-
-
 class MetadataConfig(BaseModel):
     """Relational store for incident metadata. SQLite (dev) or Postgres (prod)."""
     url: str = "sqlite:///incidents/incidents.db"
@@ -392,17 +858,8 @@ class StorageConfig(BaseModel):
 
 
 class Paths(BaseModel):
-    skills_dir: str = "config/skills"
+    skills_dir: str | None = None
     incidents_dir: str = "incidents"
-
-
-class InterventionConfig(BaseModel):
-    confidence_threshold: float = 0.75
-    escalation_teams: list[str] = Field(
-        default_factory=lambda: [
-            "platform-oncall", "data-oncall", "security-oncall",
-        ],
-    )
 
 
 class OrchestratorConfig(BaseModel):
@@ -414,31 +871,227 @@ class OrchestratorConfig(BaseModel):
     signals: list[str] = Field(
         default_factory=lambda: ["success", "failed", "needs_input"],
     )
-    # Mapping from raw severity inputs to canonical severity labels.
-    # Override in YAML to adapt to domain-specific taxonomies.
-    # Default reproduces the original hardcoded _SEVERITY_MAP in incident.py.
-    severity_aliases: dict[str, str] = Field(
-        default_factory=lambda: {
-            "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
-            "critical": "high", "urgent": "high", "high": "high",
-            "sev3": "medium", "p3": "medium", "moderate": "medium", "medium": "medium",
-            "sev4": "low", "p4": "low", "info": "low", "informational": "low",
-            "low": "low",
-        }
-    )
+
+
+RiskLevel = Literal["low", "medium", "high"]
+
+
+class ProdOverrides(BaseModel):
+    """Per-environment HITL tightening rules for the gateway (P4-E).
+
+    When the live ``Session.environment`` is in ``prod_environments`` AND
+    the tool name matches one of the globs in ``resolution_trigger_tools``,
+    the gateway forces ``require-approval`` regardless of the tool's
+    risk-tier lookup. The override can only TIGHTEN, never relax — it runs
+    BEFORE the risk-tier dispatch in ``effective_action``.
+
+    Globs use ``fnmatch`` semantics (``*`` matches any run of characters,
+    ``?`` matches one). E.g. ``"remediation:*"`` matches all tools whose
+    name starts with ``remediation:``.
+    """
+
+    prod_environments: list[str] = Field(default_factory=lambda: ["production"])
+    resolution_trigger_tools: list[str] = Field(default_factory=list)
+
+
+class GatewayConfig(BaseModel):
+    """Risk-rated tool gateway configuration (P4-A).
+
+    ``policy`` maps a tool name to a declared risk level. The level drives
+    the hybrid HITL action:
+
+      * ``low``    -> auto-execute, no operator action;
+      * ``medium`` -> notify-soft (no graph pause);
+      * ``high``   -> require-approval (LangGraph ``interrupt()`` pauses).
+
+    Tools absent from the policy default to ``low`` (auto). Apps that need
+    stricter prod behaviour configure ``prod_overrides``.
+
+    ``notify_channel`` is an opaque routing hint passed to the notify
+    sink (Slack handle, log channel, webhook id …); the gateway itself
+    does not interpret it.
+    """
+
+    policy: dict[str, RiskLevel] = Field(default_factory=dict)
+    notify_channel: str | None = None
+    prod_overrides: ProdOverrides | None = None
+    # P4-I: pending-approval timeout (seconds). When a high-risk tool
+    # call enters ``interrupt()`` and the operator never returns, the
+    # session sits in ``awaiting_input`` indefinitely and counts against
+    # ``OrchestratorService.max_concurrent_sessions`` — eventually
+    # leaking the slot. The :class:`runtime.tools.approval_watchdog`
+    # asyncio task scans active sessions every 60s and resumes any
+    # ``pending_approval`` ToolCall whose ``ts`` is older than this
+    # value with ``decision="timeout"``. Default: 1 hour.
+    approval_timeout_seconds: int = 3600
+
+
+class RuntimeConfig(BaseModel):
+    """Framework-runtime knobs that apps can override.
+
+    ``state_class`` is a dotted import path to a ``runtime.state.Session``
+    subclass. ``None`` (or omitted) means "use the framework default
+    (``runtime.state.Session``)". Apps that ship a custom domain state set
+    this to e.g. ``"examples.incident_management.state.IncidentState"`` so
+    that the orchestrator and storage layer hydrate rows into the right
+    class.
+
+    ``framework_app_config_path`` is a dotted reference of the form
+    ``module.path:callable`` resolving to a no-arg callable that returns
+    a :class:`FrameworkAppConfig` instance. Used by
+    ``Orchestrator.create`` so the runtime never has to import an
+    app-specific config module. ``None`` (default) falls back to a bare
+    ``FrameworkAppConfig()``.
+    """
+
+    state_class: str | None = None
+    framework_app_config_path: str | None = None
+    # Optional dotted reference of the form ``module.path:callable``
+    # resolving to a no-arg callable returning a :class:`DedupConfig`
+    # (or ``None`` if dedup is not configured). Apps that want the
+    # two-stage dedup pipeline expose this on their YAML so the
+    # runtime never has to import an app-specific config module to
+    # discover dedup settings.
+    dedup_config_path: str | None = None
+    # Optional dotted reference for the app-specific list of
+    # environments rendered on the ``GET /environments`` endpoint.
+    # Apps that don't expose environments leave this unset; the
+    # endpoint then returns an empty list.
+    environments_provider_path: str | None = None
+    # P3-G: hard cap on concurrent in-flight sessions a single
+    # ``OrchestratorService`` will run. ``start_session`` raises
+    # ``SessionCapExceeded`` once the registry holds this many entries
+    # — fail fast, do not queue. Tune per deployment; the default is
+    # generous enough for an interactive desk while keeping a single
+    # process from saturating MCP transports.
+    max_concurrent_sessions: int = 8
+    # P4-A: optional risk-rated tool gateway. When ``None``, the gateway
+    # is bypassed entirely and tools execute as before — preserving
+    # Phase-3 behaviour for callers that have not opted in.
+    gateway: GatewayConfig | None = None
+
+
+# ---------------------------------------------------------------------------
+# FrameworkAppConfig — generic cross-cutting application knobs the
+# framework reads at runtime. Apps compose this inside their own
+# ``AppConfig`` (``IncidentAppConfig``, ``CodeReviewAppConfig``) and
+# expose a no-arg provider via ``RuntimeConfig.framework_app_config_path``.
+# This shape is the post-merge code-review's #1 architectural fix —
+# it kills the four ``examples.incident_management.config`` imports
+# that used to leak out of ``runtime/`` and bake one app's defaults
+# into every app's graph.
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_DEDUP_SYSTEM_PROMPT = (
+    "You are deduplicating sessions in an agent-orchestration framework. "
+    "Decide whether the new session is a duplicate of the prior session. "
+    "Return strict JSON: {\"is_duplicate\": bool, \"confidence\": float, "
+    "\"rationale\": string}."
+)
+
+
+class FrameworkAppConfig(BaseModel):
+    """Generic application-supplied knobs the framework reads at runtime.
+
+    Apps compose this inside their own AppConfig and surface it via
+    a no-arg provider callable referenced by
+    ``RuntimeConfig.framework_app_config_path``. The framework never
+    imports app-specific config modules; it only reads these fields.
+    """
+
+    confidence_threshold: float = 0.75
+    similarity_threshold: float = 0.2
+    escalation_teams: list[str] = Field(default_factory=list)
+    severity_aliases: dict[str, str] = Field(default_factory=dict)
+    dedup_system_prompt: str = _DEFAULT_DEDUP_SYSTEM_PROMPT
+
+
+def resolve_framework_app_config(
+    dotted: str | None,
+) -> FrameworkAppConfig:
+    """Resolve a ``module:callable`` provider into a ``FrameworkAppConfig``.
+
+    Returns a bare ``FrameworkAppConfig()`` when ``dotted`` is ``None``.
+    Raises ``ValueError`` for malformed paths and ``ImportError`` /
+    ``AttributeError`` propagate from the underlying resolution so that
+    misconfiguration fails loud at boot.
+
+    The provider must be a no-arg callable returning a
+    ``FrameworkAppConfig``; anything else raises ``TypeError``.
+    """
+    if dotted is None:
+        return FrameworkAppConfig()
+    if ":" not in dotted:
+        raise ValueError(
+            f"framework_app_config_path={dotted!r} must be in "
+            "'module.path:callable' form"
+        )
+    module_name, _, attr = dotted.partition(":")
+    import importlib
+    mod = importlib.import_module(module_name)
+    provider = getattr(mod, attr)
+    cfg = provider()
+    if not isinstance(cfg, FrameworkAppConfig):
+        raise TypeError(
+            f"provider {dotted!r} returned {type(cfg).__name__}; "
+            "expected FrameworkAppConfig"
+        )
+    return cfg
 
 
 class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
-    incidents: IncidentConfig = Field(default_factory=IncidentConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
-    environments: list[str] = Field(
-        default_factory=lambda: ["production", "staging", "dev", "local"]
-    )
     paths: Paths = Field(default_factory=Paths)
-    intervention: InterventionConfig = Field(default_factory=InterventionConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    # P5-A: declarative trigger registry. Each entry is one
+    # transport-flavoured ``TriggerConfig`` (api/webhook/schedule/plugin).
+    # Typed as ``list[Any]`` because Pydantic v2's discriminated-union
+    # binding pulls in the trigger module at import time, which would
+    # introduce a circular import. The ``_coerce_triggers`` validator
+    # below promotes raw dicts to the proper TriggerConfig variants.
+    triggers: list[Any] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _coerce_triggers(self) -> "AppConfig":
+        # Lazy import inside the validator to avoid a circular import:
+        # ``runtime.triggers.config`` is free to ``import AppConfig`` for
+        # typing without a forward-declaration dance.
+
+        variants = {
+            "api": APITriggerConfig,
+            "webhook": WebhookTriggerConfig,
+            "schedule": ScheduleTriggerConfig,
+            "plugin": PluginTriggerConfig,
+        }
+        coerced: list[Any] = []
+        for raw in self.triggers:
+            if isinstance(
+                raw,
+                (APITriggerConfig, WebhookTriggerConfig,
+                 ScheduleTriggerConfig, PluginTriggerConfig),
+            ):
+                coerced.append(raw)
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError(
+                    f"trigger entries must be dicts; got {type(raw).__name__}"
+                )
+            t = raw.get("transport", "api")
+            cls = variants.get(t)
+            if cls is None:
+                raise ValueError(
+                    f"unknown trigger transport {t!r}; "
+                    f"expected one of {sorted(variants)}"
+                )
+            coerced.append(cls(**raw))
+        # Pydantic v2 stores fields in ``__dict__``; assigning here is
+        # the documented way to mutate after validation.
+        self.__dict__["triggers"] = coerced
+        return self
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
@@ -466,21 +1119,25 @@ def load_config(path: str | Path) -> AppConfig:
     resolved = _interpolate(raw)
     return AppConfig(**resolved)
 
-# ====== module: orchestrator/incident.py ======
+# ====== module: orchestrator/config.py ======
 
-_INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
+
+
+# ====== module: runtime/state.py ======
+
 _UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-IncidentStatus = Literal[
-    "new", "in_progress", "matched", "resolved",
-    "escalated", "awaiting_input", "stopped", "deleted",
+# P4-D: per-call audit metadata for the risk-rated tool gateway.
+ToolRisk = Literal["low", "medium", "high"]
+ToolStatus = Literal[
+    "executed",                 # auto / legacy default
+    "executed_with_notify",     # medium-risk: ran + soft-notify
+    "pending_approval",         # high-risk: graph paused on interrupt()
+    "approved",                 # high-risk: operator approved, then ran
+    "rejected",                 # high-risk: operator rejected, did not run
+    "timeout",                  # high-risk: approval window expired
 ]
-
-
-class Reporter(BaseModel):
-    id: str
-    team: str
 
 
 class ToolCall(BaseModel):
@@ -489,6 +1146,15 @@ class ToolCall(BaseModel):
     args: dict
     result: dict | str | list | int | float | bool | None
     ts: str
+    # P4-D: audit fields for the risk-rated gateway. All optional and
+    # default-permissive so legacy rows in the JSON column hydrate with
+    # ``status="executed"`` and the rest of the fields ``None`` —
+    # preserving back-compat with Phase-1 / Phase-3 incidents.
+    risk: ToolRisk | None = None
+    status: ToolStatus = "executed"
+    approver: str | None = None
+    approved_at: str | None = None
+    approval_rationale: str | None = None
 
 
 class TokenUsage(BaseModel):
@@ -508,33 +1174,137 @@ class AgentRun(BaseModel):
     signal: str | None = None
 
 
-class Incident(BaseModel):
+class Session(BaseModel):
+    """Framework base session. Lifecycle + telemetry fields only.
+
+    Applications subclass this and add domain fields. The framework only
+    reads/writes the fields declared here.
+    """
+
     id: str
-    status: IncidentStatus
+    status: str
     created_at: str
     updated_at: str
-    query: str
-    environment: str
-    reporter: Reporter
-    summary: str = ""
-    tags: list[str] = Field(default_factory=list)
-    severity: str | None = None
-    category: str | None = None
-    matched_prior_inc: str | None = None
-    embedding: list[float] | None = None
+    deleted_at: str | None = None
     agents_run: list[AgentRun] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
-    # Findings is an open mapping keyed by agent name (or any agent-declared
-    # output key). Old saves with {"triage": ..., "deep_investigator": ...}
-    # load transparently because Pydantic accepts those as dict entries.
     findings: dict[str, Any] = Field(default_factory=dict)
-    resolution: Any = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     pending_intervention: dict | None = None
     user_inputs: list[str] = Field(default_factory=list)
-    deleted_at: str | None = None
+    # P7-A: dedup linkage. NULL by default; set when this session is
+    # confirmed as a duplicate of a prior closed session. The value is
+    # the prior session's id; the link is non-destructive — both
+    # sessions remain queryable. See ``runtime.dedup``.
+    parent_session_id: str | None = None
+    # P7-E: stage-2 LLM rationale for the dedup decision. Stored on the
+    # session row so the UI can render "why was this marked duplicate?"
+    # without needing a separate join.
+    dedup_rationale: str | None = None
 
-# ====== module: orchestrator/similarity.py ======
+    # ------------------------------------------------------------------
+    # App-overridable agent-input formatter hook.
+    # ------------------------------------------------------------------
+    def to_agent_input(self) -> str:
+        """Return the human-message preamble each agent receives.
+
+        Apps subclass ``Session`` and override this to surface the
+        domain shape (``Incident X / Environment Y / Query Z`` for the
+        incident-management app, ``PR title / repo / diff stats`` for
+        code review, etc.). The framework default keeps the prompt
+        framework-agnostic — id + status only — so that any app that
+        has not overridden the hook still gets a usable preamble.
+
+        Findings, prior agent output, and operator-supplied user input
+        are appended at the end so the surface stays useful even when
+        the subclass keeps the default prefix.
+        """
+        base = (
+            f"Session {self.id}\n"
+            f"Status: {self.status}\n"
+        )
+        for agent_key, finding in self.findings.items():
+            base += f"Findings ({agent_key}): {finding}\n"
+        if self.user_inputs:
+            bullets = "\n".join(f"- {ui}" for ui in self.user_inputs)
+            base += (
+                "\nUser-provided context (appended via intervention):\n"
+                f"{bullets}\n"
+            )
+        return base
+
+    # ------------------------------------------------------------------
+    # P8-C: app-overridable session id minting hook.
+    # ------------------------------------------------------------------
+    @classmethod
+    def id_format(cls, *, seq: int) -> str:
+        """Return the canonical session id for the given sequence number.
+
+        Apps override this on their ``Session`` subclass to produce an
+        id format that suits their domain (e.g. ``PR-{repo}-{number}``
+        for code review). The framework default keeps the legacy
+        ``INC-YYYYMMDD-NNN`` shape so existing on-disk rows and any app
+        that has not opted in continue to round-trip cleanly.
+
+        ``seq`` is the per-day monotonic sequence supplied by
+        ``SessionStore._next_id``; it lets the default format produce
+        the expected zero-padded suffix without each subclass
+        re-implementing the SQL scan.
+        """
+        from datetime import datetime, timezone
+
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        return f"INC-{today}-{seq:03d}"
+
+# ====== module: runtime/state_resolver.py ======
+
+def resolve_state_class(dotted_path: str | None) -> Type[Session]:
+    """Resolve ``dotted_path`` to a concrete ``Session`` subclass.
+
+    ``None`` and ``""`` are treated as "use the framework default
+    (``runtime.state.Session``)". Any other input must be a fully
+    qualified dotted import path (``pkg.module.ClassName``) pointing at a
+    class that ``issubclass(Session)``.
+
+    Raises:
+        ValueError: if ``dotted_path`` is not a dotted path.
+        ImportError: if the target module cannot be imported.
+        AttributeError: if the module does not define the attribute.
+        TypeError: if the resolved attribute is not a Session subclass.
+    """
+    if not dotted_path:
+        return Session
+
+    if "." not in dotted_path:
+        raise ValueError(
+            f"state_class must be a dotted path 'pkg.module.ClassName'; "
+            f"got {dotted_path!r}"
+        )
+
+    module_path, _, attr_name = dotted_path.rpartition(".")
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as exc:
+        raise ImportError(
+            f"cannot import state_class module {module_path!r} "
+            f"(from {dotted_path!r}): {exc}"
+        ) from exc
+
+    if not hasattr(module, attr_name):
+        raise AttributeError(
+            f"module {module_path!r} has no attribute {attr_name!r} "
+            f"(state_class={dotted_path!r})"
+        )
+
+    cls = getattr(module, attr_name)
+    if not isinstance(cls, type) or not issubclass(cls, Session):
+        raise TypeError(
+            f"state_class {dotted_path!r} must be a Session subclass; "
+            f"got {cls!r}"
+        )
+    return cls
+
+# ====== module: runtime/similarity.py ======
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOP = frozenset({
@@ -567,7 +1337,7 @@ def find_similar(*, query: str, candidates: list[dict], text_field: str,
     passing.sort(key=lambda x: x[1], reverse=True)
     return passing[:limit]
 
-# ====== module: orchestrator/skill.py ======
+# ====== module: runtime/skill.py ======
 
 _AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -594,17 +1364,186 @@ class RouteRule(BaseModel):
     gate: str | None = None
 
 
+class DispatchRule(BaseModel):
+    """One condition/target pair used by ``kind: supervisor`` skills with
+    ``dispatch_strategy: rule``.
+
+    ``when`` is a safe-eval expression (see :func:`_validate_safe_expr`)
+    evaluated against the live session payload at dispatch time. The
+    first matching rule wins; ``target`` names a subordinate agent.
+    """
+
+    when: str
+    target: str
+
+
+SkillKind = Literal["responsive", "supervisor", "monitor"]
+
+
+# Cron-expression sanity check (5-field form: minute hour dom month dow).
+# Each field accepts: '*', or a comma-separated list of ints / int ranges
+# (a-b) / step ('* /n' or 'a-b/n'). This is intentionally a small subset
+# of POSIX cron — broad enough for monitor schedules, narrow enough to
+# parse with a regex (no external ``croniter`` dep, which is unavailable
+# in the air-gapped target env per ``rules/build.md``).
+_CRON_FIELD_RE = re.compile(
+    r"^(\*|\*/\d+|\d+(-\d+)?(/\d+)?(,\d+(-\d+)?(/\d+)?)*)$"
+)
+
+
+def _validate_cron(expr: str) -> None:
+    parts = expr.split()
+    if len(parts) != 5:
+        raise ValueError(
+            f"schedule {expr!r} is not a 5-field cron expression "
+            f"(got {len(parts)} fields)"
+        )
+    for i, field in enumerate(parts):
+        if not _CRON_FIELD_RE.match(field):
+            raise ValueError(
+                f"schedule {expr!r}: field #{i+1} {field!r} is not a "
+                f"valid cron expression component"
+            )
+
+
+# Safe-eval AST whitelist for monitor ``emit_signal_when`` and
+# supervisor ``DispatchRule.when``. We intentionally implement this with
+# the stdlib ``ast`` module rather than depend on ``simpleeval`` —
+# ``simpleeval`` is not available in the air-gapped target env. The
+# whitelist is the smallest set that lets operators write conditions
+# like ``observation['error_rate'] > 0.05 and status == 'open'`` without
+# enabling arbitrary code execution. See plan R7.
+_SAFE_AST_NODES: tuple[type, ...] = (
+    ast.Expression, ast.BoolOp, ast.BinOp, ast.UnaryOp, ast.Compare,
+    ast.Name, ast.Load, ast.Constant, ast.And, ast.Or, ast.Not,
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    ast.In, ast.NotIn, ast.Is, ast.IsNot,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+    ast.USub, ast.UAdd, ast.Subscript, ast.Index, ast.Slice,
+    ast.List, ast.Tuple, ast.Dict, ast.Set,
+    ast.IfExp,
+)
+
+
+def _validate_safe_expr(expr: str, *, source: str) -> None:
+    """Reject non-whitelisted AST nodes in user-supplied expressions.
+
+    Raises ``ValueError`` if the expression is not parseable or contains
+    nodes outside :data:`_SAFE_AST_NODES`. Callable invocations,
+    attribute access, comprehensions, lambdas, walrus, and the like are
+    explicitly rejected.
+    """
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(
+            f"{source}: cannot parse expression {expr!r}: {exc.msg}"
+        ) from exc
+    for node in ast.walk(tree):
+        if not isinstance(node, _SAFE_AST_NODES):
+            raise ValueError(
+                f"{source}: expression {expr!r} uses disallowed "
+                f"construct {type(node).__name__!r} (safe-eval only "
+                f"permits constants, names, comparisons, boolean ops, "
+                f"arithmetic, subscripts, and literals)"
+            )
+
+
+def _resolve_dotted_callable(path: str, *, source: str) -> Callable[..., Any]:
+    """Resolve a ``module.path:attr`` (or ``module.path.attr``) string to a callable.
+
+    Used by ``kind: supervisor`` skills' ``runner`` field so app-level
+    extension hooks can be wired in via YAML and validated at
+    skill-load time. Raises ``ValueError`` on any failure mode
+    (malformed path, missing module, missing attribute, non-callable
+    target). The error names ``source`` so the YAML author sees which
+    skill is broken.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{source}: dotted path must be a non-empty string")
+    text = path.strip()
+    if ":" in text:
+        mod_part, _, attr_part = text.partition(":")
+    elif "." in text:
+        mod_part, _, attr_part = text.rpartition(".")
+    else:
+        raise ValueError(
+            f"{source}: dotted path {path!r} must include an attribute "
+            f"(use 'pkg.module:func' or 'pkg.module.func')"
+        )
+    if not mod_part or not attr_part:
+        raise ValueError(
+            f"{source}: dotted path {path!r} is missing the module or "
+            f"attribute component"
+        )
+    try:
+        module = importlib.import_module(mod_part)
+    except ImportError as exc:
+        raise ValueError(
+            f"{source}: cannot import module {mod_part!r} from path "
+            f"{path!r}: {exc}"
+        ) from exc
+    try:
+        target = getattr(module, attr_part)
+    except AttributeError as exc:
+        raise ValueError(
+            f"{source}: module {mod_part!r} has no attribute "
+            f"{attr_part!r} (path={path!r})"
+        ) from exc
+    if not callable(target):
+        raise ValueError(
+            f"{source}: target {path!r} resolved to a non-callable "
+            f"({type(target).__name__})"
+        )
+    return target
+
+
 class Skill(BaseModel):
+    """Single skill definition with a ``kind`` discriminator.
+
+    The ``kind`` field selects the agent's execution model. Per-kind
+    fields are declared at the model level for ergonomic YAML
+    authoring; a ``model_validator`` rejects any combination that
+    doesn't match the declared kind.
+
+    Default kind is ``responsive`` so existing YAML (and historic
+    Skill(...) construction in tests) keeps working without an explicit
+    ``kind:`` field.
+    """
+
     name: str
     description: str
+    kind: SkillKind = "responsive"
+
+    # ----- responsive (today's default behaviour) -----
     model: str | None = None
     tools: dict[str, list[str]] = Field(default_factory=dict)
     routes: list[RouteRule] = Field(default_factory=list)
-    system_prompt: str
+    system_prompt: str = ""
     stub_response: str | None = None
     """Per-skill canned response used by ``StubChatModel`` when
     ``provider.kind == "stub"``.  Takes precedence over any entry in
     ``_DEFAULT_STUB_CANNED`` for the same agent name."""
+
+    # ----- supervisor (no-LLM router) -----
+    subordinates: list[str] = Field(default_factory=list)
+    dispatch_strategy: Literal["llm", "rule"] = "llm"
+    dispatch_prompt: str | None = None
+    dispatch_rules: list[DispatchRule] = Field(default_factory=list)
+    max_dispatch_depth: int = 3
+    # P9-9h: optional dotted-path extension hook for app-specific
+    # supervisor logic (e.g. memory-layer hydration, single-active-
+    # investigation gates). The runner is invoked BEFORE the dispatch
+    # table and may either mutate state or short-circuit to ``__end__``.
+    # Resolved at skill-load time so misconfigured YAML fails fast.
+    runner: str | None = None
+
+    # ----- monitor (out-of-band, scheduled) -----
+    schedule: str | None = None             # cron expression
+    observe: list[str] = Field(default_factory=list)  # tool names
+    emit_signal_when: str | None = None     # safe-eval expression
+    trigger_target: str | None = None       # P5 trigger name
+    tick_timeout_seconds: float = 30.0      # per-tick timeout (R6)
 
     @field_validator("tools")
     @classmethod
@@ -626,6 +1565,160 @@ class Skill(BaseModel):
     @classmethod
     def _strip_prompt(cls, v: str) -> str:
         return v.strip()
+
+    @field_validator("max_dispatch_depth")
+    @classmethod
+    def _validate_max_depth(cls, v: int) -> int:
+        if not (1 <= v <= 10):
+            raise ValueError(
+                f"max_dispatch_depth must be between 1 and 10 (got {v})"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_kind_shape(self) -> "Skill":
+        """Per-kind field-shape validation (P6-B).
+
+        Each kind has a strict allow-list of fields. Anything from
+        another kind raises ValueError naming the offending field and
+        the kind. Required fields (e.g. monitor.schedule) are also
+        enforced here.
+        """
+        kind = self.kind
+        if kind == "responsive":
+            self._validate_responsive()
+        elif kind == "supervisor":
+            self._validate_supervisor()
+        elif kind == "monitor":
+            self._validate_monitor()
+        return self
+
+    # ----- per-kind shape validators (called from _validate_kind_shape) -----
+
+    def _validate_responsive(self) -> None:
+        forbidden = {
+            "subordinates": bool(self.subordinates),
+            "dispatch_prompt": self.dispatch_prompt is not None,
+            "dispatch_rules": bool(self.dispatch_rules),
+            "schedule": self.schedule is not None,
+            "observe": bool(self.observe),
+            "emit_signal_when": self.emit_signal_when is not None,
+            "trigger_target": self.trigger_target is not None,
+            "runner": self.runner is not None,
+        }
+        # dispatch_strategy is allowed to keep its default; only flag it if
+        # the user explicitly set it to non-default.
+        if self.dispatch_strategy != "llm":
+            forbidden["dispatch_strategy"] = True
+        for field, present in forbidden.items():
+            if present:
+                raise ValueError(
+                    f"skill {self.name!r} (kind=responsive) must not set "
+                    f"{field!r} — that field belongs to another kind"
+                )
+        # ``system_prompt`` is sourced from the agent's *.md files at load
+        # time (see ``load_skill``); the model itself permits an empty
+        # string for tests and ad-hoc constructors that don't go through
+        # the loader. The loader enforces .md presence for responsive
+        # skills.
+
+    def _validate_supervisor(self) -> None:
+        forbidden = {
+            "system_prompt": bool(self.system_prompt),
+            "tools": bool(self.tools),
+            "routes": bool(self.routes),
+            "stub_response": self.stub_response is not None,
+            "schedule": self.schedule is not None,
+            "observe": bool(self.observe),
+            "emit_signal_when": self.emit_signal_when is not None,
+            "trigger_target": self.trigger_target is not None,
+        }
+        for field, present in forbidden.items():
+            if present:
+                raise ValueError(
+                    f"skill {self.name!r} (kind=supervisor) must not set "
+                    f"{field!r} — that field belongs to another kind"
+                )
+        if not self.subordinates:
+            raise ValueError(
+                f"skill {self.name!r} (kind=supervisor) requires a non-empty "
+                f"subordinates list"
+            )
+        if self.runner is not None:
+            # Resolve at skill-load time so a typo in YAML surfaces here,
+            # not in the middle of a session. The resolver itself raises
+            # ``ValueError`` with a helpful message — bubble that up.
+            _resolve_dotted_callable(
+                self.runner,
+                source=f"skill {self.name!r} runner",
+            )
+        if self.dispatch_strategy == "llm" and not self.dispatch_prompt:
+            raise ValueError(
+                f"skill {self.name!r} (kind=supervisor, strategy=llm) requires "
+                f"dispatch_prompt"
+            )
+        if self.dispatch_strategy == "rule":
+            if not self.dispatch_rules:
+                raise ValueError(
+                    f"skill {self.name!r} (kind=supervisor, strategy=rule) "
+                    f"requires dispatch_rules"
+                )
+            for i, rule in enumerate(self.dispatch_rules):
+                _validate_safe_expr(
+                    rule.when,
+                    source=f"skill {self.name!r} dispatch_rules[{i}].when",
+                )
+                if rule.target not in self.subordinates:
+                    raise ValueError(
+                        f"skill {self.name!r}: dispatch_rules[{i}].target="
+                        f"{rule.target!r} not found in subordinates "
+                        f"({sorted(self.subordinates)})"
+                    )
+
+    def _validate_monitor(self) -> None:
+        forbidden = {
+            "system_prompt": bool(self.system_prompt),
+            "routes": bool(self.routes),
+            "stub_response": self.stub_response is not None,
+            "subordinates": bool(self.subordinates),
+            "dispatch_prompt": self.dispatch_prompt is not None,
+            "dispatch_rules": bool(self.dispatch_rules),
+            "runner": self.runner is not None,
+        }
+        for field, present in forbidden.items():
+            if present:
+                raise ValueError(
+                    f"skill {self.name!r} (kind=monitor) must not set "
+                    f"{field!r} — that field belongs to another kind"
+                )
+        if not self.schedule:
+            raise ValueError(
+                f"skill {self.name!r} (kind=monitor) requires a schedule "
+                f"(5-field cron expression)"
+            )
+        _validate_cron(self.schedule)
+        if not self.observe:
+            raise ValueError(
+                f"skill {self.name!r} (kind=monitor) requires a non-empty "
+                f"observe list"
+            )
+        if not self.emit_signal_when:
+            raise ValueError(
+                f"skill {self.name!r} (kind=monitor) requires emit_signal_when"
+            )
+        _validate_safe_expr(
+            self.emit_signal_when,
+            source=f"skill {self.name!r} emit_signal_when",
+        )
+        if not self.trigger_target:
+            raise ValueError(
+                f"skill {self.name!r} (kind=monitor) requires trigger_target"
+            )
+        if self.tick_timeout_seconds <= 0:
+            raise ValueError(
+                f"skill {self.name!r}: tick_timeout_seconds must be positive "
+                f"(got {self.tick_timeout_seconds})"
+            )
 
 
 def _concat_md(md_files: list[Path]) -> str:
@@ -672,13 +1765,24 @@ def load_skill(agent_dir: str | Path, *, common: str = "") -> Skill:
             f"agent name is taken from the directory ({base.name!r})"
         )
     cfg["name"] = base.name
+    # P6: only ``responsive`` skills require a system_prompt assembled from
+    # the directory's .md files. ``supervisor`` and ``monitor`` skills are
+    # configured purely via YAML, so the .md requirement is relaxed for
+    # those kinds. The default kind is still ``responsive`` so existing
+    # YAML keeps the historical "config.yaml + system.md" requirement.
+    kind = cfg.get("kind", "responsive")
     md_files = sorted(base.glob("*.md"))
-    if not md_files:
-        raise FileNotFoundError(f"no .md prompt files in skill dir: {base}")
-    agent_prompt = _concat_md(md_files)
-    cfg["system_prompt"] = (
-        f"{agent_prompt}\n\n{common}".strip() if common else agent_prompt
-    )
+    if kind == "responsive":
+        if not md_files:
+            raise FileNotFoundError(f"no .md prompt files in skill dir: {base}")
+        agent_prompt = _concat_md(md_files)
+        cfg["system_prompt"] = (
+            f"{agent_prompt}\n\n{common}".strip() if common else agent_prompt
+        )
+    else:
+        # Non-responsive kinds may still ship descriptive .md alongside
+        # config.yaml, but it's optional and never used as a system prompt.
+        cfg.setdefault("system_prompt", "")
     return Skill(**cfg)
 
 
@@ -701,7 +1805,7 @@ def load_all_skills(skills_dir: str | Path) -> dict[str, Skill]:
         skills[skill.name] = skill
     return skills
 
-# ====== module: orchestrator/llm.py ======
+# ====== module: runtime/llm.py ======
 
 class StubChatModel(BaseChatModel):
     """Deterministic chat model for tests/CI. Returns canned text per role.
@@ -832,7 +1936,7 @@ def get_embedding(cfg: LLMConfig) -> Embeddings:
         f"Embedding not supported for provider kind {provider.kind!r}"
     )
 
-# ====== module: orchestrator/storage/models.py ======
+# ====== module: runtime/storage/models.py ======
 
 class Base(DeclarativeBase):
     pass
@@ -870,6 +1974,23 @@ class IncidentRow(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # P7-A: dedup linkage. NULL by default; set when this session is
+    # confirmed as a duplicate of a prior closed session. Indexed so
+    # ``list_children(parent)`` is fast.
+    parent_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # P7-E: stage-2 LLM rationale persisted on the row so the UI can
+    # surface "why was this flagged?" without a separate decisions
+    # table. Mirror of ``Session.dedup_rationale``.
+    dedup_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # P8-J: bag for any state-class field that does not have a typed
+    # column above. ``SessionStore`` walks ``state_cls.model_fields``
+    # and routes unknown fields here on save; ``_row_to_session``
+    # merges them back into the model on load. Additive: legacy rows
+    # written before this column existed have ``NULL`` and round-trip
+    # cleanly.
+    extra_fields: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     __table_args__ = (
         Index("ix_incidents_status_env_active", "status", "environment",
               postgresql_where=text("deleted_at IS NULL"),
@@ -877,21 +1998,91 @@ class IncidentRow(Base):
         Index("ix_incidents_created_at_active", "created_at",
               postgresql_where=text("deleted_at IS NULL"),
               sqlite_where=text("deleted_at IS NULL")),
+        Index("ix_incidents_parent_session_id", "parent_session_id"),
     )
 
-# ====== module: orchestrator/storage/engine.py ======
+
+# P7-H: append-only audit log of dedup retractions. No FK to ``incidents``
+# so retraction history survives session deletion. Indexed on
+# ``session_id`` for the parent detail pane lookup.
+class DedupRetractionRow(Base):
+    __tablename__ = "dedup_retractions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String, nullable=False)
+    retracted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    retracted_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    original_match_id: Mapped[str] = mapped_column(String, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_dedup_retractions_session_id", "session_id"),
+    )
+
+
+SessionRow = IncidentRow  # generic alias
+
+# ====== module: runtime/storage/engine.py ======
+
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+
 
 def build_engine(cfg: MetadataConfig) -> Engine:
     if cfg.url.startswith("sqlite"):
-        return create_engine(
+        engine = create_engine(
             cfg.url,
             poolclass=NullPool,
             echo=cfg.echo,
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "isolation_level": None},
         )
+        _install_sqlite_concurrency_pragmas(engine)
+        return engine
     return create_engine(cfg.url, pool_size=cfg.pool_size, echo=cfg.echo)
 
-# ====== module: orchestrator/storage/embeddings.py ======
+
+def _install_sqlite_concurrency_pragmas(engine: Engine) -> None:
+    """Configure every new SQLite connection so it plays nicely with a
+    concurrent LangGraph checkpointer on the same DB file.
+
+    Three things happen here:
+
+    1. ``connect_args["isolation_level"]=None`` (set in ``build_engine``)
+       puts the underlying ``sqlite3.Connection`` in autocommit mode so
+       Python's stdlib doesn't sneak a ``BEGIN`` in front of our SQL.
+       SQLAlchemy then drives transactions explicitly via the ``begin``
+       event hook below — this is the documented escape hatch for
+       custom transaction modes.
+    2. ``PRAGMA journal_mode=WAL`` + ``PRAGMA synchronous=NORMAL`` +
+       ``PRAGMA busy_timeout`` are issued on every new connection so
+       readers and writers don't block each other and writers wait
+       briefly on contention rather than failing immediately.
+    3. ``BEGIN IMMEDIATE`` on the ``begin`` hook acquires the RESERVED
+       lock at transaction start (before any read), so the
+       ``busy_timeout`` retry loop can wait out a concurrent writer
+       cleanly. Without this, two writers each in a ``BEGIN DEFERRED``
+       transaction race to escalate and the loser hits ``database is
+       locked`` instantly.
+    """
+    @sa_event.listens_for(engine, "connect")
+    def _on_connect(dbapi_conn, _conn_record):  # noqa: ANN001 — sqlalchemy event sig
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cur.close()
+
+    @sa_event.listens_for(engine, "begin")
+    def _on_begin(conn):  # noqa: ANN001 — sqlalchemy event sig
+        # Replace SQLAlchemy's default ``BEGIN`` (deferred) with
+        # ``BEGIN IMMEDIATE``. Required so concurrent writers serialize
+        # cleanly via busy_timeout instead of failing on lock-escalation.
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+# ====== module: runtime/storage/embeddings.py ======
 
 class _StubEmbeddings(Embeddings):
     """Deterministic dummy embedder.
@@ -949,7 +2140,7 @@ def build_embedder(
         return _StubEmbeddings(dim=cfg.dim)
     raise ValueError(f"unknown provider kind: {p.kind!r}")
 
-# ====== module: orchestrator/storage/vector.py ======
+# ====== module: runtime/storage/vector.py ======
 
 _PLACEHOLDER_ID = "__seed__"
 
@@ -1042,19 +2233,208 @@ def distance_to_similarity(distance: float, strategy: str) -> float:
         return 1.0 / (1.0 + distance)
     raise ValueError(f"unknown distance strategy: {strategy!r}")
 
-# ====== module: orchestrator/storage/repository.py ======
+# ====== module: runtime/storage/history_store.py ======
+
+StateT = TypeVar("StateT", bound=BaseModel)
+
+# Allowed ``filter_kwargs`` keys = IncidentRow column names.
+# Computed at module load so we can produce a precise error for typos.
+_ALLOWED_FILTER_COLUMNS: frozenset[str] = frozenset(
+    c.name for c in IncidentRow.__table__.columns
+)
+
+
+class HistoryStore(Generic[StateT]):
+    """Read-only similarity search over the same row store, parametrised on ``StateT``.
+
+    Never mutates. Reuses ``SessionStore``'s row->state converter via a
+    private internal instance to avoid duplicating mapping logic; that
+    converter inherits the same ``state_cls`` so hydration stays consistent.
+    """
+
+    def __init__(
+        self,
+        *,
+        engine: Engine,
+        state_cls: Optional[Type[StateT]] = None,
+        embedder: Optional[Embeddings] = None,
+        vector_store: Optional[VectorStore] = None,
+        similarity_threshold: float = 0.85,
+        distance_strategy: str = "cosine",
+    ) -> None:
+        # Imported lazily so a bare ``HistoryStore`` import has no
+        # side-effect of pulling SessionStore's heavier dep tree.
+
+
+        self.engine = engine
+        self._state_cls = state_cls
+        self.embedder = embedder
+        self.vector_store = vector_store
+        self.similarity_threshold = similarity_threshold
+        self.distance_strategy = distance_strategy
+        # Private converter helper. We never call its mutating methods.
+        # ``state_cls=None`` lets SessionStore pick its own default
+        # (``runtime.state.Session`` post-P2-J).
+        ss_kwargs: dict[str, Any] = {
+            "engine": engine, "embedder": None, "vector_store": None,
+            "distance_strategy": distance_strategy,
+        }
+        if state_cls is not None:
+            ss_kwargs["state_cls"] = state_cls
+        self._converter: SessionStore[StateT] = SessionStore(**ss_kwargs)
+
+    def _row_to_incident(self, row: IncidentRow) -> StateT:
+        return self._converter._row_to_incident(row)
+
+    def _load(self, incident_id: str) -> StateT:
+        with Session(self.engine) as session:
+            row = session.get(IncidentRow, incident_id)
+            if row is None:
+                raise FileNotFoundError(incident_id)
+            return self._row_to_incident(row)
+
+    def _list_filtered(self, *, filter_kwargs: Mapping[str, Any]) -> list[StateT]:
+        """List non-deleted rows matching the given column filters.
+
+        Pure SQL prefilter — used by both vector and keyword paths.
+        """
+        with Session(self.engine) as session:
+            stmt = select(IncidentRow).where(IncidentRow.deleted_at.is_(None))
+            for col, val in filter_kwargs.items():
+                stmt = stmt.where(getattr(IncidentRow, col) == val)
+            rows = session.execute(stmt).scalars().all()
+            return [self._row_to_incident(r) for r in rows]
+
+    @staticmethod
+    def _validate_filter_kwargs(filter_kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Reject filter keys that aren't IncidentRow columns.
+
+        Returns a plain ``dict`` (defensive copy). ``None`` is treated as
+        an empty filter for ergonomic callers.
+        """
+        if filter_kwargs is None:
+            return {}
+        bad = [k for k in filter_kwargs if k not in _ALLOWED_FILTER_COLUMNS]
+        if bad:
+            raise ValueError(
+                f"unsupported filter_kwargs key(s): {bad}. "
+                f"Allowed columns: {sorted(_ALLOWED_FILTER_COLUMNS)}"
+            )
+        return dict(filter_kwargs)
+
+    def find_similar(
+        self, *, query: str,
+        filter_kwargs: Mapping[str, Any] | None = None,
+        status_filter: str = "resolved",
+        threshold: Optional[float] = None,
+        limit: int = 5,
+        # Back-compat: accept ``environment=`` so existing callers keep
+        # compiling. New code should pass ``filter_kwargs={"environment": ...}``.
+        environment: Optional[str] = None,
+    ) -> list[tuple[StateT, float]]:
+        """Return up to ``limit`` similar sessions matching the given filters.
+
+        ``filter_kwargs`` is a mapping of ``IncidentRow`` column -> value
+        (e.g. ``{"environment": "production"}``); each entry becomes an
+        equality predicate in the SQL prefilter. ``status_filter`` is
+        also applied (defaulting to ``"resolved"``). Vector path uses
+        the configured VectorStore when both ``vector_store`` and
+        ``embedder`` are present; otherwise keyword similarity.
+        """
+        filter_dict = self._validate_filter_kwargs(filter_kwargs)
+        if environment is not None and "environment" not in filter_dict:
+            # Convenience for legacy callers — translate to the new dict.
+            filter_dict["environment"] = environment
+
+        if self.vector_store is None or self.embedder is None:
+            return self._keyword_similar(
+                query=query, filter_kwargs=filter_dict,
+                status_filter=status_filter,
+                threshold=threshold, limit=limit,
+            )
+        threshold = self.similarity_threshold if threshold is None else threshold
+
+        vec = self.embedder.embed_query(query)
+        raw = self.vector_store.similarity_search_with_score_by_vector(vec, k=limit * 4)
+        out: list[tuple[StateT, float]] = []
+        for doc, distance in raw:
+            score = distance_to_similarity(float(distance), self.distance_strategy)
+            if score < threshold:
+                continue
+            inc_id = doc.metadata.get("id")
+            if inc_id is None:
+                continue
+            try:
+                inc = self._load(inc_id)
+            except (FileNotFoundError, ValueError):
+                continue
+            if getattr(inc, "status", None) != status_filter:
+                continue
+            if getattr(inc, "deleted_at", None) is not None:
+                continue
+            # Generic column-equality check via getattr — works for any
+            # field declared on the configured state subclass.
+            if not all(getattr(inc, k, None) == v for k, v in filter_dict.items()):
+                continue
+            out.append((inc, score))
+            if len(out) >= limit:
+                break
+        return out
+
+    def _keyword_similar(self, *, query, filter_kwargs, status_filter, threshold, limit):
+
+        # SQL prefilter narrows the row set; status is filtered in
+        # Python because it lives on the row but apps occasionally
+        # override it via custom states.
+        all_filtered = self._list_filtered(filter_kwargs=filter_kwargs)
+        candidates_inc = [
+            i for i in all_filtered
+            if getattr(i, "status", None) == status_filter
+            and getattr(i, "deleted_at", None) is None
+        ]
+        candidates = [
+            {
+                "id": i.id,
+                "text": " ".join(filter(None, [
+                    getattr(i, "query", "") or "",
+                    getattr(i, "summary", "") or "",
+                    " ".join(getattr(i, "tags", []) or []),
+                ])),
+                "incident": i,
+            }
+            for i in candidates_inc
+        ]
+        results = find_similar(
+            query=query, candidates=candidates, text_field="text",
+            scorer=KeywordSimilarity(),
+            threshold=self.similarity_threshold if threshold is None else threshold,
+            limit=limit,
+        )
+        return [(c["incident"], float(s)) for c, s in results]
+
+# ====== module: runtime/storage/session_store.py ======
 
 _INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
+_SESSION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-\d{8}-\d{3}$")
+
+# StateT is bound to ``BaseModel`` so callers can pass either bare
+# ``Session`` or any pydantic subclass. The resolver in
+# :mod:`runtime.state_resolver` enforces a ``runtime.state.Session``
+# subclass at config time; the looser bound here keeps the storage
+# layer usable by ad-hoc tests that build a ``BaseModel`` directly.
+StateT = TypeVar("StateT", bound=BaseModel)
 
 
-def _embed_source(inc: "Incident") -> str:
-    """Produce the text that represents an incident in the vector store.
+def _embed_source(inc: BaseModel) -> str:
+    """Produce the text that represents a session in the vector store.
 
-    Uses query only so that ``find_similar(query=inc.query)`` retrieves the
-    same vector (enabling self-match and cross-incident similarity by query
-    semantics, regardless of how the summary evolves).
+    Uses ``query`` (when present on the state subclass) so that
+    ``find_similar(query=inc.query)`` retrieves the same vector. Bare
+    ``Session`` instances without a ``query`` attribute fall through to
+    an empty string and are not vectorised — apps that want vector
+    similarity must extend ``Session`` with a ``query``-shaped field.
     """
-    return (inc.query or "").strip()
+    return (getattr(inc, "query", "") or "").strip()
 
 
 def _embed_source_from_row(row: "IncidentRow") -> str:
@@ -1096,38 +2476,71 @@ def _deserialize_resolution(raw: Optional[str]):
         return raw
 
 
-class IncidentRepository:
-    """SQLAlchemy-backed Incident store. Drop-in for the old ``IncidentStore``.
+class SessionStore(Generic[StateT]):
+    """Active session/incident lifecycle store, parametrised on ``StateT``.
+
+    Owns CRUD on the row schema plus the vector write-through. Read-only
+    similarity search lives in ``HistoryStore``.
 
     Threading note: methods open short-lived sessions; safe for the
     orchestrator's coarse-grained concurrency model.
+
+    The ``state_cls`` ctor argument controls row->model hydration. Default
+    is :class:`runtime.state.Session` (the framework base). Apps inject
+    their own ``Session`` subclass (e.g. ``IncidentState``) via
+    ``RuntimeConfig.state_class`` to surface domain-specific fields.
     """
 
     def __init__(
         self,
         *,
         engine: Engine,
+        state_cls: Type[StateT] = Session,  # type: ignore[assignment]
         embedder: Optional[Embeddings] = None,
         vector_store: Optional[VectorStore] = None,
         vector_path: Optional[str] = None,
         vector_index_name: str = "incidents",
         distance_strategy: str = "cosine",
-        similarity_threshold: float = 0.85,
-        severity_aliases: Optional[dict[str, str]] = None,
     ) -> None:
         self.engine = engine
+        self._state_cls = state_cls
         self.embedder = embedder
         self.vector_store = vector_store
         self.vector_path = vector_path
         self.vector_index_name = vector_index_name
         self.distance_strategy = distance_strategy
-        self.similarity_threshold = similarity_threshold
-        self.severity_aliases = severity_aliases or {}
 
     # ---------- ID minting ----------
-    def _next_id(self, session: Session) -> str:
-        prefix = f"INC-{_today_str()}-"
-        like = f"{prefix}%"
+    def _next_id(self, session: SqlSession) -> str:
+        """Mint a new session id via ``state_cls.id_format(seq=...)``.
+
+        P8-C: the per-app id format lives on the ``Session`` subclass so
+        each app picks its own prefix (``INC-`` for incidents, ``CR-``
+        for code-review, anything else custom apps want). The store still
+        owns the monotonic sequence — it scans for prior rows whose id
+        starts with the same ``PREFIX-YYYYMMDD-`` stem and returns
+        ``max(seq) + 1``.
+        """
+        # Probe today's prefix by asking the state class to format seq=1
+        # and stripping the ``-001`` suffix. Apps that override
+        # ``id_format`` to return a non-``PREFIX-YYYYMMDD-NNN`` shape
+        # (e.g. opaque ULIDs) fall through to the simple count path
+        # below.
+        sample = self._state_cls.id_format(seq=1)
+        m = _SESSION_ID_RE.match(sample)
+        if m is None:
+            # Custom format — count all rows as the sequence base. Apps
+            # that want collision-free ids should mint ULIDs in
+            # ``id_format`` and ignore ``seq``.
+            count = session.execute(
+                select(IncidentRow.id)
+            ).scalars().all()
+            return self._state_cls.id_format(seq=len(count) + 1)
+
+        # Extract the ``PREFIX-YYYYMMDD-`` stem (everything up to and
+        # including the second hyphen).
+        stem = sample.rsplit("-", 1)[0] + "-"
+        like = f"{stem}%"
         rows = session.execute(
             select(IncidentRow.id).where(IncidentRow.id.like(like))
         ).scalars().all()
@@ -1137,13 +2550,13 @@ class IncidentRepository:
                 max_seq = max(max_seq, int(r.rsplit("-", 1)[1]))
             except (ValueError, IndexError):
                 continue
-        return f"{prefix}{max_seq + 1:03d}"
+        return self._state_cls.id_format(seq=max_seq + 1)
 
     # ---------- public API ----------
     def create(self, *, query: str, environment: str,
                reporter_id: str = "user-mock",
-               reporter_team: str = "platform") -> Incident:
-        with Session(self.engine) as session:
+               reporter_team: str = "platform") -> StateT:
+        with SqlSession(self.engine) as session:
             now = _now()
             inc_id = self._next_id(session)
             row = IncidentRow(
@@ -1169,24 +2582,24 @@ class IncidentRepository:
         self._add_vector(inc)
         return inc
 
-    def load(self, incident_id: str) -> Incident:
-        if not _INC_ID_RE.match(incident_id):
+    def load(self, incident_id: str) -> StateT:
+        if not _SESSION_ID_RE.match(incident_id):
             raise ValueError(
-                f"Invalid incident id {incident_id!r}; expected INC-YYYYMMDD-NNN"
+                f"Invalid incident id {incident_id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
-        with Session(self.engine) as session:
+        with SqlSession(self.engine) as session:
             row = session.get(IncidentRow, incident_id)
             if row is None:
                 raise FileNotFoundError(incident_id)
             return self._row_to_incident(row)
 
-    def save(self, incident: Incident) -> None:
-        if not _INC_ID_RE.match(incident.id):
+    def save(self, incident: StateT) -> None:
+        if not _SESSION_ID_RE.match(incident.id):
             raise ValueError(
-                f"Invalid incident id {incident.id!r}; expected INC-YYYYMMDD-NNN"
+                f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         incident.updated_at = _iso(_now())
-        with Session(self.engine) as session:
+        with SqlSession(self.engine) as session:
             existing = session.get(IncidentRow, incident.id)
             prior_text = _embed_source_from_row(existing) if existing is not None else ""
             data = self._incident_to_row_dict(incident)
@@ -1198,8 +2611,8 @@ class IncidentRepository:
             session.commit()
         self._refresh_vector(incident, prior_text=prior_text)
 
-    def delete(self, incident_id: str) -> Incident:
-        with Session(self.engine) as session:
+    def delete(self, incident_id: str) -> StateT:
+        with SqlSession(self.engine) as session:
             row = session.get(IncidentRow, incident_id)
             if row is None:
                 raise FileNotFoundError(incident_id)
@@ -1211,8 +2624,8 @@ class IncidentRepository:
             session.refresh(row)
             return self._row_to_incident(row)
 
-    def list_all(self, *, include_deleted: bool = False) -> list[Incident]:
-        with Session(self.engine) as session:
+    def list_all(self, *, include_deleted: bool = False) -> list[StateT]:
+        with SqlSession(self.engine) as session:
             stmt = select(IncidentRow)
             if not include_deleted:
                 stmt = stmt.where(IncidentRow.deleted_at.is_(None))
@@ -1220,16 +2633,91 @@ class IncidentRepository:
             return [self._row_to_incident(r) for r in rows]
 
     def list_recent(self, limit: int = 20, *,
-                    include_deleted: bool = False) -> list[Incident]:
-        with Session(self.engine) as session:
+                    include_deleted: bool = False,
+                    include_duplicates: bool = False) -> list[StateT]:
+        """Most-recent sessions first.
+
+        P7-G: ``include_duplicates`` defaults to ``False`` so the main
+        UI list stays clean of the long tail of dedup'd sessions. The UI
+        opts in via ``include_duplicates=True`` to render the
+        collapsed-duplicates row.
+        """
+        with SqlSession(self.engine) as session:
             stmt = select(IncidentRow)
             if not include_deleted:
                 stmt = stmt.where(IncidentRow.deleted_at.is_(None))
+            if not include_duplicates:
+                stmt = stmt.where(IncidentRow.status != "duplicate")
             stmt = stmt.order_by(
                 desc(IncidentRow.created_at), desc(IncidentRow.id)
             ).limit(limit)
             rows = session.execute(stmt).scalars().all()
             return [self._row_to_incident(r) for r in rows]
+
+    def list_children(self, parent_session_id: str) -> list[StateT]:
+        """Return all sessions whose ``parent_session_id`` equals the given id.
+
+        P7-G: powers the parent-session detail pane "children" section.
+        Soft-deleted children are excluded; ordering is oldest-first so
+        the UI shows them in the order they were flagged.
+        """
+        with SqlSession(self.engine) as session:
+            stmt = (
+                select(IncidentRow)
+                .where(IncidentRow.parent_session_id == parent_session_id)
+                .where(IncidentRow.deleted_at.is_(None))
+                .order_by(IncidentRow.created_at, IncidentRow.id)
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [self._row_to_incident(r) for r in rows]
+
+    def un_duplicate(self, session_id: str, *,
+                     retracted_by: str | None = None,
+                     note: str | None = None) -> StateT:
+        """Retract a duplicate flag (P7-H).
+
+        Behaviour (one transaction):
+          * Loads the row; raises ``FileNotFoundError`` if missing.
+          * Raises ``ValueError`` if ``status != "duplicate"`` so the
+            HTTP layer can return ``409 Conflict``.
+          * Captures ``parent_session_id`` as ``original_match_id``.
+          * Sets ``status="new"`` and clears ``parent_session_id`` /
+            ``dedup_rationale``.
+          * Inserts a row in ``dedup_retractions`` for the audit trail.
+
+        Idempotent at the boundary: a second call on the same id raises
+        ``ValueError`` (the row is no longer a duplicate). The retraction
+        does **not** auto-rerun the agent graph — operators trigger that
+        explicitly.
+        """
+        # Imported here so the storage layer doesn't take a hard
+        # import-time dependency on the audit table for callers that
+        # never invoke retraction.
+
+        with SqlSession(self.engine) as session:
+            row = session.get(IncidentRow, session_id)
+            if row is None:
+                raise FileNotFoundError(session_id)
+            if row.status != "duplicate":
+                raise ValueError(
+                    f"session {session_id!r} is not a duplicate "
+                    f"(status={row.status!r})"
+                )
+            original_match_id = row.parent_session_id or ""
+            row.status = "new"
+            row.parent_session_id = None
+            row.dedup_rationale = None
+            row.updated_at = _now()
+            session.add(DedupRetractionRow(
+                session_id=session_id,
+                retracted_at=_now(),
+                retracted_by=retracted_by,
+                original_match_id=original_match_id,
+                note=note,
+            ))
+            session.commit()
+            session.refresh(row)
+            return self._row_to_incident(row)
 
     # ---------- vector helpers ----------
     def _persist_vector(self) -> None:
@@ -1248,7 +2736,7 @@ class IncidentRepository:
             index_name=self.vector_index_name,
         )
 
-    def _add_vector(self, inc: "Incident") -> None:
+    def _add_vector(self, inc: BaseModel) -> None:
         if self.vector_store is None or self.embedder is None:
             return
         text = _embed_source(inc)
@@ -1261,7 +2749,7 @@ class IncidentRepository:
         )
         self._persist_vector()
 
-    def _refresh_vector(self, inc: "Incident", *, prior_text: str) -> None:
+    def _refresh_vector(self, inc: BaseModel, *, prior_text: str) -> None:
         if self.vector_store is None or self.embedder is None:
             return
         text = _embed_source(inc)
@@ -1277,72 +2765,48 @@ class IncidentRepository:
         )
         self._persist_vector()
 
-    # ---------- similarity search ----------
-    def find_similar(
-        self, *, query: str, environment: str,
-        status_filter: str = "resolved",
-        threshold: Optional[float] = None,
-        limit: int = 5,
-    ) -> list[tuple[Incident, float]]:
-        """Return up to ``limit`` similar resolved incidents for the same env.
-
-        Vector path: uses the configured VectorStore when both vector_store
-        and embedder are present. Falls back to keyword similarity otherwise.
-        """
-        if self.vector_store is None or self.embedder is None:
-            return self._keyword_similar(
-                query=query, environment=environment,
-                status_filter=status_filter,
-                threshold=threshold, limit=limit,
-            )
-        threshold = self.similarity_threshold if threshold is None else threshold
-
-        vec = self.embedder.embed_query(query)
-        raw = self.vector_store.similarity_search_with_score_by_vector(vec, k=limit * 4)
-        out: list[tuple[Incident, float]] = []
-        for doc, distance in raw:
-            score = distance_to_similarity(float(distance), self.distance_strategy)
-            if score < threshold:
-                continue
-            inc_id = doc.metadata.get("id")
-            if inc_id is None:
-                continue
-            try:
-                inc = self.load(inc_id)
-            except (FileNotFoundError, ValueError):
-                continue
-            if (inc.environment != environment
-                    or inc.status != status_filter
-                    or inc.deleted_at is not None):
-                continue
-            out.append((inc, score))
-            if len(out) >= limit:
-                break
-        return out
-
-    def _keyword_similar(self, *, query, environment, status_filter, threshold, limit):
-
-        candidates_inc = [
-            i for i in self.list_all()
-            if i.environment == environment
-            and i.status == status_filter
-            and i.deleted_at is None
-        ]
-        candidates = [
-            {"id": i.id, "text": f"{i.query} {i.summary} {' '.join(i.tags)}",
-             "incident": i}
-            for i in candidates_inc
-        ]
-        results = find_similar(
-            query=query, candidates=candidates, text_field="text",
-            scorer=KeywordSimilarity(),
-            threshold=self.similarity_threshold if threshold is None else threshold,
-            limit=limit,
-        )
-        return [(c["incident"], float(s)) for c, s in results]
-
     # ---------- mapping helpers ----------
-    def _row_to_incident(self, row: IncidentRow) -> Incident:
+    #
+    # P8-J: round-trip is driven by ``state_cls.model_fields`` so any
+    # ``Session`` subclass — incident-shaped, code-review-shaped, or
+    # whatever a future app brings — round-trips losslessly. The
+    # ``IncidentRow`` schema keeps its incident-shaped typed columns
+    # for back-compat indexing (``query``, ``environment``,
+    # ``severity``, ...); fields the row schema doesn't have a column
+    # for land in the ``extra_fields`` JSON column on save and merge
+    # back into the model on load.
+
+    # Fields handled out-of-band by the row<->model converters; do not
+    # send these to ``extra_fields`` on save.
+    _STATE_TOP_LEVEL_FIELDS = frozenset({
+        "id", "status", "created_at", "updated_at", "deleted_at",
+        "agents_run", "tool_calls", "findings", "token_usage",
+        "pending_intervention", "user_inputs",
+        "parent_session_id", "dedup_rationale",
+    })
+
+    # Incident-shaped typed columns the row carries for back-compat
+    # indexing. Apps whose state declares any of these get full
+    # round-trip identity through the typed column; apps without them
+    # leave the column at its DB default (empty string / NULL).
+    _ROW_TYPED_DOMAIN_COLUMNS = frozenset({
+        "query", "environment", "summary", "tags", "severity",
+        "category", "matched_prior_inc", "resolution",
+    })
+
+    def _row_to_incident(self, row: IncidentRow) -> StateT:
+        """Hydrate ``row`` into ``self._state_cls``.
+
+        Fields are pulled from typed columns when the state class
+        declares them; everything else is merged in from the
+        ``extra_fields`` JSON bag. ``reporter`` is reconstituted from
+        the typed ``reporter_id`` / ``reporter_team`` columns *only* when
+        the state class has a ``reporter`` field — otherwise it's
+        omitted so apps without a reporter concept (code-review) don't
+        receive an unexpected attribute.
+        """
+        model_fields = self._state_cls.model_fields
+
         agents_run = [AgentRun.model_validate(a) for a in (row.agents_run or [])]
         tool_calls = [ToolCall.model_validate(t) for t in (row.tool_calls or [])]
         token_usage = TokenUsage(
@@ -1350,49 +2814,122 @@ class IncidentRepository:
             output_tokens=row.output_tokens,
             total_tokens=row.total_tokens,
         )
-        return Incident(
-            id=row.id,
-            status=row.status,
-            created_at=_iso(row.created_at),
-            updated_at=_iso(row.updated_at),
-            deleted_at=_iso(row.deleted_at) if row.deleted_at else None,
-            query=row.query,
-            environment=row.environment,
-            reporter=Reporter(id=row.reporter_id, team=row.reporter_team),
-            summary=row.summary or "",
-            tags=list(row.tags or []),
-            severity=row.severity,
-            category=row.category,
-            matched_prior_inc=row.matched_prior_inc,
-            agents_run=agents_run,
-            tool_calls=tool_calls,
-            findings=dict(row.findings or {}),
-            resolution=_deserialize_resolution(row.resolution),
-            token_usage=token_usage,
-            pending_intervention=row.pending_intervention,
-            user_inputs=list(row.user_inputs or []),
-        )
 
-    def _incident_to_row_dict(self, inc: Incident) -> dict:
+        kwargs: dict[str, object] = {
+            "id": row.id,
+            "status": row.status,
+            "created_at": _iso(row.created_at),
+            "updated_at": _iso(row.updated_at),
+            "deleted_at": _iso(row.deleted_at) if row.deleted_at else None,
+            "agents_run": agents_run,
+            "tool_calls": tool_calls,
+            "findings": dict(row.findings or {}),
+            "token_usage": token_usage,
+            "pending_intervention": row.pending_intervention,
+            "user_inputs": list(row.user_inputs or []),
+            "parent_session_id": row.parent_session_id,
+            "dedup_rationale": row.dedup_rationale,
+        }
+
+        # Incident-shaped typed columns: include only fields the state
+        # class actually declares.
+        if "query" in model_fields:
+            kwargs["query"] = row.query
+        if "environment" in model_fields:
+            kwargs["environment"] = row.environment
+        if "reporter" in model_fields:
+            kwargs["reporter"] = {"id": row.reporter_id, "team": row.reporter_team}
+        if "summary" in model_fields:
+            kwargs["summary"] = row.summary or ""
+        if "tags" in model_fields:
+            kwargs["tags"] = list(row.tags or [])
+        if "severity" in model_fields:
+            kwargs["severity"] = row.severity
+        if "category" in model_fields:
+            kwargs["category"] = row.category
+        if "matched_prior_inc" in model_fields:
+            kwargs["matched_prior_inc"] = row.matched_prior_inc
+        if "resolution" in model_fields:
+            kwargs["resolution"] = _deserialize_resolution(row.resolution)
+
+        # P8-J: merge in any non-typed-column fields from ``extra_fields``.
+        # Pydantic's ``extra='ignore'`` will drop any keys the state
+        # class doesn't declare (e.g. legacy fields written by an older
+        # binary), keeping the round-trip robust.
+        extra = row.extra_fields or {}
+        for k, v in extra.items():
+            if k in self._STATE_TOP_LEVEL_FIELDS:
+                continue  # handled above
+            kwargs[k] = v
+
+        return self._state_cls(**kwargs)
+
+    def _incident_to_row_dict(self, inc: StateT) -> dict:
+        """Serialize a state instance into a row-shaped dict.
+
+        Fields with a typed column on ``IncidentRow`` are written there;
+        everything else (any field declared by the state class but not
+        present on the row schema) lands in ``extra_fields`` JSON.
+        """
+        model_fields = type(inc).model_fields
+        # Apps may pass either a ``Session`` subclass with the full
+        # incident-shaped fields (round-trip identity) or a narrower
+        # state. Use ``getattr`` so narrower states default safely.
+        reporter = getattr(inc, "reporter", None)
+        reporter_id = getattr(reporter, "id", None) if reporter is not None else None
+        reporter_team = getattr(reporter, "team", None) if reporter is not None else None
+        resolution = getattr(inc, "resolution", None)
+
+        # Build ``extra_fields``: every state-class field that is *not*
+        # a top-level Session field and *not* one of the incident-shaped
+        # typed columns ends up here as JSON-safe dict.
+        extra: dict[str, object] = {}
+        for fname in model_fields:
+            if fname in self._STATE_TOP_LEVEL_FIELDS:
+                continue
+            if fname in self._ROW_TYPED_DOMAIN_COLUMNS:
+                continue
+            if fname == "reporter":
+                # Already projected onto reporter_id / reporter_team
+                # typed columns above; do not also persist to extra.
+                continue
+            value = getattr(inc, fname, None)
+            # Pydantic v2: prefer model_dump for nested BaseModels and
+            # collections-of-BaseModels so the JSON column gets a
+            # JSON-safe representation.
+            if isinstance(value, BaseModel):
+                extra[fname] = value.model_dump(mode="json")
+            elif isinstance(value, list) and value and isinstance(value[0], BaseModel):
+                extra[fname] = [v.model_dump(mode="json") for v in value]
+            elif isinstance(value, dict):
+                # Convert any embedded BaseModel values to JSON-safe form
+                # via model_dump where appropriate; otherwise pass through.
+                extra[fname] = {
+                    k: (v.model_dump(mode="json") if isinstance(v, BaseModel) else v)
+                    for k, v in value.items()
+                }
+            else:
+                extra[fname] = value
+
         return {
             "id": inc.id,
             "status": inc.status,
             "created_at": _parse_iso(inc.created_at),
             "updated_at": _parse_iso(inc.updated_at),
             "deleted_at": _parse_iso(inc.deleted_at) if inc.deleted_at else None,
-            "query": inc.query,
-            "environment": inc.environment,
-            "reporter_id": inc.reporter.id,
-            "reporter_team": inc.reporter.team,
-            "summary": inc.summary or "",
-            "severity": inc.severity,
-            "category": inc.category,
-            "matched_prior_inc": inc.matched_prior_inc,
+            "query": getattr(inc, "query", "") or "",
+            "environment": getattr(inc, "environment", "") or "",
+            "reporter_id": reporter_id or "",
+            "reporter_team": reporter_team or "",
+            "summary": getattr(inc, "summary", "") or "",
+            "severity": getattr(inc, "severity", None),
+            "category": getattr(inc, "category", None),
+            "matched_prior_inc": getattr(inc, "matched_prior_inc", None),
             "resolution": (
-                inc.resolution if inc.resolution is None or isinstance(inc.resolution, str)
-                else json.dumps(inc.resolution)
+                resolution if resolution is None or isinstance(resolution, str)
+                else json.dumps(resolution)
             ),
-            "tags": list(inc.tags),
+            "tags": list(getattr(inc, "tags", []) or []),
             "agents_run": [a.model_dump(mode="json") for a in inc.agents_run],
             "tool_calls": [t.model_dump(mode="json") for t in inc.tool_calls],
             "findings": dict(inc.findings),
@@ -1401,149 +2938,16 @@ class IncidentRepository:
             "input_tokens": inc.token_usage.input_tokens,
             "output_tokens": inc.token_usage.output_tokens,
             "total_tokens": inc.token_usage.total_tokens,
+            # P7-A/E: dedup linkage + rationale columns. ``getattr`` so
+            # bare ``Session`` instances (without the framework's P7
+            # fields) round-trip with NULL.
+            "parent_session_id": getattr(inc, "parent_session_id", None),
+            "dedup_rationale": getattr(inc, "dedup_rationale", None),
+            # P8-J: everything not covered by a typed column.
+            "extra_fields": extra or None,
         }
 
-
-# ====== module: orchestrator/mcp_servers/incident.py ======
-
-_DEFAULT_SEVERITY_ALIASES: dict[str, str] = {
-    "sev1": "high", "sev2": "high", "p1": "high", "p2": "high",
-    "critical": "high", "urgent": "high", "high": "high",
-    "sev3": "medium", "p3": "medium", "moderate": "medium", "medium": "medium",
-    "sev4": "low", "p4": "low", "info": "low", "informational": "low",
-    "low": "low",
-}
-
-
-def normalize_severity(
-    value: str | None,
-    aliases: dict[str, str] | None = None,
-) -> str | None:
-    if value is None:
-        return None
-    lowered = value.strip().lower()
-    if aliases is None:
-        return lowered
-    return aliases.get(lowered, value)
-
-
-@dataclass
-class IncidentMCPServer:
-    """FastMCP server bound to a single :class:`IncidentRepository`."""
-    repository: IncidentRepository | None = None
-    severity_aliases: dict[str, str] = field(
-        default_factory=lambda: dict(_DEFAULT_SEVERITY_ALIASES)
-    )
-    mcp: FastMCP = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.mcp = FastMCP("incident_management")
-        self.mcp.tool(name="lookup_similar_incidents")(self._tool_lookup_similar_incidents)
-        self.mcp.tool(name="create_incident")(self._tool_create_incident)
-        self.mcp.tool(name="update_incident")(self._tool_update_incident)
-
-    def configure(
-        self, *,
-        repository: IncidentRepository,
-        severity_aliases: dict[str, str] | None = None,
-    ) -> None:
-        self.repository = repository
-        if severity_aliases is not None:
-            self.severity_aliases = severity_aliases
-
-    def _require_repo(self) -> IncidentRepository:
-        if self.repository is None:
-            raise RuntimeError(
-                "incident_management server not initialized — "
-                "call configure() (or the module-level set_state) first"
-            )
-        return self.repository
-
-    async def _tool_lookup_similar_incidents(self, query: str, environment: str) -> dict:
-        """Search past resolved INCs for similar issues. Returns top 5 by similarity score."""
-        repo = self._require_repo()
-        hits = repo.find_similar(query=query, environment=environment, limit=5)
-        return {"matches": [
-            {"id": i.id, "summary": i.summary, "resolution": i.resolution,
-             "score": round(s, 3)}
-            for i, s in hits
-        ]}
-
-    async def _tool_create_incident(self, query: str, environment: str,
-                                    reporter_id: str = "user-mock",
-                                    reporter_team: str = "platform") -> dict:
-        """Create a new INC ticket and persist it."""
-        inc = self._require_repo().create(query=query, environment=environment,
-                                          reporter_id=reporter_id,
-                                          reporter_team=reporter_team)
-        return inc.model_dump()
-
-    async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
-        """Apply a flat patch to an INC.
-
-        Allowed keys:
-          - status, severity, category, summary, tags, matched_prior_inc, resolution
-          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``.
-        """
-        repo = self._require_repo()
-        inc = repo.load(incident_id)
-        if "status" in patch:
-            inc.status = patch["status"]
-        if "severity" in patch:
-            inc.severity = normalize_severity(patch["severity"], self.severity_aliases)
-        if "category" in patch:
-            inc.category = patch["category"]
-        if "summary" in patch:
-            inc.summary = patch["summary"]
-        if "tags" in patch:
-            inc.tags = list(patch["tags"])
-        if "matched_prior_inc" in patch:
-            inc.matched_prior_inc = patch["matched_prior_inc"]
-        if "resolution" in patch:
-            inc.resolution = patch["resolution"]
-        for key, value in patch.items():
-            if key.startswith("findings_"):
-                inc.findings[key[len("findings_"):]] = value
-        repo.save(inc)
-        return inc.model_dump()
-
-
-# ---------------------------------------------------------------------------
-# Module-level default server (back-compat for the MCP loader path).
-# The MCP loader imports ``mcp`` from this module by name; this keeps that
-# contract working unchanged.
-# ---------------------------------------------------------------------------
-
-_default_server = IncidentMCPServer()
-mcp = _default_server.mcp
-
-
-def set_state(*, repository: IncidentRepository,
-              severity_aliases: dict[str, str] | None = None) -> None:
-    """Configure the default IncidentMCPServer instance."""
-    _default_server.configure(
-        repository=repository,
-        severity_aliases=severity_aliases,
-    )
-
-
-# Direct-call shims kept for tests that import these names.
-async def lookup_similar_incidents(query: str, environment: str) -> dict:
-    return await _default_server._tool_lookup_similar_incidents(query, environment)
-
-
-async def create_incident(query: str, environment: str,
-                          reporter_id: str = "user-mock",
-                          reporter_team: str = "platform") -> dict:
-    return await _default_server._tool_create_incident(
-        query, environment, reporter_id, reporter_team
-    )
-
-
-async def update_incident(incident_id: str, patch: dict) -> dict:
-    return await _default_server._tool_update_incident(incident_id, patch)
-
-# ====== module: orchestrator/mcp_servers/observability.py ======
+# ====== module: runtime/mcp_servers/observability.py ======
 
 mcp = FastMCP("observability")
 
@@ -1614,7 +3018,7 @@ async def check_deployment_history(environment: str, hours: int = 24) -> dict:
     ]
     return {"environment": environment, "window_hours": hours, "deployments": deployments}
 
-# ====== module: orchestrator/mcp_servers/remediation.py ======
+# ====== module: runtime/mcp_servers/remediation.py ======
 
 mcp = FastMCP("remediation")
 
@@ -1660,7 +3064,7 @@ async def notify_oncall(incident_id: str, message: str) -> dict:
         "message": message,
     }
 
-# ====== module: orchestrator/mcp_servers/user_context.py ======
+# ====== module: runtime/mcp_servers/user_context.py ======
 
 mcp = FastMCP("user_context")
 
@@ -1676,7 +3080,7 @@ async def get_user_context(user_id: str) -> dict:
         "timezone": "UTC",
     }
 
-# ====== module: orchestrator/mcp_loader.py ======
+# ====== module: runtime/mcp_loader.py ======
 
 @dataclass
 class ToolEntry:
@@ -1769,6 +3173,43 @@ class ToolRegistry:
         return out
 
 
+def build_fastmcp_client(server_cfg: MCPServerConfig):
+    """Build an un-entered FastMCP ``Client`` for ``server_cfg``.
+
+    Returned client is not yet attached to any exit stack — the caller is
+    responsible for ``await stack.enter_async_context(client)``. Used by
+    :class:`runtime.service.OrchestratorService` to populate the
+    process-singleton MCP client pool (P3-C); the legacy per-orchestrator
+    loaders below stay as-is.
+    """
+    from fastmcp import Client
+    if server_cfg.transport == "in_process":
+        if server_cfg.module is None:
+            raise ValueError(
+                f"in_process server '{server_cfg.name}' missing 'module'"
+            )
+        mod = importlib.import_module(server_cfg.module)
+        fmcp = getattr(mod, "mcp", None)
+        if fmcp is None:
+            raise ValueError(
+                f"Module {server_cfg.module} has no 'mcp' (FastMCP instance)"
+            )
+        return Client(fmcp)
+    if server_cfg.transport in ("http", "sse"):
+        if not server_cfg.url:
+            raise ValueError(f"remote server '{server_cfg.name}' missing 'url'")
+        return Client(server_cfg.url, headers=server_cfg.headers or None)
+    if server_cfg.transport == "stdio":
+        if not server_cfg.command:
+            raise ValueError(
+                f"stdio server '{server_cfg.name}' missing 'command'"
+            )
+        return Client(
+            {"command": server_cfg.command[0], "args": server_cfg.command[1:]}
+        )
+    raise ValueError(f"Unknown transport: {server_cfg.transport}")
+
+
 async def _load_in_process(server_cfg: MCPServerConfig,
                            stack: AsyncExitStack) -> list[BaseTool]:
     if server_cfg.module is None:
@@ -1839,7 +3280,7 @@ async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
             ))
     return registry
 
-# ====== module: orchestrator/graph.py ======
+# ====== module: runtime/graph.py ======
 
 logger = logging.getLogger(__name__)
 
@@ -1935,10 +3376,16 @@ def _coerce_signal(raw, valid_signals: frozenset[str] | None = None) -> str | No
 
 
 class GraphState(TypedDict, total=False):
-    incident: Incident
+    session: Session
     next_route: str | None
     last_agent: str | None
     gated_target: str | None  # set by gate node; the downstream target if gate passes
+    # P6-D: depth counter for supervisor recursion (R1). The supervisor
+    # node bumps it on entry and aborts at ``skill.max_dispatch_depth``.
+    # Carrying it on graph state — rather than stashing it on the
+    # session — keeps audit fields off the session and the depth check
+    # cheap (no store reload).
+    dispatch_depth: int | None
     error: str | None
 
 
@@ -1957,7 +3404,7 @@ def route_from_skill(skill: Skill, signal: str) -> str:
 class AgentRunRecorder:
     """Helper to capture an agent's run + tool calls into the incident."""
 
-    def __init__(self, *, agent: str, incident: Incident):
+    def __init__(self, *, agent: str, incident: Session):
         self.agent = agent
         self.incident = incident
         self._started_at: str | None = None
@@ -2015,28 +3462,15 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     raise last_exc or RuntimeError("retry exhausted with no attempts")  # pragma: no cover
 
 
-def _format_agent_input(incident: Incident) -> str:
+def _format_agent_input(incident: Session) -> str:
     """Build the human-message preamble each agent receives.
 
-    Findings are now a free-form mapping (one entry per upstream agent),
-    so emit one ``Findings (<agent>): <value>`` line per recorded finding
-    instead of pinning the prompt to two specific agent identities.
+    Delegates to ``Session.to_agent_input`` so each app subclass owns the
+    domain-shape of its prompt. The framework default surfaces only the
+    session id + status; ``IncidentState`` and ``CodeReviewState``
+    override with their respective shapes.
     """
-    base = (
-        f"Incident {incident.id}\n"
-        f"Environment: {incident.environment}\n"
-        f"Query: {incident.query}\n"
-        f"Status: {incident.status}\n"
-    )
-    for agent_key, finding in incident.findings.items():
-        base += f"Findings ({agent_key}): {finding}\n"
-    if incident.user_inputs:
-        bullets = "\n".join(f"- {ui}" for ui in incident.user_inputs)
-        base += (
-            "\nUser-provided context (appended via intervention):\n"
-            f"{bullets}\n"
-        )
-    return base
+    return incident.to_agent_input()
 
 
 def _merge_patch_metadata(
@@ -2066,7 +3500,7 @@ def _merge_patch_metadata(
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
-    incident: Incident,
+    incident: Session,
     ts: str,
     valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
@@ -2104,7 +3538,7 @@ def _harvest_tool_calls_and_patches(
     return agent_confidence, agent_rationale, agent_signal
 
 
-def _pair_tool_responses(messages: list, incident: Incident) -> None:
+def _pair_tool_responses(messages: list, incident: Session) -> None:
     """Match ToolMessage responses back to their corresponding ToolCall entries."""
     for msg in messages:
         if msg.__class__.__name__ == "ToolMessage":
@@ -2142,8 +3576,8 @@ def _handle_agent_failure(
     started_at: str,
     exc: Exception,
     inc_id: str,
-    store: "IncidentRepository",
-    fallback: "Incident",
+    store: "SessionStore",
+    fallback: "Session",
 ) -> dict:
     """Reload incident (absorbing partial tool writes), stamp a failure AgentRun,
     persist, and return the error state dict for the LangGraph node.
@@ -2162,13 +3596,13 @@ def _handle_agent_failure(
         token_usage=TokenUsage(),
     ))
     store.save(incident)
-    return {"incident": incident, "next_route": None,
+    return {"session": incident, "next_route": None,
             "last_agent": skill_name, "error": str(exc)}
 
 
 def _record_success_run(
     *,
-    incident: "Incident",
+    incident: "Session",
     skill_name: str,
     started_at: str,
     final_text: str,
@@ -2176,7 +3610,7 @@ def _record_success_run(
     confidence: float | None,
     rationale: str | None,
     signal: str | None,
-    store: "IncidentRepository",
+    store: "SessionStore",
 ) -> None:
     """Append the success-path AgentRun, update the incident's running token
     totals, and persist. Mutates ``incident`` in place."""
@@ -2200,9 +3634,10 @@ def make_agent_node(
     skill: Skill,
     llm: BaseChatModel,
     tools: list[BaseTool],
-    decide_route: Callable[[Incident], str],
-    store: IncidentRepository,
+    decide_route: Callable[[Session], str],
+    store: SessionStore,
     valid_signals: frozenset[str] | None = None,
+    gateway_cfg: GatewayConfig | None = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -2210,13 +3645,36 @@ def make_agent_node(
     (``cfg.orchestrator.signals``). When omitted, the legacy
     ``{success, failed, needs_input}`` default is used so older callers and
     tests keep working.
+
+    ``gateway_cfg`` (P4-F) is the optional risk-rated tool gateway config.
+    When supplied, every ``BaseTool`` in ``tools`` is wrapped via
+    :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so the
+    closure captures the live ``Session`` per agent invocation — the
+    R2 mitigation in the Phase-4 plan. When ``None``, tools are passed
+    through untouched (back-compat).
     """
-    agent_executor = create_react_agent(llm, tools, prompt=skill.system_prompt)
 
     async def node(state: GraphState) -> dict:
-        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
+        incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # P4-F: wrap tools per-invocation so each wrap closes over the
+        # live ``Session`` for this run (mitigation R2 in the Phase-4
+        # plan). When the gateway is unconfigured, the original tools
+        # pass through untouched and ``create_react_agent`` sees the
+        # exact same surface as pre-Phase-4.
+        if gateway_cfg is not None:
+            run_tools = [
+                wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
+                          agent_name=skill.name)
+                for t in tools
+            ]
+        else:
+            run_tools = tools
+        agent_executor = create_react_agent(
+            llm, run_tools, prompt=skill.system_prompt,
+        )
 
         try:
             result = await _ainvoke_with_retry(
@@ -2258,13 +3716,13 @@ def make_agent_node(
         )
         next_route_signal = decide_route(incident)
         next_node = route_from_skill(skill, next_route_signal)
-        return {"incident": incident, "next_route": next_node,
+        return {"session": incident, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
     return node
 
 
-def _decide_from_signal(inc: Incident) -> str:
+def _decide_from_signal(inc: Session) -> str:
     """Return the latest agent's emitted signal, or "default" if absent.
 
     Agents emit one of {success, failed, needs_input} via the ``signal``
@@ -2290,7 +3748,7 @@ _DEFAULT_STUB_CANNED: dict[str, str] = {
 }
 
 
-def _latest_run_for(incident: Incident, agent_name: str | None):
+def _latest_run_for(incident: Session, agent_name: str | None):
     """Return the most recent ``AgentRun`` for ``agent_name``, or None.
 
     ``agent_name`` is whichever agent ran immediately before the gate,
@@ -2306,14 +3764,32 @@ def _latest_run_for(incident: Incident, agent_name: str | None):
     return None
 
 
-def make_gate_node(*, cfg: AppConfig, store: IncidentRepository):
+def make_gate_node(
+    *,
+    cfg: AppConfig,
+    store: SessionStore,
+    threshold: float | None = None,
+    teams: list[str] | None = None,
+):
     """Build the intervention gate node placed before a gated downstream.
 
     The gate evaluates the confidence of whichever agent ran immediately
     before it (``state["last_agent"]``). If that confidence is below the
-    configured threshold (or absent), the gate marks the incident
-    ``awaiting_input``, populates ``pending_intervention``, and routes
-    to END. Otherwise it routes to the gated target.
+    configured threshold (or absent), the gate persists a
+    ``pending_intervention`` payload on the Session row **and** raises
+    ``langgraph.types.interrupt(payload)``. The checkpointer captures
+    the suspended state; ``Orchestrator.resume_session`` resumes the
+    graph via ``Command(resume=user_input)``. On resume the node body
+    re-executes from the start, ``interrupt()`` returns the resume
+    value (instead of raising), the user input is appended to
+    ``session.user_inputs``, ``pending_intervention`` is cleared, and
+    execution falls through to the gated downstream.
+
+    The dual-write order is intentional: persist the row **before**
+    calling ``interrupt()`` so the Streamlit UI (which polls
+    ``Session.pending_intervention``) sees the pending state even on a
+    cold restart. Reversing the order would leave the UI blind to a
+    pending intervention captured only inside the LangGraph checkpoint.
 
     Implemented as a plain async coroutine (not via ``make_agent_node``)
     so it does not invoke an LLM — but it IS a real graph node, so
@@ -2322,12 +3798,29 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentRepository):
     The gate is fully agent-agnostic: any YAML route carrying
     ``gate: confidence`` causes the gate to evaluate the upstream agent
     named on that route, regardless of agent identity.
+
+    ``threshold`` and ``teams`` are the cross-cutting confidence cutoff
+    and escalation roster the gate exposes to the operator on
+    intervention. They are supplied by ``build_graph`` from the
+    orchestrator's resolved :class:`FrameworkAppConfig` so the gate is
+    completely free of any app-specific config import. When ``None``
+    (legacy callers / unit tests that build the gate directly), the
+    framework defaults are used (0.75 / empty roster).
     """
-    threshold = cfg.intervention.confidence_threshold
-    teams = list(cfg.intervention.escalation_teams)
+    if threshold is None:
+        threshold = FrameworkAppConfig().confidence_threshold
+    if teams is None:
+        teams = []
+    teams = list(teams)
 
     async def gate(state: GraphState) -> dict:
-        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies incident
+        # Imported lazily so unit tests that import graph.py without a
+        # checkpointer don't pay the import cost. ``interrupt`` raises
+        # ``GraphInterrupt`` on first execution and returns the resume
+        # value on subsequent executions of the same node.
+        from langgraph.types import interrupt
+
+        incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
         upstream = state.get("last_agent")
         # Capture the intended downstream target before we overwrite next_route.
         # The upstream agent set next_route to the gated target; we stash it in
@@ -2345,7 +3838,7 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentRepository):
             # Surface the upstream agent's own summary + rationale so the
             # human reviewer can decide what input to give without scrolling
             # through every step of the agents-run log.
-            incident.pending_intervention = {
+            payload = {
                 "reason": "low_confidence",
                 "confidence": upstream_conf,
                 "threshold": threshold,
@@ -2354,26 +3847,87 @@ def make_gate_node(*, cfg: AppConfig, store: IncidentRepository):
                 "rationale": upstream_run.confidence_rationale if upstream_run else "",
                 "options": ["resume_with_input", "escalate", "stop"],
                 "escalation_teams": teams,
+                "intended_target": intended_target,
             }
+            incident.pending_intervention = payload
+            # CRITICAL ORDERING: persist the Session row BEFORE calling
+            # ``interrupt()``. ``interrupt()`` raises ``GraphInterrupt`` on
+            # first execution; if we reversed the order the UI (which
+            # polls Session.pending_intervention) would never see the
+            # pending state. See plan R4 / "Streamlit hand-off".
             store.save(incident)
-            return {"incident": incident, "next_route": "__end__",
+            # First execution: this raises GraphInterrupt and the
+            # checkpointer captures the paused state.
+            # Resume: this returns the value supplied via
+            # ``Command(resume=...)``.
+            decision = interrupt(payload)
+            # Post-resume continuation. ``decision`` is whatever the
+            # caller passed to ``Command(resume=...)`` — typically the
+            # operator's free-text note (str) or a dict with an
+            # ``input`` key. Empty/None decisions are treated as a
+            # no-op (the gate still clears and falls through to the
+            # gated target — the orchestrator wraps non-text actions
+            # like ``stop``/``escalate`` outside the graph).
+            user_text: str | None = None
+            if isinstance(decision, str):
+                stripped = decision.strip()
+                if stripped:
+                    user_text = stripped
+            elif isinstance(decision, dict):
+                raw = decision.get("input")
+                if isinstance(raw, str) and raw.strip():
+                    user_text = raw.strip()
+            if user_text is not None:
+                incident.user_inputs.append(user_text)
+            incident.pending_intervention = None
+            incident.status = "in_progress"
+            store.save(incident)
+            return {"session": incident, "next_route": "default",
                     "gated_target": intended_target, "last_agent": "gate", "error": None}
         # Confidence met threshold — clear any stale intervention payload.
         if incident.pending_intervention is not None:
             incident.pending_intervention = None
             store.save(incident)
-        return {"incident": incident, "next_route": "default",
+        return {"session": incident, "next_route": "default",
                 "gated_target": intended_target, "last_agent": "gate", "error": None}
 
     return gate
 
 
-def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentRepository,
+def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
                        registry: ToolRegistry) -> dict:
-    """Materialize agent nodes from skills + registry. Reused by main + resume graphs."""
+    """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
+
+    P6-C: dispatches on ``skill.kind``:
+
+    * ``responsive`` — builds a ReAct LLM node via :func:`make_agent_node`
+      (today's path).
+    * ``supervisor`` — builds a no-LLM router node via
+      :func:`runtime.agents.supervisor.make_supervisor_node`. Supervisor
+      skills with ``dispatch_strategy=llm`` get a small LLM bound; rule
+      strategy uses ``None``.
+    * ``monitor``   — **skipped**: monitor skills run out-of-band under
+      :class:`runtime.agents.monitor.MonitorRunner`, not inside the
+      session graph.
+    """
+    # Local import — agents package depends on this module's helpers.
+
+
     valid_signals = frozenset(cfg.orchestrator.signals)
+    gateway_cfg = getattr(cfg.runtime, "gateway", None)
     nodes: dict = {}
     for agent_name, skill in skills.items():
+        kind = getattr(skill, "kind", "responsive")
+        if kind == "monitor":
+            # Monitors are not graph nodes; skip silently.
+            continue
+        if kind == "supervisor":
+            llm = None
+            if skill.dispatch_strategy == "llm":
+                llm = get_llm(cfg.llm, skill.model, role=agent_name)
+            nodes[agent_name] = make_supervisor_node(skill=skill, llm=llm)
+            continue
+        # Default / "responsive" path.
         if skill.stub_response is not None:
             stub_canned: dict[str, str] | None = {skill.name: skill.stub_response}
         elif agent_name in _DEFAULT_STUB_CANNED:
@@ -2392,6 +3946,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentRepositor
             skill=skill, llm=llm, tools=tools,
             decide_route=decide, store=store,
             valid_signals=valid_signals,
+            gateway_cfg=gateway_cfg,
         )
     return nodes
 
@@ -2399,8 +3954,8 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: IncidentRepositor
 def _make_router(gated_edges: dict[tuple[str, str], str]):
     """Build a state router that intercepts gated edges into the gate node.
 
-    Used by both ``build_graph`` and ``build_resume_graph`` — they share
-    the same routing semantics, so this factory eliminates duplication.
+    Used by ``build_graph`` to route an agent's outbound edges through
+    the gate when the corresponding ``RouteRule`` carries ``gate=...``.
     """
     def _router(state: GraphState):
         nr = state.get("next_route")
@@ -2445,8 +4000,10 @@ def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
     return edges
 
 
-async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentRepository,
-                      registry: ToolRegistry):
+async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
+                      registry: ToolRegistry,
+                      checkpointer=None,
+                      framework_cfg: FrameworkAppConfig | None = None):
     """Compile the main LangGraph from configured skills and routes.
 
     The entry agent is read from ``cfg.orchestrator.entry_agent``. Gate
@@ -2458,6 +4015,17 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentRepository
     :class:`Orchestrator`, which loads MCP tools into an :class:`AsyncExitStack`
     so the underlying FastMCP transports stay alive for the lifetime of the
     compiled graph.
+
+    ``checkpointer`` (P2-F/G) is an optional :class:`BaseCheckpointSaver`
+    that LangGraph uses for durable per-thread state. When ``None``, the
+    graph compiles without one (back-compat for the few callers that
+    build a graph outside the orchestrator, e.g. unit tests).
+
+    ``framework_cfg`` carries the cross-cutting confidence/escalation
+    knobs the gate node reads. When ``None`` (legacy / unit-test
+    callers that compile a graph without an orchestrator), the
+    runtime falls back to ``resolve_framework_app_config(None)`` which
+    yields a bare ``FrameworkAppConfig()``.
     """
     entry = cfg.orchestrator.entry_agent
     if entry not in skills:
@@ -2465,13 +4033,21 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentRepository
             f"orchestrator.entry_agent={entry!r} is not a known skill "
             f"(known: {sorted(skills.keys())})"
         )
+    if framework_cfg is None:
+        framework_cfg = resolve_framework_app_config(
+            getattr(cfg.runtime, "framework_app_config_path", None),
+        )
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
-    sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
+    sg.add_node("gate", make_gate_node(
+        cfg=cfg, store=store,
+        threshold=framework_cfg.confidence_threshold,
+        teams=list(framework_cfg.escalation_teams),
+    ))
 
     sg.set_entry_point(entry)
 
@@ -2507,87 +4083,1638 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: IncidentRepository
     else:
         sg.add_edge("gate", END)
 
-    return sg.compile()
+    return sg.compile(checkpointer=checkpointer) if checkpointer is not None else sg.compile()
 
+# ====== module: runtime/checkpointer_postgres.py ======
 
-async def build_resume_graph(*, cfg: AppConfig, skills: dict,
-                             store: IncidentRepository, registry: ToolRegistry):
-    """Compile a sub-graph that re-runs from the upstream end of whichever
-    gated edge the INC was awaiting input from.
+async def make_postgres_checkpointer(
+    url: str,
+) -> Tuple[BaseCheckpointSaver, Callable[[], Awaitable[None]]]:
+    """Build a Postgres checkpointer + async cleanup callable.
 
-    Supports any number of gated edges. The correct upstream agent is
-    determined at runtime from ``incident.pending_intervention["upstream_agent"]``
-    (stamped by the gate node). A lightweight dispatcher node is used as the
-    fixed entry point; it reads the upstream agent from state and sets
-    ``next_route`` so the shared router forwards execution to it.
+    The orchestrator runs in async mode, so we use the async variant
+    (:class:`AsyncPostgresSaver`) backed by an
+    :class:`AsyncConnectionPool` rather than the sync ``PostgresSaver``
+    -- LangGraph's async Pregel loop calls ``aget_tuple`` which the
+    sync saver does not support.
 
-    Used by ``Orchestrator.resume_investigation`` after the user supplies
-    new context. Same gate semantics — if the new run is still low-confidence
-    the gate will pause again.
+    The pool is configured with ``autocommit=True`` because LangGraph
+    issues each checkpoint write as a single statement and the
+    enclosing transaction would otherwise hold the row lock until
+    explicit commit.
     """
-    gated_edges = _collect_gated_edges(skills)
-    if not gated_edges:
-        raise ValueError(
-            "build_resume_graph requires at least one route with gate set; "
-            "no gated edges were found in the configured skills — add "
-            "'gate: confidence' to the relevant agent's route in "
-            "config/skills/<agent>/config.yaml"
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg_pool import AsyncConnectionPool
+
+    # Translate SQLAlchemy URL -> libpq connection string. SQLAlchemy
+    # accepts ``postgresql+psycopg://...`` while psycopg's
+    # AsyncConnectionPool wants the bare ``postgresql://...``. Strip
+    # any dialect suffix on the scheme so both URL flavours work.
+    if "+" in url.split("://", 1)[0]:
+        _, rest = url.split("://", 1)
+        url = f"postgresql://{rest}"
+
+    pool = AsyncConnectionPool(
+        conninfo=url,
+        max_size=4,
+        kwargs={"autocommit": True},
+        # ``open=False`` defers the actual TCP connect to ``open()``;
+        # we open immediately below so callers see real connection
+        # errors at construction time, not on first request.
+        open=False,
+    )
+    await pool.open()
+    saver = AsyncPostgresSaver(pool)  # type: ignore[arg-type] — pool is the right shape per docs
+    # Idempotent: creates the checkpoint tables if they don't yet exist.
+    await saver.setup()
+    return saver, pool.close
+
+# ====== module: runtime/checkpointer.py ======
+
+def _sqlite_path_from_url(url: str) -> str:
+    """Extract the on-disk path from a sqlite SQLAlchemy URL.
+
+    Accepts the SQLAlchemy ``sqlite:///<path>`` form (three slashes ->
+    relative or absolute path begins after the third slash). The four-
+    slash variant ``sqlite:////abs/path`` is also tolerated for callers
+    who explicitly want an absolute path; sqlite3 itself accepts both.
+    """
+    parsed = urlparse(url)
+    path = parsed.path
+    if path.startswith("//"):
+        # sqlite:////abs/path -> urlparse path "//abs/path" -> "/abs/path"
+        return path[1:]
+    # sqlite:///x -> urlparse path "/x". sqlite3 accepts both absolute
+    # and relative; tests use absolute via tmp_path.
+    return path
+
+
+async def make_checkpointer(
+    cfg: AppConfig | MetadataConfig,
+) -> Tuple[BaseCheckpointSaver, Callable[[], Awaitable[None]]]:
+    """Build a checkpointer for the configured metadata DB.
+
+    Accepts either a full :class:`AppConfig` (``cfg.storage.metadata`` is
+    read) or a :class:`MetadataConfig` directly. The orchestrator uses
+    the direct form because it post-processes the raw URL (resolving
+    the default ``incidents/incidents.db`` sentinel against
+    ``cfg.paths.incidents_dir``) and needs to pass *that* resolved URL
+    through so per-test ``tmp_path`` isolation lands on the same DB
+    file as the SQLAlchemy engine.
+
+    Branches on the URL scheme:
+
+    - ``sqlite:`` -> :class:`langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver`
+    - ``postgresql:`` / ``postgres:`` -> Postgres path (P2-G)
+
+    Returns ``(saver, cleanup)``. ``cleanup`` is an async callable that
+    closes the dedicated connection / pool; the caller is expected to
+    await it at orchestrator shutdown.
+    """
+    if isinstance(cfg, MetadataConfig):
+        url = cfg.url
+    else:
+        url = cfg.storage.metadata.url
+
+    if url.startswith("sqlite:"):
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        db_path = _sqlite_path_from_url(url)
+        # Ensure the parent directory exists. The orchestrator may build
+        # the checkpointer before any storage write that would otherwise
+        # have created it (e.g. on first start in a fresh deploy dir).
+        if db_path != ":memory:":
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        # Dedicated aiosqlite connection — separate from the SQLAlchemy
+        # engine's connection pool. WAL mode lets readers and writers
+        # proceed concurrently on the same file.
+        #
+        # ``isolation_level=None`` puts the underlying ``sqlite3`` driver
+        # in autocommit mode so Python's stdlib doesn't sneak a
+        # ``BEGIN DEFERRED`` in front of our INSERTs. AsyncSqliteSaver's
+        # ``aput`` then runs as an implicit single-statement write
+        # followed by ``commit()``; SQLite handles the transaction
+        # internally as ``BEGIN IMMEDIATE`` for any DML, so the saver
+        # plays nicely with the SQLAlchemy engine's explicit
+        # ``BEGIN IMMEDIATE`` (see ``runtime.storage.engine``).
+        conn = await aiosqlite.connect(db_path, isolation_level=None)
+        # Set WAL + relaxed durability up front so the orchestrator's
+        # other path (the SQLAlchemy engine) sees them; AsyncSqliteSaver
+        # itself also enables WAL during setup() but doing it here makes
+        # the pragma observable to verification tests immediately.
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        # SQLAlchemy and the saver share the same DB file via separate
+        # connections. Without a generous busy_timeout, a contended
+        # writer races straight into ``database is locked``. 30s matches
+        # the engine-side setting (see ``runtime.storage.engine``) so
+        # both writers wait the same amount before failing.
+        await conn.execute("PRAGMA busy_timeout=30000")
+        saver = AsyncSqliteSaver(conn)
+        # Create checkpoint tables on first use. Idempotent.
+        await saver.setup()
+        return saver, conn.close
+
+    if url.startswith("postgresql:") or url.startswith("postgres:"):
+        # Filled in P2-G. Imported lazily so SQLite-only deploys don't
+        # need psycopg_pool installed.
+
+
+        return await make_postgres_checkpointer(url)
+
+    raise ValueError(
+        f"unsupported checkpointer URL scheme {url!r} — "
+        "expected sqlite or postgresql"
+    )
+
+# ====== module: runtime/triggers/base.py ======
+
+if TYPE_CHECKING:
+    pass
+
+
+
+@dataclass(frozen=True)
+class TriggerInfo:
+    """Provenance attached to every session started via a trigger.
+
+    Stamped onto ``Orchestrator.start_session(trigger=...)`` by every
+    transport. The framework does not branch on the contents; the field
+    exists so dashboards / audit logs can answer "where did this session
+    come from?" without re-deriving from disjoint sources.
+    """
+
+    name: str          # the trigger name from config (``triggers[].name``)
+    transport: str     # ``api`` / ``webhook`` / ``schedule`` / plugin kind
+    target_app: str    # ``triggers[].target_app``
+    received_at: datetime
+
+
+class TriggerTransport(ABC):
+    """Lifecycle interface for a transport (api / webhook / schedule / plugin).
+
+    The registry calls ``start(registry)`` on lifespan-enter and ``stop()``
+    on lifespan-exit. Transports own their own state (router, scheduler,
+    background tasks) and must be safe to construct *before* ``start`` —
+    the FastAPI app collects routers from webhook transports during
+    ``build_app`` and mounts them once during the lifespan handshake.
+    """
+
+    @abstractmethod
+    async def start(self, registry: "TriggerRegistry") -> None:
+        """Begin accepting inbound traffic. Must be idempotent."""
+
+    @abstractmethod
+    async def stop(self) -> None:
+        """Stop accepting traffic and release resources. Must be idempotent."""
+
+# ====== module: runtime/triggers/config.py ======
+
+_DOTTED_PATH_RE = re.compile(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)+(:[A-Za-z_][\w]*)?$")
+
+# 5-field cron, optionally allowing ``*/N`` step / ``A,B,C`` list / ``A-B``
+# range tokens. Validation here is intentionally loose — APScheduler's
+# ``CronTrigger.from_crontab`` is the source of truth and will reject
+# semantically bad strings at scheduler-start time.
+_CRON_5FIELD_RE = re.compile(
+    r"^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s*$"
+)
+
+
+class _BaseTriggerConfig(BaseModel):
+    """Shared fields for every trigger transport variant."""
+
+    name: str = Field(..., min_length=1, max_length=128)
+    target_app: str = Field(..., min_length=1)
+    target_agent: str | None = None
+    transform: str | None = None  # dotted path; required for webhook/schedule
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        # Webhook URLs use the name as a path segment — restrict to a safe
+        # alphabet so we never have to URL-encode.
+        if not re.match(r"^[A-Za-z0-9_\-]+$", v):
+            raise ValueError(
+                f"trigger name must match [A-Za-z0-9_-]+, got {v!r}"
+            )
+        return v
+
+    @field_validator("transform")
+    @classmethod
+    def _validate_transform(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not _DOTTED_PATH_RE.match(v):
+            raise ValueError(f"transform must be dotted path, got {v!r}")
+        return v
+
+
+class APITriggerConfig(_BaseTriggerConfig):
+    """Built-in HTTP route — preserves ``POST /investigate`` semantics.
+
+    The api transport is implicitly registered for back-compat; explicitly
+    listing it in ``triggers:`` is supported for symmetry but not required.
+    """
+
+    transport: Literal["api"] = "api"
+
+
+class WebhookTriggerConfig(_BaseTriggerConfig):
+    """Webhook trigger — third-party ``POST /triggers/{name}``.
+
+    ``payload_schema`` is a dotted path to a Pydantic ``BaseModel``; the
+    request JSON is validated against it, then ``transform(payload)`` is
+    invoked to produce the keyword args for ``Orchestrator.start_session``.
+
+    ``auth_token_env`` is the name of an environment variable holding the
+    bearer token; the gateway never reads raw secrets from YAML.
+    """
+
+    transport: Literal["webhook"] = "webhook"
+    payload_schema: str
+    auth: Literal["bearer", "none"] = "bearer"
+    auth_token_env: str | None = None
+    idempotency_ttl_hours: int = Field(24, ge=1, le=24 * 30)
+
+    @field_validator("payload_schema")
+    @classmethod
+    def _validate_payload_schema(cls, v: str) -> str:
+        if not _DOTTED_PATH_RE.match(v):
+            raise ValueError(f"payload_schema must be dotted path, got {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _check_bearer(self) -> "WebhookTriggerConfig":
+        if self.auth == "bearer" and not self.auth_token_env:
+            raise ValueError("auth: bearer requires auth_token_env")
+        if self.transform is None:
+            raise ValueError("webhook trigger requires transform: <dotted.path>")
+        return self
+
+
+class ScheduleTriggerConfig(_BaseTriggerConfig):
+    """In-process APScheduler cron job.
+
+    ``schedule`` is a 5-field standard cron string interpreted via
+    ``CronTrigger.from_crontab``. APScheduler's native 6-field form is
+    rejected here — the registry owns the cron flavour.
+
+    ``payload`` is a static dict passed to ``transform`` on each fire;
+    runtime cron jobs have no inbound payload to validate.
+    """
+
+    transport: Literal["schedule"] = "schedule"
+    schedule: str
+    timezone: str = "UTC"
+    payload: dict = Field(default_factory=dict)
+
+    @field_validator("schedule")
+    @classmethod
+    def _validate_schedule(cls, v: str) -> str:
+        if not _CRON_5FIELD_RE.match(v):
+            raise ValueError(
+                f"schedule must be a 5-field cron string, got {v!r}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _check_transform(self) -> "ScheduleTriggerConfig":
+        if self.transform is None:
+            raise ValueError("schedule trigger requires transform: <dotted.path>")
+        return self
+
+
+class PluginTriggerConfig(_BaseTriggerConfig):
+    """Plugin-defined transport, addressed by ``kind``.
+
+    Resolution: the registry merges entry-points (group ``runtime.triggers``)
+    with explicit ``plugin_transports`` passed to ``TriggerRegistry.create``;
+    explicit entries win. Bad ``kind`` raises at registry init.
+    """
+
+    transport: Literal["plugin"] = "plugin"
+    kind: str = Field(..., min_length=1)
+    options: dict = Field(default_factory=dict)
+
+
+# Discriminated union — Pydantic uses the ``transport`` literal to pick
+# the right shape during validation. Field default makes the runtime
+# triggers list ``list[TriggerConfig]`` resolve cleanly.
+TriggerConfig = Annotated[
+    Union[
+        APITriggerConfig,
+        WebhookTriggerConfig,
+        ScheduleTriggerConfig,
+        PluginTriggerConfig,
+    ],
+    Field(discriminator="transport"),
+]
+
+# ====== module: runtime/triggers/resolve.py ======
+
+def _resolve_dotted(path: str) -> Any:
+    """Import a module and return the named attribute.
+
+    Accepts both ``a.b.c`` (last segment is the attribute) and
+    ``a.b:c`` (colon-delimited per entry-point convention).
+    """
+    if ":" in path:
+        module_path, attr = path.split(":", 1)
+    else:
+        module_path, _, attr = path.rpartition(".")
+        if not module_path:
+            raise ImportError(f"dotted path missing module: {path!r}")
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ImportError(f"cannot import module for {path!r}: {e}") from e
+    if not hasattr(module, attr):
+        raise ImportError(
+            f"module {module_path!r} has no attribute {attr!r} "
+            f"(resolving {path!r})"
+        )
+    return getattr(module, attr)
+
+
+def resolve_payload_schema(path: str) -> Type[BaseModel]:
+    """Resolve a dotted path to a Pydantic ``BaseModel`` subclass.
+
+    Raises ``TypeError`` if the resolved object isn't a ``BaseModel``
+    subclass — keeps the failure on the operator console at startup.
+    """
+    obj = _resolve_dotted(path)
+    if not (isinstance(obj, type) and issubclass(obj, BaseModel)):
+        raise TypeError(
+            f"payload_schema {path!r} did not resolve to a Pydantic "
+            f"BaseModel subclass; got {obj!r}"
+        )
+    return obj
+
+
+def resolve_transform(path: str) -> Callable[..., dict]:
+    """Resolve a dotted path to a callable.
+
+    The callable is expected to return a ``dict`` of keyword arguments
+    suitable for ``Orchestrator.start_session(**kwargs)``. The framework
+    does not enforce a stricter signature — apps own the contract with
+    their own transform.
+    """
+    obj = _resolve_dotted(path)
+    if not callable(obj):
+        raise TypeError(
+            f"transform {path!r} did not resolve to a callable; got {obj!r}"
+        )
+    return obj
+
+# ====== module: runtime/triggers/idempotency.py ======
+
+_LRU_MAX_PER_TRIGGER = 1024
+
+
+class IdempotencyRow(Base):
+    """SQLite-backed dedup record. One row per (trigger_name, key)."""
+
+    __tablename__ = "trigger_idempotency_keys"
+
+    trigger_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class IdempotencyStore:
+    """Thread-safe LRU with SQLite write-through.
+
+    The LRU bounds memory; SQLite handles cold-restart survival and
+    cross-process sharing (e.g. multi-worker uvicorn). Mutations are
+    serialised via a single threading lock — the critical section is
+    a few dict ops plus one SQL round-trip, which dwarfs lock overhead.
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+        # Ensure the table exists even if the orchestrator hasn't run
+        # ``Base.metadata.create_all`` yet (early lifespan path).
+        Base.metadata.create_all(engine, tables=[IdempotencyRow.__table__])
+        self._lru: dict[str, OrderedDict[str, str]] = {}
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def connect(cls, db_url: str) -> "IdempotencyStore":
+        """Build a store backed by a fresh SQLAlchemy engine.
+
+        Convenience for tests + standalone tooling. Production paths
+        should reuse the orchestrator's engine via the constructor so a
+        single SQLite file is opened once.
+        """
+        engine = create_engine(db_url, poolclass=NullPool, future=True)
+        return cls(engine)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get(self, trigger_name: str, key: str) -> str | None:
+        """Return the cached ``session_id`` for the key, or ``None``.
+
+        LRU first, SQLite second; a SQLite hit refills the LRU so
+        subsequent reads stay in memory.
+        """
+        with self._lock:
+            cache = self._lru.get(trigger_name)
+            if cache is not None and key in cache:
+                # Bump recency
+                cache.move_to_end(key)
+                return cache[key]
+        # SQLite fall-through (outside the threading lock — sqlite3 has
+        # its own locking, and this path is rare).
+        with SqlaSession(self._engine) as s:
+            row = s.execute(
+                select(IdempotencyRow).where(
+                    IdempotencyRow.trigger_name == trigger_name,
+                    IdempotencyRow.key == key,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            expires_at = row.expires_at
+            if expires_at.tzinfo is None:
+                # SQLite drops tz on round-trip; assume UTC (we always
+                # write UTC).
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= _utc_now():
+                # Stale row — opportunistic delete.
+                s.execute(
+                    delete(IdempotencyRow).where(
+                        IdempotencyRow.trigger_name == trigger_name,
+                        IdempotencyRow.key == key,
+                    )
+                )
+                s.commit()
+                return None
+            session_id = row.session_id
+        # Refill LRU.
+        with self._lock:
+            cache = self._lru.setdefault(trigger_name, OrderedDict())
+            cache[key] = session_id
+            cache.move_to_end(key)
+            self._evict_if_needed(cache)
+        return session_id
+
+    def put(
+        self,
+        trigger_name: str,
+        key: str,
+        session_id: str,
+        *,
+        ttl_hours: int = 24,
+    ) -> None:
+        """Cache a fresh (key -> session_id) binding.
+
+        Writes through to SQLite with ``expires_at = now + ttl``. The
+        LRU receives the same record. Calling ``put`` for an existing
+        key overwrites both layers.
+        """
+        now = _utc_now()
+        expires_at = now + timedelta(hours=ttl_hours)
+        with SqlaSession(self._engine) as s:
+            existing = s.get(IdempotencyRow, (trigger_name, key))
+            if existing is None:
+                s.add(IdempotencyRow(
+                    trigger_name=trigger_name,
+                    key=key,
+                    session_id=session_id,
+                    created_at=now,
+                    expires_at=expires_at,
+                ))
+            else:
+                existing.session_id = session_id
+                existing.created_at = now
+                existing.expires_at = expires_at
+            s.commit()
+        with self._lock:
+            cache = self._lru.setdefault(trigger_name, OrderedDict())
+            cache[key] = session_id
+            cache.move_to_end(key)
+            self._evict_if_needed(cache)
+        # Opportunistic purge of expired rows so a long-running process
+        # doesn't accumulate dead records. Cheap (range-bounded delete).
+        self.purge_expired()
+
+    def purge_expired(self) -> int:
+        """Delete all rows whose ``expires_at`` is in the past. Returns
+        the number of rows removed."""
+        with SqlaSession(self._engine) as s:
+            result = s.execute(
+                delete(IdempotencyRow).where(
+                    IdempotencyRow.expires_at <= _utc_now()
+                )
+            )
+            s.commit()
+            return result.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _evict_if_needed(cache: "OrderedDict[str, str]") -> None:
+        while len(cache) > _LRU_MAX_PER_TRIGGER:
+            cache.popitem(last=False)
+
+# ====== module: runtime/triggers/auth.py ======
+
+def make_bearer_dep(token_env: str) -> Callable:
+    """Return a FastAPI dependency that asserts the inbound bearer token
+    matches ``$token_env``.
+
+    Snapshots the env var at construction time and raises ``RuntimeError``
+    if it isn't set — callers can't accidentally start a webhook without
+    a configured secret.
+    """
+    expected = os.environ.get(token_env)
+    if not expected:
+        raise RuntimeError(
+            f"env var {token_env!r} for webhook auth is not set"
         )
 
-    upstream_agents = {frm for (frm, _to) in gated_edges.keys()}
-    gate_targets = {to for (_frm, to) in gated_edges.keys()}
-
-    async def _resume_dispatcher(state: GraphState) -> dict:
-        """Route to whichever upstream agent the INC was awaiting input from.
-
-        Reads ``pending_intervention["upstream_agent"]`` from the incident
-        so the resume graph works for any gated topology without being
-        rebuilt per call.
-        """
-        incident = state["incident"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-        pi = getattr(incident, "pending_intervention", None)
-        upstream = (pi or {}).get("upstream_agent") if pi else None
-        if upstream not in upstream_agents:
-            # Fallback: pick the lexically first upstream to avoid a hard crash;
-            # callers should only resume incidents that are awaiting_input.
-            upstream = next(iter(sorted(upstream_agents)))
-            logger.warning(
-                "resume_dispatcher: upstream_agent %r not in gated upstreams %r; "
-                "falling back to %r",
-                upstream, sorted(upstream_agents), upstream,
+    async def _bearer_dep(
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="missing bearer",
             )
-        return {"next_route": upstream, "last_agent": None, "error": None}
+        token = authorization[len("Bearer "):].strip()
+        if not hmac.compare_digest(token, expected):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid bearer",
+            )
 
-    sg = StateGraph(GraphState)
-    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
-    sg.add_node("__resume_dispatcher__", _resume_dispatcher)
-    for agent_name in upstream_agents | gate_targets:
-        if agent_name in nodes:
-            sg.add_node(agent_name, nodes[agent_name])
-    sg.add_node("gate", make_gate_node(cfg=cfg, store=store))
-    sg.set_entry_point("__resume_dispatcher__")
+    return _bearer_dep
 
-    _router = _make_router(gated_edges)
+# ====== module: runtime/triggers/transports/api.py ======
 
-    all_resume_nodes = upstream_agents | gate_targets
-    shared_target_map: dict = {name: name for name in all_resume_nodes | {"gate"}}
-    shared_target_map[END] = END
+class APITransport(TriggerTransport):
+    """No-op transport that holds the ``api`` configs.
 
-    # Dispatcher routes to an upstream agent via next_route.
-    sg.add_conditional_edges("__resume_dispatcher__", _router, shared_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+    Future: when the legacy ``POST /investigate`` route is removed, this
+    class can mount its own router. For Phase 5 it exists as a marker.
+    """
 
-    for agent_name in all_resume_nodes:
-        sg.add_conditional_edges(agent_name, _router, shared_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
+    def __init__(self, configs: list[APITriggerConfig]) -> None:
+        self._configs = list(configs)
 
-    _gate_to = _make_gate_to(gate_targets)
-    gate_target_map: dict = {t: t for t in gate_targets}
-    gate_target_map[END] = END
-    sg.add_conditional_edges("gate", _gate_to, gate_target_map)  # pyright: ignore[reportArgumentType] — langgraph typing limitation with END sentinel
-    return sg.compile()
+    @property
+    def configs(self) -> list[APITriggerConfig]:
+        return list(self._configs)
 
-# ====== module: orchestrator/orchestrator.py ======
+    async def start(self, registry) -> None:  # noqa: D401, ARG002
+        return None
 
-_INCIDENT_MCP_MODULE = "orchestrator.mcp_servers.incident"
+    async def stop(self) -> None:
+        return None
+
+# ====== module: runtime/triggers/transports/webhook.py ======
+
+if TYPE_CHECKING:
+    pass
+
+
+
+_log = logging.getLogger(__name__)
+
+
+class WebhookTransport(TriggerTransport):
+    """FastAPI router exposing one ``POST /triggers/{name}`` per webhook."""
+
+    def __init__(
+        self,
+        configs: list[WebhookTriggerConfig],
+        specs: "dict[str, TriggerSpec]",
+        idempotency: "IdempotencyStore | None",
+    ) -> None:
+        self._configs = {c.name: c for c in configs}
+        self._specs = specs
+        self._idempotency = idempotency
+        self.router = APIRouter()
+        self._registry: "TriggerRegistry | None" = None
+        self._mounted = False
+
+    async def start(self, registry: "TriggerRegistry") -> None:
+        if self._mounted:
+            return
+        self._registry = registry
+        for name, cfg in self._configs.items():
+            self.router.add_api_route(
+                f"/triggers/{name}",
+                self._make_handler(name),
+                methods=["POST"],
+                dependencies=self._auth_deps(cfg),
+                status_code=status.HTTP_202_ACCEPTED,
+                name=f"trigger:{name}",
+            )
+        self._mounted = True
+
+    async def stop(self) -> None:
+        # The router lives on the FastAPI app for the process lifetime;
+        # there's nothing to tear down (FastAPI cleans up its own state
+        # when the app object is GC'd). Mark unmounted so a subsequent
+        # ``start`` is a no-op only if we were already started.
+        self._registry = None
+        self._mounted = False
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _auth_deps(cfg: WebhookTriggerConfig) -> list[Any]:
+        if cfg.auth == "none":
+            return []
+        # cfg.auth == "bearer": the model validator already enforced
+        # auth_token_env presence at config load.
+        assert cfg.auth_token_env is not None
+        return [Depends(make_bearer_dep(cfg.auth_token_env))]
+
+    def _make_handler(self, name: str) -> Callable:
+        spec = self._specs[name]
+        schema = spec.payload_schema
+        assert schema is not None  # webhook configs always carry a schema
+
+        async def handler(
+            request: Request,
+            idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        ) -> dict:
+            registry = self._registry
+            if registry is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="trigger registry not started",
+                )
+            # Parse body. We read raw JSON then run through the schema
+            # so we get a uniform 422 surface (FastAPI body-binding 422
+            # has a different shape).
+            try:
+                raw = await request.json()
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"invalid json body: {exc}",
+                ) from exc
+            try:
+                payload = schema.model_validate(raw)
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail=exc.errors()) from exc
+            # Dispatch. Translate transform/start_session errors to 422
+            # (per R3: log + 422, no retry, no idempotency cache).
+            try:
+                session_id = await registry.dispatch(
+                    name, payload, idempotency_key=idempotency_key
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except (ValueError, TypeError, ValidationError) as exc:
+                _log.warning(
+                    "trigger %r transform/dispatch failed: %s", name, exc
+                )
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"session_id": session_id}
+
+        return handler
+
+# ====== module: runtime/triggers/transports/schedule.py ======
+
+if TYPE_CHECKING:
+    pass
+
+
+_log = logging.getLogger(__name__)
+
+
+class ScheduleTransport(TriggerTransport):
+    """In-process APScheduler driving cron-firing triggers."""
+
+    def __init__(self, configs: list[ScheduleTriggerConfig]) -> None:
+        self._configs = list(configs)
+        self._scheduler: AsyncIOScheduler | None = None
+        self._registry: "TriggerRegistry | None" = None
+
+    @property
+    def scheduler(self) -> AsyncIOScheduler | None:
+        return self._scheduler
+
+    async def start(self, registry: "TriggerRegistry") -> None:
+        if self._scheduler is not None:
+            return
+        self._registry = registry
+        self._scheduler = AsyncIOScheduler(timezone="UTC")
+        for cfg in self._configs:
+            cron = CronTrigger.from_crontab(cfg.schedule, timezone=cfg.timezone)
+            self._scheduler.add_job(
+                self._fire,
+                trigger=cron,
+                kwargs={"name": cfg.name, "payload": dict(cfg.payload)},
+                id=f"trigger:{cfg.name}",
+                replace_existing=True,
+            )
+        self._scheduler.start()
+
+    async def stop(self) -> None:
+        if self._scheduler is None:
+            return
+        try:
+            self._scheduler.shutdown(wait=False)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("apscheduler shutdown raised: %s", exc)
+        self._scheduler = None
+        self._registry = None
+
+    async def _fire(self, *, name: str, payload: dict) -> None:
+        """APScheduler job target. Logs and swallows exceptions so a bad
+        cron job doesn't poison the scheduler thread."""
+        registry = self._registry
+        if registry is None:
+            _log.warning(
+                "schedule trigger %r fired with no registry attached", name
+            )
+            return
+        try:
+            await registry.dispatch(name, payload)
+        except Exception as exc:  # noqa: BLE001
+            _log.exception(
+                "schedule trigger %r dispatch failed: %s", name, exc
+            )
+
+# ====== module: runtime/triggers/transports/plugin.py ======
+
+__all__ = ["TriggerTransport"]
+
+# ====== module: runtime/triggers/registry.py ======
+
+_log = logging.getLogger(__name__)
+
+# Type aliases for clarity — ``StartSessionFn`` is the closure the
+# registry calls; the FastAPI lifespan binds it to the orchestrator
+# service so we don't take a hard import dependency on the Orchestrator
+# class here (avoids a circular import).
+StartSessionFn = Callable[..., Awaitable[str]]
+
+
+class TriggerSpec:
+    """Resolved (live) form of one ``TriggerConfig``.
+
+    Built at registry init: dotted paths bound to live callables /
+    classes; the original config is retained for transports to read.
+    """
+
+    __slots__ = (
+        "config",
+        "payload_schema",
+        "transform",
+    )
+
+    def __init__(
+        self,
+        config: TriggerConfig,
+        payload_schema: Type[BaseModel] | None,
+        transform: Callable[..., dict] | None,
+    ) -> None:
+        self.config = config
+        self.payload_schema = payload_schema
+        self.transform = transform
+
+    @property
+    def name(self) -> str:
+        return self.config.name
+
+
+class TriggerRegistry:
+    """Owns trigger lifecycle + dispatch.
+
+    Construct via :meth:`create` so dotted-path resolution and transport
+    instantiation happen together. Direct ``__init__`` use is reserved
+    for unit tests that pre-build their own spec list.
+    """
+
+    def __init__(
+        self,
+        specs: dict[str, TriggerSpec],
+        transports: list[TriggerTransport],
+        start_session_fn: StartSessionFn,
+        idempotency: IdempotencyStore | None = None,
+    ) -> None:
+        self._specs: dict[str, TriggerSpec] = specs
+        self._transports: list[TriggerTransport] = transports
+        self._start_session_fn = start_session_fn
+        self._idempotency = idempotency
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def create(
+        cls,
+        configs: list[TriggerConfig],
+        *,
+        start_session_fn: StartSessionFn,
+        idempotency: IdempotencyStore | None = None,
+        plugin_transports: dict[str, Type[TriggerTransport]] | None = None,
+    ) -> "TriggerRegistry":
+        """Resolve dotted paths + instantiate transports.
+
+        Raises ``ImportError`` / ``TypeError`` at startup for any bad
+        dotted path — fail-fast, never at request time.
+        """
+        # 1. Resolve specs (dotted paths -> live objects).
+        specs: dict[str, TriggerSpec] = {}
+        for cfg in configs:
+            schema: Type[BaseModel] | None = None
+            transform_fn: Callable[..., dict] | None = None
+            if isinstance(cfg, WebhookTriggerConfig):
+                schema = resolve_payload_schema(cfg.payload_schema)
+            if cfg.transform is not None:
+                transform_fn = resolve_transform(cfg.transform)
+            specs[cfg.name] = TriggerSpec(
+                config=cfg, payload_schema=schema, transform=transform_fn
+            )
+
+        # 2. Resolve plugin kinds (entry-points + explicit, explicit wins).
+        plugin_kinds: dict[str, Type[TriggerTransport]] = (
+            cls._load_entry_point_transports()
+        )
+        if plugin_transports:
+            plugin_kinds.update(plugin_transports)
+
+        # 3. Bucket configs by transport flavour.
+        api_cfgs: list[APITriggerConfig] = []
+        webhook_cfgs: list[WebhookTriggerConfig] = []
+        schedule_cfgs: list[ScheduleTriggerConfig] = []
+        plugin_cfgs: list[PluginTriggerConfig] = []
+        for cfg in configs:
+            if isinstance(cfg, APITriggerConfig):
+                api_cfgs.append(cfg)
+            elif isinstance(cfg, WebhookTriggerConfig):
+                webhook_cfgs.append(cfg)
+            elif isinstance(cfg, ScheduleTriggerConfig):
+                schedule_cfgs.append(cfg)
+            elif isinstance(cfg, PluginTriggerConfig):
+                plugin_cfgs.append(cfg)
+
+        # 4. Instantiate transports. Lazy import to break import cycles.
+
+
+
+
+        transports: list[TriggerTransport] = []
+        if api_cfgs:
+            transports.append(APITransport(api_cfgs))
+        if webhook_cfgs:
+            transports.append(WebhookTransport(webhook_cfgs, specs, idempotency))
+        if schedule_cfgs:
+            transports.append(ScheduleTransport(schedule_cfgs))
+        for pcfg in plugin_cfgs:
+            kind_cls = plugin_kinds.get(pcfg.kind)
+            if kind_cls is None:
+                raise ImportError(
+                    f"plugin trigger {pcfg.name!r} requested kind={pcfg.kind!r} "
+                    f"but no transport with that kind is registered "
+                    f"(known: {sorted(plugin_kinds)})"
+                )
+            transports.append(kind_cls(pcfg))
+
+        return cls(specs, transports, start_session_fn, idempotency)
+
+    @staticmethod
+    def _load_entry_point_transports() -> dict[str, Type[TriggerTransport]]:
+        """Discover plugin transports via the ``runtime.triggers`` group.
+
+        Defensive: a missing or malformed entry-point is logged and
+        skipped rather than failing registry init. Apps that need strict
+        binding pass ``plugin_transports`` explicitly.
+        """
+        out: dict[str, Type[TriggerTransport]] = {}
+        try:
+            eps = importlib.metadata.entry_points(group="runtime.triggers")
+        except Exception:  # noqa: BLE001
+            return out
+        for ep in eps:
+            try:
+                obj = ep.load()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "trigger entry-point %r failed to load: %s", ep.name, exc
+                )
+                continue
+            if not (isinstance(obj, type) and issubclass(obj, TriggerTransport)):
+                _log.warning(
+                    "trigger entry-point %r did not resolve to a "
+                    "TriggerTransport subclass; got %r",
+                    ep.name,
+                    obj,
+                )
+                continue
+            out[ep.name] = obj
+        return out
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def transports(self) -> list[TriggerTransport]:
+        return list(self._transports)
+
+    @property
+    def specs(self) -> dict[str, TriggerSpec]:
+        return dict(self._specs)
+
+    @property
+    def idempotency(self) -> IdempotencyStore | None:
+        return self._idempotency
+
+    async def start_all(self) -> None:
+        """Start every transport. Idempotent."""
+        if self._started:
+            return
+        for t in self._transports:
+            await t.start(self)
+        self._started = True
+
+    async def stop_all(self) -> None:
+        """Stop every transport. Idempotent."""
+        if not self._started:
+            return
+        for t in self._transports:
+            try:
+                await t.stop()
+            except Exception as exc:  # noqa: BLE001
+                # Best-effort: one misbehaving transport mustn't block
+                # the rest from cleaning up.
+                _log.warning("trigger transport %r stop() failed: %s", t, exc)
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    async def dispatch(
+        self,
+        name: str,
+        payload: Any,
+        *,
+        idempotency_key: str | None = None,
+    ) -> str:
+        """Run ``transform(payload)`` and call ``start_session_fn``.
+
+        Returns the session id. If ``idempotency_key`` is provided, the
+        cached session id is returned on hit; on miss the call proceeds
+        and the (key, session_id) mapping is recorded for the trigger's
+        configured TTL.
+
+        Raises ``KeyError`` for an unknown trigger name. Surfaces any
+        ``ValueError`` / ``ValidationError`` from ``transform`` to the
+        caller — transports translate to HTTP status codes (typically
+        ``422 Unprocessable Entity``).
+        """
+        spec = self._specs.get(name)
+        if spec is None:
+            raise KeyError(f"unknown trigger: {name!r}")
+
+        # Idempotency hit: return cached session id without invoking
+        # transform / orchestrator. Per R3 in the plan, transform errors
+        # are NOT cached — only successful dispatches.
+        if idempotency_key and self._idempotency is not None:
+            cached = self._idempotency.get(name, idempotency_key)
+            if cached is not None:
+                return cached
+
+        # Resolve trigger payload -> start_session kwargs.
+        if spec.transform is not None:
+            kwargs = spec.transform(payload)
+            if not isinstance(kwargs, dict):
+                raise TypeError(
+                    f"transform for trigger {name!r} returned "
+                    f"{type(kwargs).__name__}, expected dict"
+                )
+        else:
+            # api transport: payload is already the kwargs dict.
+            kwargs = dict(payload) if payload else {}
+
+        info = TriggerInfo(
+            name=name,
+            transport=spec.config.transport,
+            target_app=spec.config.target_app,
+            received_at=datetime.now(timezone.utc),
+        )
+
+        session_id = await self._start_session_fn(trigger=info, **kwargs)
+
+        # Record successful dispatch for idempotency.
+        if idempotency_key and self._idempotency is not None:
+            ttl = (
+                spec.config.idempotency_ttl_hours
+                if isinstance(spec.config, WebhookTriggerConfig)
+                else 24
+            )
+            self._idempotency.put(name, idempotency_key, session_id, ttl_hours=ttl)
+
+        return session_id
+
+# ====== module: runtime/dedup.py ======
+
+if TYPE_CHECKING:  # pragma: no cover — import-only types
+    from langchain_core.language_models.chat_models import BaseChatModel
+
+
+
+logger = logging.getLogger(__name__)
+
+# Framework-level state type. Permissive at ``BaseModel`` so the dedup
+# layer never depends on app-level subclasses (R4 enforcement).
+StateT = TypeVar("StateT", bound=BaseModel)
+
+
+# ---------------------------------------------------------------------------
+# Config (P7-C)
+# ---------------------------------------------------------------------------
+
+
+class DedupScope(BaseModel):
+    """Filter knobs that narrow the Stage 1 candidate pool."""
+
+    same_environment: bool = True
+    only_closed: bool = True
+
+
+class DedupConfig(BaseModel):
+    """Configuration for the two-stage dedup pipeline (P7-C).
+
+    All numeric thresholds are inclusive at the lower bound (``>=``),
+    so a candidate hitting exactly ``stage1_threshold`` is considered.
+
+    Defaults are tuned for the incident-management example. Apps that
+    want different policies override via YAML.
+    """
+
+    enabled: bool = False
+    stage1_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    stage1_top_k: int = Field(default=5, ge=1, le=20)
+    stage2_top_k: int = Field(default=3, ge=1, le=20)
+    stage2_model: str = "cheap"
+    stage2_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    # Optional override of the Stage-2 system prompt. When ``None`` the
+    # pipeline falls back to ``framework_cfg.dedup_system_prompt`` so
+    # apps can either tune the prompt per app (FrameworkAppConfig) or
+    # override it inline on the DedupConfig.
+    system_prompt: str | None = None
+    # Reserved for future modes; only ``post_intake`` is implemented.
+    run_at: Literal["post_intake"] = "post_intake"
+    scope: DedupScope = Field(default_factory=DedupScope)
+
+    @model_validator(mode="after")
+    def _validate_top_k(self) -> "DedupConfig":
+        if self.stage2_top_k > self.stage1_top_k:
+            raise ValueError(
+                f"dedup.stage2_top_k ({self.stage2_top_k}) must be "
+                f"<= dedup.stage1_top_k ({self.stage1_top_k})"
+            )
+        return self
+
+    def assert_model_exists(self, llm_cfg: "LLMConfig") -> None:
+        """Fail fast if ``stage2_model`` is missing from the LLM registry.
+
+        Called at orchestrator boot when dedup is enabled. Raising here
+        is preferred over discovering the typo on the first incident.
+        """
+        if self.stage2_model not in llm_cfg.models:
+            raise ValueError(
+                f"dedup.stage2_model={self.stage2_model!r} not found in "
+                f"llm.models (known: {sorted(llm_cfg.models)})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Decision schema (P7-E)
+# ---------------------------------------------------------------------------
+
+
+class DedupDecision(BaseModel):
+    """Pydantic schema for Stage 2 LLM structured output."""
+
+    is_duplicate: bool
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str = Field(default="", max_length=500)
+
+
+class DedupResult(BaseModel):
+    """Outcome of one ``DedupPipeline.run`` call.
+
+    ``matched=True`` iff Stage 2 confirmed a duplicate. The remaining
+    fields are always populated when matched and may be partially
+    populated for diagnostics when Stage 2 ran but declined.
+
+    ``parse_failures`` counts the number of Stage 2 LLM responses that
+    failed to parse into a :class:`DedupDecision` during this run. Any
+    non-zero value is an operator signal that the Stage 2 model is
+    drifting off-schema and dedup may be silently false-negative.
+    """
+
+    matched: bool = False
+    parent_session_id: str | None = None
+    candidate_id: str | None = None
+    decision: DedupDecision | None = None
+    stage1_score: float | None = None
+    parse_failures: int = 0
+
+
+# Internal tagged outcome for Stage 2 parse — distinguishes a legitimate
+# "model said not-a-duplicate" from "model returned garbage we couldn't
+# parse" so the pipeline can count parse failures separately.
+class _Stage2Outcome(enum.Enum):
+    MATCHED = "matched"
+    NOT_MATCHED = "not_matched"
+    PARSE_FAILED = "parse_failed"
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 prompt (P7-E)
+# ---------------------------------------------------------------------------
+
+
+# Legacy default — kept for back-compat with callers that referenced
+# this module-level constant directly. New code should read the prompt
+# off ``DedupConfig.system_prompt`` (when set) or the
+# ``FrameworkAppConfig.dedup_system_prompt`` the pipeline holds.
+_STAGE2_SYSTEM = (
+    "You are deduplicating incident reports for an SRE platform. "
+    "Two reports are duplicates only if they describe the same root cause "
+    "AND the same service/environment AND overlap in time-of-occurrence. "
+    "Surface-level keyword overlap is NOT enough. "
+    "Respond with a single JSON object matching this schema: "
+    '{"is_duplicate": bool, "confidence": float in [0,1], "rationale": '
+    '"1-2 sentences"}.'
+)
+
+
+def _build_stage2_user_prompt(*, prior_text: str, new_text: str,
+                              prior_id: str, new_id: str) -> str:
+    """Assemble the user-side prompt for one Stage 2 comparison."""
+    return (
+        f"[INCIDENT A — existing, id={prior_id}]\n"
+        f"{prior_text}\n\n"
+        f"[INCIDENT B — new, id={new_id}]\n"
+        f"{new_text}\n\n"
+        "Decide: is B a duplicate of A?"
+    )
+
+
+def _parse_decision_tagged(
+    raw: str, *, model_name: str = "<unknown>",
+) -> tuple[DedupDecision | None, Exception | None]:
+    """Parse the LLM's text into a ``DedupDecision`` with a failure tag.
+
+    Returns ``(decision, None)`` on success, ``(None, exc)`` on any
+    parse / validation failure (P7-E: "treat as not-duplicate, do not
+    retry — budget protection"). Empty input is also a parse failure
+    so the pipeline can surface model-stopped-responding as a signal.
+
+    Emits a structured ``warning`` log on any failure with fields a
+    log aggregator can pick up via the LogRecord ``extra`` namespace:
+    ``event``, ``error_type``, ``error_msg``, ``model``,
+    ``raw_output_excerpt``.
+    """
+    text = (raw or "").strip()
+    if not text:
+        exc = ValueError("empty Stage 2 LLM output")
+        _log_parse_failure(exc, model_name=model_name, raw=raw or "")
+        return None, exc
+    # Tolerate ```json ... ``` fences from chatty models.
+    if text.startswith("```"):
+        # Strip the first fence line and a trailing fence if present.
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        _log_parse_failure(exc, model_name=model_name, raw=raw)
+        return None, exc
+    try:
+        return DedupDecision.model_validate(payload), None
+    except Exception as exc:  # noqa: BLE001 — pydantic ValidationError + fallback
+        _log_parse_failure(exc, model_name=model_name, raw=raw)
+        return None, exc
+
+
+def _log_parse_failure(exc: Exception, *, model_name: str, raw: str) -> None:
+    """Emit a structured warning for a Stage 2 parse failure.
+
+    Fields land on the LogRecord via ``extra`` so structured log
+    aggregators (Loki, Datadog, etc.) can index them, while the
+    human-readable message stays useful for grep.
+    """
+    excerpt = (raw or "")[:200]
+    logger.warning(
+        "dedup stage 2 parse failure: %s (%s)",
+        exc, type(exc).__name__,
+        extra={
+            "event": "dedup_parse_failure",
+            "error_type": type(exc).__name__,
+            "error_msg": str(exc)[:200],
+            "model": model_name,
+            "raw_output_excerpt": excerpt,
+        },
+    )
+
+
+def _parse_decision(raw: str) -> DedupDecision | None:
+    """Backward-compatible wrapper around :func:`_parse_decision_tagged`.
+
+    Existing callers / tests that only care about the decision keep
+    working; the pipeline uses the tagged variant directly so it can
+    distinguish parse failures from legitimate non-matches.
+    """
+    decision, _err = _parse_decision_tagged(raw)
+    return decision
+
+
+# ---------------------------------------------------------------------------
+# Pipeline (P7-D)
+# ---------------------------------------------------------------------------
+
+
+class DedupPipeline(Generic[StateT]):
+    """Stage 1 (embedding) + Stage 2 (LLM) dedup orchestrator.
+
+    Construction is cheap; ``run`` is the per-session entry point. The
+    pipeline is stateless across runs.
+
+    ``text_extractor`` returns the comparison text for a given session
+    (the framework can't know which fields the app considers
+    semantically meaningful).
+
+    ``model_factory`` is a no-arg callable that returns a fresh
+    ``BaseChatModel`` configured against ``config.stage2_model``. It is
+    a callable (not a model instance) so the orchestrator can build the
+    LLM lazily and so unit tests can inject a stub without importing
+    LangChain.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: DedupConfig,
+        text_extractor: Callable[[Any], str],
+        model_factory: Callable[[], "BaseChatModel"],
+        framework_cfg: "FrameworkAppConfig | None" = None,
+    ) -> None:
+        self.config = config
+        self._text_extractor = text_extractor
+        self._model_factory = model_factory
+        # ``framework_cfg`` carries the cross-cutting prompt the
+        # framework uses when ``DedupConfig.system_prompt`` is unset.
+        # Imported lazily to avoid a circular import (``runtime.dedup``
+        # is imported from ``runtime.config`` test paths).
+        if framework_cfg is None:
+
+
+            framework_cfg = _FAC()
+        self._framework_cfg = framework_cfg
+
+    async def run(
+        self,
+        *,
+        session: StateT,
+        history_store: "HistoryStore",
+    ) -> DedupResult:
+        """Run the pipeline for ``session``.
+
+        Returns ``DedupResult(matched=False)`` when the pipeline is
+        disabled, when the session text is empty, when Stage 1 finds no
+        candidates above ``stage1_threshold``, or when Stage 2 declines
+        every candidate (or errors out parsing structured output).
+        """
+        if not self.config.enabled:
+            return DedupResult(matched=False)
+
+        new_text = (self._text_extractor(session) or "").strip()
+        if not new_text:
+            return DedupResult(matched=False)
+
+        candidates = self._stage1(session=session, new_text=new_text,
+                                  history_store=history_store)
+        if not candidates:
+            return DedupResult(matched=False)
+
+        return await self._stage2(session=session, new_text=new_text,
+                                  candidates=candidates)
+
+    # ----- Stage 1 -----
+
+    def _stage1(
+        self,
+        *,
+        session: StateT,
+        new_text: str,
+        history_store: "HistoryStore",
+    ) -> list[tuple[Any, float]]:
+        """Embedding similarity prefilter.
+
+        Filters by ``scope.same_environment`` and ``scope.only_closed``,
+        drops the current session id, applies the inclusive
+        ``stage1_threshold``, and caps to ``stage1_top_k``.
+        """
+        filter_kwargs: dict[str, Any] = {}
+        if self.config.scope.same_environment:
+            env = getattr(session, "environment", None)
+            if env:
+                filter_kwargs["environment"] = env
+        # ``status_filter`` is the resolved session bucket — only_closed
+        # maps to "resolved" in the incident-management vocabulary.
+        # Apps that disable only_closed get all statuses other than
+        # in-flight via the empty filter (HistoryStore default behaviour
+        # already screens deleted rows).
+        status_filter = "resolved" if self.config.scope.only_closed else "*"
+        try:
+            raw = history_store.find_similar(
+                query=new_text,
+                filter_kwargs=filter_kwargs or None,
+                status_filter=status_filter,
+                threshold=self.config.stage1_threshold,
+                limit=self.config.stage1_top_k,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let dedup crash intake
+            logger.warning("dedup stage 1: history_store failure: %s", exc)
+            return []
+
+        own_id = getattr(session, "id", None)
+        out: list[tuple[Any, float]] = []
+        for inc, score in raw:
+            if getattr(inc, "id", None) == own_id:
+                continue
+            if score < self.config.stage1_threshold:
+                # ``find_similar`` already screens by threshold but apps
+                # may pass a custom HistoryStore — defensive double-check.
+                continue
+            out.append((inc, float(score)))
+        return out[: self.config.stage1_top_k]
+
+    # ----- Stage 2 -----
+
+    async def _stage2(
+        self,
+        *,
+        session: StateT,
+        new_text: str,
+        candidates: list[tuple[Any, float]],
+    ) -> DedupResult:
+        """LLM confirmation pass — short-circuits on the first confirm."""
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        capped = candidates[: self.config.stage2_top_k]
+        # Build the model lazily so the factory error surfaces only when
+        # we actually need an LLM (i.e. Stage 1 found candidates).
+        try:
+            llm = self._model_factory()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("dedup stage 2: model factory failed: %s", exc)
+            return DedupResult(matched=False)
+
+        new_id = getattr(session, "id", "<new>")
+        parse_failures = 0
+        # Resolve the Stage-2 system prompt: per-config override wins,
+        # otherwise the framework default. Apps that want incident-shaped
+        # phrasing tune ``framework_cfg.dedup_system_prompt`` (the
+        # incident-management example does); apps that want a one-off
+        # override set it on ``DedupConfig.system_prompt``.
+        system_prompt = (
+            self.config.system_prompt
+            or self._framework_cfg.dedup_system_prompt
+        )
+        for prior, stage1_score in capped:
+            prior_id = getattr(prior, "id", "<unknown>")
+            prior_text = (self._text_extractor(prior) or "").strip()
+            user_prompt = _build_stage2_user_prompt(
+                prior_text=prior_text,
+                new_text=new_text,
+                prior_id=str(prior_id),
+                new_id=str(new_id),
+            )
+            try:
+                msg = await llm.ainvoke([
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt),
+                ])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "dedup stage 2: LLM call failed for prior=%s: %s",
+                    prior_id, exc,
+                )
+                continue
+            raw = getattr(msg, "content", "") or ""
+            decision, parse_err = _parse_decision_tagged(
+                raw, model_name=self.config.stage2_model,
+            )
+            if decision is None:
+                # Parse / validation failure — count it so operators can
+                # detect schema drift in dashboards / alerts. The legit
+                # "model said not-duplicate" branch goes through the
+                # ``decision is not None`` arm below and does NOT bump
+                # the counter.
+                if parse_err is not None:
+                    parse_failures += 1
+                continue
+            if (decision.is_duplicate
+                    and decision.confidence >= self.config.stage2_min_confidence):
+                return DedupResult(
+                    matched=True,
+                    parent_session_id=str(prior_id),
+                    candidate_id=str(prior_id),
+                    decision=decision,
+                    stage1_score=stage1_score,
+                    parse_failures=parse_failures,
+                )
+        return DedupResult(matched=False, parse_failures=parse_failures)
+
+# ====== module: runtime/orchestrator.py ======
+
+if TYPE_CHECKING:
+    # Avoid a runtime circular import — ``runtime.triggers.base`` only
+    # defines a dataclass, and the type appears in a method annotation.
+    pass
+
+
+
+
+
+from langgraph.types import Command
+
+
+
+
+
+
+
+
+
+
+
+def _default_text_extractor(session) -> str:
+    """Default text extraction for the incident-management example.
+
+    Concatenates the operator-supplied ``query``, the intake-summary
+    (when present), and any tags. Keeps the framework agnostic of the
+    domain class — apps with a different shape can install their own
+    extractor by subclassing the orchestrator (or by setting one of the
+    expected attributes on their state class).
+    """
+    parts = []
+    q = getattr(session, "query", None)
+    if q:
+        parts.append(str(q))
+    s = getattr(session, "summary", None)
+    if s:
+        parts.append(str(s))
+    tags = getattr(session, "tags", None)
+    if tags:
+        parts.append(" ".join(str(t) for t in tags))
+    return " ".join(parts).strip()
+
+_INCIDENT_MCP_MODULE = "examples.incident_management.mcp_server"
+
+
+def _resolve_dedup_config(dotted: str | None) -> "DedupConfig | None":
+    """Resolve ``module.path:callable`` into a :class:`DedupConfig` (or None).
+
+    Returns ``None`` when the path is unset; raises ``ValueError`` for
+    malformed paths (mirrors :func:`resolve_framework_app_config`).
+    The provider must be a no-arg callable returning ``DedupConfig | None``.
+    """
+    if dotted is None:
+        return None
+    if ":" not in dotted:
+        raise ValueError(
+            f"dedup_config_path={dotted!r} must be in 'module.path:callable' form"
+        )
+    module_name, _, attr = dotted.partition(":")
+    mod = importlib.import_module(module_name)
+    provider = getattr(mod, attr)
+    cfg = provider()
+    if cfg is None:
+        return None
+    if not isinstance(cfg, DedupConfig):
+        raise TypeError(
+            f"dedup provider {dotted!r} returned {type(cfg).__name__}; "
+            "expected DedupConfig | None"
+        )
+    return cfg
+
+# StateT mirrors the bound used in ``runtime.storage.session_store``;
+# kept permissive at ``BaseModel`` so the storage layer is usable by
+# ad-hoc tests that build a plain ``BaseModel`` directly. Real apps
+# inject a ``runtime.state.Session`` subclass via
+# ``RuntimeConfig.state_class`` and the resolver enforces that bound.
+StateT = TypeVar("StateT", bound=BaseModel)
+
+
+def _coerce_state_overrides(
+    state_overrides: dict | None,
+    environment: str | None,
+) -> dict | None:
+    """Resolve the generic ``state_overrides`` kwarg from the public
+    ``start_session`` surface, coercing the deprecated ``environment``
+    kwarg when present.
+
+    Rules mirror :func:`_coerce_submitter`:
+      - If neither is supplied, return ``None``.
+      - If only ``state_overrides`` is supplied, return it unchanged.
+      - If only ``environment`` is supplied, emit a single
+        ``DeprecationWarning`` and return ``{"environment": environment}``.
+      - If both are supplied, raise ``TypeError`` — silent precedence
+        would mask caller bugs.
+    """
+    if state_overrides is not None and environment is not None:
+        raise TypeError(
+            "start_session() received both state_overrides and "
+            "environment; pass state_overrides only "
+            "(environment is deprecated)"
+        )
+    if environment is not None:
+        warnings.warn(
+            "environment is a deprecated kwarg on start_session(); pass "
+            "state_overrides={'environment': ...} instead. The legacy kwarg "
+            "will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return {"environment": environment}
+    return state_overrides
+
+
+def _coerce_submitter(
+    submitter: dict | None,
+    reporter_id: str | None,
+    reporter_team: str | None,
+) -> dict | None:
+    """Resolve the generic ``submitter`` kwarg from the public start_session
+    surface, coercing the deprecated ``reporter_id``/``reporter_team`` pair
+    when present.
+
+    Rules:
+      - If neither ``submitter`` nor the legacy pair is supplied, return ``None``.
+      - If only ``submitter`` is supplied, return it unchanged.
+      - If only the legacy kwargs are supplied, emit a single
+        ``DeprecationWarning`` per call and return
+        ``{"id": reporter_id, "team": reporter_team}`` (defaulting missing
+        halves to the historical ``"user-mock"``/``"platform"`` so existing
+        callers behave identically).
+      - If both ``submitter`` and either legacy kwarg are supplied, raise
+        ``TypeError`` — there's no sensible merge and silent precedence
+        would mask a caller bug.
+    """
+    legacy_supplied = reporter_id is not None or reporter_team is not None
+    if submitter is not None and legacy_supplied:
+        raise TypeError(
+            "start_session() received both submitter and "
+            "reporter_id/reporter_team; pass submitter only "
+            "(reporter_id/reporter_team are deprecated)"
+        )
+    if legacy_supplied:
+        warnings.warn(
+            "reporter_id and reporter_team are deprecated kwargs on "
+            "start_session(); pass submitter={'id': ..., 'team': ...} "
+            "instead. The legacy kwargs will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return {
+            "id": reporter_id if reporter_id is not None else "user-mock",
+            "team": reporter_team if reporter_team is not None else "platform",
+        }
+    return submitter
 
 
 def _metadata_url(cfg: AppConfig) -> str:
@@ -2604,29 +5731,85 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
-class Orchestrator:
+class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
     The Orchestrator owns the lifecycle of the FastMCP clients underpinning the
     tool registry. Always call :meth:`aclose` (or use ``async with``) when done.
+
+    ``Generic[StateT]`` carries the resolved app state class through to the
+    store. The actual class is resolved at construction time via
+    :func:`runtime.state_resolver.resolve_state_class` (PEP 484 generics are
+    erased at runtime, so we can't introspect ``StateT`` directly).
     """
 
-    def __init__(self, cfg: AppConfig, store: IncidentRepository,
+    def __init__(self, cfg: AppConfig, store: SessionStore,
                  skills: dict[str, Skill], registry: ToolRegistry, graph,
-                 resume_graph, exit_stack: AsyncExitStack):
+                 exit_stack: AsyncExitStack,
+                 framework_cfg: FrameworkAppConfig | None = None,
+                 state_cls: Type[StateT] = Session,  # type: ignore[assignment]
+                 history: HistoryStore | None = None,
+                 checkpointer=None,
+                 checkpointer_close=None,
+                 dedup_pipeline: "DedupPipeline | None" = None):
         self.cfg = cfg
         self.store = store
+        # P7-F: optional two-stage dedup pipeline. Built in ``create``
+        # only when the resolved DedupConfig has ``enabled=True``;
+        # otherwise ``None`` so the lifecycle hook is a no-op.
+        self.dedup_pipeline = dedup_pipeline
+        # P2-J: split the legacy ``IncidentRepository`` facade into the
+        # active ``SessionStore`` (CRUD) plus a separate read-only
+        # ``HistoryStore`` (similarity search). Both share the same
+        # engine and vector store; ``history`` is optional for callers
+        # that don't need similarity lookups.
+        self.history = history
         self.skills = skills
         self.registry = registry
+        # P2-I: a single compiled graph drives both fresh runs and
+        # resume-from-interrupt. Resumes go through ``ainvoke`` /
+        # ``astream_events`` with ``Command(resume=...)`` against the
+        # same ``thread_id`` — the checkpointer rehydrates the paused
+        # state. The bespoke resume sub-graph is gone.
         self.graph = graph
-        self.resume_graph = resume_graph
         self._exit_stack = exit_stack
+        self.state_cls = state_cls
+        # P2-F/G: durable LangGraph checkpointer keyed off the same metadata
+        # URL as the relational store. ``checkpointer`` is the saver; the
+        # ``checkpointer_close`` callable is invoked from ``aclose`` so the
+        # underlying connection / pool is released on orchestrator shutdown.
+        self.checkpointer = checkpointer
+        self._checkpointer_close = checkpointer_close
+        # Cross-cutting domain-flavored knobs (confidence threshold,
+        # escalation roster, severity aliases, dedup prompt) now live
+        # on a generic FrameworkAppConfig the runtime can consume
+        # without importing app-specific config modules.
+        self.framework_cfg = framework_cfg or FrameworkAppConfig()
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
         stack = AsyncExitStack()
         await stack.__aenter__()
         try:
+            # Cross-cutting framework knobs come from the dotted-path
+            # provider on RuntimeConfig.framework_app_config_path. When
+            # unset the runtime falls back to a bare FrameworkAppConfig()
+            # so unit tests that build an AppConfig without an app-side
+            # provider keep working.
+            framework_cfg = resolve_framework_app_config(
+                cfg.runtime.framework_app_config_path,
+            )
+            # Resolve the app state class once. ``None`` (default) keeps the
+            # framework-default ``Session`` shape; apps point this at e.g.
+            # ``examples.incident_management.state.IncidentState`` via YAML.
+            resolved_state_cls: Type[BaseModel] = resolve_state_class(
+                cfg.runtime.state_class
+            )
+            # P2-FIX: SQLite concurrency PRAGMAs (WAL, busy_timeout,
+            # synchronous=NORMAL) and ``BEGIN IMMEDIATE`` are now installed
+            # inside ``build_engine`` so any caller (orchestrator, tests,
+            # ad-hoc scripts) gets a saver-friendly engine without
+            # duplicating the connect-event hook.
             engine = build_engine(MetadataConfig(
                 url=_metadata_url(cfg),
                 pool_size=cfg.storage.metadata.pool_size,
@@ -2635,31 +5818,49 @@ class Orchestrator:
             Base.metadata.create_all(engine)
             embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
             vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
-            store = IncidentRepository(
+            # P2-J: build SessionStore (CRUD) and HistoryStore (similarity)
+            # directly. The legacy ``IncidentRepository`` facade is gone.
+            # ``state_class`` is resolved via the runtime resolver; when an
+            # app doesn't set it the bare ``Session`` is used.
+            repo_state_cls: Type[BaseModel] = resolved_state_cls
+            store = SessionStore(
                 engine=engine,
+                state_cls=repo_state_cls,
                 embedder=embedder,
                 vector_store=vector_store,
                 vector_path=(cfg.storage.vector.path
                              if cfg.storage.vector.backend == "faiss" else None),
                 vector_index_name=cfg.storage.vector.collection_name,
                 distance_strategy=cfg.storage.vector.distance_strategy,
-                similarity_threshold=cfg.incidents.similarity_threshold,
-                severity_aliases=cfg.orchestrator.severity_aliases,
+            )
+            history = HistoryStore(
+                engine=engine,
+                state_cls=repo_state_cls,
+                embedder=embedder,
+                vector_store=vector_store,
+                similarity_threshold=framework_cfg.similarity_threshold,
+                distance_strategy=cfg.storage.vector.distance_strategy,
             )
             # Configure incident_management state via importlib so we hit the
             # *same* module instance the MCP loader will import. In the
             # single-file dist bundle a direct ``set_state`` call would
             # configure a bundled-local ``_default_server`` while the loader
-            # imports ``orchestrator.mcp_servers.incident`` from src and uses
+            # imports ``examples.incident_management.mcp_server`` and uses
             # a *different* singleton — leaving FastMCP tools unconfigured.
             for srv in cfg.mcp.servers:
                 if (srv.transport == "in_process" and srv.enabled
                         and srv.module == _INCIDENT_MCP_MODULE):
                     importlib.import_module(_INCIDENT_MCP_MODULE).set_state(
-                        repository=store,
-                        severity_aliases=cfg.orchestrator.severity_aliases,
+                        store=store,
+                        history=history,
+                        severity_aliases=framework_cfg.severity_aliases,
                     )
                     break
+            if cfg.paths.skills_dir is None:
+                raise RuntimeError(
+                    "paths.skills_dir is not configured; apps must set it "
+                    "via config.yaml or env"
+                )
             skills = load_all_skills(cfg.paths.skills_dir)
             for s in skills.values():
                 if s.model is not None and s.model not in cfg.llm.models:
@@ -2669,28 +5870,84 @@ class Orchestrator:
                         f"(known: {sorted(cfg.llm.models)})"
                     )
             registry = await load_tools(cfg.mcp, stack)
+            # Build the durable checkpointer once and pass it into the
+            # compiled graph. Stays attached to the orchestrator so
+            # aclose() can release the underlying connection / pool.
+            # Pass the *resolved* metadata config (URL rewritten via
+            # ``_metadata_url`` so per-test ``tmp_path`` isolation lands
+            # on the same DB file the SQLAlchemy engine just opened).
+            checkpointer, checkpointer_close = await make_checkpointer(
+                MetadataConfig(
+                    url=_metadata_url(cfg),
+                    pool_size=cfg.storage.metadata.pool_size,
+                    echo=cfg.storage.metadata.echo,
+                )
+            )
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
-                                      registry=registry)
-            # Build the resume graph only when at least one skill declares
-            # a gated route. Without gates an INC can never enter the
-            # ``awaiting_input`` state, so the resume path is dead code —
-            # and ``build_resume_graph`` raises by design when gated_edges
-            # is empty. This unblocks intake-only YAML configurations.
-            has_gates = any(
-                r.gate for s in skills.values() for r in s.routes
+                                      registry=registry,
+                                      checkpointer=checkpointer,
+                                      framework_cfg=framework_cfg)
+            # P7-F: build the dedup pipeline iff the app has opted in
+            # AND the configured stage 2 model resolves in the LLM
+            # registry. When the registry doesn't include the configured
+            # model (e.g. CI uses ``LLMConfig.stub()``), dedup is
+            # silently treated as off so unrelated tests don't need to
+            # know about Phase 7. Production deployments with a real
+            # registry hit the strict validation path.
+            #
+            # The DedupConfig comes through a generic provider hook
+            # (``RuntimeConfig.dedup_config_path``) — the runtime never
+            # imports an app-specific config to discover dedup settings.
+            dedup_pipeline: DedupPipeline | None = None
+            dedup_cfg: DedupConfig | None = _resolve_dedup_config(
+                cfg.runtime.dedup_config_path,
             )
-            resume_graph = (
-                await build_resume_graph(
-                    cfg=cfg, skills=skills, store=store, registry=registry,
-                ) if has_gates else None
-            )
-            return cls(cfg, store, skills, registry, graph, resume_graph, stack)
+            if dedup_cfg is not None and dedup_cfg.enabled:
+                if dedup_cfg.stage2_model in cfg.llm.models:
+                    _llm_cfg_capture = cfg.llm
+                    _model_name = dedup_cfg.stage2_model
+
+                    def _factory():
+                        return get_llm(
+                            _llm_cfg_capture, _model_name, role="dedup",
+                        )
+
+                    dedup_pipeline = DedupPipeline(
+                        config=dedup_cfg,
+                        text_extractor=_default_text_extractor,
+                        model_factory=_factory,
+                        framework_cfg=framework_cfg,
+                    )
+            # P2-I: no resume graph anymore — resume runs through the
+            # main graph via ``Command(resume=...)`` against the same
+            # thread_id, with the checkpointer rehydrates paused state.
+            return cls(cfg, store, skills, registry, graph,
+                       stack, framework_cfg=framework_cfg,
+                       state_cls=repo_state_cls,
+                       history=history,
+                       checkpointer=checkpointer,
+                       checkpointer_close=checkpointer_close,
+                       dedup_pipeline=dedup_pipeline)
         except BaseException:
+            # Best-effort: close the checkpointer connection if it was
+            # built before we hit the failure, so we don't leak FDs.
+            try:
+                await checkpointer_close()  # pyright: ignore[reportPossiblyUnboundVariable]
+            except Exception:  # noqa: BLE001
+                pass
             await stack.aclose()
             raise
 
     async def aclose(self) -> None:
-        """Close all owned MCP clients/transports. Idempotent."""
+        """Close all owned MCP clients/transports + checkpointer. Idempotent."""
+        # Drop the checkpointer first so its pool drains before the
+        # AsyncExitStack tears down anything that might have observed it.
+        if self._checkpointer_close is not None:
+            try:
+                await self._checkpointer_close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._checkpointer_close = None
         await self._exit_stack.aclose()
 
     async def __aenter__(self) -> "Orchestrator":
@@ -2740,41 +5997,217 @@ class Orchestrator:
             for e in self.registry.entries.values()
         ]
 
-    def get_incident(self, incident_id: str) -> dict:
+    def _thread_config(self, incident_id: str) -> dict:
+        """Build the LangGraph ``config`` dict for a per-session thread.
+
+        With a checkpointer attached, every ``ainvoke`` / ``astream_events``
+        call must carry a ``configurable.thread_id`` so LangGraph can scope
+        the durable state. Using the incident id keeps each INC's graph
+        state isolated and lets the checkpointer act as a resume index.
+        """
+        return {"configurable": {"thread_id": incident_id}}
+
+    def get_session(self, incident_id: str) -> dict:
+        """Load a session by id and return its serialized form."""
         return self.store.load(incident_id).model_dump()
 
-    def list_recent_incidents(self, limit: int = 20) -> list[dict]:
+    def get_incident(self, incident_id: str) -> dict:
+        """Deprecated alias for ``get_session`` — remove in Phase 2."""
+        return self.get_session(incident_id)
+
+    def list_recent_sessions(self, limit: int = 20) -> list[dict]:
+        """List the most recent sessions, newest first."""
         return [i.model_dump() for i in self.store.list_recent(limit)]
 
-    def delete_incident(self, incident_id: str) -> dict:
+    def list_recent_incidents(self, limit: int = 20) -> list[dict]:
+        """Deprecated alias for ``list_recent_sessions`` — remove in Phase 2."""
+        return self.list_recent_sessions(limit)
+
+    def delete_session(self, incident_id: str) -> dict:
+        """Soft-delete a session and return its final serialized form."""
         return self.store.delete(incident_id).model_dump()
+
+    def delete_incident(self, incident_id: str) -> dict:
+        """Deprecated alias for ``delete_session`` — remove in Phase 2."""
+        return self.delete_session(incident_id)
+
+    async def _run_dedup_check(self, inc) -> bool:
+        """Run the ``dedup_check`` lifecycle hook (P7-F).
+
+        Returns ``True`` iff the session was confirmed as a duplicate
+        and marked accordingly — callers should skip the agent graph in
+        that case. Idempotent: a second invocation on a session that
+        already has ``status="duplicate"`` is a no-op (returns ``True``).
+
+        Failure modes (history error, LLM error, malformed structured
+        output) all degrade to "not a duplicate" so dedup never crashes
+        intake. Uses ``getattr`` for defensive access so unit-test stubs
+        that build the orchestrator via ``__new__`` (bypassing
+        ``__init__``) still get a working passthrough.
+        """
+        pipeline = getattr(self, "dedup_pipeline", None)
+        history = getattr(self, "history", None)
+        if pipeline is None:
+            return False
+        if getattr(inc, "status", None) == "duplicate":
+            return True
+        if history is None:
+            return False
+        try:
+            result: DedupResult = await pipeline.run(
+                session=inc, history_store=history,
+            )
+        except Exception:  # noqa: BLE001 — dedup must never crash intake
+            return False
+        if not result.matched:
+            return False
+        # Mark + persist. The session row is non-destructively linked to
+        # the matched parent; the agent graph is skipped.
+        inc.status = "duplicate"
+        inc.parent_session_id = result.parent_session_id
+        if result.decision is not None:
+            inc.dedup_rationale = result.decision.rationale
+        self.store.save(inc)
+        return True
+
+    async def start_session(self, *, query: str,
+                            state_overrides: dict | None = None,
+                            environment: str | None = None,
+                            submitter: dict | None = None,
+                            reporter_id: str | None = None,
+                            reporter_team: str | None = None,
+                            trigger: "TriggerInfo | None" = None) -> str:
+        """Start a new agent session and run the entry agent.
+
+        ``state_overrides`` is a free-form dict of domain-specific
+        fields the app stamps onto the new session row. The framework
+        only projects ``environment`` onto the storage column (the row
+        schema's last domain leak); other keys flow through the
+        app-specific MCP tools (or, in future, ``state_cls(...)``
+        kwargs once the row schema is fully generic).
+
+        ``submitter`` is a free-form dict the app interprets. For
+        incident-management it is ``{"id": "...", "team": "..."}``; for
+        other apps it can carry app-specific keys (e.g. code-review's
+        ``{"id": "<github-username>", "pr_url": "..."}``). The framework
+        only projects ``id``/``team`` onto the row's reporter columns;
+        apps unpack the rest via their own MCP tools.
+
+        Deprecated kwargs (coerced into ``state_overrides`` / ``submitter``
+        and warned about):
+          * ``environment`` -> ``state_overrides={"environment": ...}``
+          * ``reporter_id`` / ``reporter_team`` -> ``submitter={"id": ...,
+            "team": ...}``
+
+        Passing both a generic kwarg and its legacy partner raises
+        ``TypeError``.
+
+        ``trigger`` (P5-I) is the optional provenance record from
+        :mod:`runtime.triggers`. When supplied, ``name``/``transport``/
+        ``target_app`` are written to ``inc.findings['trigger']`` for
+        post-hoc audit; the orchestrator does not branch on its
+        contents.
+
+        P7-F: if the dedup pipeline is configured and stage 2 confirms
+        a duplicate of a prior closed session, the new session is
+        marked ``status="duplicate"`` with ``parent_session_id`` set
+        and the agent graph is skipped entirely.
+        """
+        state_overrides = _coerce_state_overrides(state_overrides, environment)
+        submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
+        sub_id = (submitter or {}).get("id", "user-mock")
+        sub_team = (submitter or {}).get("team", "platform")
+        env = (state_overrides or {}).get("environment", "")
+        inc = self.store.create(query=query, environment=env,
+                                reporter_id=sub_id, reporter_team=sub_team)
+        if trigger is not None:
+            inc.findings["trigger"] = {
+                "name": trigger.name,
+                "transport": trigger.transport,
+                "target_app": trigger.target_app,
+                "received_at": trigger.received_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            self.store.save(inc)
+        # P7-F: dedup_check before the graph fires.
+        if await self._run_dedup_check(inc):
+            return inc.id
+        await self.graph.ainvoke(
+            GraphState(session=inc, next_route=None,
+                       last_agent=None, error=None),
+            config=self._thread_config(inc.id),
+        )
+        return inc.id
 
     async def start_investigation(self, *, query: str, environment: str,
                                   reporter_id: str = "user-mock",
                                   reporter_team: str = "platform") -> str:
-        inc = self.store.create(query=query, environment=environment,
-                                reporter_id=reporter_id, reporter_team=reporter_team)
-        await self.graph.ainvoke(GraphState(incident=inc, next_route=None,
-                                            last_agent=None, error=None))
-        return inc.id
+        """Deprecated alias for ``start_session`` — remove in Phase 2.
+
+        Coerces the legacy positional surface into the generic
+        ``submitter`` + ``state_overrides`` kwargs so the runtime
+        deprecation paths never fire from the alias.
+        """
+        return await self.start_session(
+            query=query,
+            state_overrides={"environment": environment},
+            submitter={"id": reporter_id, "team": reporter_team},
+        )
+
+    async def stream_session(self, *, query: str, environment: str,
+                             reporter_id: str = "user-mock",
+                             reporter_team: str = "platform"
+                             ) -> AsyncIterator[dict]:
+        """Start a new session and stream UI events as it runs.
+
+        Internally builds a ``submitter`` dict so the row's reporter
+        columns are populated through the same coercion path
+        ``start_session`` uses.
+        """
+        sub = {"id": reporter_id, "team": reporter_team}
+        inc = self.store.create(
+            query=query,
+            environment=environment,
+            reporter_id=sub["id"],
+            reporter_team=sub["team"],
+        )
+        yield {"event": "investigation_started", "incident_id": inc.id,
+               "ts": _event_ts()}
+        # P7-F: dedup_check before the graph fires. Surface a one-shot
+        # ``dedup_matched`` event so the UI can render the "marked
+        # duplicate" banner without polling.
+        if await self._run_dedup_check(inc):
+            yield {"event": "dedup_matched", "incident_id": inc.id,
+                   "parent_session_id": inc.parent_session_id,
+                   "ts": _event_ts()}
+            yield {"event": "investigation_completed", "incident_id": inc.id,
+                   "ts": _event_ts()}
+            return
+        async for ev in self.graph.astream_events(
+            GraphState(session=inc, next_route=None, last_agent=None, error=None),
+            version="v2",
+            config=self._thread_config(inc.id),
+        ):
+            yield self._to_ui_event(ev, inc.id)
+        yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _event_ts()}
 
     async def stream_investigation(self, *, query: str, environment: str,
                                    reporter_id: str = "user-mock",
                                    reporter_team: str = "platform"
                                    ) -> AsyncIterator[dict]:
-        inc = self.store.create(query=query, environment=environment,
-                                reporter_id=reporter_id, reporter_team=reporter_team)
-        yield {"event": "investigation_started", "incident_id": inc.id,
-               "ts": _event_ts()}
-        async for ev in self.graph.astream_events(
-            GraphState(incident=inc, next_route=None, last_agent=None, error=None),
-            version="v2",
-        ):
-            yield self._to_ui_event(ev, inc.id)
-        yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _event_ts()}
+        """Deprecated alias for ``stream_session`` — remove in Phase 2.
 
-    async def resume_investigation(self, incident_id: str,
-                                   decision: dict) -> AsyncIterator[dict]:
+        Forwards the legacy positional surface into ``stream_session``;
+        the underlying flow already coerces the reporter pair into
+        a submitter dict internally so no runtime deprecation fires.
+        """
+        async for event in self.stream_session(
+            query=query, environment=environment,
+            reporter_id=reporter_id, reporter_team=reporter_team,
+        ):
+            yield event
+
+    async def resume_session(self, incident_id: str,
+                             decision: dict) -> AsyncIterator[dict]:
         """Resume a paused INC. ``decision`` shapes:
 
         - ``{"action": "resume_with_input", "input": "<text>"}``
@@ -2810,7 +6243,7 @@ class Orchestrator:
 
         if action == "escalate":
             team = decision.get("team") or "platform-oncall"
-            allowed = list(self.cfg.intervention.escalation_teams)
+            allowed = list(self.framework_cfg.escalation_teams)
             if team not in allowed:
                 # Reject the request entirely. The INC stays awaiting_input
                 # so the user can retry with a valid team. Logging the
@@ -2850,36 +6283,35 @@ class Orchestrator:
 
         raise ValueError(f"Unknown resume action: {action!r}")
 
+    async def resume_investigation(self, incident_id: str,
+                                   decision: dict) -> AsyncIterator[dict]:
+        """Deprecated alias for ``resume_session`` — remove in Phase 2."""
+        async for event in self.resume_session(incident_id, decision):
+            yield event
+
     async def _resume_with_input(self, incident_id: str, inc, decision: dict):
-        """Handle the resume_with_input action: append user text, re-run sub-graph,
-        restore state on failure. Yields UI events."""
+        """Handle the resume_with_input action via P2-I.
+
+        Drives the *same* compiled graph with ``Command(resume=user_text)``
+        against the paused thread_id. The checkpointer rehydrates the
+        suspended gate node; the gate body (P2-H) appends the input to
+        ``session.user_inputs``, clears ``pending_intervention``, and
+        falls through to the gated downstream target. On failure the
+        intervention payload is restored so the UI can reprompt.
+        """
         user_text = (decision.get("input") or "").strip()
         if not user_text:
             raise ValueError("resume_with_input requires a non-empty 'input'")
-        # The resume sub-graph only exists when the YAML declares at least
-        # one gated route. An intake-only configuration has nothing to
-        # resume into — bail with a rejection event rather than crashing.
-        if self.resume_graph is None:
-            yield {"event": "resume_rejected", "incident_id": incident_id,
-                   "reason": "resume_with_input not available: no gated route configured",
-                   "ts": _event_ts()}
-            return
-        # Snapshot the intervention payload BEFORE we mutate the INC, so
-        # we can restore it if the sub-graph blows up. Without this an
-        # apply_fix exception leaves the INC stuck at in_progress with a
-        # cleared pending_intervention — the user can no longer resolve it
-        # via the UI.
+        # Snapshot the intervention payload BEFORE we hand off to the
+        # graph. The gate's post-resume continuation (P2-H) clears it on
+        # the way out; if the downstream graph blows up we restore from
+        # this snapshot so the UI can reprompt the user.
         saved_pi = inc.pending_intervention
-        inc.user_inputs.append(user_text)
-        inc.pending_intervention = None
-        inc.status = "in_progress"
-        self.store.save(inc)
-        inc = self.store.load(incident_id)  # reload as canonical state
         try:
-            async for ev in self.resume_graph.astream_events(
-                GraphState(incident=inc, next_route=None, last_agent=None,
-                           error=None),
+            async for ev in self.graph.astream_events(
+                Command(resume=user_text),
                 version="v2",
+                config=self._thread_config(incident_id),
             ):
                 yield self._to_ui_event(ev, incident_id)
         except Exception as exc:  # noqa: BLE001 — restore on any failure
@@ -2931,7 +6363,34 @@ class Orchestrator:
 def _event_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ====== module: orchestrator/api.py ======
+# ====== module: runtime/api.py ======
+
+def _resolve_environments(dotted: str | None) -> list[str]:
+    """Resolve ``RuntimeConfig.environments_provider_path`` to a list.
+
+    Returns an empty list when ``dotted`` is unset (apps that don't
+    expose an environments roster). Provider callables must return a
+    sequence of strings; anything else raises ``TypeError``.
+    """
+    if dotted is None:
+        return []
+    if ":" not in dotted:
+        raise ValueError(
+            f"environments_provider_path={dotted!r} must be in "
+            "'module.path:callable' form"
+        )
+    import importlib
+    module_name, _, attr = dotted.partition(":")
+    mod = importlib.import_module(module_name)
+    provider = getattr(mod, attr)
+    envs = provider()
+    if not isinstance(envs, (list, tuple)):
+        raise TypeError(
+            f"environments provider {dotted!r} returned "
+            f"{type(envs).__name__}; expected list[str]"
+        )
+    return [str(e) for e in envs]
+
 
 class InvestigateRequest(BaseModel):
     query: str
@@ -2949,30 +6408,167 @@ class ResumeRequest(BaseModel):
     user_input: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# P3-H: multi-session schemas
+# ---------------------------------------------------------------------------
+
+
+class SessionStartBody(BaseModel):
+    query: str
+    environment: str
+    # Generic submitter dict — the framework projects ``id``/``team``
+    # onto the row's reporter columns; apps interpret the rest. The
+    # legacy ``reporter_id`` / ``reporter_team`` fields were removed
+    # from this body because the deprecation path on the runtime
+    # would emit a warning at every request — production-log noise.
+    submitter: dict | None = None
+
+
+class SessionStartResponse(BaseModel):
+    session_id: str
+
+
+class SessionStatus(BaseModel):
+    session_id: str
+    status: str
+    started_at: str
+    current_agent: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# P4-G: HITL approval schemas (risk-rated tool gateway)
+# ---------------------------------------------------------------------------
+
+
+class ApprovalDecisionBody(BaseModel):
+    """Request body for ``POST /sessions/{sid}/approvals/{tool_call_id}``.
+
+    The wrap_tool closure interprets ``decision`` as either ``approve``
+    (run the tool, audit) or ``reject`` (skip the tool, audit rejection).
+    ``approver`` is the operator id; ``rationale`` is optional free text.
+    """
+
+    decision: Literal["approve", "reject"]
+    approver: str
+    rationale: str | None = None
+
+
+class PendingApproval(BaseModel):
+    """Snapshot of one pending tool approval read from session.tool_calls."""
+
+    tool_call_id: str
+    agent: str
+    tool: str
+    args: dict
+    ts: str
+
+
 def _make_lifespan(cfg: AppConfig):
     """Build the lifespan context manager for an app constructed with ``cfg``.
 
-    The orchestrator owns FastMCP transports tied to an asyncio event loop;
-    creating it inside the lifespan ensures it lives on uvicorn's loop and
-    is closed cleanly on shutdown.
+    Constructs the :class:`runtime.service.OrchestratorService` singleton,
+    starts its background loop, eagerly builds the underlying
+    :class:`runtime.orchestrator.Orchestrator` (so legacy routes that
+    expect ``app.state.orchestrator`` keep working), and (P5-B) builds
+    the :class:`runtime.triggers.TriggerRegistry` from
+    ``cfg.triggers``. The webhook router is mounted on the FastAPI app
+    here; APScheduler is started by the schedule transport's ``start``.
+
+    On shutdown, the registry's ``stop_all`` runs first (drains
+    APScheduler), then ``service.shutdown()`` tears the orchestrator down.
     """
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-        orch = await Orchestrator.create(cfg)
+        # Lazy import: ``runtime.service`` transitively pulls a lot of
+        # heavyweight modules (FastMCP, SQLAlchemy). Importing at function
+        # scope keeps ``import runtime.api`` cheap for tests/tools that
+        # only need ``build_app``.
+
+
+
+
+        svc = OrchestratorService.get_or_create(cfg)
+        svc.start()
+        # Eagerly build the shared Orchestrator so legacy routes can read
+        # it via ``app.state.orchestrator`` without racing on the
+        # lazy-build path. ``_ensure_orchestrator`` is on the loop thread,
+        # so we hop through the sync bridge.
+        orch = svc.submit_and_wait(svc._ensure_orchestrator(), timeout=30.0)
+        app.state.service = svc
         app.state.orchestrator = orch
-        app.state.environments = list(cfg.environments)
+        # Environments roster is app-specific (incident-management has
+        # production/staging/dev/local; code-review doesn't expose one).
+        # Resolve via the generic provider hook so the runtime never
+        # imports an app config module.
+        app.state.environments = _resolve_environments(
+            getattr(cfg.runtime, "environments_provider_path", None),
+        )
+
+        # ------------------------------------------------------------
+        # P5-B: build & start the trigger registry
+        # ------------------------------------------------------------
+        plugin_transports = getattr(app.state, "plugin_transports", None)
+
+        async def _start_session_fn(**kwargs):
+            # The registry's dispatch sink. Bridges through the
+            # OrchestratorService so we share the one MCP pool / one
+            # orchestrator / one DB engine that the rest of the app uses.
+            return svc.submit_and_wait(
+                _trigger_dispatch(svc, kwargs), timeout=60.0
+            )
+
+        async def _trigger_dispatch(service, kwargs):
+            # ``svc.start_session`` is sync (returns the session id); the
+            # registry awaits us. Trampoline through the loop's
+            # default executor.
+            import asyncio as _asyncio
+            loop = _asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: service.start_session(**kwargs)
+            )
+
+        idempotency: IdempotencyStore | None = None
+        if cfg.triggers:
+            try:
+                idempotency = IdempotencyStore(orch.store.engine)
+            except AttributeError:
+                # Older test stubs don't expose ``store.engine``; the
+                # registry tolerates ``idempotency=None`` (no caching).
+                idempotency = None
+        registry = TriggerRegistry.create(
+            list(cfg.triggers),
+            start_session_fn=_start_session_fn,
+            idempotency=idempotency,
+            plugin_transports=plugin_transports,
+        )
+        app.state.trigger_registry = registry
+        await registry.start_all()
+        # Mount any webhook routers onto the FastAPI app so the routes
+        # become live.
+        for t in registry.transports:
+            if isinstance(t, WebhookTransport):
+                app.include_router(t.router)
         try:
             yield
         finally:
-            await orch.aclose()
+            try:
+                await registry.stop_all()
+            except Exception:  # noqa: BLE001
+                pass
+            # ``shutdown()`` cancels in-flight session tasks, closes the
+            # underlying Orchestrator + MCP pool, joins the loop thread,
+            # and resets the process-singleton.
+            svc.shutdown()
     return _lifespan
 
 
 def build_app(cfg: AppConfig) -> FastAPI:
     """Construct the FastAPI app. Synchronous.
 
-    The ``orchestrator`` is created during the app's startup lifespan and
-    is reachable as ``app.state.orchestrator`` from any route handler.
+    The :class:`OrchestratorService` and its underlying
+    :class:`Orchestrator` are created during the app's startup lifespan
+    and are reachable as ``app.state.service`` / ``app.state.orchestrator``
+    from any route handler.
     """
     fastapi_app = FastAPI(
         title="ASR — Agent Orchestrator",
@@ -3004,12 +6600,34 @@ def build_app(cfg: AppConfig) -> FastAPI:
         return fastapi_app.state.orchestrator.delete_incident(incident_id)
 
     @fastapi_app.post("/investigate")
-    async def investigate(req: InvestigateRequest) -> InvestigateResponse:
-        inc_id = await fastapi_app.state.orchestrator.start_investigation(
-            query=req.query, environment=req.environment,
-            reporter_id=req.reporter_id, reporter_team=req.reporter_team,
-        )
-        return InvestigateResponse(incident_id=inc_id)
+    async def investigate(req: InvestigateRequest, request: Request) -> InvestigateResponse:
+        """Legacy alias for ``POST /sessions`` — kept for back-compat.
+
+        .. deprecated:: P3-H
+            Prefer ``POST /sessions``. This route now delegates to
+            :meth:`OrchestratorService.start_session` so old clients keep
+            working with the long-lived service backing.
+        """
+        svc = request.app.state.service
+        # Coerce the legacy HTTP body into the generic runtime kwargs
+        # BEFORE delegating, so the runtime's deprecation path never
+        # fires on a hot HTTP route. Production logs stay quiet.
+        try:
+            sid = svc.start_session(
+                query=req.query,
+                state_overrides={"environment": req.environment},
+                submitter={
+                    "id": req.reporter_id,
+                    "team": req.reporter_team,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            # P3-G's ``SessionCapExceeded`` may not be importable yet at
+            # code-load time. Class-name match avoids the hard import.
+            if e.__class__.__name__ == "SessionCapExceeded":
+                raise HTTPException(status_code=429, detail=str(e)) from e
+            raise
+        return InvestigateResponse(incident_id=sid)
 
     @fastapi_app.get("/environments")
     async def environments():
@@ -3044,6 +6662,179 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type="text/event-stream")
 
+    # ------------------------------------------------------------------
+    # P3-H: multi-session endpoints
+    # ------------------------------------------------------------------
+
+    @fastapi_app.post(
+        "/sessions",
+        response_model=SessionStartResponse,
+        status_code=201,
+    )
+    async def start_session_endpoint(
+        body: SessionStartBody, request: Request
+    ) -> SessionStartResponse:
+        """Start a new long-running session. Returns ``201 {session_id}``.
+
+        Returns ``429`` if the configured concurrent-session cap is hit
+        (raised by ``OrchestratorService.start_session`` once P3-F+G
+        lands). The exception class is matched by name so this handler
+        does not depend on the in-flight P3-F+G import surface.
+        """
+        svc = request.app.state.service
+        try:
+            sid = svc.start_session(
+                query=body.query,
+                state_overrides={"environment": body.environment},
+                submitter=body.submitter,
+            )
+        except Exception as e:  # noqa: BLE001
+            if e.__class__.__name__ == "SessionCapExceeded":
+                raise HTTPException(status_code=429, detail=str(e)) from e
+            raise
+        return SessionStartResponse(session_id=sid)
+
+    @fastapi_app.get("/sessions", response_model=list[SessionStatus])
+    async def list_sessions_endpoint(request: Request) -> list[SessionStatus]:
+        """Snapshot of in-flight sessions (running / awaiting_input / error)."""
+        svc = request.app.state.service
+        return [SessionStatus(**row) for row in svc.list_active_sessions()]
+
+    # ------------------------------------------------------------------
+    # P4-G: HITL approval endpoints (risk-rated tool gateway)
+    # ------------------------------------------------------------------
+
+    @fastapi_app.get(
+        "/sessions/{session_id}/approvals",
+        response_model=list[PendingApproval],
+    )
+    async def list_pending_approvals(
+        session_id: str, request: Request
+    ) -> list[PendingApproval]:
+        """Return the list of pending tool approvals for a session.
+
+        Filters ``session.tool_calls`` to entries with
+        ``status="pending_approval"``. Returns an empty list when the
+        session has no pending approvals; ``404`` when the session id
+        is unknown.
+        """
+        svc = request.app.state.service
+        orch = request.app.state.orchestrator
+        try:
+            inc = orch.store.load(session_id)
+        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+            # ``ValueError`` covers the SessionStore id-format guard
+            # (``Invalid incident id ...``) which we treat as a 404
+            # at the API boundary — the client passed an id that
+            # cannot exist, semantically equivalent to "not found".
+            raise HTTPException(
+                status_code=404, detail="session not found"
+            ) from e
+        # Defensive: ``svc`` is unused here today — the read goes through
+        # the orchestrator's store. We keep the reference so a future
+        # observability hook (per-call metrics) lives next to the read.
+        _ = svc
+        out: list[PendingApproval] = []
+        for idx, tc in enumerate(inc.tool_calls):
+            if tc.status == "pending_approval":
+                # tool_call_id is the index in the audit list; stable
+                # within the lifetime of the session because tool calls
+                # are append-only.
+                out.append(PendingApproval(
+                    tool_call_id=str(idx),
+                    agent=tc.agent,
+                    tool=tc.tool,
+                    args=tc.args,
+                    ts=tc.ts,
+                ))
+        return out
+
+    @fastapi_app.post(
+        "/sessions/{session_id}/approvals/{tool_call_id}",
+        status_code=200,
+    )
+    async def submit_approval_decision(
+        session_id: str,
+        tool_call_id: str,
+        body: ApprovalDecisionBody,
+        request: Request,
+    ) -> dict:
+        """Resolve a pending tool approval by resuming the paused graph.
+
+        Resumes via ``Command(resume={decision, approver, rationale})``
+        against the session's thread_id. The wrap_tool closure (P4-C)
+        reads the resume value and either runs the tool (``approve``)
+        or short-circuits with ``status="rejected"`` (``reject``).
+        """
+        svc = request.app.state.service
+        orch = request.app.state.orchestrator
+        try:
+            orch.store.load(session_id)
+        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+            raise HTTPException(
+                status_code=404, detail="session not found"
+            ) from e
+
+        decision_payload = {
+            "decision": body.decision,
+            "approver": body.approver,
+            "rationale": body.rationale,
+        }
+
+        async def _resume() -> None:
+            from langgraph.types import Command
+
+            await orch.graph.ainvoke(
+                Command(resume=decision_payload),
+                config=orch._thread_config(session_id),
+            )
+
+        # Submit the resume onto the long-lived service loop so we
+        # don't fight the lifespan thread for the same FastMCP/SQLite
+        # transports. We use the async bridge (``submit_async``) rather
+        # than ``submit_and_wait`` because this handler may run on the
+        # very loop the service is hosting (FastAPI under
+        # ``httpx.AsyncClient + ASGITransport``, or any single-loop
+        # deployment): blocking that loop while waiting for work
+        # scheduled onto it would deadlock.
+        await svc.submit_async(_resume())
+        return {
+            "session_id": session_id,
+            "tool_call_id": tool_call_id,
+            "decision": body.decision,
+            "approver": body.approver,
+            "rationale": body.rationale,
+        }
+
+    @fastapi_app.delete("/sessions/{session_id}", status_code=204)
+    async def stop_session_endpoint(
+        session_id: str, request: Request
+    ) -> Response:
+        """Cancel an in-flight session and evict its registry entry.
+
+        ``stop_session`` is added by parallel task P3-F. If it has not
+        landed yet, return ``501 Not Implemented`` with a clear message
+        rather than crashing — keeps tests deterministic during the
+        rolling merge.
+        """
+        svc = request.app.state.service
+        if not hasattr(svc, "stop_session"):
+            raise HTTPException(
+                status_code=501,
+                detail="stop_session not available; P3-F pending",
+            )
+        try:
+            svc.stop_session(session_id)
+        except Exception as e:  # noqa: BLE001
+            # Translate a "session not found" condition into 404 if the
+            # parallel agent's stop_session uses a recognisable
+            # exception. Otherwise re-raise.
+            name = e.__class__.__name__
+            if name in {"KeyError", "SessionNotFound"}:
+                raise HTTPException(status_code=404, detail=str(e)) from e
+            raise
+        return Response(status_code=204)
+
     return fastapi_app
 
 
@@ -3062,3 +6853,94 @@ def get_app() -> FastAPI:
     """
     cfg_path = Path(os.environ.get("ASR_CONFIG", "config/config.yaml"))
     return build_app(load_config(cfg_path))
+
+# ====== module: runtime/api_dedup.py ======
+
+class UnDuplicateRequest(BaseModel):
+    """Request body for the retraction endpoint.
+
+    Both fields are optional. ``retracted_by`` is self-claimed (the
+    framework does not authenticate the operator id at P7); ``note`` is
+    free text persisted on the audit row.
+    """
+
+    retracted_by: str | None = None
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class UnDuplicateResponse(BaseModel):
+    """Successful retraction payload."""
+
+    session_id: str
+    status: str
+    parent_session_id: str | None
+    original_match_id: str
+    retracted_by: str | None = None
+    note: str | None = None
+
+
+def register_dedup_routes(
+    app: FastAPI,
+    *,
+    store_provider: Callable[[], Any],
+) -> None:
+    """Register the un-duplicate route on ``app``.
+
+    ``store_provider`` is a no-arg callable that returns the live
+    ``SessionStore``. We accept a callable (rather than the store
+    directly) so apps can defer construction until first request — the
+    route handler itself never caches the store.
+    """
+
+    @app.post(
+        "/sessions/{session_id}/un-duplicate",
+        response_model=UnDuplicateResponse,
+        status_code=200,
+        tags=["dedup"],
+    )
+    async def un_duplicate(
+        session_id: str,
+        body: UnDuplicateRequest | None = None,
+    ) -> UnDuplicateResponse:
+        store = store_provider()
+        # Pre-flight: capture the parent id BEFORE the flip so we can
+        # echo it on the response. The store does the same capture
+        # internally for the audit row.
+        try:
+            current = store.load(session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            # ``load`` validates the id format; map malformed -> 404.
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if current.status != "duplicate":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "not a duplicate",
+                    "status": current.status,
+                },
+            )
+        original_match_id = current.parent_session_id or ""
+        payload = body or UnDuplicateRequest()
+        try:
+            updated = store.un_duplicate(
+                session_id,
+                retracted_by=payload.retracted_by,
+                note=payload.note,
+            )
+        except FileNotFoundError as exc:
+            # Race: deleted between load and un_duplicate.
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            # Race: status flipped between load and un_duplicate.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return UnDuplicateResponse(
+            session_id=updated.id,
+            status=updated.status,
+            parent_session_id=updated.parent_session_id,
+            original_match_id=original_match_id,
+            retracted_by=payload.retracted_by,
+            note=payload.note,
+        )

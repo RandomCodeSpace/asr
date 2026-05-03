@@ -1,0 +1,10 @@
+description: Walks the PR diff, files findings against the session.
+tools:
+  local: ["fetch_pr_diff", "add_review_finding"]
+routes:
+  - when: success
+    next: recommender
+  - when: failed
+    next: __end__
+  - when: default
+    next: recommender

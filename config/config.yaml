@@ -43,7 +43,7 @@ mcp:
   servers:
   - name: local_inc
     transport: in_process
-    module: orchestrator.mcp_servers.incident
+    module: examples.incident_management.mcp_server
     category: incident_management
   - name: local_observability
     transport: in_process
@@ -64,23 +64,44 @@ mcp:
       Authorization: Bearer ${EXT_TOKEN}
     category: ticketing
     enabled: false
-environments:
-- production
-- staging
-- dev
-- local
-incidents:
-  store_path: incidents
-  similarity_threshold: 0.2
-  similarity_method: keyword
 paths:
-  skills_dir: config/skills
+  skills_dir: examples/incident_management/skills
   incidents_dir: incidents
-intervention:
-  confidence_threshold: 0.75
-  escalation_teams:
-  - platform-oncall
-  - data-oncall
-  - security-oncall
 orchestrator:
-  entry_agent: intake
+  # P9-9h: ASR investigation supervisor is the entry agent. It hydrates
+  # L2/L5/L7 memory and applies the single-active-investigation gate
+  # before dispatching to ``triage``.
+  entry_agent: asr_supervisor
+runtime:
+  # Wires the orchestrator and storage layer to the incident-management
+  # domain state class (see examples/incident_management/state.py).
+  # Apps swapping in a different state class point this at their own
+  # ``Session`` subclass.
+  state_class: examples.incident_management.state.IncidentState
+  # Cross-cutting framework knobs (confidence threshold, escalation
+  # roster, severity aliases, dedup prompt) come from a no-arg
+  # provider the example app exposes. Lets the runtime read them
+  # without ever importing IncidentAppConfig.
+  framework_app_config_path: examples.incident_management.config:framework_app_config_provider
+  # Two-stage dedup pipeline shape. The provider returns ``None`` when
+  # the bundled example app's YAML disables it.
+  dedup_config_path: examples.incident_management.config:dedup_config_provider
+  # Environments roster surfaced on GET /environments.
+  environments_provider_path: examples.incident_management.config:environments_provider
+  # P9-9k: Risk-rated tool gateway with prod-HITL override.
+  # ``policy`` declares per-tool risk tiers; tools absent default to ``low``.
+  # ``prod_overrides`` forces ``require-approval`` regardless of the tier
+  # whenever the live session's environment is in ``prod_environments``
+  # AND the tool matches a ``resolution_trigger_tools`` glob. The override
+  # only TIGHTENS — it can never relax a higher-risk tool to ``auto``.
+  gateway:
+    policy:
+      update_incident: medium
+      "remediation:restart_service": high
+      "remediation:rollback": high
+    prod_overrides:
+      prod_environments:
+        - production
+      resolution_trigger_tools:
+        - update_incident
+        - "remediation:*"

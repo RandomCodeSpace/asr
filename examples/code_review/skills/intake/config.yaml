@@ -1,0 +1,10 @@
+description: Ingests a PR description and bootstraps CodeReviewState before analysis.
+tools:
+  local: ["fetch_pr_diff"]
+routes:
+  - when: success
+    next: analyzer
+  - when: failed
+    next: __end__
+  - when: default
+    next: analyzer

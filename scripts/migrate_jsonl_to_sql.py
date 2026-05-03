@@ -2,18 +2,21 @@
 
 Usage:
     python scripts/migrate_jsonl_to_sql.py [--config PATH] [--with-embeddings] [--dry-run]
+
+P2-J: migrated off the deleted ``IncidentRepository`` shim. Uses
+``SessionStore`` directly with the example app's ``IncidentState``.
 """
 from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
 
+from examples.incident_management.state import IncidentState
 from orchestrator.config import AppConfig, load_config
-from orchestrator.incident import Incident
 from orchestrator.storage.embeddings import build_embedder
 from orchestrator.storage.engine import build_engine
 from orchestrator.storage.models import Base
-from orchestrator.storage.repository import IncidentRepository
+from orchestrator.storage.session_store import SessionStore
 from orchestrator.storage.vector import build_vector_store
 
 
@@ -34,8 +37,9 @@ def migrate(cfg: AppConfig, *, with_embeddings: bool, dry_run: bool) -> dict[str
         build_vector_store(cfg.storage.vector, embedder, engine)
         if with_embeddings else None
     )
-    repo = IncidentRepository(
+    store = SessionStore(
         engine=engine,
+        state_cls=IncidentState,
         embedder=embedder,
         vector_store=vector_store,
         vector_path=(cfg.storage.vector.path
@@ -46,18 +50,18 @@ def migrate(cfg: AppConfig, *, with_embeddings: bool, dry_run: bool) -> dict[str
     counts = {"inserted": 0, "skipped": 0, "failed": 0}
     for path in sorted(src.glob("INC-*.json")):
         try:
-            inc = Incident.model_validate(json.loads(path.read_text()))
+            inc = IncidentState.model_validate(json.loads(path.read_text()))
         except Exception:
             counts["failed"] += 1
             continue
         try:
-            repo.load(inc.id)
+            store.load(inc.id)
             counts["skipped"] += 1
             continue
         except FileNotFoundError:
             pass
         if not dry_run:
-            repo.save(inc)
+            store.save(inc)
         counts["inserted"] += 1
     return counts
 

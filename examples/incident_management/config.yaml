@@ -1,0 +1,50 @@
+# App-level config for the incident-management example.
+#
+# Mirrors the IncidentAppConfig defaults so load_incident_app_config()
+# returns a fully-populated config in environments where this file is
+# present (the framework loader falls back to defaults when missing).
+
+store_path: incidents
+similarity_threshold: 0.2
+similarity_method: keyword
+confidence_threshold: 0.75
+escalation_teams:
+  - platform-oncall
+  - data-oncall
+  - security-oncall
+environments:
+  - production
+  - staging
+  - dev
+  - local
+severity_aliases:
+  sev1: high
+  sev2: high
+  p1: high
+  p2: high
+  critical: high
+  urgent: high
+  high: high
+  sev3: medium
+  p3: medium
+  moderate: medium
+  medium: medium
+  sev4: low
+  p4: low
+  info: low
+  informational: low
+  low: low
+
+# P7-C: two-stage dedup pipeline. The example app opts in here; the
+# framework default (no `dedup` key) is off.
+dedup:
+  enabled: true
+  stage1_threshold: 0.6
+  stage1_top_k: 5
+  stage2_top_k: 3
+  stage2_model: cheap
+  stage2_min_confidence: 0.7
+  run_at: post_intake
+  scope:
+    same_environment: true
+    only_closed: true
