@@ -1,4 +1,4 @@
-"""P9-9d — L7 Playbook Store.
+"""L7 Playbook Store.
 
 Pin tests for ``PlaybookStore``. Cover seed fallback, YAML schema
 parsing, the case-insensitive signal matcher, score ranking, and the

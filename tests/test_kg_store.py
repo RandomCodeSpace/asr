@@ -1,4 +1,4 @@
-"""P9-9b-FS — L2 Knowledge Graph filesystem backend.
+"""L2 Knowledge Graph filesystem backend.
 
 Pin tests for ``KGStore``. Cover both the bundled seed fallback (used
 when ``incidents/kg/`` is empty) and a tmp_path-driven custom graph

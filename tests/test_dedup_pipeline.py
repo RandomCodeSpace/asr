@@ -1,4 +1,4 @@
-"""Unit tests for the P7-C/D/E dedup pipeline (framework-level).
+"""Unit tests for the dedup pipeline (framework-level).
 
 Stage 1 wraps ``HistoryStore.find_similar`` and applies the top-K +
 threshold cap; Stage 2 calls a stubbed LLM and parses Pydantic-typed
@@ -126,7 +126,7 @@ def test_dedup_config_assert_model_exists():
 
 
 # ---------------------------------------------------------------------------
-# Decision parser (P7-E)
+# Decision parser
 # ---------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""End-to-end prod-env HITL override tests (P4-E).
+"""End-to-end prod-env HITL override tests.
 
 Locked decision EXTRA: when the live ``Session.environment`` is in
 ``prod_overrides.prod_environments`` AND the tool name matches one of

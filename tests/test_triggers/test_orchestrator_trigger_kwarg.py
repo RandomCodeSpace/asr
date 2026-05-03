@@ -46,7 +46,7 @@ async def test_orchestrator_start_session_records_trigger(tmp_path, monkeypatch)
     orch.store = _FakeStore()
     orch.graph = _FakeGraph()
     orch._thread_config = lambda sid: {"configurable": {"thread_id": sid}}
-    # P7-F: tests that bypass __init__ must set the dedup pipeline
+    # Tests that bypass __init__ must set the dedup pipeline
     # attribute to ``None`` so the dedup-check shortcut returns False
     # without touching the (uninitialised) attribute.
     orch.dedup_pipeline = None

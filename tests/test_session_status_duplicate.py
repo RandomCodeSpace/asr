@@ -1,4 +1,4 @@
-"""Tests for the P7-A/B "duplicate" status + parent_session_id linkage.
+"""Tests for the "duplicate" status + parent_session_id linkage.
 
 Covers:
   * The ``IncidentStatus`` literal exposes ``"duplicate"``.

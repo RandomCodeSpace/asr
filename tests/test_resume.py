@@ -197,8 +197,8 @@ async def test_resume_handles_subgraph_exception(cfg, monkeypatch):
                 yield  # makes this function an async generator
             raise RuntimeError("apply_fix exploded mid-stream")
 
-        # P2-I: resume now goes through the same compiled graph; patch
-        # orch.graph.astream_events instead of the deleted resume_graph.
+        # Resume goes through the same compiled graph; patch
+        # orch.graph.astream_events.
         monkeypatch.setattr(orch.graph, "astream_events", _boom)
 
         events = []
@@ -237,7 +237,7 @@ async def _drive_to_interrupt(orch: Orchestrator) -> str:
     sid = await orch.start_investigation(
         query="payments slow", environment="production",
     )
-    # The gate dual-write (P2-H) leaves the row in awaiting_input.
+    # The gate dual-write leaves the row in awaiting_input.
     sess = orch.store.load(sid)
     assert sess.status == "awaiting_input", (
         f"expected gate to interrupt; got status={sess.status!r}"
@@ -248,7 +248,7 @@ async def _drive_to_interrupt(orch: Orchestrator) -> str:
 
 @pytest.mark.asyncio
 async def test_resume_uses_command_resume(cfg):
-    """P2-I: resume invokes the same graph via Command(resume=...).
+    """Resume invokes the same graph via Command(resume=...).
 
     Drives a fresh investigation to the gate's interrupt, then resumes
     with operator input. The session should advance past the gate and
@@ -269,7 +269,7 @@ async def test_resume_uses_command_resume(cfg):
 
         sess2 = orch.store.load(sid)
         # Gate's post-resume continuation appended the user input and
-        # cleared pending_intervention (P2-H).
+        # cleared pending_intervention.
         assert "DB pool exhausted at 14:30." in sess2.user_inputs[-1]
         assert sess2.pending_intervention is None
         assert sess2.status != "awaiting_input"
@@ -280,7 +280,7 @@ async def test_resume_uses_command_resume(cfg):
 
 
 def test_orchestrator_has_no_resume_graph_attr():
-    """P2-I: the bespoke resume graph is gone from the source."""
+    """The bespoke resume graph is gone from the source."""
     import runtime.orchestrator as mod
     src = open(mod.__file__).read()
     assert "build_resume_graph" not in src
@@ -288,7 +288,7 @@ def test_orchestrator_has_no_resume_graph_attr():
 
 
 def test_graph_module_has_no_build_resume_graph():
-    """P2-I: build_resume_graph is deleted from the graph module."""
+    """build_resume_graph is deleted from the graph module."""
     import runtime.graph as mod
     src = open(mod.__file__).read()
     assert "build_resume_graph" not in src
@@ -297,7 +297,7 @@ def test_graph_module_has_no_build_resume_graph():
 
 @pytest.mark.asyncio
 async def test_cold_restart_resume(tmp_path):
-    """P2-L (folded into P2-I): cold-restart resume — checkpointer state
+    """Cold-restart resume — checkpointer state
     survives orchestrator teardown.
 
     Process 1: start a session, drive to the gate's interrupt, tear down.

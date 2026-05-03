@@ -1,10 +1,10 @@
-"""Tests for Phase 2 state-class plumbing (P2-A, P2-B, P2-C).
+"""Tests for state-class plumbing.
 
 Covers:
-- ``RuntimeConfig`` and its placement on ``AppConfig`` (P2-A).
-- ``resolve_state_class`` dotted-path resolver (P2-B).
+- ``RuntimeConfig`` and its placement on ``AppConfig``.
+- ``resolve_state_class`` dotted-path resolver.
 - ``Generic[StateT]`` parametrisation of ``Orchestrator`` /
-  ``SessionStore`` / ``HistoryStore`` (P2-C).
+  ``SessionStore`` / ``HistoryStore``.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import yaml
 from sqlalchemy import create_engine
 
 
-# ---------- P2-A: RuntimeConfig + AppConfig.runtime ----------
+# ---------- RuntimeConfig + AppConfig.runtime ----------
 
 def test_runtime_config_defaults_to_none_state_class():
     from runtime.config import RuntimeConfig
@@ -71,7 +71,7 @@ def test_load_config_picks_up_runtime_block(tmp_path):
     assert cfg.runtime.state_class == "examples.incident_management.state.IncidentState"
 
 
-# ---------- P2-B: resolve_state_class ----------
+# ---------- resolve_state_class ----------
 
 def test_resolve_state_class_returns_default_session_for_none():
     from runtime.state import Session
@@ -132,7 +132,7 @@ def test_resolve_state_class_rejects_invalid_format():
         resolve_state_class("not_a_dotted_path")
 
 
-# ---------- P2-C: SessionStore / HistoryStore / Orchestrator are Generic[StateT] ----------
+# ---------- SessionStore / HistoryStore / Orchestrator are Generic[StateT] ----------
 
 @pytest.fixture()
 def engine(tmp_path):
@@ -155,7 +155,7 @@ def test_session_store_accepts_state_cls(engine):
 
 
 def test_session_store_default_state_cls_is_session(engine):
-    """P2-J: default ``state_cls`` is ``runtime.state.Session`` (the framework
+    """Default ``state_cls`` is ``runtime.state.Session`` (the framework
     base). Apps inject their own subclass via ``RuntimeConfig.state_class``.
     """
     from runtime.state import Session

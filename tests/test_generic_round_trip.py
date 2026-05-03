@@ -1,18 +1,12 @@
-"""P8-J: ``SessionStore`` round-trips any ``Session`` subclass.
+"""``SessionStore`` round-trips any ``Session`` subclass.
 
-The framework was originally written against an incident-shaped row schema
-(``query / environment / reporter / severity / ...``). A second example
-app (``code_review``) introduced a ``CodeReviewState`` whose typed fields
-(``pr: PullRequest``, ``review_findings: list[ReviewFinding]``,
-``overall_recommendation``) had no place in the row dict — they silently
-dropped on round-trip.
+The schema carries an ``extra_fields: JSON`` column. Round-trip is
+driven by ``state_cls.model_fields``: known typed-column fields go
+to their own columns; everything else lands in ``extra_fields`` and
+hydrates back through pydantic on load.
 
-P8-J adds an ``extra_fields: JSON`` column. Round-trip is now driven by
-``state_cls.model_fields``: known typed-column fields go to their own
-columns; everything else lands in ``extra_fields`` and hydrates back
-through pydantic on load.
-
-Tests cover both apps to prevent regression of either.
+Tests cover both example apps (incident-management and code-review)
+to prevent regression of either.
 """
 from __future__ import annotations
 
@@ -38,7 +32,7 @@ def engine(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Code-review round-trip — the canonical failing case before P8-J.
+# Code-review round-trip
 # ---------------------------------------------------------------------------
 def test_code_review_state_round_trips_typed_fields(engine):
     store = SessionStore[CodeReviewState](

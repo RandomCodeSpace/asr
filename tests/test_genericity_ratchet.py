@@ -29,7 +29,10 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                in favour of ``submitter``; the legacy ``/investigate``
 #                endpoint and method aliases coerce internally so the
 #                runtime deprecation paths never fire on hot routes.
-BASELINE_TOTAL = 139
+#   139 -> 137   Phase-tag noise stripped from runtime/ comments —
+#                cleanup removed two incidental ``incident``-token
+#                mentions that lived inside historical phase narrative.
+BASELINE_TOTAL = 137
 
 
 def test_runtime_leaks_at_or_below_baseline():

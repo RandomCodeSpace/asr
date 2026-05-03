@@ -1,10 +1,10 @@
-"""Tests for the P4-G HITL approval endpoints.
+"""Tests for the HITL approval endpoints.
 
 Endpoints:
   * ``GET  /sessions/{sid}/approvals``                 — list pending.
   * ``POST /sessions/{sid}/approvals/{tool_call_id}``  — resolve.
 
-The wrap_tool closure (P4-C) is unit-tested in
+The wrap_tool closure is unit-tested in
 ``tests/test_gateway_wrap.py`` and integration-tested in
 ``tests/test_gateway_integration.py``. These tests target the HTTP
 surface only: schemas, status codes, routing through

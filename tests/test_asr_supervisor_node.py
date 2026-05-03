@@ -1,4 +1,4 @@
-"""P9-9h — ASR supervisor node hydration + single-active-investigation gate.
+"""ASR supervisor node hydration + single-active-investigation gate.
 
 Tests for ``examples.incident_management.asr.supervisor_node``. Covers:
 
@@ -281,7 +281,7 @@ def test_intake_skill_yaml_loads(tmp_path: Path) -> None:
     assert "triage" in skill.subordinates
     assert skill.dispatch_strategy == "rule"
     assert skill.dispatch_rules
-    # P9-9h: the skill must wire the default supervisor runner so the
+    # The skill must wire the default supervisor runner so the
     # framework actually invokes hydrate_and_gate at session start.
     assert skill.runner == (
         "examples.incident_management.asr.supervisor_node:default_supervisor_runner"

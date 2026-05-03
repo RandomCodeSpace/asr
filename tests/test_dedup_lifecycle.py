@@ -1,4 +1,4 @@
-"""Integration tests for the P7-F dedup_check lifecycle hook.
+"""Integration tests for the dedup_check lifecycle hook.
 
 The orchestrator wires ``DedupPipeline.run`` into ``start_session`` /
 ``stream_session`` so a confirmed-duplicate session is marked + the
@@ -113,7 +113,7 @@ async def test_start_session_skips_graph_on_confirmed_duplicate(cfg):
             query="payments timeout production", environment="production",
         )
         assert graph_calls == [], (
-            "P7-F: graph must not run for confirmed duplicates"
+            "graph must not run for confirmed duplicates"
         )
         loaded = orch.store.load(new_id)
         assert loaded.status == "duplicate"

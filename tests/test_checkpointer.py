@@ -1,4 +1,4 @@
-"""Tests for runtime.checkpointer factory (P2-F, P2-G)."""
+"""Tests for runtime.checkpointer factory."""
 import os
 import sqlite3
 
@@ -143,7 +143,7 @@ async def test_make_checkpointer_accepts_metadata_config_directly(tmp_path):
         await cleanup()
 
 
-# ----- P2-G postgres path (gated; integration test) -----
+# ----- Postgres path (gated; integration test) -----
 
 
 @pytest.mark.asyncio

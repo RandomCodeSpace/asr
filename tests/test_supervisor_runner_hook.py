@@ -1,4 +1,4 @@
-"""P9-9h — supervisor runner extension hook.
+"""Supervisor runner extension hook.
 
 Covers the framework-level pieces:
 

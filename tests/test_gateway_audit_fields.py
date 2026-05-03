@@ -1,10 +1,10 @@
-"""Tests for the P4-D ``ToolCall`` audit-field extension.
+"""Tests for the ``ToolCall`` audit-field extension.
 
 The JSON column on ``incidents.tool_calls`` already accepts arbitrary
 structure, so no DDL is needed. The schema must:
 
   * default ``status="executed"`` so legacy rows hydrate cleanly
-  * accept all P4 statuses (executed, executed_with_notify,
+  * accept all gateway statuses (executed, executed_with_notify,
     pending_approval, approved, rejected, timeout)
   * accept all risk levels (low, medium, high) and ``None``
   * reject unknown statuses / risks at construction time
@@ -95,7 +95,7 @@ def test_invalid_risk_rejected():
 
 
 def test_back_compat_existing_session_load():
-    """A Session with ``tool_calls`` produced before Phase 4 must still load."""
+    """A Session with ``tool_calls`` produced before the audit-field extension must still load."""
     from runtime.state import Session
 
     raw = {

@@ -1,4 +1,4 @@
-"""Tests for examples/code_review scaffold (P8-A, P8-B)."""
+"""Tests for examples/code_review scaffold."""
 
 
 def test_code_review_state_importable():

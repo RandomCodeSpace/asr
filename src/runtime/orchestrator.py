@@ -214,30 +214,30 @@ class Orchestrator(Generic[StateT]):
                  dedup_pipeline: "DedupPipeline | None" = None):
         self.cfg = cfg
         self.store = store
-        # P7-F: optional two-stage dedup pipeline. Built in ``create``
-        # only when the resolved DedupConfig has ``enabled=True``;
-        # otherwise ``None`` so the lifecycle hook is a no-op.
+        # Optional two-stage dedup pipeline. Built in ``create`` only
+        # when the resolved DedupConfig has ``enabled=True``; otherwise
+        # ``None`` so the lifecycle hook is a no-op.
         self.dedup_pipeline = dedup_pipeline
-        # P2-J: split the legacy ``IncidentRepository`` facade into the
-        # active ``SessionStore`` (CRUD) plus a separate read-only
-        # ``HistoryStore`` (similarity search). Both share the same
-        # engine and vector store; ``history`` is optional for callers
-        # that don't need similarity lookups.
+        # The active ``SessionStore`` (CRUD) plus a separate read-only
+        # ``HistoryStore`` (similarity search) share the same engine and
+        # vector store; ``history`` is optional for callers that don't
+        # need similarity lookups.
         self.history = history
         self.skills = skills
         self.registry = registry
-        # P2-I: a single compiled graph drives both fresh runs and
-        # resume-from-interrupt. Resumes go through ``ainvoke`` /
+        # A single compiled graph drives both fresh runs and resume-
+        # from-interrupt. Resumes go through ``ainvoke`` /
         # ``astream_events`` with ``Command(resume=...)`` against the
         # same ``thread_id`` — the checkpointer rehydrates the paused
-        # state. The bespoke resume sub-graph is gone.
+        # state.
         self.graph = graph
         self._exit_stack = exit_stack
         self.state_cls = state_cls
-        # P2-F/G: durable LangGraph checkpointer keyed off the same metadata
-        # URL as the relational store. ``checkpointer`` is the saver; the
-        # ``checkpointer_close`` callable is invoked from ``aclose`` so the
-        # underlying connection / pool is released on orchestrator shutdown.
+        # Durable LangGraph checkpointer keyed off the same metadata URL
+        # as the relational store. ``checkpointer`` is the saver; the
+        # ``checkpointer_close`` callable is invoked from ``aclose`` so
+        # the underlying connection / pool is released on orchestrator
+        # shutdown.
         self.checkpointer = checkpointer
         self._checkpointer_close = checkpointer_close
         # Cross-cutting domain-flavored knobs (confidence threshold,
@@ -265,8 +265,8 @@ class Orchestrator(Generic[StateT]):
             resolved_state_cls: Type[BaseModel] = resolve_state_class(
                 cfg.runtime.state_class
             )
-            # P2-FIX: SQLite concurrency PRAGMAs (WAL, busy_timeout,
-            # synchronous=NORMAL) and ``BEGIN IMMEDIATE`` are now installed
+            # SQLite concurrency PRAGMAs (WAL, busy_timeout,
+            # synchronous=NORMAL) and ``BEGIN IMMEDIATE`` are installed
             # inside ``build_engine`` so any caller (orchestrator, tests,
             # ad-hoc scripts) gets a saver-friendly engine without
             # duplicating the connect-event hook.
@@ -278,10 +278,10 @@ class Orchestrator(Generic[StateT]):
             Base.metadata.create_all(engine)
             embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
             vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
-            # P2-J: build SessionStore (CRUD) and HistoryStore (similarity)
-            # directly. The legacy ``IncidentRepository`` facade is gone.
-            # ``state_class`` is resolved via the runtime resolver; when an
-            # app doesn't set it the bare ``Session`` is used.
+            # Build SessionStore (CRUD) and HistoryStore (similarity)
+            # directly. ``state_class`` is resolved via the runtime
+            # resolver; when an app doesn't set it the bare ``Session``
+            # is used.
             repo_state_cls: Type[BaseModel] = resolved_state_cls
             store = SessionStore(
                 engine=engine,
@@ -361,13 +361,13 @@ class Orchestrator(Generic[StateT]):
                                       registry=registry,
                                       checkpointer=checkpointer,
                                       framework_cfg=framework_cfg)
-            # P7-F: build the dedup pipeline iff the app has opted in
-            # AND the configured stage 2 model resolves in the LLM
-            # registry. When the registry doesn't include the configured
-            # model (e.g. CI uses ``LLMConfig.stub()``), dedup is
-            # silently treated as off so unrelated tests don't need to
-            # know about Phase 7. Production deployments with a real
-            # registry hit the strict validation path.
+            # Build the dedup pipeline iff the app has opted in AND the
+            # configured stage 2 model resolves in the LLM registry.
+            # When the registry doesn't include the configured model
+            # (e.g. CI uses ``LLMConfig.stub()``), dedup is silently
+            # treated as off so unrelated tests don't need to know
+            # about it. Production deployments with a real registry hit
+            # the strict validation path.
             #
             # The DedupConfig comes through a generic provider hook
             # (``RuntimeConfig.dedup_config_path``) — the runtime never
@@ -397,9 +397,9 @@ class Orchestrator(Generic[StateT]):
             # because the pipeline is built after graph construction.
             if dedup_pipeline is not None:
                 framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
-            # P2-I: no resume graph anymore — resume runs through the
-            # main graph via ``Command(resume=...)`` against the same
-            # thread_id, with the checkpointer rehydrates paused state.
+            # No bespoke resume graph — resume runs through the main
+            # graph via ``Command(resume=...)`` against the same
+            # thread_id, with the checkpointer rehydrating paused state.
             return cls(cfg, store, skills, registry, graph,
                        stack, framework_cfg=framework_cfg,
                        state_cls=repo_state_cls,
@@ -491,7 +491,7 @@ class Orchestrator(Generic[StateT]):
         return self.store.load(incident_id).model_dump()
 
     def get_incident(self, incident_id: str) -> dict:
-        """Deprecated alias for ``get_session`` — remove in Phase 2."""
+        """Deprecated alias for ``get_session``."""
         return self.get_session(incident_id)
 
     def list_recent_sessions(self, limit: int = 20) -> list[dict]:
@@ -499,7 +499,7 @@ class Orchestrator(Generic[StateT]):
         return [i.model_dump() for i in self.store.list_recent(limit)]
 
     def list_recent_incidents(self, limit: int = 20) -> list[dict]:
-        """Deprecated alias for ``list_recent_sessions`` — remove in Phase 2."""
+        """Deprecated alias for ``list_recent_sessions``."""
         return self.list_recent_sessions(limit)
 
     def delete_session(self, incident_id: str) -> dict:
@@ -507,11 +507,11 @@ class Orchestrator(Generic[StateT]):
         return self.store.delete(incident_id).model_dump()
 
     def delete_incident(self, incident_id: str) -> dict:
-        """Deprecated alias for ``delete_session`` — remove in Phase 2."""
+        """Deprecated alias for ``delete_session``."""
         return self.delete_session(incident_id)
 
     async def _run_dedup_check(self, inc) -> bool:
-        """Run the ``dedup_check`` lifecycle hook (P7-F).
+        """Run the ``dedup_check`` lifecycle hook.
 
         Returns ``True`` iff the session was confirmed as a duplicate
         and marked accordingly — callers should skip the agent graph in
@@ -581,16 +581,16 @@ class Orchestrator(Generic[StateT]):
         Passing both a generic kwarg and its legacy partner raises
         ``TypeError``.
 
-        ``trigger`` (P5-I) is the optional provenance record from
+        ``trigger`` is the optional provenance record from
         :mod:`runtime.triggers`. When supplied, ``name``/``transport``/
         ``target_app`` are written to ``inc.findings['trigger']`` for
         post-hoc audit; the orchestrator does not branch on its
         contents.
 
-        P7-F: if the dedup pipeline is configured and stage 2 confirms
-        a duplicate of a prior closed session, the new session is
-        marked ``status="duplicate"`` with ``parent_session_id`` set
-        and the agent graph is skipped entirely.
+        If the dedup pipeline is configured and stage 2 confirms a
+        duplicate of a prior closed session, the new session is marked
+        ``status="duplicate"`` with ``parent_session_id`` set and the
+        agent graph is skipped entirely.
         """
         state_overrides = _coerce_state_overrides(state_overrides, environment)
         submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
@@ -607,7 +607,7 @@ class Orchestrator(Generic[StateT]):
                 "received_at": trigger.received_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             self.store.save(inc)
-        # P7-F: dedup_check before the graph fires.
+        # dedup_check before the graph fires.
         if await self._run_dedup_check(inc):
             return inc.id
         await self.graph.ainvoke(
@@ -620,7 +620,7 @@ class Orchestrator(Generic[StateT]):
     async def start_investigation(self, *, query: str, environment: str,
                                   reporter_id: str = "user-mock",
                                   reporter_team: str = "platform") -> str:
-        """Deprecated alias for ``start_session`` — remove in Phase 2.
+        """Deprecated alias for ``start_session``.
 
         Coerces the legacy positional surface into the generic
         ``submitter`` + ``state_overrides`` kwargs so the runtime
@@ -651,7 +651,7 @@ class Orchestrator(Generic[StateT]):
         )
         yield {"event": "investigation_started", "incident_id": inc.id,
                "ts": _event_ts()}
-        # P7-F: dedup_check before the graph fires. Surface a one-shot
+        # dedup_check before the graph fires. Surface a one-shot
         # ``dedup_matched`` event so the UI can render the "marked
         # duplicate" banner without polling.
         if await self._run_dedup_check(inc):
@@ -673,7 +673,7 @@ class Orchestrator(Generic[StateT]):
                                    reporter_id: str = "user-mock",
                                    reporter_team: str = "platform"
                                    ) -> AsyncIterator[dict]:
-        """Deprecated alias for ``stream_session`` — remove in Phase 2.
+        """Deprecated alias for ``stream_session``.
 
         Forwards the legacy positional surface into ``stream_session``;
         the underlying flow already coerces the reporter pair into
@@ -764,16 +764,16 @@ class Orchestrator(Generic[StateT]):
 
     async def resume_investigation(self, incident_id: str,
                                    decision: dict) -> AsyncIterator[dict]:
-        """Deprecated alias for ``resume_session`` — remove in Phase 2."""
+        """Deprecated alias for ``resume_session``."""
         async for event in self.resume_session(incident_id, decision):
             yield event
 
     async def _resume_with_input(self, incident_id: str, inc, decision: dict):
-        """Handle the resume_with_input action via P2-I.
+        """Handle the resume_with_input action.
 
         Drives the *same* compiled graph with ``Command(resume=user_text)``
         against the paused thread_id. The checkpointer rehydrates the
-        suspended gate node; the gate body (P2-H) appends the input to
+        suspended gate node; the gate body appends the input to
         ``session.user_inputs``, clears ``pending_intervention``, and
         falls through to the gated downstream target. On failure the
         intervention payload is restored so the UI can reprompt.
@@ -782,7 +782,7 @@ class Orchestrator(Generic[StateT]):
         if not user_text:
             raise ValueError("resume_with_input requires a non-empty 'input'")
         # Snapshot the intervention payload BEFORE we hand off to the
-        # graph. The gate's post-resume continuation (P2-H) clears it on
+        # graph. The gate's post-resume continuation clears it on
         # the way out; if the downstream graph blows up we restore from
         # this snapshot so the UI can reprompt the user.
         saved_pi = inc.pending_intervention

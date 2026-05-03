@@ -7,9 +7,6 @@ from runtime.config import (
 
 
 def test_default_app_config_is_stub_provider():
-    # P1-E moved incidents/intervention/environments off AppConfig onto
-    # examples.incident_management.config.IncidentAppConfig; their default
-    # values are pinned by tests/test_incident_app_config.py instead.
     cfg = AppConfig(llm=LLMConfig.stub(), mcp=MCPConfig())
     assert cfg.llm.providers["stub"].kind == "stub"
     assert cfg.llm.default == "stub_default"

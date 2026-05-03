@@ -1,4 +1,4 @@
-"""Tests for the gateway config schema (P4-A).
+"""Tests for the gateway config schema.
 
 The framework-side ``GatewayConfig`` declares per-tool risk levels,
 plus an optional ``ProdOverrides`` block that can force HITL approval
@@ -67,7 +67,7 @@ def test_prod_overrides_accepts_globs_and_env_list():
 
 
 def test_runtime_config_carries_optional_gateway():
-    """``RuntimeConfig.gateway`` is optional — Phase 4 must not break Phase 3 callers."""
+    """``RuntimeConfig.gateway`` is optional — callers without gateway config must still work."""
     rc = RuntimeConfig()
     assert rc.gateway is None
 

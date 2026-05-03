@@ -1,4 +1,4 @@
-"""Tests for the supervisor agent kind (P6-D).
+"""Tests for the supervisor agent kind.
 
 Covers:
 

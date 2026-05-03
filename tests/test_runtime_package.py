@@ -1,8 +1,7 @@
 """Smoke tests for the runtime package layout.
 
-These tests assert that the framework's generic surface is importable from
-``runtime``. The Session model in ``runtime.state`` lands in P1-B; until
-then ``test_runtime_state_importable`` is expected to fail under TDD.
+These tests assert that the framework's generic surface is importable
+from ``runtime``.
 """
 
 
@@ -62,7 +61,7 @@ def test_graph_state_no_incident_alias():
     hints = typing.get_type_hints(GraphState)
     assert "session" in hints
     assert "incident" not in hints, (
-        "GraphState.incident bridge alias should be removed in Phase 2"
+        "GraphState must not carry an incident bridge alias"
     )
 
 
@@ -72,8 +71,9 @@ def test_session_row_alias_exists():
 
 
 def test_runtime_config_no_incident_keys():
-    """P1-E stripped incident-flavored keys off AppConfig — they live on
-    examples.incident_management.config.IncidentAppConfig now."""
+    """Incident-flavored keys live on
+    examples.incident_management.config.IncidentAppConfig, not on the
+    framework's generic ``AppConfig``."""
     from runtime.config import AppConfig
 
     fields = set(AppConfig.model_fields.keys())
@@ -83,7 +83,7 @@ def test_runtime_config_no_incident_keys():
 
 
 def test_runtime_config_no_severity_aliases():
-    """severity_aliases moved to IncidentAppConfig (P1-E)."""
+    """severity_aliases lives on IncidentAppConfig, not OrchestratorConfig."""
     from runtime.config import OrchestratorConfig
 
     fields = set(OrchestratorConfig.model_fields.keys())
@@ -99,12 +99,12 @@ def test_runtime_canonical_imports():
     from runtime.orchestrator import Orchestrator  # noqa: F401
 
 
-# ---------- P2-J: legacy ``runtime.incident`` + ``IncidentRepository`` are gone ----------
+# ---------- legacy ``runtime.incident`` + ``IncidentRepository`` are gone ----------
 
 def test_legacy_incident_module_removed():
     import importlib.util
     assert importlib.util.find_spec("runtime.incident") is None, (
-        "runtime/incident.py should be deleted in P2-J"
+        "runtime/incident.py must not exist"
     )
 
 
@@ -115,21 +115,21 @@ def test_incident_repository_shim_removed():
     if spec is not None:
         import runtime.storage.repository
         assert not hasattr(runtime.storage.repository, "IncidentRepository"), (
-            "IncidentRepository shim should be removed in P2-J"
+            "IncidentRepository shim must not be present"
         )
 
 
 def test_storage_init_does_not_export_incident_repository():
     import runtime.storage as s
     assert not hasattr(s, "IncidentRepository"), (
-        "IncidentRepository should be removed from runtime.storage exports in P2-J"
+        "IncidentRepository must not be exported from runtime.storage"
     )
 
 
 def test_orchestrator_storage_init_does_not_export_incident_repository():
     import runtime.storage as s
     assert not hasattr(s, "IncidentRepository"), (
-        "IncidentRepository should be removed from orchestrator.storage exports in P2-J"
+        "IncidentRepository must not be exported from orchestrator.storage"
     )
 
 

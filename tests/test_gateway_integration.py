@@ -1,5 +1,5 @@
 """Integration tests for the risk-rated tool gateway plumbed through
-``make_agent_node`` (P4-F).
+``make_agent_node``.
 
 Each test drives a tiny single-node LangGraph with one wrapped MCP-style
 ``BaseTool`` so we can assert the gateway-wrapped tool surface that the
@@ -108,7 +108,7 @@ def _run_wrap_in_graph(wrapped, args: dict, *, resume_value=None):
 
 
 # ---------------------------------------------------------------------------
-# P4-F integration tests — verify the gateway is correctly *integrated*
+# Integration tests — verify the gateway is correctly *integrated*
 # (i.e. callers get the right tool surface). The wrap factory is unit-
 # tested separately in ``test_gateway_wrap.py``.
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ def test_high_risk_tool_pauses_graph_with_tool_approval_payload():
     assert payload["kind"] == "tool_approval"
     assert payload["tool"] == "apply_fix"
     assert inner.calls == [], "high-risk tool must NOT run before approval"
-    # P4-I: a ``pending_approval`` audit row is persisted BEFORE the
+    # A ``pending_approval`` audit row is persisted BEFORE the
     # GraphInterrupt fires so the watchdog can observe stale approvals.
     # The row carries the tool + open-ts but no result/approver yet.
     assert len(session.tool_calls) == 1
@@ -196,9 +196,9 @@ def test_medium_risk_tool_runs_and_persists_executed_with_notify():
 
 
 def test_make_agent_node_accepts_gateway_cfg_kwarg():
-    """``make_agent_node`` must accept the ``gateway_cfg`` kwarg added
-    in P4-F. Calling without it (back-compat) keeps the legacy
-    ``None`` default. Both forms must return a callable node.
+    """``make_agent_node`` must accept the ``gateway_cfg`` kwarg.
+    Calling without it (back-compat) keeps the legacy ``None`` default.
+    Both forms must return a callable node.
     """
     import inspect
 
@@ -206,7 +206,7 @@ def test_make_agent_node_accepts_gateway_cfg_kwarg():
 
     sig = inspect.signature(make_agent_node)
     assert "gateway_cfg" in sig.parameters, (
-        "P4-F regression: make_agent_node missing gateway_cfg kwarg"
+        "make_agent_node missing gateway_cfg kwarg"
     )
     # Default must be None so legacy callers (no gateway) keep working.
     assert sig.parameters["gateway_cfg"].default is None

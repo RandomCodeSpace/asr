@@ -1,4 +1,4 @@
-"""Tests for the P4-M idempotent migration that fills the per-call audit
+"""Tests for the idempotent migration that fills the per-call audit
 fields on legacy ``tool_calls`` JSON rows.
 
 The migration walks every session in the metadata DB, fills missing
@@ -106,7 +106,7 @@ def test_migration_fills_missing_audit_fields_on_legacy_row(tmp_path):
 
 
 def test_migration_leaves_rows_with_audit_fields_unchanged(tmp_path):
-    """A row already carrying the post-P4-D audit fields must be
+    """A row already carrying the audit fields must be
     untouched. ``rows_filled`` is 0; the row dict is byte-equal."""
     engine = _make_engine(tmp_path)
     new_shape = {
@@ -149,7 +149,7 @@ def test_migration_leaves_rows_with_audit_fields_unchanged(tmp_path):
 
 def test_migration_handles_mixed_batch_correctly(tmp_path):
     """A DB containing legacy + already-migrated + multi-entry rows must
-    end up uniformly post-P4-D shaped, and the stats dict must report
+    end up uniformly audit-shaped, and the stats dict must report
     only the rows that genuinely changed."""
     engine = _make_engine(tmp_path)
 

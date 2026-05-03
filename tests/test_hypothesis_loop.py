@@ -1,4 +1,4 @@
-"""P9-9i — triage hypothesis-refinement helpers.
+"""Triage hypothesis-refinement helpers.
 
 Pin tests for the deterministic primitives that gate the triage
 agent's inner loop:

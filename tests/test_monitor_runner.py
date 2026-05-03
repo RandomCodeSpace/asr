@@ -1,4 +1,4 @@
-"""Tests for the monitor agent kind + ``MonitorRunner`` (P6-E,F).
+"""Tests for the monitor agent kind + ``MonitorRunner``.
 
 Covers:
 

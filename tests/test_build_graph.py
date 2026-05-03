@@ -68,7 +68,7 @@ async def test_build_graph_compiles_with_4_agents(cfg, tmp_path):
 @pytest.mark.asyncio
 async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
     """End-to-end: graph runs through agents, gate interrupts on low
-    confidence (P2-H), and the row carries pending_intervention. Stub DI
+    confidence, and the row carries pending_intervention. Stub DI
     never emits a confidence value, so the gate's interrupt() pauses the
     graph mid-flight rather than reaching resolution.
     """
@@ -77,7 +77,7 @@ async def test_full_graph_runs_to_terminal_with_stub_llm(cfg, tmp_path):
     store = _make_repo(tmp_path)
     async with AsyncExitStack() as stack:
         registry = await load_tools(cfg.mcp, stack)
-        # P2-H: the gate calls langgraph.types.interrupt(), which requires a
+        # The gate calls langgraph.types.interrupt(), which requires a
         # Pregel checkpointer to capture paused state. Compile with an
         # InMemorySaver so the gate can interrupt cleanly.
         graph = await build_graph(cfg=cfg, skills=skills, store=store,

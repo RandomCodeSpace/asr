@@ -1,8 +1,8 @@
-"""Tests for ``wrap_tool`` (P4-C): hybrid HITL dispatch around BaseTool.
+"""Tests for ``wrap_tool``: hybrid HITL dispatch around BaseTool.
 
 The wrapper is a *closure factory*: it captures the live ``Session`` and
 ``GatewayConfig`` per agent invocation and returns a new ``BaseTool``.
-Per locked decision P4.1, the dispatch is:
+The dispatch is:
 
   ``auto``     -> invoke inner tool, no audit overhead
   ``notify``   -> invoke inner tool, append ToolCall(risk="medium",
@@ -50,7 +50,7 @@ def _new_session(env: str | None = None) -> Session:
         created_at="2026-05-02T00:00:00Z",
         updated_at="2026-05-02T00:00:00Z",
     )
-    # Phase 4 prod-override path reads ``getattr(session, "environment", None)``;
+    # The prod-override path reads ``getattr(session, "environment", None)``;
     # patch the attribute dynamically for env-based tests so we don't need
     # to import IncidentState here (gateway is framework-side and must work
     # for non-incident apps too).
@@ -172,7 +172,7 @@ def test_approve_path_pauses_via_interrupt_before_invoking_tool():
     ``interrupt()`` pauses the graph and the captured payload describes
     the pending tool call.
 
-    P4-I: an audit row with ``status="pending_approval"`` is persisted
+    An audit row with ``status="pending_approval"`` is persisted
     BEFORE the GraphInterrupt fires so the timeout watchdog has a
     record to scan. The pending row carries the tool name + open-ts
     but no ``result`` / ``approver`` yet.
@@ -186,7 +186,7 @@ def test_approve_path_pauses_via_interrupt_before_invoking_tool():
 
     assert interrupts, "high-risk wrap must surface an Interrupt"
     assert inner.calls == [], "high-risk tool must NOT run before approval"
-    # P4-I: a pending_approval audit row is persisted before interrupt.
+    # A pending_approval audit row is persisted before interrupt.
     assert len(session.tool_calls) == 1
     pending = session.tool_calls[0]
     assert pending.status == "pending_approval"

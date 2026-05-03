@@ -1,4 +1,4 @@
-"""P8-K: ``dist/apps/code-review.py`` is a clean, parseable bundle.
+"""``dist/apps/code-review.py`` is a clean, parseable bundle.
 
 The bundler at ``scripts/build_single_file.py`` produces a second
 self-contained app bundle that proves the framework is generic — the

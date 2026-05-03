@@ -42,7 +42,7 @@ def _reset_orchestrator_service_singleton():
     """Ensure the process-singleton ``OrchestratorService`` does not
     leak across test cases.
 
-    P3-H wired the FastAPI lifespan onto ``OrchestratorService.get_or_create``,
+    The FastAPI lifespan wires onto ``OrchestratorService.get_or_create``,
     which is process-scoped. Each test builds its own ``build_app(cfg)``
     and the lifespan calls ``shutdown()`` cleanly, but a failed test
     could skip teardown — sweep up here belt-and-braces.
@@ -178,7 +178,7 @@ async def test_resume_endpoint_streams_error_for_unknown_incident(cfg):
 
 
 # ---------------------------------------------------------------------------
-# P3-H: multi-session endpoints
+# Multi-session endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -234,8 +234,8 @@ async def test_get_sessions_returns_list(cfg):
 
 @pytest.mark.asyncio
 async def test_delete_session_endpoint_returns_204_or_501(cfg):
-    """DELETE /sessions/{id} returns 204 once P3-F lands; before it
-    lands, the route surfaces a deterministic 501 Not Implemented.
+    """DELETE /sessions/{id} returns 204 when stop_session is wired up;
+    otherwise the route surfaces a deterministic 501 Not Implemented.
 
     Either outcome is acceptable here — we only assert the contract."""
     app = build_app(cfg)
@@ -251,8 +251,8 @@ async def test_delete_session_endpoint_returns_204_or_501(cfg):
         assert start.status_code == 201
         sid = start.json()["session_id"]
         res = await client.delete(f"/sessions/{sid}")
-    # 204 = stopped cleanly (P3-F landed); 501 = parallel agent hasn't
-    # merged stop_session yet; 404 = session already evicted.
+    # 204 = stopped cleanly; 501 = stop_session not wired up;
+    # 404 = session already evicted.
     assert res.status_code in (204, 404, 501)
 
 
