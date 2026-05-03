@@ -81,7 +81,9 @@ class IncidentMCPServer:
             limit=5,
         )
         return {"matches": [
-            {"id": i.id, "summary": i.summary, "resolution": i.resolution,
+            {"id": i.id,
+             "summary": i.extra_fields.get("summary", ""),
+             "resolution": i.extra_fields.get("resolution"),
              "score": round(s, 3)}
             for i, s in hits
         ]}
@@ -139,17 +141,19 @@ class IncidentMCPServer:
         if "status" in patch:
             inc.status = patch["status"]
         if "severity" in patch:
-            inc.severity = normalize_severity(patch["severity"], self.severity_aliases)
+            inc.extra_fields["severity"] = normalize_severity(
+                patch["severity"], self.severity_aliases
+            )
         if "category" in patch:
-            inc.category = patch["category"]
+            inc.extra_fields["category"] = patch["category"]
         if "summary" in patch:
-            inc.summary = patch["summary"]
+            inc.extra_fields["summary"] = patch["summary"]
         if "tags" in patch:
-            inc.tags = list(patch["tags"])
+            inc.extra_fields["tags"] = list(patch["tags"])
         if "matched_prior_inc" in patch:
-            inc.matched_prior_inc = patch["matched_prior_inc"]
+            inc.extra_fields["matched_prior_inc"] = patch["matched_prior_inc"]
         if "resolution" in patch:
-            inc.resolution = patch["resolution"]
+            inc.extra_fields["resolution"] = patch["resolution"]
         for key, value in patch.items():
             if key.startswith("findings_"):
                 inc.findings[key[len("findings_"):]] = value
