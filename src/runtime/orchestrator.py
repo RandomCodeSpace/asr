@@ -38,7 +38,7 @@ from runtime.storage.engine import build_engine
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.history_store import HistoryStore
 from runtime.storage.models import Base
-from runtime.storage.session_store import SessionStore
+from runtime.storage.session_store import SessionStore, StaleVersionError
 from runtime.storage.vector import build_vector_store
 
 
@@ -508,31 +508,41 @@ class Orchestrator(Generic[StateT]):
 
         executed = [tc for tc in inc.tool_calls
                     if getattr(tc, "status", None) == "executed"]
+
+        def _save_or_skip() -> bool:
+            """Save with stale-version protection. Returns False if a
+            concurrent finalize won the race; the caller should yield.
+            """
+            try:
+                self.store.save(inc)
+                return True
+            except StaleVersionError:
+                return False
+
         for tc in reversed(executed):
-            tool_name = tc.tool or ""
+            tool_name = tc.tool
+            args = tc.args if isinstance(tc.args, dict) else {}
+            result = tc.result if isinstance(tc.result, dict) else {}
             if tool_name == "mark_escalated" or tool_name.endswith(":mark_escalated"):
-                team = (tc.args or {}).get("team") or (tc.result or {}).get("team")
+                team = args.get("team") or result.get("team")
                 inc.status = "escalated"
                 if team:
                     inc.extra_fields["escalated_to"] = team
-                self.store.save(inc)
-                return "escalated"
+                return "escalated" if _save_or_skip() else None
             if tool_name == "mark_resolved" or tool_name.endswith(":mark_resolved"):
                 inc.status = "resolved"
-                self.store.save(inc)
-                return "resolved"
+                return "resolved" if _save_or_skip() else None
+            # legacy / forward-compat: direct notify_oncall path
             if tool_name == "notify_oncall" or tool_name.endswith(":notify_oncall"):
-                team = (tc.args or {}).get("team")
+                team = args.get("team")
                 inc.status = "escalated"
                 if team:
                     inc.extra_fields["escalated_to"] = team
-                self.store.save(inc)
-                return "escalated"
+                return "escalated" if _save_or_skip() else None
 
         inc.status = "needs_review"
         inc.extra_fields["needs_review_reason"] = "graph completed without terminal tool call"
-        self.store.save(inc)
-        return "needs_review"
+        return "needs_review" if _save_or_skip() else None
 
     def _thread_config(self, incident_id: str) -> dict:
         """Build the LangGraph ``config`` dict for a per-session thread.

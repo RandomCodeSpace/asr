@@ -840,11 +840,14 @@ def _render_summary_meta(sess: dict, app_cfg: FrameworkAppConfig) -> None:
     escalated_to = _field(sess, "escalated_to")
     if escalated_to:
         st.markdown(f"**Escalated to:** `{escalated_to}`")
-    needs_review_reason = (sess.get("extra_fields") or {}).get("needs_review_reason")
-    if needs_review_reason:
+    extra = sess.get("extra_fields") or {}
+    needs_review_reason = extra.get("needs_review_reason")
+    legacy_auto_resolved = extra.get("auto_resolved")
+    if needs_review_reason or legacy_auto_resolved:
+        msg = needs_review_reason or "session was auto-resolved by the legacy finalizer"
         st.warning(
             "⚠ This session needs review: "
-            f"{needs_review_reason}. The graph completed without the agent "
+            f"{msg}. The graph completed without the agent "
             "calling a terminal tool — verify the actual outcome before "
             "closing."
         )

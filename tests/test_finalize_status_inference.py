@@ -1,10 +1,9 @@
-import pytest
 from sqlalchemy import create_engine
 
 from runtime.orchestrator import Orchestrator
-from runtime.state import Session, ToolCall
+from runtime.state import ToolCall
 from runtime.storage.models import Base
-from runtime.storage.session_store import SessionStore
+from runtime.storage.session_store import SessionStore, StaleVersionError
 
 
 def _make_orch_with_store(tmp_path):
@@ -61,3 +60,19 @@ def test_finalize_does_not_clobber_terminal_status(tmp_path):
     store.save(inc)
     assert orch._finalize_session_status(inc.id) is None
     assert store.load(inc.id).status == "escalated"
+
+
+def test_finalize_returns_none_on_stale_version(tmp_path, monkeypatch):
+    """If a concurrent finalize wins the race, save() raises
+    StaleVersionError; this finalize must yield (return None) rather
+    than propagate the exception up the async stream loop."""
+    orch, store = _make_orch_with_store(tmp_path)
+    inc = store.create(query="q", environment="dev", reporter_id="u", reporter_team="t")
+    inc.status = "in_progress"
+    store.save(inc)
+
+    def _raise_stale(_):
+        raise StaleVersionError("concurrent writer settled first")
+
+    monkeypatch.setattr(store, "save", _raise_stale)
+    assert orch._finalize_session_status(inc.id) is None
