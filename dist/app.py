@@ -3419,11 +3419,18 @@ async def apply_fix(proposal_id: str, environment: str) -> dict:
 
 
 @mcp.tool()
-async def notify_oncall(incident_id: str, message: str) -> dict:
-    """Page the oncall engineer."""
+async def notify_oncall(incident_id: str, message: str,
+                       team: str = "") -> dict:
+    """Page the oncall engineer for the named team.
+
+    ``team`` should be one of the framework's configured
+    ``escalation_teams``. The result echoes ``team`` so callers and the
+    UI can record which roster was paged.
+    """
     return {
         "incident_id": incident_id,
-        "page_id": f"page-{abs(hash(incident_id)) % 10000:04d}",
+        "team": team,
+        "page_id": f"page-{abs(hash(incident_id + team)) % 10000:04d}",
         "delivered_at": datetime.now(timezone.utc).isoformat(),
         "message": message,
     }
@@ -7578,6 +7585,7 @@ class Orchestrator(Generic[StateT]):
                 ts=_event_ts(),
             ))
             inc.status = "escalated"
+            inc.extra_fields["escalated_to"] = team
             inc.pending_intervention = None
             self.store.save(inc)
             yield {"event": "resume_completed", "incident_id": incident_id,

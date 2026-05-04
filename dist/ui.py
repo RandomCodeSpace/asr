@@ -301,6 +301,25 @@ def _badge_field_slots(app_cfg: FrameworkAppConfig) -> tuple[str, str]:
     return primary, secondary
 
 
+def _field(item: dict, key: str, default: str = "") -> str:
+    """Read a domain field from a session dict — top-level first, falling
+    back to ``extra_fields``. Returns a string; non-string values are
+    coerced via ``str``.
+
+    Bare ``runtime.state.Session`` rounds app-specific values
+    (``query``, ``environment``, ``summary``, ...) through
+    ``extra_fields``. Typed state subclasses keep them at the top
+    level. This helper lets the UI work against either shape without
+    branching at every call site.
+    """
+    val = item.get(key)
+    if not val:
+        val = (item.get("extra_fields") or {}).get(key)
+    if val is None or val == "":
+        return default
+    return val if isinstance(val, str) else str(val)
+
+
 def _resolve_field(item: dict, dotted_key: str) -> str:
     """Resolve a dotted-path key against ``item.extra_fields`` (preferred)
     or the item dict itself.
@@ -334,12 +353,12 @@ def _render_session_row(sess: dict, store: SessionStore,
     """
     session_id = sess["id"]
     status = sess.get("status") or ""
-    env = sess.get("environment", "")
+    env = _field(sess, "environment", "")
     age = _age(sess.get("created_at", ""))
     sev_field, cat_field = _badge_field_slots(app_cfg)
     sev = (sess.get(sev_field) or "") if sev_field else ""
     cat = (sess.get(cat_field) or "") if cat_field else ""
-    summary = (sess.get("summary") or sess.get("query") or "").strip()
+    summary = (_field(sess, "summary") or _field(sess, "query") or "").strip()
     toks = (sess.get("token_usage") or {}).get("total_tokens", 0)
     is_deleted = status == "deleted"
     is_selected = st.session_state.get("selected_session") == session_id
@@ -793,8 +812,12 @@ def _render_summary_meta(sess: dict, app_cfg: FrameworkAppConfig) -> None:
     """Render the query, environment, tags, summary, configured detail
     fields, and prior-match callout.
     """
-    st.markdown(f"**Query:** {sess['query']}")
-    st.markdown(f"**Environment:** `{sess['environment']}`")
+    query = _field(sess, "query")
+    if query:
+        st.markdown(f"**Query:** {query}")
+    env = _field(sess, "environment")
+    if env:
+        st.markdown(f"**Environment:** `{env}`")
     # App-configured summary fields (e.g. submitter id / team / component).
     for field in app_cfg.ui.detail_fields:
         if field.section != "summary":
@@ -804,8 +827,12 @@ def _render_summary_meta(sess: dict, app_cfg: FrameworkAppConfig) -> None:
             st.markdown(f"**{field.label}:** {v}")
     if sess.get("tags"):
         st.markdown("**Tags:** " + " ".join(f"`{t}`" for t in sess["tags"]))
-    if sess.get("summary"):
-        st.markdown(f"**Summary:** {sess['summary']}")
+    summary = _field(sess, "summary")
+    if summary:
+        st.markdown(f"**Summary:** {summary}")
+    escalated_to = _field(sess, "escalated_to")
+    if escalated_to:
+        st.markdown(f"**Escalated to:** `{escalated_to}`")
     if sess.get("matched_prior_inc"):
         _render_prior_match(sess, app_cfg)
 
@@ -1062,7 +1089,7 @@ def render_session_detail(store: SessionStore,
     except FileNotFoundError:
         return
     status = sess.get("status") or ""
-    env = sess.get("environment") or ""
+    env = _field(sess, "environment") or ""
     toks = (sess.get("token_usage") or {}).get("total_tokens", 0)
     header = (
         f"`{session_id}` "
@@ -1349,12 +1376,34 @@ def _inject_global_css() -> None:
     Without the ``[aria-expanded="true"]`` predicate the min-width sticks
     around after the user collapses the sidebar, leaving a blank gap on
     the left of the main content area.
+
+    On viewports narrower than the desktop breakpoint we (a) drop the
+    min-width pin so the sidebar fits the screen, (b) cap the sidebar
+    at the viewport width so the close affordance never falls off
+    screen, and (c) keep streamlit's collapse control reachable above
+    any sticky content the sidebar may render.
     """
     st.markdown(
         f"""
         <style>
-        section[data-testid="stSidebar"][aria-expanded="true"] {{
-            min-width: {_SIDEBAR_MIN_WIDTH_PX}px !important;
+        @media (min-width: 768px) {{
+            section[data-testid="stSidebar"][aria-expanded="true"] {{
+                min-width: {_SIDEBAR_MIN_WIDTH_PX}px !important;
+            }}
+        }}
+        @media (max-width: 767px) {{
+            section[data-testid="stSidebar"][aria-expanded="true"] {{
+                min-width: 0 !important;
+                width: 100vw !important;
+                max-width: 100vw !important;
+            }}
+            button[data-testid="stSidebarCollapseButton"],
+            button[data-testid="baseButton-headerNoPadding"][kind="headerNoPadding"] {{
+                position: fixed !important;
+                top: 0.5rem !important;
+                right: 0.5rem !important;
+                z-index: 999999 !important;
+            }}
         }}
         </style>
         """,
