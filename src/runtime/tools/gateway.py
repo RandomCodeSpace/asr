@@ -59,12 +59,13 @@ def effective_action(
          ``low->auto``, ``medium->notify``, ``high->approve``.
       4. No policy entry -> ``"auto"`` (safe default).
 
-    Tool-name lookups try both the fully-qualified name (``<server>:<tool>``,
-    as registered by ``runtime.mcp_loader``) AND the bare original name
-    (``<tool>``). This lets app config use the bare names that match the
-    MCP tool's source declaration without having to know the server
-    prefix. Globs in ``resolution_trigger_tools`` are matched against
-    both forms for the same reason.
+    Tool-name lookups try the fully-qualified name (``<server>:<tool>``,
+    as registered by ``runtime.mcp_loader``) FIRST, then the bare
+    suffix as a fallback. This lets app config use bare names without
+    knowing the server prefix while keeping prefixed-form policy keys
+    deterministically more specific. Globs in
+    ``resolution_trigger_tools`` are matched against both forms for
+    the same reason, prefixed first.
 
     The function is pure: same inputs always yield the same output and
     no argument is mutated.
@@ -72,21 +73,21 @@ def effective_action(
     if gateway_cfg is None:
         return "auto"
 
-    # Build the lookup-name list: prefixed first (most specific), then
-    # the bare suffix (so config can be server-agnostic).
-    candidates = [tool_name]
-    if ":" in tool_name:
-        candidates.append(tool_name.split(":", 1)[1])
+    bare = tool_name.split(":", 1)[1] if ":" in tool_name else None
 
     overrides = gateway_cfg.prod_overrides
-    if overrides is not None and env:
-        if env in overrides.prod_environments:
-            for pattern in overrides.resolution_trigger_tools:
-                if any(fnmatchcase(c, pattern) for c in candidates):
-                    return "approve"
+    if overrides is not None and env and env in overrides.prod_environments:
+        for pattern in overrides.resolution_trigger_tools:
+            if fnmatchcase(tool_name, pattern):
+                return "approve"
+            if bare is not None and fnmatchcase(bare, pattern):
+                return "approve"
 
-    for c in candidates:
-        risk = gateway_cfg.policy.get(c)
+    risk = gateway_cfg.policy.get(tool_name)
+    if risk is not None:
+        return _RISK_TO_ACTION[risk]
+    if bare is not None:
+        risk = gateway_cfg.policy.get(bare)
         if risk is not None:
             return _RISK_TO_ACTION[risk]
     return "auto"
