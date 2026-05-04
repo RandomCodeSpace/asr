@@ -87,7 +87,7 @@ def make_agent_node(
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name)
+                          agent_name=skill.name, store=store)
                 for t in tools
             ]
         else:

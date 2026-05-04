@@ -19,12 +19,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from langchain_core.tools import BaseTool
 
 from runtime.config import GatewayConfig
 from runtime.state import Session, ToolCall
+
+if TYPE_CHECKING:
+    from runtime.storage.session_store import SessionStore
 
 GatewayAction = Literal["auto", "notify", "approve"]
 
@@ -160,6 +163,7 @@ def wrap_tool(
     session: Session,
     gateway_cfg: GatewayConfig | None,
     agent_name: str = "",
+    store: "SessionStore | None" = None,
 ) -> BaseTool:
     """Wrap ``base_tool`` so every invocation passes through the gateway.
 
@@ -238,6 +242,14 @@ def wrap_tool(
                             status="pending_approval",
                         )
                     )
+                    # CRITICAL: persist the pending_approval row BEFORE
+                    # raising interrupt() so the approval-timeout
+                    # watchdog (which reads from the DB) and the
+                    # /approvals UI can see the pending state. Without
+                    # this save the in-memory mutation is invisible to
+                    # any out-of-process observer.
+                    if store is not None:
+                        store.save(session)
                 payload = {
                     "kind": "tool_approval",
                     "tool": inner.name,
@@ -361,6 +373,12 @@ def wrap_tool(
                             status="pending_approval",
                         )
                     )
+                    # CRITICAL: persist the pending_approval row BEFORE
+                    # raising interrupt() so the approval-timeout
+                    # watchdog (which reads from the DB) and the
+                    # /approvals UI can see the pending state.
+                    if store is not None:
+                        store.save(session)
                 payload = {
                     "kind": "tool_approval",
                     "tool": inner.name,
