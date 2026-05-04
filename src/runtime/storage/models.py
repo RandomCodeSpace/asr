@@ -6,7 +6,7 @@ Vector similarity lives in a separate LangChain VectorStore (landed in M3).
 """
 from __future__ import annotations
 from datetime import datetime
-from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -95,3 +95,21 @@ class DedupRetractionRow(Base):
 
 
 SessionRow = IncidentRow  # generic alias
+
+
+class SessionEventRow(Base):
+    """Append-only event log for a session.
+
+    Events are immutable; they record what was observed (tool call,
+    status transition, agent run completion) and feed the status
+    finalizer's inference logic. Sequence is monotonic per session
+    and globally autoincrementing.
+    """
+    __tablename__ = "session_events"
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("incidents.id"), index=True, nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    ts: Mapped[str] = mapped_column(String, nullable=False)
