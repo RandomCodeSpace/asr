@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, TypedDict
 
 from fastmcp import FastMCP
+from pydantic import BaseModel, ConfigDict, Field
 
 from runtime.intake import (
     compose_runners,
@@ -47,6 +48,70 @@ from runtime.storage.history_store import HistoryStore
 from runtime.storage.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas for typed terminal tools
+# ---------------------------------------------------------------------------
+
+
+class _TerminalPatchBase(BaseModel):
+    """Common fields shared by all terminal tool requests.
+
+    ``extra="forbid"`` is set so an LLM that types ``confidance`` (or
+    any other non-allowed field) gets a ValidationError back rather
+    than a silent drop.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    confidence_rationale: str = Field(min_length=1)
+
+
+class ResolveRequest(_TerminalPatchBase):
+    """Payload for ``mark_resolved`` — terminal close to status=resolved."""
+    resolution_summary: str = Field(min_length=1)
+
+
+class EscalateRequest(_TerminalPatchBase):
+    """Payload for ``mark_escalated`` — terminal close to status=escalated.
+
+    ``team`` MUST be one of the framework's configured
+    ``escalation_teams``; the runtime validates that at the tool layer.
+    """
+    team: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class HypothesisSubmission(_TerminalPatchBase):
+    """Payload for ``submit_hypothesis`` — used by the deep_investigator
+    agent to record ranked hypotheses + confidence in a single typed call.
+
+    ``findings_for`` defaults to ``"deep_investigator"``; other agents
+    that submit hypotheses set it to their own name.
+    """
+    hypotheses: str = Field(min_length=1)
+    findings_for: str = Field(default="deep_investigator")
+
+
+class UpdateIncidentPatch(BaseModel):
+    """Patch shape for non-terminal session updates.
+
+    Status / resolution / escalation fields are NOT here — those move
+    through the typed terminal tools (``mark_resolved`` /
+    ``mark_escalated``). Confidence / signal flow through the graph's
+    AgentRun harvester from tool-call return values, never via this
+    patch.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    severity: str | None = None
+    category: str | None = None
+    summary: str | None = None
+    tags: list[str] | None = None
+    matched_prior_inc: str | None = None
+    findings: dict[str, str] | None = None
 
 
 # ---------------------------------------------------------------------------
