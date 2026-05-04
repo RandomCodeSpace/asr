@@ -40,6 +40,7 @@ from runtime.storage.history_store import HistoryStore
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore, StaleVersionError
 from runtime.storage.vector import build_vector_store
+from runtime.locks import SessionLockRegistry
 
 
 def _default_text_extractor(session) -> str:
@@ -245,6 +246,10 @@ class Orchestrator(Generic[StateT]):
         # on a generic FrameworkAppConfig the runtime can consume
         # without importing app-specific config modules.
         self.framework_cfg = framework_cfg or FrameworkAppConfig()
+        # Per-session asyncio.Lock keyed off session_id; serializes
+        # finalize and retry within a single process so concurrent
+        # streams cannot race on terminal-status transitions.
+        self._locks = SessionLockRegistry()
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
@@ -544,6 +549,20 @@ class Orchestrator(Generic[StateT]):
         inc.extra_fields["needs_review_reason"] = "graph completed without terminal tool call"
         return "needs_review" if _save_or_skip() else None
 
+    async def _finalize_session_status_async(
+        self, session_id: str,
+    ) -> str | None:
+        """Lock-guarded async wrapper around ``_finalize_session_status``.
+
+        All async call sites must use this one. The per-session lock
+        prevents two concurrent flows from each observing
+        pre-transition state and racing on the save. The second waiter
+        loads after the first commits, sees terminal status, and the
+        sync helper returns ``None`` (no transition).
+        """
+        async with self._locks.acquire(session_id):
+            return self._finalize_session_status(session_id)
+
     def _thread_config(self, incident_id: str) -> dict:
         """Build the LangGraph ``config`` dict for a per-session thread.
 
@@ -744,7 +763,7 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(inc.id),
         ):
             yield self._to_ui_event(ev, inc.id)
-        new_status = self._finalize_session_status(inc.id)
+        new_status = await self._finalize_session_status_async(inc.id)
         if new_status:
             yield {"event": "status_auto_finalized", "incident_id": inc.id,
                    "status": new_status, "ts": _event_ts()}
@@ -901,7 +920,7 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(session_id),
         ):
             yield self._to_ui_event(ev, session_id)
-        new_status = self._finalize_session_status(session_id)
+        new_status = await self._finalize_session_status_async(session_id)
         if new_status:
             yield {"event": "status_auto_finalized", "incident_id": session_id,
                    "status": new_status, "ts": _event_ts()}
