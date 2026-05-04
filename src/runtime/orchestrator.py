@@ -401,6 +401,13 @@ class Orchestrator(Generic[StateT]):
                     echo=cfg.storage.metadata.echo,
                 )
             )
+            from runtime.storage.checkpoint_gc import gc_orphaned_checkpoints
+            try:
+                removed = gc_orphaned_checkpoints(engine)
+                if removed:
+                    _log.info("checkpoint gc: removed %d orphaned threads", removed)
+            except Exception:
+                _log.exception("checkpoint gc failed (non-fatal)")
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry,
                                       checkpointer=checkpointer,
