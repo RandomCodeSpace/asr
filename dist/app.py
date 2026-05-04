@@ -3391,6 +3391,58 @@ _Minutes = Annotated[int, BeforeValidator(_coerce_int(15))]
 _Hours = Annotated[int, BeforeValidator(_coerce_int(24))]
 
 
+def build_environment_validator(allowed: list[str]):
+    """Return an Annotated[str, BeforeValidator] that lowercases input
+    and rejects values not in ``allowed``. Bound at server-init time
+    from the framework env list. Tools using this type get a
+    recoverable 422 from FastMCP when the LLM emits ``"prod"`` instead
+    of ``"production"`` instead of silently passing through to a
+    backend that has no policy entry for the typo.
+    """
+    allowed_lower = {a.lower() for a in allowed}
+
+    def _validate(v: object) -> str:
+        if not isinstance(v, str):
+            raise ValueError(f"environment must be a string, got {type(v).__name__}")
+        canonical = v.lower()
+        if canonical not in allowed_lower:
+            raise ValueError(
+                f"environment {v!r} not in {sorted(allowed_lower)}"
+            )
+        return canonical
+
+    return Annotated[str, BeforeValidator(_validate)]
+
+
+_environments: list[str] = []
+
+
+def set_environments(envs: list[str]) -> None:
+    """Bind the allowed environments roster from app config.
+
+    Called once by the orchestrator at create()-time after MCP servers
+    load. Tools defined below use ``_validate_environment`` (defined
+    below) which reads this module-level list at call time.
+    """
+    global _environments
+    _environments = list(envs)
+
+
+def _validate_environment(env: str) -> str:
+    """In-tool guard: raise ValueError if env not in the bound roster.
+    No-op if the roster is empty (test/early-init scenarios).
+    """
+    if not _environments:
+        return env
+    canonical = env.lower() if isinstance(env, str) else env
+    allowed_lower = {e.lower() for e in _environments}
+    if canonical not in allowed_lower:
+        raise ValueError(
+            f"environment {env!r} not in {sorted(allowed_lower)}"
+        )
+    return canonical
+
+
 def _seed(*parts: str) -> int:
     return int(hashlib.sha1("|".join(parts).encode()).hexdigest()[:8], 16)
 
@@ -3398,6 +3450,7 @@ def _seed(*parts: str) -> int:
 @mcp.tool()
 async def get_logs(service: str, environment: str, minutes: _Minutes = 15) -> dict:
     """Return canned recent log lines for a service in an environment."""
+    environment = _validate_environment(environment)
     seed = _seed(service, environment, str(minutes))
     rng = (seed >> 4) % 4
     base = [
@@ -3412,6 +3465,7 @@ async def get_logs(service: str, environment: str, minutes: _Minutes = 15) -> di
 @mcp.tool()
 async def get_metrics(service: str, environment: str, minutes: _Minutes = 15) -> dict:
     """Return canned metrics snapshot."""
+    environment = _validate_environment(environment)
     seed = _seed(service, environment)
     return {
         "service": service,
@@ -3429,6 +3483,7 @@ async def get_metrics(service: str, environment: str, minutes: _Minutes = 15) ->
 @mcp.tool()
 async def get_service_health(environment: str) -> dict:
     """Return overall environment health summary."""
+    environment = _validate_environment(environment)
     seed = _seed(environment)
     statuses = ["healthy", "degraded", "unhealthy"]
     status = statuses[seed % 3]
@@ -3447,6 +3502,7 @@ async def get_service_health(environment: str) -> dict:
 @mcp.tool()
 async def check_deployment_history(environment: str, hours: _Hours = 24) -> dict:
     """Return canned recent deployments."""
+    environment = _validate_environment(environment)
     now = datetime.now(timezone.utc)
     seed = _seed(environment, str(hours))
     deployments = [
@@ -3493,15 +3549,26 @@ async def apply_fix(proposal_id: str, environment: str) -> dict:
     }
 
 
-@mcp.tool()
-async def notify_oncall(incident_id: str, message: str,
-                       team: str = "") -> dict:
-    """Page the oncall engineer for the named team.
+_escalation_teams: list[str] = []
 
-    ``team`` should be one of the framework's configured
-    ``escalation_teams``. The result echoes ``team`` so callers and the
-    UI can record which roster was paged.
+
+def set_escalation_teams(teams: list[str]) -> None:
+    """Bind the allowed escalation_teams roster from app config."""
+    global _escalation_teams
+    _escalation_teams = list(teams)
+
+
+@mcp.tool()
+async def notify_oncall(incident_id: str, message: str, team: str) -> dict:
+    """Page the oncall engineer for the named team. ``team`` is REQUIRED
+    and must be in the configured escalation_teams roster.
     """
+    if not team:
+        raise ValueError("team is required (got empty string)")
+    if _escalation_teams and team not in _escalation_teams:
+        raise ValueError(
+            f"team {team!r} not in escalation_teams ({_escalation_teams})"
+        )
     return {
         "incident_id": incident_id,
         "team": team,
@@ -6984,6 +7051,8 @@ from langgraph.types import Command
 
 
 
+_log = logging.getLogger("runtime.orchestrator")
+
 
 def _default_text_extractor(session) -> str:
     """Default text extraction for the incident-management example.
@@ -7192,6 +7261,10 @@ class Orchestrator(Generic[StateT]):
         # finalize and retry within a single process so concurrent
         # streams cannot race on terminal-status transitions.
         self._locks = SessionLockRegistry()
+        # Membership-tracked rejection of concurrent retry_session calls
+        # on the same session id. The set is mutated under self._locks
+        # so the in-flight check + add is atomic per session.
+        self._retries_in_flight: set[str] = set()
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
@@ -7282,6 +7355,21 @@ class Orchestrator(Generic[StateT]):
                         severity_aliases=framework_cfg.severity_aliases,
                     )
                     break
+            # Bind config-driven rosters into the observability and
+            # remediation MCP servers so out-of-roster values fail at
+            # the tool boundary with a recoverable ValueError instead
+            # of silently flowing to backends that have no policy
+            # entry for them.
+            try:
+
+                _obs_mod.set_environments(list(cfg.environments))
+            except Exception:
+                pass
+            try:
+
+                _rem_mod.set_escalation_teams(list(framework_cfg.escalation_teams))
+            except Exception:
+                pass
             if cfg.paths.skills_dir is None:
                 raise RuntimeError(
                     "paths.skills_dir is not configured; apps must set it "
@@ -7296,6 +7384,15 @@ class Orchestrator(Generic[StateT]):
                         f"(known: {sorted(cfg.llm.models)})"
                     )
             registry = await load_tools(cfg.mcp, stack)
+
+            registered = {e.name for e in registry.entries.values()}
+            validate_skill_tool_references(
+                {s.name: s.model_dump() for s in skills.values()},
+                registered,
+            )
+            validate_skill_routes(
+                {s.name: s.model_dump() for s in skills.values()},
+            )
             # Build the durable checkpointer once and pass it into the
             # compiled graph. Stays attached to the orchestrator so
             # aclose() can release the underlying connection / pool.
@@ -7309,6 +7406,13 @@ class Orchestrator(Generic[StateT]):
                     echo=cfg.storage.metadata.echo,
                 )
             )
+
+            try:
+                removed = gc_orphaned_checkpoints(engine)
+                if removed:
+                    _log.info("checkpoint gc: removed %d orphaned threads", removed)
+            except Exception:
+                _log.exception("checkpoint gc failed (non-fatal)")
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry,
                                       checkpointer=checkpointer,
@@ -7780,7 +7884,8 @@ class Orchestrator(Generic[StateT]):
                 f"INC {incident_id} escalated by user — team {team}. "
                 "Confidence below threshold."
             )
-            tool_args = {"incident_id": incident_id, "message": message}
+            tool_args = {"incident_id": incident_id, "message": message,
+                         "team": team}
             tool_result = await self._invoke_tool("notify_oncall", tool_args)
             inc = self.store.load(incident_id)
             inc.tool_calls.append(ToolCall(
@@ -7812,6 +7917,43 @@ class Orchestrator(Generic[StateT]):
             yield event
 
     async def retry_session(self, session_id: str) -> AsyncIterator[dict]:
+        """Restart a failed/stopped session on a fresh LangGraph thread.
+
+        Rejects (with retry_rejected event) if a retry is already in
+        flight for this session id. The check is fast-fail BEFORE
+        acquiring the lock so the rejecting caller is not blocked.
+        """
+        if session_id in self._retries_in_flight:
+            _log.warning("retry_session rejected (fast-fail): %s already in flight",
+                         session_id)
+            yield {"event": "retry_rejected",
+                   "incident_id": session_id,
+                   "reason": "retry already in progress",
+                   "ts": _event_ts()}
+            return
+        async with self._locks.acquire(session_id):
+            # Re-check inside the lock to close the TOCTOU window
+            # between the membership check above and the acquire:
+            # task A could have completed its full retry-and-finally
+            # discard between this caller's outer check and acquire,
+            # but a third concurrent task could have entered and added
+            # itself between A's discard and B's acquire.
+            if session_id in self._retries_in_flight:
+                _log.warning("retry_session rejected (post-acquire): %s",
+                             session_id)
+                yield {"event": "retry_rejected",
+                       "incident_id": session_id,
+                       "reason": "retry already in progress",
+                       "ts": _event_ts()}
+                return
+            self._retries_in_flight.add(session_id)
+            try:
+                async for ev in self._retry_session_locked(session_id):
+                    yield ev
+            finally:
+                self._retries_in_flight.discard(session_id)
+
+    async def _retry_session_locked(self, session_id: str) -> AsyncIterator[dict]:
         """Re-run the graph for a session that failed mid-flight.
 
         Only sessions in ``status="error"`` are retryable — those are
