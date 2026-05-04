@@ -40,7 +40,12 @@ def test_playbook_translates_remediation_steps_to_tool_calls() -> None:
         "id": "pb-x",
         "remediation": [
             {"tool": "remediation:restart_service", "args": {"service": "payments"}},
-            {"tool": "update_incident", "args": {"patch": {"status": "resolved"}}},
+            {"tool": "mark_resolved", "args": {
+                "incident_id": "INC-1",
+                "resolution_summary": "restarted service",
+                "confidence": 0.9,
+                "confidence_rationale": "service recovered after restart",
+            }},
         ],
         "required_approval": True,
     }
@@ -49,7 +54,7 @@ def test_playbook_translates_remediation_steps_to_tool_calls() -> None:
     assert calls[0]["tool"] == "remediation:restart_service"
     assert calls[0]["args"] == {"service": "payments"}
     assert calls[0]["requires_approval"] is True
-    assert calls[1]["tool"] == "update_incident"
+    assert calls[1]["tool"] == "mark_resolved"
 
 
 def test_playbook_with_no_remediation_returns_empty() -> None:

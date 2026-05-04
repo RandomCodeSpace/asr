@@ -686,35 +686,45 @@ class IncidentMCPServer:
         return inc.model_dump()
 
     async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
-        """Apply a flat patch to an INC.
+        """Apply a typed patch to an INC.
 
-        Allowed keys:
-          - status, severity, category, summary, tags, matched_prior_inc, resolution, escalated_to
-          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``.
+        Allowed keys are declared by ``UpdateIncidentPatch``. Unknown
+        keys raise ``ValueError`` so the LLM gets a recoverable tool
+        error and can retry.
+
+        Status transitions (``resolved`` / ``escalated``), resolution
+        text, and the escalated-to team are NOT writeable here — they
+        flow through the typed terminal tools ``mark_resolved`` and
+        ``mark_escalated``. The legacy ``findings_<agent>`` underscore
+        pattern is replaced by the typed ``findings: dict[str, str]``
+        field.
         """
+        try:
+            typed = UpdateIncidentPatch(**patch)
+        except Exception as exc:  # pydantic ValidationError + others
+            raise ValueError(
+                f"invalid update_incident patch: {exc}. "
+                f"Status/resolution/escalation use mark_resolved or mark_escalated; "
+                f"per-agent findings use the typed `findings` dict."
+            ) from exc
+
         store = self._require_store()
         inc = store.load(incident_id)
-        if "status" in patch:
-            inc.status = patch["status"]
-        if "severity" in patch:
+        if typed.severity is not None:
             inc.extra_fields["severity"] = normalize_severity(
-                patch["severity"], self.severity_aliases
+                typed.severity, self.severity_aliases,
             )
-        if "category" in patch:
-            inc.extra_fields["category"] = patch["category"]
-        if "summary" in patch:
-            inc.extra_fields["summary"] = patch["summary"]
-        if "tags" in patch:
-            inc.extra_fields["tags"] = list(patch["tags"])
-        if "matched_prior_inc" in patch:
-            inc.extra_fields["matched_prior_inc"] = patch["matched_prior_inc"]
-        if "resolution" in patch:
-            inc.extra_fields["resolution"] = patch["resolution"]
-        if "escalated_to" in patch:
-            inc.extra_fields["escalated_to"] = patch["escalated_to"]
-        for key, value in patch.items():
-            if key.startswith("findings_"):
-                inc.findings[key[len("findings_"):]] = value
+        if typed.category is not None:
+            inc.extra_fields["category"] = typed.category
+        if typed.summary is not None:
+            inc.extra_fields["summary"] = typed.summary
+        if typed.tags is not None:
+            inc.extra_fields["tags"] = list(typed.tags)
+        if typed.matched_prior_inc is not None:
+            inc.extra_fields["matched_prior_inc"] = typed.matched_prior_inc
+        if typed.findings:
+            for agent_name, finding in typed.findings.items():
+                inc.findings[agent_name] = finding
         store.save(inc)
         return inc.model_dump()
 
