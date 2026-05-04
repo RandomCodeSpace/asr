@@ -39,6 +39,14 @@ def validate_skill_tool_references(
             if tool_ref in registered_tools:
                 continue
             if tool_ref in bare_to_full:
+                resolutions = bare_to_full[tool_ref]
+                if len(resolutions) > 1:
+                    raise SkillValidationError(
+                        f"skill {skill_name!r} uses bare tool ref "
+                        f"{tool_ref!r} but it is exposed by multiple "
+                        f"servers: {sorted(resolutions)}. Use the prefixed "
+                        f"form to disambiguate."
+                    )
                 continue
             raise SkillValidationError(
                 f"skill {skill_name!r} references tool {tool_ref!r} which "
