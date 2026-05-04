@@ -5,7 +5,7 @@ tc_args and implies signal=success.
 This is the post-Task-3.5 contract: confidence is no longer carried inside
 update_incident.patch — it's a required arg on the typed terminal tools, and
 the harvester picks it up directly."""
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage
 
 from runtime.graph import _harvest_tool_calls_and_patches
 from runtime.state import Session
@@ -20,7 +20,7 @@ def _make_inc(sid: str = "INC-1") -> Session:
     )
 
 
-def test_harvester_reads_confidence_from_submit_hypothesis():
+def test_harvester_reads_confidence_from_submit_hypothesis_return():
     inc = _make_inc()
     messages = [
         AIMessage(
@@ -31,7 +31,7 @@ def test_harvester_reads_confidence_from_submit_hypothesis():
                     "incident_id": "INC-1",
                     "hypotheses": "h",
                     "confidence": 0.85,
-                    "confidence_rationale": "strong",
+                    "confidence_rationale": "r",
                 },
             }],
         ),
@@ -41,7 +41,7 @@ def test_harvester_reads_confidence_from_submit_hypothesis():
         valid_signals=frozenset({"success", "failed", "default"}),
     )
     assert conf == 0.85
-    assert rationale == "strong"
+    assert rationale == "r"
     assert signal == "success"
 
 
