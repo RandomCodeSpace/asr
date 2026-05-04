@@ -840,9 +840,21 @@ class IncidentMCPServer:
 
 
 # ---------------------------------------------------------------------------
-# Module-level default server (back-compat for the MCP loader path).
-# The MCP loader imports ``mcp`` from this module by name; this keeps that
-# contract working unchanged.
+# Module-level default server.
+#
+# The MCP loader (``runtime.mcp_loader:137``) imports the module by name
+# and reads ``getattr(mod, "mcp")`` to find the FastMCP instance to wire
+# tools through. This singleton is purely a *loader-side default* —
+# every concurrent orchestrator can and should construct its own fresh
+# ``IncidentMCPServer()`` and ``configure(...)`` it against its own
+# store. State on the class is held PER-INSTANCE; the singleton does
+# not bleed into separate instances. ``tests/test_mcp_per_session_context.py``
+# locks that guarantee.
+#
+# A future loader API (``register_in_process_server``) could let the
+# orchestrator wire its own ``IncidentMCPServer`` instance instead of
+# this singleton. Until then, ``set_state`` configures *the loader's
+# default*, which is what the bundled example apps actually use.
 # ---------------------------------------------------------------------------
 
 _default_server = IncidentMCPServer()
@@ -852,7 +864,13 @@ mcp = _default_server.mcp
 def set_state(*, store: SessionStore,
               history: HistoryStore | None = None,
               severity_aliases: dict[str, str] | None = None) -> None:
-    """Configure the default IncidentMCPServer instance."""
+    """Configure the loader's default IncidentMCPServer instance.
+
+    Per-orchestrator isolation is enforced at the class level, not via
+    this function. Apps that need multiple isolated servers in the
+    same process should construct ``IncidentMCPServer()`` instances
+    directly and configure each.
+    """
     _default_server.configure(
         store=store,
         history=history,
