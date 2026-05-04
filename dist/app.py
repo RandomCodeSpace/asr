@@ -134,7 +134,7 @@ Vector similarity lives in a separate LangChain VectorStore (landed in M3).
 """
 
 from datetime import datetime
-from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -1478,6 +1478,11 @@ class Session(BaseModel):
     # store them here. The storage layer round-trips this via the
     # matching ``IncidentRow.extra_fields`` JSON column.
     extra_fields: dict[str, Any] = Field(default_factory=dict)
+    # Optimistic concurrency token. Incremented on every successful
+    # ``SessionStore.save``; reads observe the value at load time. Saves
+    # with a stale version raise ``StaleVersionError`` so the caller can
+    # reload + retry.
+    version: int = 1
 
     # ------------------------------------------------------------------
     # App-overridable agent-input formatter hook.
@@ -2270,6 +2275,7 @@ class IncidentRow(Base):
     # them back into the model on load. Additive: legacy rows written
     # before this column existed have ``NULL`` and round-trip cleanly.
     extra_fields: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
     __table_args__ = (
         Index("ix_incidents_status_env_active", "status", "environment",
@@ -2303,6 +2309,24 @@ class DedupRetractionRow(Base):
 
 
 SessionRow = IncidentRow  # generic alias
+
+
+class SessionEventRow(Base):
+    """Append-only event log for a session.
+
+    Events are immutable; they record what was observed (tool call,
+    status transition, agent run completion) and feed the status
+    finalizer's inference logic. Sequence is monotonic per session
+    and globally autoincrementing.
+    """
+    __tablename__ = "session_events"
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("incidents.id"), index=True, nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    ts: Mapped[str] = mapped_column(String, nullable=False)
 
 # ====== module: runtime/storage/engine.py ======
 
@@ -2766,6 +2790,14 @@ def _deserialize_resolution(raw: Optional[str]):
         return raw
 
 
+class StaleVersionError(RuntimeError):
+    """Raised when ``SessionStore.save`` observes that the row has been
+    updated since the in-memory copy was loaded.
+
+    Callers should reload from the store and re-apply their mutation.
+    """
+
+
 class SessionStore(Generic[StateT]):
     """Active session/incident lifecycle store, parametrised on ``StateT``.
 
@@ -2889,9 +2921,21 @@ class SessionStore(Generic[StateT]):
                 f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         incident.updated_at = _iso(_now())
+        sess = incident  # local alias — avoids repeating the domain token in new code
+        expected_version = getattr(sess, "version", 1)
+        # Bump in-memory BEFORE building the row dict so the persisted
+        # row reflects the new version.
+        sess.version = expected_version + 1
         with SqlSession(self.engine) as session:
-            existing = session.get(IncidentRow, incident.id)
+            existing = session.get(IncidentRow, sess.id)
             prior_text = _embed_source_from_row(existing) if existing is not None else ""
+            if existing is not None and existing.version != expected_version:
+                # Roll back the in-memory bump so the caller can reload + retry.
+                sess.version = expected_version
+                raise StaleVersionError(
+                    f"session {sess.id} version is {existing.version}, "
+                    f"expected {expected_version}"
+                )
             data = self._incident_to_row_dict(incident)
             if existing is None:
                 session.add(IncidentRow(**data))
@@ -3076,6 +3120,8 @@ class SessionStore(Generic[StateT]):
         # ``extra_fields`` is the bag itself — round-tripped via the
         # JSON column directly, never nested inside the bag.
         "extra_fields",
+        # Optimistic-concurrency token — has its own typed column.
+        "version",
     })
 
     # Incident-shaped typed columns the row carries for back-compat
@@ -3122,6 +3168,7 @@ class SessionStore(Generic[StateT]):
             "user_inputs": list(row.user_inputs or []),
             "parent_session_id": row.parent_session_id,
             "dedup_rationale": row.dedup_rationale,
+            "version": row.version if row.version is not None else 1,
         }
 
         # Incident-shaped typed columns: include only fields the state
@@ -3311,6 +3358,7 @@ class SessionStore(Generic[StateT]):
             # data in ``state.extra_fields`` directly. Merge both, with
             # subclass fields taking precedence (parity with load path).
             "extra_fields": ({**bare_extra, **extra}) or None,
+            "version": getattr(inc, "version", 1),
         }
 
 # ====== module: runtime/mcp_servers/observability.py ======
@@ -3895,6 +3943,11 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
+_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
+    "mark_resolved", "mark_escalated", "submit_hypothesis",
+})
+
+
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
@@ -3903,8 +3956,14 @@ def _harvest_tool_calls_and_patches(
     valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Iterate agent messages, record ToolCall entries on the incident, and
-    harvest any confidence / confidence_rationale / signal from update_incident
-    patches.
+    harvest confidence / confidence_rationale / signal from typed terminal
+    tools or legacy update_incident patches.
+
+    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
+    carry confidence and rationale as flat kwargs; they imply
+    ``signal=success`` since invoking a terminal tool is the agent's
+    declaration of completion. Non-terminal agents emit signal via
+    ``update_incident.patch.signal``.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
@@ -3927,7 +3986,22 @@ def _harvest_tool_calls_and_patches(
                 result=None,
                 ts=ts,
             ))
-            if tc_original == "update_incident":
+            if tc_original in _TYPED_TERMINAL_TOOLS:
+                # Confidence/rationale are required pydantic args on the
+                # typed terminal tools — read them directly from tc_args.
+                conf = _coerce_confidence(tc_args.get("confidence"))
+                if conf is not None:
+                    agent_confidence = conf
+                rat = _coerce_rationale(tc_args.get("confidence_rationale"))
+                if rat is not None:
+                    agent_rationale = rat
+                # Terminal tools imply success — agent has declared
+                # completion by invoking them. Use _coerce_signal so the
+                # vocabulary is consistent with the configured set.
+                terminal = _coerce_signal("success", valid_signals)
+                if terminal is not None:
+                    agent_signal = terminal
+            elif tc_original == "update_incident":
                 patch = tc_args.get("patch") or {}
                 agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
                     patch, agent_confidence, agent_rationale, agent_signal,
@@ -4067,7 +4141,7 @@ def make_agent_node(
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name)
+                          agent_name=skill.name, store=store)
                 for t in tools
             ]
         else:

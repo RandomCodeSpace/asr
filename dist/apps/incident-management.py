@@ -134,7 +134,7 @@ Vector similarity lives in a separate LangChain VectorStore (landed in M3).
 """
 
 from datetime import datetime
-from sqlalchemy import DateTime, Index, Integer, JSON, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -1510,6 +1510,11 @@ class Session(BaseModel):
     # store them here. The storage layer round-trips this via the
     # matching ``IncidentRow.extra_fields`` JSON column.
     extra_fields: dict[str, Any] = Field(default_factory=dict)
+    # Optimistic concurrency token. Incremented on every successful
+    # ``SessionStore.save``; reads observe the value at load time. Saves
+    # with a stale version raise ``StaleVersionError`` so the caller can
+    # reload + retry.
+    version: int = 1
 
     # ------------------------------------------------------------------
     # App-overridable agent-input formatter hook.
@@ -2302,6 +2307,7 @@ class IncidentRow(Base):
     # them back into the model on load. Additive: legacy rows written
     # before this column existed have ``NULL`` and round-trip cleanly.
     extra_fields: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
     __table_args__ = (
         Index("ix_incidents_status_env_active", "status", "environment",
@@ -2335,6 +2341,24 @@ class DedupRetractionRow(Base):
 
 
 SessionRow = IncidentRow  # generic alias
+
+
+class SessionEventRow(Base):
+    """Append-only event log for a session.
+
+    Events are immutable; they record what was observed (tool call,
+    status transition, agent run completion) and feed the status
+    finalizer's inference logic. Sequence is monotonic per session
+    and globally autoincrementing.
+    """
+    __tablename__ = "session_events"
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("incidents.id"), index=True, nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    ts: Mapped[str] = mapped_column(String, nullable=False)
 
 # ====== module: runtime/storage/engine.py ======
 
@@ -2798,6 +2822,14 @@ def _deserialize_resolution(raw: Optional[str]):
         return raw
 
 
+class StaleVersionError(RuntimeError):
+    """Raised when ``SessionStore.save`` observes that the row has been
+    updated since the in-memory copy was loaded.
+
+    Callers should reload from the store and re-apply their mutation.
+    """
+
+
 class SessionStore(Generic[StateT]):
     """Active session/incident lifecycle store, parametrised on ``StateT``.
 
@@ -2921,9 +2953,21 @@ class SessionStore(Generic[StateT]):
                 f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         incident.updated_at = _iso(_now())
+        sess = incident  # local alias — avoids repeating the domain token in new code
+        expected_version = getattr(sess, "version", 1)
+        # Bump in-memory BEFORE building the row dict so the persisted
+        # row reflects the new version.
+        sess.version = expected_version + 1
         with SqlSession(self.engine) as session:
-            existing = session.get(IncidentRow, incident.id)
+            existing = session.get(IncidentRow, sess.id)
             prior_text = _embed_source_from_row(existing) if existing is not None else ""
+            if existing is not None and existing.version != expected_version:
+                # Roll back the in-memory bump so the caller can reload + retry.
+                sess.version = expected_version
+                raise StaleVersionError(
+                    f"session {sess.id} version is {existing.version}, "
+                    f"expected {expected_version}"
+                )
             data = self._incident_to_row_dict(incident)
             if existing is None:
                 session.add(IncidentRow(**data))
@@ -3108,6 +3152,8 @@ class SessionStore(Generic[StateT]):
         # ``extra_fields`` is the bag itself — round-tripped via the
         # JSON column directly, never nested inside the bag.
         "extra_fields",
+        # Optimistic-concurrency token — has its own typed column.
+        "version",
     })
 
     # Incident-shaped typed columns the row carries for back-compat
@@ -3154,6 +3200,7 @@ class SessionStore(Generic[StateT]):
             "user_inputs": list(row.user_inputs or []),
             "parent_session_id": row.parent_session_id,
             "dedup_rationale": row.dedup_rationale,
+            "version": row.version if row.version is not None else 1,
         }
 
         # Incident-shaped typed columns: include only fields the state
@@ -3343,6 +3390,7 @@ class SessionStore(Generic[StateT]):
             # data in ``state.extra_fields`` directly. Merge both, with
             # subclass fields taking precedence (parity with load path).
             "extra_fields": ({**bare_extra, **extra}) or None,
+            "version": getattr(inc, "version", 1),
         }
 
 # ====== module: runtime/mcp_servers/observability.py ======
@@ -3927,6 +3975,11 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
+_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
+    "mark_resolved", "mark_escalated", "submit_hypothesis",
+})
+
+
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
@@ -3935,8 +3988,14 @@ def _harvest_tool_calls_and_patches(
     valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Iterate agent messages, record ToolCall entries on the incident, and
-    harvest any confidence / confidence_rationale / signal from update_incident
-    patches.
+    harvest confidence / confidence_rationale / signal from typed terminal
+    tools or legacy update_incident patches.
+
+    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
+    carry confidence and rationale as flat kwargs; they imply
+    ``signal=success`` since invoking a terminal tool is the agent's
+    declaration of completion. Non-terminal agents emit signal via
+    ``update_incident.patch.signal``.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
@@ -3959,7 +4018,22 @@ def _harvest_tool_calls_and_patches(
                 result=None,
                 ts=ts,
             ))
-            if tc_original == "update_incident":
+            if tc_original in _TYPED_TERMINAL_TOOLS:
+                # Confidence/rationale are required pydantic args on the
+                # typed terminal tools — read them directly from tc_args.
+                conf = _coerce_confidence(tc_args.get("confidence"))
+                if conf is not None:
+                    agent_confidence = conf
+                rat = _coerce_rationale(tc_args.get("confidence_rationale"))
+                if rat is not None:
+                    agent_rationale = rat
+                # Terminal tools imply success — agent has declared
+                # completion by invoking them. Use _coerce_signal so the
+                # vocabulary is consistent with the configured set.
+                terminal = _coerce_signal("success", valid_signals)
+                if terminal is not None:
+                    agent_signal = terminal
+            elif tc_original == "update_incident":
                 patch = tc_args.get("patch") or {}
                 agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
                     patch, agent_confidence, agent_rationale, agent_signal,
@@ -4099,7 +4173,7 @@ def make_agent_node(
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name)
+                          agent_name=skill.name, store=store)
                 for t in tools
             ]
         else:
@@ -8429,6 +8503,72 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Pydantic schemas for typed terminal tools
+# ---------------------------------------------------------------------------
+
+
+class _TerminalPatchBase(BaseModel):
+    """Common fields shared by all terminal tool requests.
+
+    ``extra="forbid"`` is set so an LLM that types ``confidance`` (or
+    any other non-allowed field) gets a ValidationError back rather
+    than a silent drop.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    confidence_rationale: str = Field(min_length=1)
+
+
+class ResolveRequest(_TerminalPatchBase):
+    """Payload for ``mark_resolved`` — terminal close to status=resolved."""
+    resolution_summary: str = Field(min_length=1)
+
+
+class EscalateRequest(_TerminalPatchBase):
+    """Payload for ``mark_escalated`` — terminal close to status=escalated.
+
+    ``team`` MUST be one of the framework's configured
+    ``escalation_teams``; the runtime validates that at the tool layer.
+    """
+    team: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class HypothesisSubmission(_TerminalPatchBase):
+    """Payload for ``submit_hypothesis`` — used by the deep_investigator
+    agent to record ranked hypotheses + confidence in a single typed call.
+
+    ``findings_for`` defaults to ``"deep_investigator"``; other agents
+    that submit hypotheses set it to their own name.
+    """
+    hypotheses: str = Field(min_length=1)
+    findings_for: str = Field(default="deep_investigator")
+
+
+class UpdateIncidentPatch(BaseModel):
+    """Patch shape for non-terminal session updates.
+
+    Status / resolution / escalation fields are NOT here — those move
+    through the typed terminal tools (``mark_resolved`` /
+    ``mark_escalated``). ``signal`` is permitted because non-terminal
+    agents (triage, intake) use it to drive graph routing; terminal
+    tools imply ``signal=success`` automatically and don't need to
+    set it on a separate update_incident call.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    severity: str | None = None
+    category: str | None = None
+    summary: str | None = None
+    tags: list[str] | None = None
+    matched_prior_inc: str | None = None
+    findings: dict[str, str] | None = None
+    signal: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
 
@@ -8900,6 +9040,7 @@ class IncidentMCPServer:
     # ``AppConfig.framework`` in the YAML). Bare default of ``{}``
     # keeps direct dataclass construction working in unit tests.
     severity_aliases: dict[str, str] = field(default_factory=dict)
+    escalation_teams: list[str] = field(default_factory=list)
     mcp: FastMCP = field(init=False)
 
     def __post_init__(self) -> None:
@@ -8907,17 +9048,23 @@ class IncidentMCPServer:
         self.mcp.tool(name="lookup_similar_incidents")(self._tool_lookup_similar_incidents)
         self.mcp.tool(name="create_incident")(self._tool_create_incident)
         self.mcp.tool(name="update_incident")(self._tool_update_incident)
+        self.mcp.tool(name="mark_resolved")(self._tool_mark_resolved)
+        self.mcp.tool(name="mark_escalated")(self._tool_mark_escalated)
+        self.mcp.tool(name="submit_hypothesis")(self._tool_submit_hypothesis)
 
     def configure(
         self, *,
         store: SessionStore,
         history: HistoryStore | None = None,
         severity_aliases: dict[str, str] | None = None,
+        escalation_teams: list[str] | None = None,
     ) -> None:
         self.store = store
         self.history = history
         if severity_aliases is not None:
             self.severity_aliases = severity_aliases
+        if escalation_teams is not None:
+            self.escalation_teams = list(escalation_teams)
 
     def _require_store(self) -> SessionStore:
         if self.store is None:
@@ -8993,37 +9140,155 @@ class IncidentMCPServer:
         return inc.model_dump()
 
     async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
-        """Apply a flat patch to an INC.
+        """Apply a typed patch to an INC.
 
-        Allowed keys:
-          - status, severity, category, summary, tags, matched_prior_inc, resolution, escalated_to
-          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``.
+        Allowed keys are declared by ``UpdateIncidentPatch``. Unknown
+        keys raise ``ValueError`` so the LLM gets a recoverable tool
+        error and can retry.
+
+        Status transitions (``resolved`` / ``escalated``), resolution
+        text, and the escalated-to team are NOT writeable here — they
+        flow through the typed terminal tools ``mark_resolved`` and
+        ``mark_escalated``. The legacy ``findings_<agent>`` underscore
+        pattern is replaced by the typed ``findings: dict[str, str]``
+        field.
         """
+        try:
+            typed = UpdateIncidentPatch(**patch)
+        except Exception as exc:  # pydantic ValidationError + others
+            raise ValueError(
+                f"invalid update_incident patch: {exc}. "
+                f"Status/resolution/escalation use mark_resolved or mark_escalated; "
+                f"per-agent findings use the typed `findings` dict."
+            ) from exc
+
         store = self._require_store()
         inc = store.load(incident_id)
-        if "status" in patch:
-            inc.status = patch["status"]
-        if "severity" in patch:
+        if typed.severity is not None:
             inc.extra_fields["severity"] = normalize_severity(
-                patch["severity"], self.severity_aliases
+                typed.severity, self.severity_aliases,
             )
-        if "category" in patch:
-            inc.extra_fields["category"] = patch["category"]
-        if "summary" in patch:
-            inc.extra_fields["summary"] = patch["summary"]
-        if "tags" in patch:
-            inc.extra_fields["tags"] = list(patch["tags"])
-        if "matched_prior_inc" in patch:
-            inc.extra_fields["matched_prior_inc"] = patch["matched_prior_inc"]
-        if "resolution" in patch:
-            inc.extra_fields["resolution"] = patch["resolution"]
-        if "escalated_to" in patch:
-            inc.extra_fields["escalated_to"] = patch["escalated_to"]
-        for key, value in patch.items():
-            if key.startswith("findings_"):
-                inc.findings[key[len("findings_"):]] = value
+        if typed.category is not None:
+            inc.extra_fields["category"] = typed.category
+        if typed.summary is not None:
+            inc.extra_fields["summary"] = typed.summary
+        if typed.tags is not None:
+            inc.extra_fields["tags"] = list(typed.tags)
+        if typed.matched_prior_inc is not None:
+            inc.extra_fields["matched_prior_inc"] = typed.matched_prior_inc
+        if typed.findings:
+            for agent_name, finding in typed.findings.items():
+                inc.findings[agent_name] = finding
         store.save(inc)
         return inc.model_dump()
+
+    async def _tool_mark_resolved(
+        self,
+        incident_id: str,
+        resolution_summary: str,
+        confidence: float,
+        confidence_rationale: str,
+    ) -> dict:
+        """Terminal close → status=resolved.
+
+        This is the only sanctioned path to a ``resolved`` status. The
+        legacy ``update_incident({"status":"resolved"})`` path no longer
+        works (Task 3.5 locks down ``update_incident.patch`` to a typed
+        schema that excludes ``status``).
+        """
+        req = ResolveRequest(
+            incident_id=incident_id,
+            resolution_summary=resolution_summary,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+        )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.status = "resolved"
+        inc.extra_fields["resolution"] = req.resolution_summary
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "status": "resolved",
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
+
+    async def _tool_mark_escalated(
+        self,
+        incident_id: str,
+        team: str,
+        reason: str,
+        confidence: float,
+        confidence_rationale: str,
+    ) -> dict:
+        """Terminal close → status=escalated.
+
+        Validates ``team`` against the configured roster (when one is
+        set) so an LLM that emits a non-existent team gets a recoverable
+        ToolError back instead of silently routing a page to nowhere.
+        When ``escalation_teams`` is empty (e.g. test config), any
+        non-empty team string is accepted.
+        """
+        req = EscalateRequest(
+            incident_id=incident_id,
+            team=team,
+            reason=reason,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+        )
+        if self.escalation_teams and req.team not in self.escalation_teams:
+            raise ValueError(
+                f"team {req.team!r} not in escalation_teams "
+                f"({self.escalation_teams})"
+            )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.status = "escalated"
+        inc.extra_fields["escalated_to"] = req.team
+        inc.extra_fields["escalation_reason"] = req.reason
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "status": "escalated",
+            "team": req.team,
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
+
+    async def _tool_submit_hypothesis(
+        self,
+        incident_id: str,
+        hypotheses: str,
+        confidence: float,
+        confidence_rationale: str,
+        findings_for: str = "deep_investigator",
+    ) -> dict:
+        """Submit ranked hypotheses + confidence in a single typed call.
+
+        Replaces the free-form ``update_incident({"findings_*", ...})``
+        path used by the deep_investigator. ``confidence`` is required
+        (Pydantic validation) so the agent cannot omit it; the graph's
+        AgentRun harvester will read confidence + rationale from the
+        typed return value.
+        """
+        req = HypothesisSubmission(
+            incident_id=incident_id,
+            hypotheses=hypotheses,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+            findings_for=findings_for,
+        )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.findings[req.findings_for] = req.hypotheses
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "findings_for": req.findings_for,
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
 
 
 # ---------------------------------------------------------------------------
