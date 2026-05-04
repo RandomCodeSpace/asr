@@ -206,6 +206,7 @@ _STATUS_COLOR = {
     "awaiting_input": "orange",
     "stopped": "gray",
     "deleted": "gray",
+    "error": "red",
 }
 
 # Human-readable labels — awaiting_input is highlighted as the action-required state.
@@ -218,6 +219,7 @@ _STATUS_LABEL = {
     "escalated": "ESCALATED",
     "awaiting_input": "⚠ NEEDS INPUT",
     "stopped": "STOPPED",
+    "error": "⚠ FAILED",
 }
 
 def _badge(label: str, color: str) -> None:
@@ -530,7 +532,7 @@ def render_sidebar(store: SessionStore,
         show_deleted = st.checkbox("Show deleted", value=False,
                                    key="show_deleted")
         statuses = ["all", "new", "in_progress", "matched", "resolved",
-                    "escalated", "awaiting_input", "stopped"]
+                    "escalated", "awaiting_input", "stopped", "error"]
         if show_deleted:
             statuses.append("deleted")
         status_filter = st.selectbox(
@@ -835,6 +837,12 @@ def _render_summary_meta(sess: dict, app_cfg: FrameworkAppConfig) -> None:
     escalated_to = _field(sess, "escalated_to")
     if escalated_to:
         st.markdown(f"**Escalated to:** `{escalated_to}`")
+    if (sess.get("extra_fields") or {}).get("auto_resolved"):
+        st.warning(
+            "⚠ This session was auto-finalised because the resolution agent "
+            "did not explicitly set a terminal status. Treat the resolution "
+            "summary as advisory — verify the actual outcome before closing."
+        )
     if sess.get("matched_prior_inc"):
         _render_prior_match(sess, app_cfg)
 
@@ -1105,6 +1113,8 @@ def render_session_detail(store: SessionStore,
         _render_summary_meta(sess, app_cfg)
         if sess.get("status") == "awaiting_input" and sess.get("pending_intervention"):
             _render_intervention_block(sess, session_id, app_cfg, agent_names)
+        if sess.get("status") == "error":
+            _render_retry_block(sess, session_id, agent_names)
         # Pending tool-approval cards (risk-rated gateway HITL).
         # Rendered above the agents/tool-calls blocks so a paused
         # approval is the first action surface the operator sees.
@@ -1179,6 +1189,38 @@ async def _run_investigation_async(cfg: AppConfig, query: str, environment: str,
         await orch.aclose()
 
 
+async def _retry_async(cfg: AppConfig, session_id: str,
+                       log_area, lines: list[str],
+                       agent_names: frozenset[str] = frozenset()) -> dict:
+    """Build a fresh Orchestrator, stream retry events, aclose.
+
+    Returns ``{"rejected": <reason or None>}`` so the caller can render
+    a warning when the orchestrator refuses the retry (e.g. session
+    isn't in error state).
+    """
+    outcome: dict = {"rejected": None}
+    orch = await Orchestrator.create(cfg)
+    try:
+        async for ev in orch.retry_session(session_id):
+            kind = ev.get("event")
+            ts = ev.get("ts", "")
+            if kind == "retry_started":
+                lines.append(f"[{ts}] retry  attempt #{ev.get('retry_count')}")
+            elif kind == "retry_rejected":
+                lines.append(f"[{ts}] rejected {ev.get('reason')}")
+                outcome["rejected"] = ev.get("reason")
+            elif kind == "retry_completed":
+                lines.append(f"[{ts}] done")
+            else:
+                line = _format_event(ev, agent_names)
+                if line:
+                    lines.append(line)
+            log_area.code("\n".join(lines), language="text")
+    finally:
+        await orch.aclose()
+    return outcome
+
+
 async def _resume_async(cfg: AppConfig, session_id: str, decision: dict,
                         log_area, lines: list[str],
                         agent_names: frozenset[str] = frozenset()) -> dict:
@@ -1213,6 +1255,50 @@ async def _resume_async(cfg: AppConfig, session_id: str, decision: dict,
     finally:
         await orch.aclose()
     return outcome
+
+
+def _render_retry_block(sess: dict, session_id: str,
+                        agent_names: frozenset[str] = frozenset()) -> None:
+    """Render a retry control for failed sessions.
+
+    Sessions land in ``status="error"`` when a graph node raises and
+    the framework's auto-retry on transient 5xxs (see
+    :data:`runtime.graph._TRANSIENT_MARKERS`) has already been
+    exhausted. Surfaces the failed agent + the recorded exception so
+    the operator can decide whether to retry.
+    """
+    cfg = load_config(CONFIG_PATH)
+    failed_run = next(
+        (r for r in reversed(sess.get("agents_run") or [])
+         if (r.get("summary") or "").startswith("agent failed:")),
+        None,
+    )
+    failed_agent = (failed_run or {}).get("agent", "unknown")
+    failure_msg = ((failed_run or {}).get("summary") or "").removeprefix("agent failed:").strip()
+    retry_count = int((sess.get("extra_fields") or {}).get("retry_count", 0))
+    with st.container(border=True):
+        st.markdown(f"#### 🔴 Agent failed — `{failed_agent}`")
+        if failure_msg:
+            st.caption(f"Last error: {failure_msg}")
+        if retry_count:
+            st.caption(f"Previous retry attempts: {retry_count}")
+        st.caption(
+            "Retry re-runs the graph from the entry node. The framework "
+            "already retried transient 5xx errors automatically — this "
+            "is for cases where the underlying issue may now be cleared "
+            "(provider hiccup, transient network, etc.)."
+        )
+        if st.button("Retry", type="primary", key=f"retry_btn_{session_id}"):
+            log_area = st.empty()
+            lines: list[str] = []
+            outcome = asyncio.run(_retry_async(
+                cfg, session_id, log_area, lines, agent_names,
+            ))
+            if outcome.get("rejected"):
+                st.warning(f"Retry rejected: {outcome['rejected']}")
+                return
+            st.success("Retry complete.")
+            st.rerun()
 
 
 def _render_intervention_block(sess: dict, session_id: str,

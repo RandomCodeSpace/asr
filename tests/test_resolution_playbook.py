@@ -194,14 +194,22 @@ def test_config_yaml_loads_with_locked_gateway_block(monkeypatch) -> None:
     gw = cfg.runtime.gateway
     assert gw is not None
     assert gw.policy.get("update_incident") == "medium"
-    assert gw.policy.get("remediation:restart_service") == "high"
+    assert gw.policy.get("apply_fix") == "high"
     assert gw.prod_overrides is not None
     assert "production" in gw.prod_overrides.prod_environments
     assert "update_incident" in gw.prod_overrides.resolution_trigger_tools
-    assert "remediation:*" in gw.prod_overrides.resolution_trigger_tools
-    # And the runtime contract still holds.
+    assert "apply_fix" in gw.prod_overrides.resolution_trigger_tools
+    # The runtime contract still holds — bare AND prefixed tool names
+    # both resolve to ``approve`` in production via the candidate-list
+    # fallback in ``effective_action``.
     assert effective_action(
         "update_incident", env="production", gateway_cfg=gw,
+    ) == "approve"
+    assert effective_action(
+        "local_inc:update_incident", env="production", gateway_cfg=gw,
+    ) == "approve"
+    assert effective_action(
+        "local_remediation:apply_fix", env="production", gateway_cfg=gw,
     ) == "approve"
 
 

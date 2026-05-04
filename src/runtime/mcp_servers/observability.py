@@ -2,9 +2,36 @@
 from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone, timedelta
+from typing import Annotated
 from fastmcp import FastMCP
+from pydantic import BeforeValidator
 
 mcp = FastMCP("observability")
+
+
+def _coerce_int(default: int):
+    """Build a BeforeValidator that coerces LLM-supplied junk to ``default``.
+
+    LLMs occasionally pass placeholder strings (``"??"``, ``""``,
+    ``"unknown"``) into numeric tool args. Strict pydantic validation
+    aborts the tool call and the agent often abandons the turn instead
+    of retrying. Coercing to a sane default keeps the investigation
+    moving with the documented lookback window.
+    """
+    def _coerce(v: object) -> int:
+        if v is None or v == "":
+            return default
+        if isinstance(v, bool):
+            return default
+        try:
+            return int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+    return _coerce
+
+
+_Minutes = Annotated[int, BeforeValidator(_coerce_int(15))]
+_Hours = Annotated[int, BeforeValidator(_coerce_int(24))]
 
 
 def _seed(*parts: str) -> int:
@@ -12,7 +39,7 @@ def _seed(*parts: str) -> int:
 
 
 @mcp.tool()
-async def get_logs(service: str, environment: str, minutes: int = 15) -> dict:
+async def get_logs(service: str, environment: str, minutes: _Minutes = 15) -> dict:
     """Return canned recent log lines for a service in an environment."""
     seed = _seed(service, environment, str(minutes))
     rng = (seed >> 4) % 4
@@ -26,7 +53,7 @@ async def get_logs(service: str, environment: str, minutes: int = 15) -> dict:
 
 
 @mcp.tool()
-async def get_metrics(service: str, environment: str, minutes: int = 15) -> dict:
+async def get_metrics(service: str, environment: str, minutes: _Minutes = 15) -> dict:
     """Return canned metrics snapshot."""
     seed = _seed(service, environment)
     return {
@@ -61,7 +88,7 @@ async def get_service_health(environment: str) -> dict:
 
 
 @mcp.tool()
-async def check_deployment_history(environment: str, hours: int = 24) -> dict:
+async def check_deployment_history(environment: str, hours: _Hours = 24) -> dict:
     """Return canned recent deployments."""
     now = datetime.now(timezone.utc)
     seed = _seed(environment, str(hours))

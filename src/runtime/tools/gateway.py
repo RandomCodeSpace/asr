@@ -56,23 +56,37 @@ def effective_action(
          ``low->auto``, ``medium->notify``, ``high->approve``.
       4. No policy entry -> ``"auto"`` (safe default).
 
+    Tool-name lookups try both the fully-qualified name (``<server>:<tool>``,
+    as registered by ``runtime.mcp_loader``) AND the bare original name
+    (``<tool>``). This lets app config use the bare names that match the
+    MCP tool's source declaration without having to know the server
+    prefix. Globs in ``resolution_trigger_tools`` are matched against
+    both forms for the same reason.
+
     The function is pure: same inputs always yield the same output and
     no argument is mutated.
     """
     if gateway_cfg is None:
         return "auto"
 
+    # Build the lookup-name list: prefixed first (most specific), then
+    # the bare suffix (so config can be server-agnostic).
+    candidates = [tool_name]
+    if ":" in tool_name:
+        candidates.append(tool_name.split(":", 1)[1])
+
     overrides = gateway_cfg.prod_overrides
     if overrides is not None and env:
         if env in overrides.prod_environments:
             for pattern in overrides.resolution_trigger_tools:
-                if fnmatchcase(tool_name, pattern):
+                if any(fnmatchcase(c, pattern) for c in candidates):
                     return "approve"
 
-    risk = gateway_cfg.policy.get(tool_name)
-    if risk is None:
-        return "auto"
-    return _RISK_TO_ACTION[risk]
+    for c in candidates:
+        risk = gateway_cfg.policy.get(c)
+        if risk is not None:
+            return _RISK_TO_ACTION[risk]
+    return "auto"
 
 
 def _now_iso() -> str:

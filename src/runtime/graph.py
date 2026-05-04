@@ -337,6 +337,10 @@ def _handle_agent_failure(
         summary=f"agent failed: {exc}",
         token_usage=TokenUsage(),
     ))
+    # Mark the session as terminally failed so the UI can render a
+    # retry control. The retry path (``Orchestrator.retry_session``)
+    # is the only documented way to move out of this state.
+    incident.status = "error"
     store.save(incident)
     return {"session": incident, "next_route": None,
             "last_agent": skill_name, "error": str(exc)}

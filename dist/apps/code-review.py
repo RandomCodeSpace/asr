@@ -270,7 +270,9 @@ from sqlalchemy.orm import Session as SqlSession
 """FastMCP server: observability mock tools."""
 
 from datetime import datetime, timezone, timedelta
+from typing import Annotated
 from fastmcp import FastMCP
+from pydantic import BeforeValidator
 
 # ----- imports for runtime/mcp_servers/remediation.py -----
 """FastMCP server: remediation mock tools."""
@@ -3355,12 +3357,37 @@ class SessionStore(Generic[StateT]):
 mcp = FastMCP("observability")
 
 
+def _coerce_int(default: int):
+    """Build a BeforeValidator that coerces LLM-supplied junk to ``default``.
+
+    LLMs occasionally pass placeholder strings (``"??"``, ``""``,
+    ``"unknown"``) into numeric tool args. Strict pydantic validation
+    aborts the tool call and the agent often abandons the turn instead
+    of retrying. Coercing to a sane default keeps the investigation
+    moving with the documented lookback window.
+    """
+    def _coerce(v: object) -> int:
+        if v is None or v == "":
+            return default
+        if isinstance(v, bool):
+            return default
+        try:
+            return int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+    return _coerce
+
+
+_Minutes = Annotated[int, BeforeValidator(_coerce_int(15))]
+_Hours = Annotated[int, BeforeValidator(_coerce_int(24))]
+
+
 def _seed(*parts: str) -> int:
     return int(hashlib.sha1("|".join(parts).encode()).hexdigest()[:8], 16)
 
 
 @mcp.tool()
-async def get_logs(service: str, environment: str, minutes: int = 15) -> dict:
+async def get_logs(service: str, environment: str, minutes: _Minutes = 15) -> dict:
     """Return canned recent log lines for a service in an environment."""
     seed = _seed(service, environment, str(minutes))
     rng = (seed >> 4) % 4
@@ -3374,7 +3401,7 @@ async def get_logs(service: str, environment: str, minutes: int = 15) -> dict:
 
 
 @mcp.tool()
-async def get_metrics(service: str, environment: str, minutes: int = 15) -> dict:
+async def get_metrics(service: str, environment: str, minutes: _Minutes = 15) -> dict:
     """Return canned metrics snapshot."""
     seed = _seed(service, environment)
     return {
@@ -3409,7 +3436,7 @@ async def get_service_health(environment: str) -> dict:
 
 
 @mcp.tool()
-async def check_deployment_history(environment: str, hours: int = 24) -> dict:
+async def check_deployment_history(environment: str, hours: _Hours = 24) -> dict:
     """Return canned recent deployments."""
     now = datetime.now(timezone.utc)
     seed = _seed(environment, str(hours))
@@ -4005,6 +4032,10 @@ def _handle_agent_failure(
         summary=f"agent failed: {exc}",
         token_usage=TokenUsage(),
     ))
+    # Mark the session as terminally failed so the UI can render a
+    # retry control. The retry path (``Orchestrator.retry_session``)
+    # is the only documented way to move out of this state.
+    incident.status = "error"
     store.save(incident)
     return {"session": incident, "next_route": None,
             "last_agent": skill_name, "error": str(exc)}
@@ -7351,15 +7382,50 @@ class Orchestrator(Generic[StateT]):
             for e in self.registry.entries.values()
         ]
 
+    def _finalize_session_status(self, session_id: str) -> str | None:
+        """Transition a graph-completed session to a terminal status.
+
+        The graph's per-agent ``update_incident`` calls are responsible
+        for setting ``status`` to ``resolved`` / ``escalated`` / etc.
+        when the agent decides the INC is done. Some LLMs forget — we
+        observe the symptom as a session whose graph stream ended but
+        whose status is still ``new`` or ``in_progress``. To avoid
+        permanently-stuck sessions, transition to ``resolved`` with a
+        sentinel ``auto_resolved=True`` in ``extra_fields`` so the UI
+        can flag the anomaly. Sessions that already settled into a
+        terminal status are left alone.
+
+        Returns the new status if a transition was applied, else None.
+        """
+        try:
+            inc = self.store.load(session_id)
+        except FileNotFoundError:
+            return None
+        if inc.status not in ("new", "in_progress"):
+            return None
+        inc.status = "resolved"
+        inc.extra_fields["auto_resolved"] = True
+        self.store.save(inc)
+        return "resolved"
+
     def _thread_config(self, incident_id: str) -> dict:
         """Build the LangGraph ``config`` dict for a per-session thread.
 
         With a checkpointer attached, every ``ainvoke`` / ``astream_events``
         call must carry a ``configurable.thread_id`` so LangGraph can scope
-        the durable state. Using the incident id keeps each INC's graph
-        state isolated and lets the checkpointer act as a resume index.
+        the durable state. The default thread id is the session id, but
+        ``retry_session`` rebinds the session to a fresh thread id (so
+        the graph runs from the entry rather than resuming a terminated
+        checkpoint). The chosen thread id is persisted on the session
+        in ``extra_fields["active_thread_id"]`` so subsequent resume
+        calls land on the correct paused checkpoint.
         """
-        return {"configurable": {"thread_id": incident_id}}
+        try:
+            inc = self.store.load(incident_id)
+            thread_id = (inc.extra_fields or {}).get("active_thread_id") or incident_id
+        except FileNotFoundError:
+            thread_id = incident_id
+        return {"configurable": {"thread_id": thread_id}}
 
     def get_session(self, incident_id: str) -> dict:
         """Load a session by id and return its serialized form."""
@@ -7542,6 +7608,10 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(inc.id),
         ):
             yield self._to_ui_event(ev, inc.id)
+        new_status = self._finalize_session_status(inc.id)
+        if new_status:
+            yield {"event": "status_auto_finalized", "incident_id": inc.id,
+                   "status": new_status, "ts": _event_ts()}
         yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _event_ts()}
 
     async def stream_investigation(self, *, query: str, environment: str,
@@ -7643,6 +7713,64 @@ class Orchestrator(Generic[StateT]):
         """Deprecated alias for ``resume_session``."""
         async for event in self.resume_session(incident_id, decision):
             yield event
+
+    async def retry_session(self, session_id: str) -> AsyncIterator[dict]:
+        """Re-run the graph for a session that failed mid-flight.
+
+        Only sessions in ``status="error"`` are retryable — those are
+        the ones a graph node terminated with a recorded
+        ``agent failed: ...`` AgentRun (see
+        :func:`runtime.graph._handle_agent_failure`). The retry uses a
+        fresh LangGraph thread id so the compiled graph runs from the
+        entry node rather than resuming the terminated checkpoint.
+
+        Yields the same UI-event shape as ``stream_session`` plus
+        ``retry_started`` / ``retry_rejected`` / ``retry_completed``
+        envelopes so the UI can render a banner.
+        """
+        try:
+            inc = self.store.load(session_id)
+        except FileNotFoundError:
+            yield {"event": "retry_rejected", "incident_id": session_id,
+                   "reason": "session not found", "ts": _event_ts()}
+            return
+        if inc.status != "error":
+            yield {"event": "retry_rejected", "incident_id": session_id,
+                   "reason": f"not in error state (status={inc.status})",
+                   "ts": _event_ts()}
+            return
+        # Drop the failed AgentRun(s) so the timeline only retains
+        # successful runs. Retry attempts then append fresh runs.
+        inc.agents_run = [
+            r for r in inc.agents_run
+            if not (r.summary or "").startswith("agent failed:")
+        ]
+        # Bump retry counter for unique LangGraph thread id (the prior
+        # thread's checkpoint sits at a terminal node and would
+        # short-circuit a same-thread re-invocation).
+        retry_count = int(inc.extra_fields.get("retry_count", 0)) + 1
+        inc.extra_fields["retry_count"] = retry_count
+        thread_id = f"{session_id}:retry-{retry_count}"
+        # Pin the active thread id so any subsequent resume / approval
+        # call uses the new checkpoint, not the original session-id
+        # thread (which is at the terminated failure node).
+        inc.extra_fields["active_thread_id"] = thread_id
+        inc.status = "in_progress"
+        self.store.save(inc)
+        yield {"event": "retry_started", "incident_id": session_id,
+               "retry_count": retry_count, "ts": _event_ts()}
+        async for ev in self.graph.astream_events(
+            GraphState(session=inc, next_route=None, last_agent=None, error=None),
+            version="v2",
+            config=self._thread_config(session_id),
+        ):
+            yield self._to_ui_event(ev, session_id)
+        new_status = self._finalize_session_status(session_id)
+        if new_status:
+            yield {"event": "status_auto_finalized", "incident_id": session_id,
+                   "status": new_status, "ts": _event_ts()}
+        yield {"event": "retry_completed", "incident_id": session_id,
+               "ts": _event_ts()}
 
     async def _resume_with_input(self, incident_id: str, inc, decision: dict):
         """Handle the resume_with_input action.

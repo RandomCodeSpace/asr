@@ -51,6 +51,8 @@ Thumbs.db
 AGENTS.md
 ASR.md
 docs/
+REVIEW_*.md
+review_*.md
 
 # Coverage / CI artefacts
 coverage.xml
