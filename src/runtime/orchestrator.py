@@ -250,6 +250,10 @@ class Orchestrator(Generic[StateT]):
         # finalize and retry within a single process so concurrent
         # streams cannot race on terminal-status transitions.
         self._locks = SessionLockRegistry()
+        # Membership-tracked rejection of concurrent retry_session calls
+        # on the same session id. The set is mutated under self._locks
+        # so the in-flight check + add is atomic per session.
+        self._retries_in_flight: set[str] = set()
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
@@ -870,6 +874,35 @@ class Orchestrator(Generic[StateT]):
             yield event
 
     async def retry_session(self, session_id: str) -> AsyncIterator[dict]:
+        """Restart a failed/stopped session on a fresh LangGraph thread.
+
+        Rejects (with retry_rejected event) if a retry is already in
+        flight for this session id. The check is fast-fail BEFORE
+        acquiring the lock so the rejecting caller is not blocked.
+        """
+        if session_id in self._retries_in_flight:
+            yield {"event": "retry_rejected",
+                   "incident_id": session_id,
+                   "reason": "retry already in progress",
+                   "ts": _event_ts()}
+            return
+        async with self._locks.acquire(session_id):
+            # Re-check inside the lock to close the TOCTOU window
+            # between the membership check above and the acquire.
+            if session_id in self._retries_in_flight:
+                yield {"event": "retry_rejected",
+                       "incident_id": session_id,
+                       "reason": "retry already in progress",
+                       "ts": _event_ts()}
+                return
+            self._retries_in_flight.add(session_id)
+            try:
+                async for ev in self._retry_session_locked(session_id):
+                    yield ev
+            finally:
+                self._retries_in_flight.discard(session_id)
+
+    async def _retry_session_locked(self, session_id: str) -> AsyncIterator[dict]:
         """Re-run the graph for a session that failed mid-flight.
 
         Only sessions in ``status="error"`` are retryable — those are
