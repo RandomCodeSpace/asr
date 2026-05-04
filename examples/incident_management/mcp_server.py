@@ -100,9 +100,10 @@ class UpdateIncidentPatch(BaseModel):
 
     Status / resolution / escalation fields are NOT here — those move
     through the typed terminal tools (``mark_resolved`` /
-    ``mark_escalated``). Confidence / signal flow through the graph's
-    AgentRun harvester from tool-call return values, never via this
-    patch.
+    ``mark_escalated``). ``signal`` is permitted because non-terminal
+    agents (triage, intake) use it to drive graph routing; terminal
+    tools imply ``signal=success`` automatically and don't need to
+    set it on a separate update_incident call.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -112,6 +113,7 @@ class UpdateIncidentPatch(BaseModel):
     tags: list[str] | None = None
     matched_prior_inc: str | None = None
     findings: dict[str, str] | None = None
+    signal: str | None = None
 
 
 # ---------------------------------------------------------------------------

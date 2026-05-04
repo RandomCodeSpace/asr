@@ -239,6 +239,11 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
+_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
+    "mark_resolved", "mark_escalated", "submit_hypothesis",
+})
+
+
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
@@ -247,8 +252,14 @@ def _harvest_tool_calls_and_patches(
     valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Iterate agent messages, record ToolCall entries on the incident, and
-    harvest any confidence / confidence_rationale / signal from update_incident
-    patches.
+    harvest confidence / confidence_rationale / signal from typed terminal
+    tools or legacy update_incident patches.
+
+    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
+    carry confidence and rationale as flat kwargs; they imply
+    ``signal=success`` since invoking a terminal tool is the agent's
+    declaration of completion. Non-terminal agents emit signal via
+    ``update_incident.patch.signal``.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
@@ -271,7 +282,22 @@ def _harvest_tool_calls_and_patches(
                 result=None,
                 ts=ts,
             ))
-            if tc_original == "update_incident":
+            if tc_original in _TYPED_TERMINAL_TOOLS:
+                # Confidence/rationale are required pydantic args on the
+                # typed terminal tools — read them directly from tc_args.
+                conf = _coerce_confidence(tc_args.get("confidence"))
+                if conf is not None:
+                    agent_confidence = conf
+                rat = _coerce_rationale(tc_args.get("confidence_rationale"))
+                if rat is not None:
+                    agent_rationale = rat
+                # Terminal tools imply success — agent has declared
+                # completion by invoking them. Use _coerce_signal so the
+                # vocabulary is consistent with the configured set.
+                terminal = _coerce_signal("success", valid_signals)
+                if terminal is not None:
+                    agent_signal = terminal
+            elif tc_original == "update_incident":
                 patch = tc_args.get("patch") or {}
                 agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
                     patch, agent_confidence, agent_rationale, agent_signal,
