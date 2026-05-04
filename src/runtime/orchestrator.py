@@ -759,6 +759,7 @@ class Orchestrator(Generic[StateT]):
                 ts=_event_ts(),
             ))
             inc.status = "escalated"
+            inc.extra_fields["escalated_to"] = team
             inc.pending_intervention = None
             self.store.save(inc)
             yield {"event": "resume_completed", "incident_id": incident_id,
