@@ -376,6 +376,18 @@ class Orchestrator(Generic[StateT]):
                         f"(known: {sorted(cfg.llm.models)})"
                     )
             registry = await load_tools(cfg.mcp, stack)
+            from runtime.skill_validator import (
+                validate_skill_routes,
+                validate_skill_tool_references,
+            )
+            registered = {e.name for e in registry.entries.values()}
+            validate_skill_tool_references(
+                {s.name: s.model_dump() for s in skills.values()},
+                registered,
+            )
+            validate_skill_routes(
+                {s.name: s.model_dump() for s in skills.values()},
+            )
             # Build the durable checkpointer once and pass it into the
             # compiled graph. Stays attached to the orchestrator so
             # aclose() can release the underlying connection / pool.
