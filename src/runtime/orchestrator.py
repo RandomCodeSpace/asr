@@ -347,6 +347,21 @@ class Orchestrator(Generic[StateT]):
                         severity_aliases=framework_cfg.severity_aliases,
                     )
                     break
+            # Bind config-driven rosters into the observability and
+            # remediation MCP servers so out-of-roster values fail at
+            # the tool boundary with a recoverable ValueError instead
+            # of silently flowing to backends that have no policy
+            # entry for them.
+            try:
+                from runtime.mcp_servers import observability as _obs_mod
+                _obs_mod.set_environments(list(cfg.environments))
+            except Exception:
+                pass
+            try:
+                from runtime.mcp_servers import remediation as _rem_mod
+                _rem_mod.set_escalation_teams(list(framework_cfg.escalation_teams))
+            except Exception:
+                pass
             if cfg.paths.skills_dir is None:
                 raise RuntimeError(
                     "paths.skills_dir is not configured; apps must set it "
@@ -845,7 +860,8 @@ class Orchestrator(Generic[StateT]):
                 f"INC {incident_id} escalated by user — team {team}. "
                 "Confidence below threshold."
             )
-            tool_args = {"incident_id": incident_id, "message": message}
+            tool_args = {"incident_id": incident_id, "message": message,
+                         "team": team}
             tool_result = await self._invoke_tool("notify_oncall", tool_args)
             inc = self.store.load(incident_id)
             inc.tool_calls.append(ToolCall(
