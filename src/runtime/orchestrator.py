@@ -1,6 +1,7 @@
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 from __future__ import annotations
 import importlib
+import logging
 import warnings
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -41,6 +42,8 @@ from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore, StaleVersionError
 from runtime.storage.vector import build_vector_store
 from runtime.locks import SessionLockRegistry
+
+_log = logging.getLogger("runtime.orchestrator")
 
 
 def _default_text_extractor(session) -> str:
@@ -881,6 +884,8 @@ class Orchestrator(Generic[StateT]):
         acquiring the lock so the rejecting caller is not blocked.
         """
         if session_id in self._retries_in_flight:
+            _log.warning("retry_session rejected (fast-fail): %s already in flight",
+                         session_id)
             yield {"event": "retry_rejected",
                    "incident_id": session_id,
                    "reason": "retry already in progress",
@@ -888,8 +893,14 @@ class Orchestrator(Generic[StateT]):
             return
         async with self._locks.acquire(session_id):
             # Re-check inside the lock to close the TOCTOU window
-            # between the membership check above and the acquire.
+            # between the membership check above and the acquire:
+            # task A could have completed its full retry-and-finally
+            # discard between this caller's outer check and acquire,
+            # but a third concurrent task could have entered and added
+            # itself between A's discard and B's acquire.
             if session_id in self._retries_in_flight:
+                _log.warning("retry_session rejected (post-acquire): %s",
+                             session_id)
                 yield {"event": "retry_rejected",
                        "incident_id": session_id,
                        "reason": "retry already in progress",
