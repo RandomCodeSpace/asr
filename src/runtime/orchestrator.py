@@ -487,19 +487,17 @@ class Orchestrator(Generic[StateT]):
         ]
 
     def _finalize_session_status(self, session_id: str) -> str | None:
-        """Transition a graph-completed session to a terminal status.
+        """Transition a graph-completed session to a terminal status by
+        INFERRING from tool-call history.
 
-        The graph's per-agent ``update_incident`` calls are responsible
-        for setting ``status`` to ``resolved`` / ``escalated`` / etc.
-        when the agent decides the INC is done. Some LLMs forget — we
-        observe the symptom as a session whose graph stream ended but
-        whose status is still ``new`` or ``in_progress``. To avoid
-        permanently-stuck sessions, transition to ``resolved`` with a
-        sentinel ``auto_resolved=True`` in ``extra_fields`` so the UI
-        can flag the anomaly. Sessions that already settled into a
-        terminal status are left alone.
+        Inference rules (latest executed tool wins):
+          * ``mark_escalated`` -> ``escalated`` (with ``escalated_to``)
+          * ``mark_resolved``  -> ``resolved``
+          * ``notify_oncall`` (legacy direct path) -> ``escalated``
+          * Otherwise -> ``needs_review`` (graph ran to __end__ without
+            the agent declaring a terminal intent).
 
-        Returns the new status if a transition was applied, else None.
+        Sessions already in a terminal status are left untouched.
         """
         try:
             inc = self.store.load(session_id)
@@ -507,10 +505,34 @@ class Orchestrator(Generic[StateT]):
             return None
         if inc.status not in ("new", "in_progress"):
             return None
-        inc.status = "resolved"
-        inc.extra_fields["auto_resolved"] = True
+
+        executed = [tc for tc in inc.tool_calls
+                    if getattr(tc, "status", None) == "executed"]
+        for tc in reversed(executed):
+            tool_name = tc.tool or ""
+            if tool_name == "mark_escalated" or tool_name.endswith(":mark_escalated"):
+                team = (tc.args or {}).get("team") or (tc.result or {}).get("team")
+                inc.status = "escalated"
+                if team:
+                    inc.extra_fields["escalated_to"] = team
+                self.store.save(inc)
+                return "escalated"
+            if tool_name == "mark_resolved" or tool_name.endswith(":mark_resolved"):
+                inc.status = "resolved"
+                self.store.save(inc)
+                return "resolved"
+            if tool_name == "notify_oncall" or tool_name.endswith(":notify_oncall"):
+                team = (tc.args or {}).get("team")
+                inc.status = "escalated"
+                if team:
+                    inc.extra_fields["escalated_to"] = team
+                self.store.save(inc)
+                return "escalated"
+
+        inc.status = "needs_review"
+        inc.extra_fields["needs_review_reason"] = "graph completed without terminal tool call"
         self.store.save(inc)
-        return "resolved"
+        return "needs_review"
 
     def _thread_config(self, incident_id: str) -> dict:
         """Build the LangGraph ``config`` dict for a per-session thread.

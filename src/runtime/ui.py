@@ -207,6 +207,7 @@ _STATUS_COLOR = {
     "stopped": "gray",
     "deleted": "gray",
     "error": "red",
+    "needs_review": "orange",
 }
 
 # Human-readable labels — awaiting_input is highlighted as the action-required state.
@@ -220,6 +221,7 @@ _STATUS_LABEL = {
     "awaiting_input": "⚠ NEEDS INPUT",
     "stopped": "STOPPED",
     "error": "⚠ FAILED",
+    "needs_review": "⚠ NEEDS REVIEW",
 }
 
 def _badge(label: str, color: str) -> None:
@@ -532,7 +534,8 @@ def render_sidebar(store: SessionStore,
         show_deleted = st.checkbox("Show deleted", value=False,
                                    key="show_deleted")
         statuses = ["all", "new", "in_progress", "matched", "resolved",
-                    "escalated", "awaiting_input", "stopped", "error"]
+                    "escalated", "awaiting_input", "needs_review",
+                    "stopped", "error"]
         if show_deleted:
             statuses.append("deleted")
         status_filter = st.selectbox(
@@ -837,11 +840,13 @@ def _render_summary_meta(sess: dict, app_cfg: FrameworkAppConfig) -> None:
     escalated_to = _field(sess, "escalated_to")
     if escalated_to:
         st.markdown(f"**Escalated to:** `{escalated_to}`")
-    if (sess.get("extra_fields") or {}).get("auto_resolved"):
+    needs_review_reason = (sess.get("extra_fields") or {}).get("needs_review_reason")
+    if needs_review_reason:
         st.warning(
-            "⚠ This session was auto-finalised because the resolution agent "
-            "did not explicitly set a terminal status. Treat the resolution "
-            "summary as advisory — verify the actual outcome before closing."
+            "⚠ This session needs review: "
+            f"{needs_review_reason}. The graph completed without the agent "
+            "calling a terminal tool — verify the actual outcome before "
+            "closing."
         )
     if sess.get("matched_prior_inc"):
         _render_prior_match(sess, app_cfg)
