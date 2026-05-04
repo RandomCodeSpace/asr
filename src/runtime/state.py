@@ -99,6 +99,11 @@ class Session(BaseModel):
     # store them here. The storage layer round-trips this via the
     # matching ``IncidentRow.extra_fields`` JSON column.
     extra_fields: dict[str, Any] = Field(default_factory=dict)
+    # Optimistic concurrency token. Incremented on every successful
+    # ``SessionStore.save``; reads observe the value at load time. Saves
+    # with a stale version raise ``StaleVersionError`` so the caller can
+    # reload + retry.
+    version: int = 1
 
     # ------------------------------------------------------------------
     # App-overridable agent-input formatter hook.

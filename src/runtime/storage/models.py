@@ -61,6 +61,7 @@ class IncidentRow(Base):
     # them back into the model on load. Additive: legacy rows written
     # before this column existed have ``NULL`` and round-trip cleanly.
     extra_fields: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
     __table_args__ = (
         Index("ix_incidents_status_env_active", "status", "environment",

@@ -99,6 +99,14 @@ def _deserialize_resolution(raw: Optional[str]):
         return raw
 
 
+class StaleVersionError(RuntimeError):
+    """Raised when ``SessionStore.save`` observes that the row has been
+    updated since the in-memory copy was loaded.
+
+    Callers should reload from the store and re-apply their mutation.
+    """
+
+
 class SessionStore(Generic[StateT]):
     """Active session/incident lifecycle store, parametrised on ``StateT``.
 
@@ -222,9 +230,21 @@ class SessionStore(Generic[StateT]):
                 f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         incident.updated_at = _iso(_now())
+        sess = incident  # local alias — avoids repeating the domain token in new code
+        expected_version = getattr(sess, "version", 1)
+        # Bump in-memory BEFORE building the row dict so the persisted
+        # row reflects the new version.
+        sess.version = expected_version + 1
         with SqlSession(self.engine) as session:
-            existing = session.get(IncidentRow, incident.id)
+            existing = session.get(IncidentRow, sess.id)
             prior_text = _embed_source_from_row(existing) if existing is not None else ""
+            if existing is not None and existing.version != expected_version:
+                # Roll back the in-memory bump so the caller can reload + retry.
+                sess.version = expected_version
+                raise StaleVersionError(
+                    f"session {sess.id} version is {existing.version}, "
+                    f"expected {expected_version}"
+                )
             data = self._incident_to_row_dict(incident)
             if existing is None:
                 session.add(IncidentRow(**data))
@@ -409,6 +429,8 @@ class SessionStore(Generic[StateT]):
         # ``extra_fields`` is the bag itself — round-tripped via the
         # JSON column directly, never nested inside the bag.
         "extra_fields",
+        # Optimistic-concurrency token — has its own typed column.
+        "version",
     })
 
     # Incident-shaped typed columns the row carries for back-compat
@@ -455,6 +477,7 @@ class SessionStore(Generic[StateT]):
             "user_inputs": list(row.user_inputs or []),
             "parent_session_id": row.parent_session_id,
             "dedup_rationale": row.dedup_rationale,
+            "version": row.version if row.version is not None else 1,
         }
 
         # Incident-shaped typed columns: include only fields the state
@@ -644,4 +667,5 @@ class SessionStore(Generic[StateT]):
             # data in ``state.extra_fields`` directly. Merge both, with
             # subclass fields taking precedence (parity with load path).
             "extra_fields": ({**bare_extra, **extra}) or None,
+            "version": getattr(inc, "version", 1),
         }
