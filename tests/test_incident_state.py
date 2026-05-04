@@ -13,7 +13,7 @@ def test_incident_mcp_server_importable_from_example():
     from examples.incident_management.mcp_server import IncidentMCPServer  # noqa: F401
 
 
-def test_incident_mcp_server_has_three_tools():
+def test_incident_mcp_server_has_six_tools():
     import asyncio
     from examples.incident_management.mcp_server import IncidentMCPServer
     srv = IncidentMCPServer()
@@ -23,6 +23,9 @@ def test_incident_mcp_server_has_three_tools():
         "lookup_similar_incidents",
         "create_incident",
         "update_incident",
+        "mark_resolved",
+        "mark_escalated",
+        "submit_hypothesis",
     }
 
 

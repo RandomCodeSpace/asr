@@ -586,6 +586,7 @@ class IncidentMCPServer:
     # ``AppConfig.framework`` in the YAML). Bare default of ``{}``
     # keeps direct dataclass construction working in unit tests.
     severity_aliases: dict[str, str] = field(default_factory=dict)
+    escalation_teams: list[str] = field(default_factory=list)
     mcp: FastMCP = field(init=False)
 
     def __post_init__(self) -> None:
@@ -593,17 +594,23 @@ class IncidentMCPServer:
         self.mcp.tool(name="lookup_similar_incidents")(self._tool_lookup_similar_incidents)
         self.mcp.tool(name="create_incident")(self._tool_create_incident)
         self.mcp.tool(name="update_incident")(self._tool_update_incident)
+        self.mcp.tool(name="mark_resolved")(self._tool_mark_resolved)
+        self.mcp.tool(name="mark_escalated")(self._tool_mark_escalated)
+        self.mcp.tool(name="submit_hypothesis")(self._tool_submit_hypothesis)
 
     def configure(
         self, *,
         store: SessionStore,
         history: HistoryStore | None = None,
         severity_aliases: dict[str, str] | None = None,
+        escalation_teams: list[str] | None = None,
     ) -> None:
         self.store = store
         self.history = history
         if severity_aliases is not None:
             self.severity_aliases = severity_aliases
+        if escalation_teams is not None:
+            self.escalation_teams = list(escalation_teams)
 
     def _require_store(self) -> SessionStore:
         if self.store is None:
@@ -710,6 +717,114 @@ class IncidentMCPServer:
                 inc.findings[key[len("findings_"):]] = value
         store.save(inc)
         return inc.model_dump()
+
+    async def _tool_mark_resolved(
+        self,
+        incident_id: str,
+        resolution_summary: str,
+        confidence: float,
+        confidence_rationale: str,
+    ) -> dict:
+        """Terminal close → status=resolved.
+
+        This is the only sanctioned path to a ``resolved`` status. The
+        legacy ``update_incident({"status":"resolved"})`` path no longer
+        works (Task 3.5 locks down ``update_incident.patch`` to a typed
+        schema that excludes ``status``).
+        """
+        req = ResolveRequest(
+            incident_id=incident_id,
+            resolution_summary=resolution_summary,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+        )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.status = "resolved"
+        inc.extra_fields["resolution"] = req.resolution_summary
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "status": "resolved",
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
+
+    async def _tool_mark_escalated(
+        self,
+        incident_id: str,
+        team: str,
+        reason: str,
+        confidence: float,
+        confidence_rationale: str,
+    ) -> dict:
+        """Terminal close → status=escalated.
+
+        Validates ``team`` against the configured roster (when one is
+        set) so an LLM that emits a non-existent team gets a recoverable
+        ToolError back instead of silently routing a page to nowhere.
+        When ``escalation_teams`` is empty (e.g. test config), any
+        non-empty team string is accepted.
+        """
+        req = EscalateRequest(
+            incident_id=incident_id,
+            team=team,
+            reason=reason,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+        )
+        if self.escalation_teams and req.team not in self.escalation_teams:
+            raise ValueError(
+                f"team {req.team!r} not in escalation_teams "
+                f"({self.escalation_teams})"
+            )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.status = "escalated"
+        inc.extra_fields["escalated_to"] = req.team
+        inc.extra_fields["escalation_reason"] = req.reason
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "status": "escalated",
+            "team": req.team,
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
+
+    async def _tool_submit_hypothesis(
+        self,
+        incident_id: str,
+        hypotheses: str,
+        confidence: float,
+        confidence_rationale: str,
+        findings_for: str = "deep_investigator",
+    ) -> dict:
+        """Submit ranked hypotheses + confidence in a single typed call.
+
+        Replaces the free-form ``update_incident({"findings_*", ...})``
+        path used by the deep_investigator. ``confidence`` is required
+        (Pydantic validation) so the agent cannot omit it; the graph's
+        AgentRun harvester will read confidence + rationale from the
+        typed return value.
+        """
+        req = HypothesisSubmission(
+            incident_id=incident_id,
+            hypotheses=hypotheses,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+            findings_for=findings_for,
+        )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.findings[req.findings_for] = req.hypotheses
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "findings_for": req.findings_for,
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
 
 
 # ---------------------------------------------------------------------------
