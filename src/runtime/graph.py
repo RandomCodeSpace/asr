@@ -239,6 +239,10 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
+# NOTE: Hard-coding app-specific tool names here is a layering inversion —
+# the runtime should not need to know app-level tool identities. Task 9.1
+# (per-orchestrator MCP server) will move this to a registration mechanism
+# on the tool definition itself.
 _TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
     "mark_resolved", "mark_escalated", "submit_hypothesis",
 })
@@ -258,22 +262,30 @@ def _harvest_tool_calls_and_patches(
     Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
     carry confidence and rationale as flat kwargs; they imply
     ``signal=success`` since invoking a terminal tool is the agent's
-    declaration of completion. Non-terminal agents emit signal via
-    ``update_incident.patch.signal``.
+    declaration that *its stage* completed cleanly — not that the
+    session itself was successfully resolved. The session-level
+    distinction (resolved vs escalated) is inferred separately from
+    tool_calls history by ``_finalize_session_status``. Non-terminal
+    agents emit routing signal via ``update_incident.patch.signal``.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
     agent_confidence: float | None = None
     agent_rationale: str | None = None
     agent_signal: str | None = None
+    # Once a typed terminal tool has fired, its confidence/rationale are
+    # authoritative — a same-message update_incident.patch must not
+    # override them. Signal still flows from later patches so triage-style
+    # routing remains expressive.
+    terminal_locked = False
     for msg in messages:
         tool_calls = getattr(msg, "tool_calls", None) or []
         for tc in tool_calls:
             tc_name = tc.get("name", "unknown")
             tc_args = tc.get("args", {}) or {}
-            # Tool names are now namespaced as ``<server>:<original>``;
-            # match on the un-prefixed suffix so the bare and prefixed
-            # forms both harvest confidence/signal patches.
+            # MCP tools follow the convention ``<server>:<tool>`` with
+            # exactly one colon; rsplit on the rightmost colon recovers
+            # the bare tool name for both prefixed and unprefixed forms.
             tc_original = tc_name.rsplit(":", 1)[-1]
             incident.tool_calls.append(ToolCall(
                 agent=skill_name,
@@ -283,26 +295,25 @@ def _harvest_tool_calls_and_patches(
                 ts=ts,
             ))
             if tc_original in _TYPED_TERMINAL_TOOLS:
-                # Confidence/rationale are required pydantic args on the
-                # typed terminal tools — read them directly from tc_args.
                 conf = _coerce_confidence(tc_args.get("confidence"))
                 if conf is not None:
                     agent_confidence = conf
                 rat = _coerce_rationale(tc_args.get("confidence_rationale"))
                 if rat is not None:
                     agent_rationale = rat
-                # Terminal tools imply success — agent has declared
-                # completion by invoking them. Use _coerce_signal so the
-                # vocabulary is consistent with the configured set.
                 terminal = _coerce_signal("success", valid_signals)
                 if terminal is not None:
                     agent_signal = terminal
+                terminal_locked = True
             elif tc_original == "update_incident":
                 patch = tc_args.get("patch") or {}
-                agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
+                merged_conf, merged_rat, merged_sig = _merge_patch_metadata(
                     patch, agent_confidence, agent_rationale, agent_signal,
                     valid_signals,
                 )
+                if not terminal_locked:
+                    agent_confidence, agent_rationale = merged_conf, merged_rat
+                agent_signal = merged_sig
     return agent_confidence, agent_rationale, agent_signal
 
 

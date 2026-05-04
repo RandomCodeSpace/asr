@@ -145,6 +145,74 @@ def test_harvester_still_reads_signal_from_update_incident_patch():
     assert signal == "success"
 
 
+def test_typed_terminal_locks_confidence_against_same_message_patch():
+    """Once a typed terminal tool fires, its confidence/rationale are
+    authoritative — a same-message update_incident.patch must not
+    override them, even though both branches still run."""
+    inc = _make_inc()
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "1", "name": "mark_resolved",
+                    "args": {
+                        "incident_id": "INC-1",
+                        "resolution_summary": "fixed",
+                        "confidence": 0.9,
+                        "confidence_rationale": "from-terminal",
+                    },
+                },
+                {
+                    "id": "2", "name": "update_incident",
+                    "args": {"incident_id": "INC-1", "patch": {
+                        "confidence": 0.1,
+                        "confidence_rationale": "from-patch",
+                    }},
+                },
+            ],
+        ),
+    ]
+    conf, rationale, _ = _harvest_tool_calls_and_patches(
+        messages, "resolution", inc, ts="t",
+        valid_signals=frozenset({"success", "failed", "default"}),
+    )
+    assert conf == 0.9
+    assert rationale == "from-terminal"
+
+
+def test_terminal_lock_does_not_block_signal_updates_from_later_patch():
+    """terminal_locked guards confidence/rationale only — signal still
+    flows from a later update_incident.patch in the same message."""
+    inc = _make_inc()
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "1", "name": "mark_resolved",
+                    "args": {
+                        "incident_id": "INC-1",
+                        "resolution_summary": "fixed",
+                        "confidence": 0.9,
+                        "confidence_rationale": "r",
+                    },
+                },
+                {
+                    "id": "2", "name": "update_incident",
+                    "args": {"incident_id": "INC-1",
+                             "patch": {"signal": "failed"}},
+                },
+            ],
+        ),
+    ]
+    _, _, signal = _harvest_tool_calls_and_patches(
+        messages, "resolution", inc, ts="t",
+        valid_signals=frozenset({"success", "failed", "default"}),
+    )
+    assert signal == "failed"
+
+
 def test_harvester_typed_tool_with_no_args_returns_none():
     """If the typed-tool args are missing (malformed message), don't crash."""
     inc = _make_inc()
