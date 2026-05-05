@@ -30,7 +30,10 @@ def test_gc_keeps_checkpoints_for_active_sessions(store):
 
 def test_gc_removes_checkpoints_for_deleted_sessions(store):
     s, engine = store
-    inc = s.create(query="q", environment="dev", reporter_id="u", reporter_team="t")
+    # Create an active session so the incidents table is non-empty;
+    # the orphan we insert below references a different (non-existent)
+    # id so the GC must remove it.
+    s.create(query="q", environment="dev", reporter_id="u", reporter_team="t")
     with engine.begin() as conn:
         conn.execute(text(
             "CREATE TABLE IF NOT EXISTS checkpoints "
