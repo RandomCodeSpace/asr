@@ -24,6 +24,7 @@ async def test_concurrent_finalize_only_one_transition(tmp_path):
             self._locks = SessionLockRegistry()
         _finalize_session_status = Orchestrator._finalize_session_status
         _finalize_session_status_async = Orchestrator._finalize_session_status_async
+        _save_or_yield = Orchestrator._save_or_yield
 
     orch = _O(store)
     inc = store.create(query="q", environment="dev",

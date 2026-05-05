@@ -14,6 +14,39 @@ class SkillValidationError(RuntimeError):
     exist or is malformed. Refuses to start the orchestrator."""
 
 
+def _build_bare_to_full_map(registered_tools: set[str]) -> dict[str, list[str]]:
+    """Map bare tool name → list of fully-qualified ``<server>:<tool>``."""
+    bare_to_full: dict[str, list[str]] = {}
+    for full in registered_tools:
+        bare = full.split(":", 1)[1] if ":" in full else full
+        bare_to_full.setdefault(bare, []).append(full)
+    return bare_to_full
+
+
+def _check_tool_ref(
+    skill_name: str,
+    tool_ref: str,
+    registered_tools: set[str],
+    bare_to_full: dict[str, list[str]],
+) -> None:
+    """Raise SkillValidationError if ``tool_ref`` doesn't resolve to a
+    registered tool, or resolves ambiguously across multiple servers."""
+    if tool_ref in registered_tools:
+        return
+    resolutions = bare_to_full.get(tool_ref)
+    if resolutions is None:
+        raise SkillValidationError(
+            f"skill {skill_name!r} references tool {tool_ref!r} which "
+            f"is not registered. Known tools: {sorted(registered_tools)[:10]}..."
+        )
+    if len(resolutions) > 1:
+        raise SkillValidationError(
+            f"skill {skill_name!r} uses bare tool ref {tool_ref!r} but "
+            f"it is exposed by multiple servers: {sorted(resolutions)}. "
+            f"Use the prefixed form to disambiguate."
+        )
+
+
 def validate_skill_tool_references(
     skills: dict, registered_tools: set[str],
 ) -> None:
@@ -25,33 +58,11 @@ def validate_skill_tool_references(
     in skill YAML (the LLM-facing call uses prefixed; YAML can use
     either for ergonomics).
     """
-    bare_to_full: dict[str, list[str]] = {}
-    for full in registered_tools:
-        if ":" in full:
-            bare = full.split(":", 1)[1]
-            bare_to_full.setdefault(bare, []).append(full)
-        else:
-            bare_to_full.setdefault(full, []).append(full)
-
+    bare_to_full = _build_bare_to_full_map(registered_tools)
     for skill_name, skill in skills.items():
         local = (skill.get("tools") or {}).get("local") or []
         for tool_ref in local:
-            if tool_ref in registered_tools:
-                continue
-            if tool_ref in bare_to_full:
-                resolutions = bare_to_full[tool_ref]
-                if len(resolutions) > 1:
-                    raise SkillValidationError(
-                        f"skill {skill_name!r} uses bare tool ref "
-                        f"{tool_ref!r} but it is exposed by multiple "
-                        f"servers: {sorted(resolutions)}. Use the prefixed "
-                        f"form to disambiguate."
-                    )
-                continue
-            raise SkillValidationError(
-                f"skill {skill_name!r} references tool {tool_ref!r} which "
-                f"is not registered. Known tools: {sorted(registered_tools)[:10]}..."
-            )
+            _check_tool_ref(skill_name, tool_ref, registered_tools, bare_to_full)
 
 
 def validate_skill_routes(skills: dict) -> None:

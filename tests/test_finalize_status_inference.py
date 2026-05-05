@@ -13,6 +13,7 @@ def _make_orch_with_store(tmp_path):
     class _O:
         def __init__(self, s): self.store = s
         _finalize_session_status = Orchestrator._finalize_session_status
+        _save_or_yield = Orchestrator._save_or_yield
     return _O(store), store
 
 

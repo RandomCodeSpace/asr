@@ -195,6 +195,42 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
+# Map terminal-tool name -> (status_to_set, team_arg_keys_to_check).
+# Both bare and ``<server>:<tool>`` forms are matched via suffix check.
+_TERMINAL_TOOL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("mark_escalated", "escalated", ("args.team", "result.team")),
+    ("mark_resolved", "resolved", ()),
+    # Legacy / forward-compat: direct notify_oncall page = escalation.
+    ("notify_oncall", "escalated", ("args.team",)),
+)
+
+
+def _extract_team(tc, lookup_keys: tuple[str, ...]) -> str | None:
+    """Pull a ``team`` value from a ToolCall's args/result by ``"args.team"``
+    / ``"result.team"`` lookup hints. Returns the first non-falsy match."""
+    args = tc.args if isinstance(tc.args, dict) else {}
+    result = tc.result if isinstance(tc.result, dict) else {}
+    for key in lookup_keys:
+        scope, _, attr = key.partition(".")
+        source = args if scope == "args" else result
+        value = source.get(attr)
+        if value:
+            return value
+    return None
+
+
+def _infer_terminal_decision(tool_calls) -> tuple[str, str | None] | None:
+    """Walk executed tool_calls latest-first; return (new_status, team)
+    for the first matching terminal tool, or None if no rule fires."""
+    for tc in reversed([tc for tc in tool_calls
+                        if getattr(tc, "status", None) == "executed"]):
+        tool_name = tc.tool or ""
+        for bare, status, team_keys in _TERMINAL_TOOL_RULES:
+            if tool_name == bare or tool_name.endswith(f":{bare}"):
+                return status, _extract_team(tc, team_keys)
+    return None
+
+
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -552,43 +588,28 @@ class Orchestrator(Generic[StateT]):
         if inc.status not in ("new", "in_progress"):
             return None
 
-        executed = [tc for tc in inc.tool_calls
-                    if getattr(tc, "status", None) == "executed"]
+        decision = _infer_terminal_decision(inc.tool_calls)
+        if decision is None:
+            inc.status = "needs_review"
+            inc.extra_fields["needs_review_reason"] = (
+                "graph completed without terminal tool call"
+            )
+            return self._save_or_yield(inc, "needs_review")
+        new_status, team = decision
+        inc.status = new_status
+        if team:
+            inc.extra_fields["escalated_to"] = team
+        return self._save_or_yield(inc, new_status)
 
-        def _save_or_skip() -> bool:
-            """Save with stale-version protection. Returns False if a
-            concurrent finalize won the race; the caller should yield.
-            """
-            try:
-                self.store.save(inc)
-                return True
-            except StaleVersionError:
-                return False
-
-        for tc in reversed(executed):
-            tool_name = tc.tool
-            args = tc.args if isinstance(tc.args, dict) else {}
-            result = tc.result if isinstance(tc.result, dict) else {}
-            if tool_name == "mark_escalated" or tool_name.endswith(":mark_escalated"):
-                team = args.get("team") or result.get("team")
-                inc.status = "escalated"
-                if team:
-                    inc.extra_fields["escalated_to"] = team
-                return "escalated" if _save_or_skip() else None
-            if tool_name == "mark_resolved" or tool_name.endswith(":mark_resolved"):
-                inc.status = "resolved"
-                return "resolved" if _save_or_skip() else None
-            # legacy / forward-compat: direct notify_oncall path
-            if tool_name == "notify_oncall" or tool_name.endswith(":notify_oncall"):
-                team = args.get("team")
-                inc.status = "escalated"
-                if team:
-                    inc.extra_fields["escalated_to"] = team
-                return "escalated" if _save_or_skip() else None
-
-        inc.status = "needs_review"
-        inc.extra_fields["needs_review_reason"] = "graph completed without terminal tool call"
-        return "needs_review" if _save_or_skip() else None
+    def _save_or_yield(self, inc, new_status: str) -> str | None:
+        """Save with stale-version protection. Returns ``new_status`` on
+        success or ``None`` if a concurrent finalize won the race.
+        """
+        try:
+            self.store.save(inc)
+            return new_status
+        except StaleVersionError:
+            return None
 
     async def _finalize_session_status_async(
         self, session_id: str,

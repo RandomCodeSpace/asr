@@ -248,6 +248,47 @@ _TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
 })
 
 
+def _harvest_typed_terminal(
+    tc_args: dict,
+    state: tuple[float | None, str | None, str | None],
+    valid_signals: frozenset[str] | None,
+) -> tuple[float | None, str | None, str | None]:
+    """Apply a typed-terminal tool call's args to the harvest state."""
+    conf, rat, sig = state
+    new_conf = _coerce_confidence(tc_args.get("confidence"))
+    if new_conf is not None:
+        conf = new_conf
+    new_rat = _coerce_rationale(tc_args.get("confidence_rationale"))
+    if new_rat is not None:
+        rat = new_rat
+    terminal = _coerce_signal("success", valid_signals)
+    if terminal is not None:
+        sig = terminal
+    return conf, rat, sig
+
+
+def _harvest_update_incident(
+    tc_args: dict,
+    state: tuple[float | None, str | None, str | None],
+    terminal_locked: bool,
+    valid_signals: frozenset[str] | None,
+) -> tuple[float | None, str | None, str | None]:
+    """Apply an ``update_incident.patch`` to the harvest state.
+
+    When ``terminal_locked`` is True (a typed-terminal call already
+    fired this session), confidence/rationale are pinned; only signal
+    can flow through.
+    """
+    conf, rat, sig = state
+    patch = tc_args.get("patch") or {}
+    merged_conf, merged_rat, merged_sig = _merge_patch_metadata(
+        patch, conf, rat, sig, valid_signals,
+    )
+    if not terminal_locked:
+        conf, rat = merged_conf, merged_rat
+    return conf, rat, merged_sig
+
+
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
@@ -268,53 +309,35 @@ def _harvest_tool_calls_and_patches(
     tool_calls history by ``_finalize_session_status``. Non-terminal
     agents emit routing signal via ``update_incident.patch.signal``.
 
+    Once a typed terminal tool has fired, its confidence/rationale are
+    authoritative — a same-message update_incident.patch must not
+    override them. Signal still flows from later patches so triage-style
+    routing remains expressive.
+
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
-    agent_confidence: float | None = None
-    agent_rationale: str | None = None
-    agent_signal: str | None = None
-    # Once a typed terminal tool has fired, its confidence/rationale are
-    # authoritative — a same-message update_incident.patch must not
-    # override them. Signal still flows from later patches so triage-style
-    # routing remains expressive.
+    state: tuple[float | None, str | None, str | None] = (None, None, None)
     terminal_locked = False
     for msg in messages:
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        for tc in tool_calls:
+        for tc in (getattr(msg, "tool_calls", None) or []):
             tc_name = tc.get("name", "unknown")
             tc_args = tc.get("args", {}) or {}
-            # MCP tools follow the convention ``<server>:<tool>`` with
-            # exactly one colon; rsplit on the rightmost colon recovers
-            # the bare tool name for both prefixed and unprefixed forms.
+            # MCP tools follow ``<server>:<tool>`` with exactly one
+            # colon; rsplit on the rightmost colon recovers the bare
+            # tool name for both prefixed and unprefixed forms.
             tc_original = tc_name.rsplit(":", 1)[-1]
             incident.tool_calls.append(ToolCall(
-                agent=skill_name,
-                tool=tc_name,
-                args=tc_args,
-                result=None,
-                ts=ts,
+                agent=skill_name, tool=tc_name, args=tc_args,
+                result=None, ts=ts,
             ))
             if tc_original in _TYPED_TERMINAL_TOOLS:
-                conf = _coerce_confidence(tc_args.get("confidence"))
-                if conf is not None:
-                    agent_confidence = conf
-                rat = _coerce_rationale(tc_args.get("confidence_rationale"))
-                if rat is not None:
-                    agent_rationale = rat
-                terminal = _coerce_signal("success", valid_signals)
-                if terminal is not None:
-                    agent_signal = terminal
+                state = _harvest_typed_terminal(tc_args, state, valid_signals)
                 terminal_locked = True
             elif tc_original == "update_incident":
-                patch = tc_args.get("patch") or {}
-                merged_conf, merged_rat, merged_sig = _merge_patch_metadata(
-                    patch, agent_confidence, agent_rationale, agent_signal,
-                    valid_signals,
+                state = _harvest_update_incident(
+                    tc_args, state, terminal_locked, valid_signals,
                 )
-                if not terminal_locked:
-                    agent_confidence, agent_rationale = merged_conf, merged_rat
-                agent_signal = merged_sig
-    return agent_confidence, agent_rationale, agent_signal
+    return state
 
 
 def _pair_tool_responses(messages: list, incident: Session) -> None:

@@ -4058,6 +4058,47 @@ _TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
 })
 
 
+def _harvest_typed_terminal(
+    tc_args: dict,
+    state: tuple[float | None, str | None, str | None],
+    valid_signals: frozenset[str] | None,
+) -> tuple[float | None, str | None, str | None]:
+    """Apply a typed-terminal tool call's args to the harvest state."""
+    conf, rat, sig = state
+    new_conf = _coerce_confidence(tc_args.get("confidence"))
+    if new_conf is not None:
+        conf = new_conf
+    new_rat = _coerce_rationale(tc_args.get("confidence_rationale"))
+    if new_rat is not None:
+        rat = new_rat
+    terminal = _coerce_signal("success", valid_signals)
+    if terminal is not None:
+        sig = terminal
+    return conf, rat, sig
+
+
+def _harvest_update_incident(
+    tc_args: dict,
+    state: tuple[float | None, str | None, str | None],
+    terminal_locked: bool,
+    valid_signals: frozenset[str] | None,
+) -> tuple[float | None, str | None, str | None]:
+    """Apply an ``update_incident.patch`` to the harvest state.
+
+    When ``terminal_locked`` is True (a typed-terminal call already
+    fired this session), confidence/rationale are pinned; only signal
+    can flow through.
+    """
+    conf, rat, sig = state
+    patch = tc_args.get("patch") or {}
+    merged_conf, merged_rat, merged_sig = _merge_patch_metadata(
+        patch, conf, rat, sig, valid_signals,
+    )
+    if not terminal_locked:
+        conf, rat = merged_conf, merged_rat
+    return conf, rat, merged_sig
+
+
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
@@ -4078,53 +4119,35 @@ def _harvest_tool_calls_and_patches(
     tool_calls history by ``_finalize_session_status``. Non-terminal
     agents emit routing signal via ``update_incident.patch.signal``.
 
+    Once a typed terminal tool has fired, its confidence/rationale are
+    authoritative — a same-message update_incident.patch must not
+    override them. Signal still flows from later patches so triage-style
+    routing remains expressive.
+
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
-    agent_confidence: float | None = None
-    agent_rationale: str | None = None
-    agent_signal: str | None = None
-    # Once a typed terminal tool has fired, its confidence/rationale are
-    # authoritative — a same-message update_incident.patch must not
-    # override them. Signal still flows from later patches so triage-style
-    # routing remains expressive.
+    state: tuple[float | None, str | None, str | None] = (None, None, None)
     terminal_locked = False
     for msg in messages:
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        for tc in tool_calls:
+        for tc in (getattr(msg, "tool_calls", None) or []):
             tc_name = tc.get("name", "unknown")
             tc_args = tc.get("args", {}) or {}
-            # MCP tools follow the convention ``<server>:<tool>`` with
-            # exactly one colon; rsplit on the rightmost colon recovers
-            # the bare tool name for both prefixed and unprefixed forms.
+            # MCP tools follow ``<server>:<tool>`` with exactly one
+            # colon; rsplit on the rightmost colon recovers the bare
+            # tool name for both prefixed and unprefixed forms.
             tc_original = tc_name.rsplit(":", 1)[-1]
             incident.tool_calls.append(ToolCall(
-                agent=skill_name,
-                tool=tc_name,
-                args=tc_args,
-                result=None,
-                ts=ts,
+                agent=skill_name, tool=tc_name, args=tc_args,
+                result=None, ts=ts,
             ))
             if tc_original in _TYPED_TERMINAL_TOOLS:
-                conf = _coerce_confidence(tc_args.get("confidence"))
-                if conf is not None:
-                    agent_confidence = conf
-                rat = _coerce_rationale(tc_args.get("confidence_rationale"))
-                if rat is not None:
-                    agent_rationale = rat
-                terminal = _coerce_signal("success", valid_signals)
-                if terminal is not None:
-                    agent_signal = terminal
+                state = _harvest_typed_terminal(tc_args, state, valid_signals)
                 terminal_locked = True
             elif tc_original == "update_incident":
-                patch = tc_args.get("patch") or {}
-                merged_conf, merged_rat, merged_sig = _merge_patch_metadata(
-                    patch, agent_confidence, agent_rationale, agent_signal,
-                    valid_signals,
+                state = _harvest_update_incident(
+                    tc_args, state, terminal_locked, valid_signals,
                 )
-                if not terminal_locked:
-                    agent_confidence, agent_rationale = merged_conf, merged_rat
-                agent_signal = merged_sig
-    return agent_confidence, agent_rationale, agent_signal
+    return state
 
 
 def _pair_tool_responses(messages: list, incident: Session) -> None:
@@ -7242,6 +7265,42 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
+# Map terminal-tool name -> (status_to_set, team_arg_keys_to_check).
+# Both bare and ``<server>:<tool>`` forms are matched via suffix check.
+_TERMINAL_TOOL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("mark_escalated", "escalated", ("args.team", "result.team")),
+    ("mark_resolved", "resolved", ()),
+    # Legacy / forward-compat: direct notify_oncall page = escalation.
+    ("notify_oncall", "escalated", ("args.team",)),
+)
+
+
+def _extract_team(tc, lookup_keys: tuple[str, ...]) -> str | None:
+    """Pull a ``team`` value from a ToolCall's args/result by ``"args.team"``
+    / ``"result.team"`` lookup hints. Returns the first non-falsy match."""
+    args = tc.args if isinstance(tc.args, dict) else {}
+    result = tc.result if isinstance(tc.result, dict) else {}
+    for key in lookup_keys:
+        scope, _, attr = key.partition(".")
+        source = args if scope == "args" else result
+        value = source.get(attr)
+        if value:
+            return value
+    return None
+
+
+def _infer_terminal_decision(tool_calls) -> tuple[str, str | None] | None:
+    """Walk executed tool_calls latest-first; return (new_status, team)
+    for the first matching terminal tool, or None if no rule fires."""
+    for tc in reversed([tc for tc in tool_calls
+                        if getattr(tc, "status", None) == "executed"]):
+        tool_name = tc.tool or ""
+        for bare, status, team_keys in _TERMINAL_TOOL_RULES:
+            if tool_name == bare or tool_name.endswith(f":{bare}"):
+                return status, _extract_team(tc, team_keys)
+    return None
+
+
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -7596,43 +7655,28 @@ class Orchestrator(Generic[StateT]):
         if inc.status not in ("new", "in_progress"):
             return None
 
-        executed = [tc for tc in inc.tool_calls
-                    if getattr(tc, "status", None) == "executed"]
+        decision = _infer_terminal_decision(inc.tool_calls)
+        if decision is None:
+            inc.status = "needs_review"
+            inc.extra_fields["needs_review_reason"] = (
+                "graph completed without terminal tool call"
+            )
+            return self._save_or_yield(inc, "needs_review")
+        new_status, team = decision
+        inc.status = new_status
+        if team:
+            inc.extra_fields["escalated_to"] = team
+        return self._save_or_yield(inc, new_status)
 
-        def _save_or_skip() -> bool:
-            """Save with stale-version protection. Returns False if a
-            concurrent finalize won the race; the caller should yield.
-            """
-            try:
-                self.store.save(inc)
-                return True
-            except StaleVersionError:
-                return False
-
-        for tc in reversed(executed):
-            tool_name = tc.tool
-            args = tc.args if isinstance(tc.args, dict) else {}
-            result = tc.result if isinstance(tc.result, dict) else {}
-            if tool_name == "mark_escalated" or tool_name.endswith(":mark_escalated"):
-                team = args.get("team") or result.get("team")
-                inc.status = "escalated"
-                if team:
-                    inc.extra_fields["escalated_to"] = team
-                return "escalated" if _save_or_skip() else None
-            if tool_name == "mark_resolved" or tool_name.endswith(":mark_resolved"):
-                inc.status = "resolved"
-                return "resolved" if _save_or_skip() else None
-            # legacy / forward-compat: direct notify_oncall path
-            if tool_name == "notify_oncall" or tool_name.endswith(":notify_oncall"):
-                team = args.get("team")
-                inc.status = "escalated"
-                if team:
-                    inc.extra_fields["escalated_to"] = team
-                return "escalated" if _save_or_skip() else None
-
-        inc.status = "needs_review"
-        inc.extra_fields["needs_review_reason"] = "graph completed without terminal tool call"
-        return "needs_review" if _save_or_skip() else None
+    def _save_or_yield(self, inc, new_status: str) -> str | None:
+        """Save with stale-version protection. Returns ``new_status`` on
+        success or ``None`` if a concurrent finalize won the race.
+        """
+        try:
+            self.store.save(inc)
+            return new_status
+        except StaleVersionError:
+            return None
 
     async def _finalize_session_status_async(
         self, session_id: str,
