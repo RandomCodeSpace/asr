@@ -239,15 +239,6 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
-# NOTE: Hard-coding app-specific tool names here is a layering inversion —
-# the runtime should not need to know app-level tool identities. Task 9.1
-# (per-orchestrator MCP server) will move this to a registration mechanism
-# on the tool definition itself.
-_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
-    "mark_resolved", "mark_escalated", "submit_hypothesis",
-})
-
-
 def _harvest_typed_terminal(
     tc_args: dict,
     state: tuple[float | None, str | None, str | None],
@@ -295,24 +286,32 @@ def _harvest_tool_calls_and_patches(
     incident: Session,
     ts: str,
     valid_signals: frozenset[str] | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ) -> tuple[float | None, str | None, str | None]:
-    """Iterate agent messages, record ToolCall entries on the incident, and
+    """Iterate agent messages, record ToolCall entries on the session, and
     harvest confidence / confidence_rationale / signal from typed terminal
-    tools or legacy update_incident patches.
+    tools or app-declared patch tools.
 
-    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
-    carry confidence and rationale as flat kwargs; they imply
-    ``signal=success`` since invoking a terminal tool is the agent's
-    declaration that *its stage* completed cleanly — not that the
-    session itself was successfully resolved. The session-level
-    distinction (resolved vs escalated) is inferred separately from
-    tool_calls history by ``_finalize_session_status``. Non-terminal
-    agents emit routing signal via ``update_incident.patch.signal``.
+    Typed terminal tools (those whose bare name is in
+    ``terminal_tool_names``, supplied by the caller from
+    ``OrchestratorConfig.terminal_tools``) carry confidence and rationale
+    as flat kwargs; they imply ``signal=success`` since invoking a
+    terminal tool is the agent's declaration that *its stage* completed
+    cleanly — not that the session itself was successfully resolved.
+    The session-level outcome is inferred separately from tool_calls
+    history by ``_finalize_session_status``. Non-terminal agents emit
+    routing signal via patch-tool args.
+
+    ``patch_tool_names`` lists the bare tool names that ship a
+    ``patch:`` arg the harvester should merge (apps' equivalent of
+    the v1.0 ``update_incident`` flow). Empty default means "no patch
+    tools" so unconfigured apps pay nothing.
 
     Once a typed terminal tool has fired, its confidence/rationale are
-    authoritative — a same-message update_incident.patch must not
-    override them. Signal still flows from later patches so triage-style
-    routing remains expressive.
+    authoritative — a same-message patch must not override them.
+    Signal still flows from later patches so triage-style routing
+    remains expressive.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
@@ -330,10 +329,10 @@ def _harvest_tool_calls_and_patches(
                 agent=skill_name, tool=tc_name, args=tc_args,
                 result=None, ts=ts,
             ))
-            if tc_original in _TYPED_TERMINAL_TOOLS:
+            if tc_original in terminal_tool_names:
                 state = _harvest_typed_terminal(tc_args, state, valid_signals)
                 terminal_locked = True
-            elif tc_original == "update_incident":
+            elif tc_original in patch_tool_names:
                 state = _harvest_update_incident(
                     tc_args, state, terminal_locked, valid_signals,
                 )

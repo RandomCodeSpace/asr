@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
 
 
+
 # Session-id prefix grammar. The framework mints session ids of the form
 # ``{PREFIX}-YYYYMMDD-NNN`` (see ``runtime.state.Session.id_format``);
 # the prefix is the only piece an app picks. Allow alphanumerics + hyphens,
@@ -1119,6 +1120,8 @@ class Paths(BaseModel):
 
 
 class OrchestratorConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+
     entry_agent: str = "intake"
     # Signals an agent may emit (via ``update_incident.patch.signal``) that
     # the router will accept and look up against the skill's ``routes`` table.
@@ -1127,6 +1130,91 @@ class OrchestratorConfig(BaseModel):
     signals: list[str] = Field(
         default_factory=lambda: ["success", "failed", "needs_input"],
     )
+
+    # Generic terminal-tool registry — apps declare which tool calls
+    # transition the session to which status, plus optional per-rule
+    # extra-field extraction. Replaces the v1.0 hardcoded
+    # ``_TERMINAL_TOOL_RULES`` table in ``orchestrator.py`` (D-06-01,
+    # D-06-02). Empty list = framework cannot infer any terminal
+    # status -> every session falls through to
+    # ``default_terminal_status``.
+    terminal_tools: list[TerminalToolRule] = Field(default_factory=list)
+
+    # Status vocabulary the app exposes. Keys are the status names
+    # the app uses (``resolved``, ``escalated``, ``approved``,
+    # ``changes_requested``, ...). Empty dict is allowed for the
+    # framework default ``OrchestratorConfig()`` so unconfigured apps
+    # still validate (real apps populate this in their YAML).
+    # D-06-03, D-06-05.
+    statuses: dict[str, StatusDef] = Field(default_factory=dict)
+
+    # Status assigned when the graph runs to ``__end__`` and no
+    # ``terminal_tools`` rule fires. Required when ``statuses`` is
+    # non-empty; must reference a key in ``statuses``. Apps own
+    # this name — ``incident_management`` uses ``needs_review``,
+    # ``code_review`` uses ``unreviewed`` (D-06-06).
+    default_terminal_status: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_terminal_tool_registry(self) -> "OrchestratorConfig":
+        """Cross-field invariants for the terminal-tool registry.
+
+        * If ``statuses`` is non-empty, ``default_terminal_status``
+          must be set and reference an existing status name.
+        * The status referenced by ``default_terminal_status`` must
+          be ``terminal=True`` (a non-terminal default makes no
+          sense).
+        * Every ``terminal_tools[i].status`` must reference an
+          existing status name.
+
+        Empty ``statuses`` (the framework's bare default) skips
+        these checks so ``OrchestratorConfig()`` still constructs.
+        Apps with ``statuses`` populated cross-validate at boot per
+        D-06-03 / D-06-06.
+        """
+        if not self.statuses:
+            # Bare framework default: nothing to cross-validate. If
+            # ``default_terminal_status`` is set without ``statuses``
+            # the app made a config mistake — flag it.
+            if self.default_terminal_status is not None:
+                raise ValueError(
+                    "default_terminal_status is set but statuses is "
+                    "empty; declare the status vocabulary first"
+                )
+            if self.terminal_tools:
+                raise ValueError(
+                    "terminal_tools is non-empty but statuses is "
+                    "empty; declare the status vocabulary first"
+                )
+            return self
+
+        if self.default_terminal_status is None:
+            raise ValueError(
+                "default_terminal_status is required when statuses "
+                "is non-empty"
+            )
+        if self.default_terminal_status not in self.statuses:
+            valid = sorted(self.statuses.keys())
+            raise ValueError(
+                f"default_terminal_status={self.default_terminal_status!r} "
+                f"is not a declared status; valid statuses: {valid}"
+            )
+        default_def = self.statuses[self.default_terminal_status]
+        if not default_def.terminal:
+            raise ValueError(
+                f"default_terminal_status={self.default_terminal_status!r} "
+                f"references a non-terminal status (terminal=False); "
+                f"the default must be terminal"
+            )
+        for idx, rule in enumerate(self.terminal_tools):
+            if rule.status not in self.statuses:
+                valid = sorted(self.statuses.keys())
+                raise ValueError(
+                    f"terminal_tools[{idx}].status={rule.status!r} "
+                    f"(tool_name={rule.tool_name!r}) is not a "
+                    f"declared status; valid statuses: {valid}"
+                )
+        return self
 
 
 RiskLevel = Literal["low", "medium", "high"]

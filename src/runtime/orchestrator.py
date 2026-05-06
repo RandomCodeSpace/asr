@@ -195,42 +195,6 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
-# Map terminal-tool name -> (status_to_set, team_arg_keys_to_check).
-# Both bare and ``<server>:<tool>`` forms are matched via suffix check.
-_TERMINAL_TOOL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("mark_escalated", "escalated", ("args.team", "result.team")),
-    ("mark_resolved", "resolved", ()),
-    # Legacy / forward-compat: direct notify_oncall page = escalation.
-    ("notify_oncall", "escalated", ("args.team",)),
-)
-
-
-def _extract_team(tc, lookup_keys: tuple[str, ...]) -> str | None:
-    """Pull a ``team`` value from a ToolCall's args/result by ``"args.team"``
-    / ``"result.team"`` lookup hints. Returns the first non-falsy match."""
-    args = tc.args if isinstance(tc.args, dict) else {}
-    result = tc.result if isinstance(tc.result, dict) else {}
-    for key in lookup_keys:
-        scope, _, attr = key.partition(".")
-        source = args if scope == "args" else result
-        value = source.get(attr)
-        if value:
-            return value
-    return None
-
-
-def _infer_terminal_decision(tool_calls) -> tuple[str, str | None] | None:
-    """Walk executed tool_calls latest-first; return (new_status, team)
-    for the first matching terminal tool, or None if no rule fires."""
-    for tc in reversed([tc for tc in tool_calls
-                        if getattr(tc, "status", None) == "executed"]):
-        tool_name = tc.tool or ""
-        for bare, status, team_keys in _TERMINAL_TOOL_RULES:
-            if tool_name == bare or tool_name.endswith(f":{bare}"):
-                return status, _extract_team(tc, team_keys)
-    return None
-
-
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -573,12 +537,20 @@ class Orchestrator(Generic[StateT]):
         """Transition a graph-completed session to a terminal status by
         INFERRING from tool-call history.
 
-        Inference rules (latest executed tool wins):
-          * ``mark_escalated`` -> ``escalated`` (with ``escalated_to``)
-          * ``mark_resolved``  -> ``resolved``
-          * ``notify_oncall`` (legacy direct path) -> ``escalated``
-          * Otherwise -> ``needs_review`` (graph ran to __end__ without
-            the agent declaring a terminal intent).
+        Inference walks the configured terminal-tool rules in
+        ``self.cfg.orchestrator.terminal_tools`` (D-06-01, D-06-08) and
+        the latest executed tool call wins. When no rule fires, the
+        session falls through to
+        ``self.cfg.orchestrator.default_terminal_status`` — apps own
+        this name (D-06-06).
+
+        Per-rule ``extract_fields`` populate ``inc.extra_fields`` with
+        whatever metadata the app declared (D-06-02; preserves the
+        v1.0 ``team`` capture for the escalation flow). When the
+        matched rule's status has ``kind="escalation"``, the
+        ``team`` extract is mirrored to ``extra_fields["escalated_to"]``
+        so existing UIs reading the v1.0 key continue to work
+        (D-06-05 — kind-based dispatch).
 
         Sessions already in a terminal status are left untouched.
         """
@@ -589,18 +561,91 @@ class Orchestrator(Generic[StateT]):
         if inc.status not in ("new", "in_progress"):
             return None
 
-        decision = _infer_terminal_decision(inc.tool_calls)
+        decision = self._infer_terminal_decision(inc.tool_calls)
         if decision is None:
-            inc.status = "needs_review"
+            default = self.cfg.orchestrator.default_terminal_status
+            if default is None:
+                # App did not declare a default — leave the session
+                # alone rather than blind-coerce. Production apps
+                # always configure it (cross-validated at config-load
+                # whenever ``statuses`` is populated).
+                return None
+            inc.status = default
             inc.extra_fields["needs_review_reason"] = (
                 "graph completed without terminal tool call"
             )
-            return self._save_or_yield(inc, "needs_review")
-        new_status, team = decision
+            return self._save_or_yield(inc, default)
+
+        new_status, extracted = decision
         inc.status = new_status
-        if team:
-            inc.extra_fields["escalated_to"] = team
+        for key, value in extracted.items():
+            if value:
+                inc.extra_fields[key] = value
+        # v1.0 compatibility: mirror ``team`` into the historical
+        # ``escalated_to`` extra-field key when the matched status is
+        # an escalation (D-06-05 kind-based dispatch). Keeps generic-
+        # framework code free of escalation vocabulary while preserving
+        # the contract existing UIs read.
+        status_def = self.cfg.orchestrator.statuses.get(new_status)
+        if status_def is not None and status_def.kind == "escalation":
+            team = extracted.get("team")
+            if team:
+                inc.extra_fields["escalated_to"] = team
         return self._save_or_yield(inc, new_status)
+
+    def _infer_terminal_decision(
+        self, tool_calls,
+    ) -> tuple[str, dict[str, str]] | None:
+        """Walk executed tool_calls latest-first; return
+        ``(new_status, extracted_fields_dict)`` for the first matching
+        configured rule, or ``None`` if no rule fires.
+
+        Replaces the v1.0 module-level ``_infer_terminal_decision``;
+        instance-method shape (D-06-08) lets us read ``self.cfg``
+        without constructor plumbing. Empty
+        ``self.cfg.orchestrator.terminal_tools`` (the framework
+        default) short-circuits to ``None`` so unconfigured apps
+        behave as if no rule fires.
+        """
+        rules = self.cfg.orchestrator.terminal_tools
+        if not rules:
+            return None
+        executed = [
+            tc for tc in tool_calls
+            if getattr(tc, "status", None) == "executed"
+        ]
+        for tc in reversed(executed):
+            tool_name = tc.tool or ""
+            for rule in rules:
+                bare = rule.tool_name
+                if tool_name == bare or tool_name.endswith(f":{bare}"):
+                    extracted = {
+                        dest: self._extract_field(tc, lookup_keys)
+                        for dest, lookup_keys in rule.extract_fields.items()
+                    }
+                    return rule.status, {
+                        k: v for k, v in extracted.items() if v
+                    }
+        return None
+
+    def _extract_field(
+        self, tc, lookup_keys: list[str],
+    ) -> str | None:
+        """Pull a field value from a ToolCall's args/result via
+        ``args.X`` / ``result.X`` lookup hints. Returns the first
+        non-falsy match, or ``None``. Generalised from v1.0
+        ``_extract_team`` (D-06-02, D-06-08) — same lookup syntax,
+        no longer pinned to the ``team`` field name.
+        """
+        args = tc.args if isinstance(tc.args, dict) else {}
+        result = tc.result if isinstance(tc.result, dict) else {}
+        for key in lookup_keys:
+            scope, _, attr = key.partition(".")
+            source = args if scope == "args" else result
+            value = source.get(attr)
+            if value:
+                return value
+        return None
 
     def _save_or_yield(self, inc, new_status: str) -> str | None:
         """Save with stale-version protection. Returns ``new_status`` on
