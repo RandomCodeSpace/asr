@@ -1,6 +1,6 @@
 import asyncio
 import pytest
-from runtime.locks import SessionLockRegistry
+from runtime.locks import SessionBusy, SessionLockRegistry
 
 
 @pytest.mark.asyncio
@@ -68,3 +68,61 @@ async def test_reentry_does_not_release_until_outermost_exits():
         # Outer block exits below; the awaiting task can then proceed.
     await task
     assert other_acquired is True
+
+
+# ---------------------------------------------------------------------------
+# is_locked() predicate tests (asyncio_mode=auto — no decorator needed)
+# ---------------------------------------------------------------------------
+
+
+async def test_is_locked_returns_false_for_unknown_session():
+    """is_locked() on a session id that has never been seen returns False
+    and does NOT create a slot as a side-effect."""
+    reg = SessionLockRegistry()
+    assert reg.is_locked("NEVER-SEEN") is False
+    # No slot should have been created.
+    assert "NEVER-SEEN" not in reg._slots
+
+
+async def test_is_locked_returns_true_while_held():
+    """is_locked() returns True while another task holds the lock."""
+    reg = SessionLockRegistry()
+    acquired = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold():
+        async with reg.acquire("INC-1"):
+            acquired.set()
+            await release.wait()
+
+    task = asyncio.create_task(_hold())
+    await acquired.wait()
+    assert reg.is_locked("INC-1") is True
+    release.set()
+    await task
+
+
+async def test_is_locked_returns_false_after_release():
+    """is_locked() returns False once the lock has been released."""
+    reg = SessionLockRegistry()
+    async with reg.acquire("INC-1"):
+        pass
+    assert reg.is_locked("INC-1") is False
+
+
+async def test_is_locked_reentrant_inner():
+    """is_locked() is True throughout the outer+inner reentrant acquire."""
+    reg = SessionLockRegistry()
+    async with reg.acquire("INC-1"):
+        assert reg.is_locked("INC-1") is True
+        async with reg.acquire("INC-1"):
+            assert reg.is_locked("INC-1") is True
+        assert reg.is_locked("INC-1") is True
+    assert reg.is_locked("INC-1") is False
+
+
+async def test_session_busy_exception_carries_session_id():
+    """SessionBusy stores the session_id attribute and includes it in str()."""
+    exc = SessionBusy("INC-42")
+    assert exc.session_id == "INC-42"
+    assert "INC-42" in str(exc)

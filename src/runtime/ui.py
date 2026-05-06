@@ -1548,7 +1548,13 @@ def main() -> None:
             log_area = timeline_box.empty()
             lines: list[str] = []
 
-            asyncio.run(_run_investigation_async(cfg, query, environment, log_area, lines, agent_names))
+            try:
+                asyncio.run(_run_investigation_async(cfg, query, environment, log_area, lines, agent_names))
+            except Exception as _e:  # noqa: BLE001
+                if _e.__class__.__name__ == "SessionBusy":
+                    st.warning("Session is busy — please retry in a moment.", icon=":material/hourglass_empty:")
+                    return
+                raise
 
             # Surface the resulting session for one-click drill-in
             recent = [i.model_dump() for i in store.list_recent(1)]

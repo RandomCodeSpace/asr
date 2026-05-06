@@ -20,6 +20,18 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 
+class SessionBusy(RuntimeError):
+    """Raised when a session is already executing and cannot accept a new turn.
+
+    Callers should surface this as HTTP 429 with a ``Retry-After: 1`` header
+    so that clients know the session will become available shortly.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"Session {session_id!r} is already executing")
+        self.session_id = session_id
+
+
 class _Slot:
     """Per-session lock state: the lock plus reentrancy tracking."""
 
@@ -32,10 +44,13 @@ class _Slot:
 
 
 class SessionLockRegistry:
-    """In-process registry of per-session task-reentrant asyncio locks."""
+    """In-process registry of per-session task-reentrant asyncio locks.
+
+    TODO(v2): evict idle slots to cap memory usage for long-running servers.
+    """
 
     def __init__(self) -> None:
-        self._slots: dict[str, _Slot] = {}
+        self._slots: dict[str, _Slot] = {}  # TODO(v2): add eviction for idle sessions
 
     def _slot(self, session_id: str) -> _Slot:
         slot = self._slots.get(session_id)
@@ -51,6 +66,15 @@ class SessionLockRegistry:
         Prefer ``async with reg.acquire(sid):`` for nested-safe entry.
         """
         return self._slot(session_id).lock
+
+    def is_locked(self, session_id: str) -> bool:
+        """Return ``True`` iff ``session_id`` currently holds the lock.
+
+        Non-blocking. Returns ``False`` for unknown / never-seen session ids
+        (no slot is created as a side-effect of this call).
+        """
+        slot = self._slots.get(session_id)
+        return slot is not None and slot.lock.locked()
 
     @asynccontextmanager
     async def acquire(self, session_id: str) -> AsyncIterator[None]:

@@ -295,10 +295,14 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 },
             )
         except Exception as e:  # noqa: BLE001
-            # ``SessionCapExceeded`` is matched by class name to avoid a
-            # hard import dependency at module-load time.
-            if e.__class__.__name__ == "SessionCapExceeded":
-                raise HTTPException(status_code=429, detail=str(e)) from e
+            # ``SessionCapExceeded`` and ``SessionBusy`` are matched by class
+            # name to avoid a hard import dependency at module-load time.
+            if e.__class__.__name__ in ("SessionCapExceeded", "SessionBusy"):
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(e),
+                    headers={"Retry-After": "1"},
+                ) from e
             raise
         return InvestigateResponse(incident_id=sid)
 
@@ -362,8 +366,12 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 submitter=body.submitter,
             )
         except Exception as e:  # noqa: BLE001
-            if e.__class__.__name__ == "SessionCapExceeded":
-                raise HTTPException(status_code=429, detail=str(e)) from e
+            if e.__class__.__name__ in ("SessionCapExceeded", "SessionBusy"):
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(e),
+                    headers={"Retry-After": "1"},
+                ) from e
             raise
         return SessionStartResponse(session_id=sid)
 
@@ -470,7 +478,16 @@ def build_app(cfg: AppConfig) -> FastAPI:
         # ``httpx.AsyncClient + ASGITransport``, or any single-loop
         # deployment): blocking that loop while waiting for work
         # scheduled onto it would deadlock.
-        await svc.submit_async(_resume())
+        try:
+            await svc.submit_async(_resume())
+        except Exception as e:  # noqa: BLE001
+            if e.__class__.__name__ == "SessionBusy":
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(e),
+                    headers={"Retry-After": "1"},
+                ) from e
+            raise
         return {
             "session_id": session_id,
             "tool_call_id": tool_call_id,
