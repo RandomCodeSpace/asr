@@ -27,6 +27,8 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from runtime.locks import SessionBusy  # noqa: TCH001 — needed at runtime for except clause
+
 if TYPE_CHECKING:
     from runtime.service import OrchestratorService
 
@@ -120,12 +122,16 @@ class ApprovalWatchdog:
         """
         if self._stop_event is not None:
             self._stop_event.set()
-        task = self._task
+        task = self._task  # LOCAL variable — guards against concurrent stop() calls
         if task is not None and not task.done():
             try:
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
+                try:
+                    await task  # drain LOCAL task ref; suppresses CancelledError
+                except asyncio.CancelledError:
+                    pass
         self._task = None
         self._stop_event = None
 
@@ -182,9 +188,21 @@ class ApprovalWatchdog:
             stale = self._find_stale_pending(inc, now)
             if not stale:
                 continue
+            if orch._locks.is_locked(session_id):
+                logger.debug(
+                    "approval watchdog: session %s busy, skipping re-arm this tick",
+                    session_id,
+                )
+                continue
             try:
                 await self._resume_with_timeout(orch, session_id)
                 resumed += 1
+            except SessionBusy:
+                logger.debug(
+                    "approval watchdog: session %s SessionBusy at resume, skipping",
+                    session_id,
+                )
+                continue
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "approval watchdog: resume failed for session %s",
