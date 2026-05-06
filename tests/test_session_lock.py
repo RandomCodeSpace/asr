@@ -136,6 +136,91 @@ async def test_session_busy_exception_carries_session_id():
 
 
 # ---------------------------------------------------------------------------
+# D-18 try_acquire — fail-fast async-contextmanager (TOCTOU-free)
+# ---------------------------------------------------------------------------
+#
+# `try_acquire(session_id)` mirrors the shape of `acquire`, but raises
+# `SessionBusy(session_id)` immediately if the lock is already held — no
+# waiting. NOT task-reentrant; callers that need reentrancy use `acquire`.
+# Deletion-test invariant (informational, not automated): replacing
+# `slot.lock.locked()` with `False` makes `test_try_acquire_raises_*` fail —
+# the locked() guard is the only thing preventing silent collision.
+# ---------------------------------------------------------------------------
+
+
+async def test_try_acquire_yields_and_releases_when_free():
+    """try_acquire on a free session yields once and releases on exit."""
+    reg = SessionLockRegistry()
+    yielded = 0
+    async with reg.try_acquire("INC-1"):
+        yielded += 1
+        assert reg.is_locked("INC-1") is True
+    assert yielded == 1
+    assert reg.is_locked("INC-1") is False
+
+
+async def test_try_acquire_raises_session_busy_on_contention():
+    """try_acquire on a held session raises SessionBusy immediately
+    (no waiting). Bound the wait to 0.5s as an upper sanity bound; the
+    raise should happen well under 50ms in practice."""
+    reg = SessionLockRegistry()
+    acquired = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold() -> None:
+        async with reg.acquire("INC-1"):
+            acquired.set()
+            await release.wait()
+
+    holder = asyncio.create_task(_hold())
+    try:
+        await acquired.wait()
+        # try_acquire must raise immediately — wrap in wait_for to fail
+        # the test if it ever blocks (would mean the locked() guard is
+        # missing).
+        async def _attempt() -> None:
+            async with reg.try_acquire("INC-1"):
+                pass
+
+        with pytest.raises(SessionBusy) as excinfo:
+            await asyncio.wait_for(_attempt(), timeout=0.5)
+        assert excinfo.value.session_id == "INC-1"
+    finally:
+        release.set()
+        await holder
+
+
+async def test_try_acquire_session_busy_carries_session_id():
+    """SessionBusy raised by try_acquire carries the offending session_id
+    (mirrors test_session_busy_exception_carries_session_id at L131)."""
+    reg = SessionLockRegistry()
+    # Hold the lock from a separate task so the test's task is the one
+    # hitting try_acquire — try_acquire is intentionally non-reentrant
+    # so even the holder would raise, but using a separate holder makes
+    # the test intent unambiguous.
+    acquired = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hold() -> None:
+        async with reg.acquire("INC-99"):
+            acquired.set()
+            await release.wait()
+
+    holder = asyncio.create_task(_hold())
+    try:
+        await acquired.wait()
+        try:
+            async with reg.try_acquire("INC-99"):
+                pytest.fail("try_acquire should have raised SessionBusy")
+        except SessionBusy as exc:
+            assert exc.session_id == "INC-99"
+            assert "INC-99" in str(exc)
+    finally:
+        release.set()
+        await holder
+
+
+# ---------------------------------------------------------------------------
 # Concurrency tests — lock serialisation + retry/finalize races (PVC-09)
 # ---------------------------------------------------------------------------
 #

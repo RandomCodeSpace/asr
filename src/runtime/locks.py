@@ -104,3 +104,33 @@ class SessionLockRegistry:
             if slot.depth == 0:
                 slot.owner = None
                 slot.lock.release()
+
+    @asynccontextmanager
+    async def try_acquire(self, session_id: str) -> AsyncIterator[None]:
+        """Acquire-or-fail. TOCTOU-free single-shot.
+
+        Raises :class:`SessionBusy` immediately if the lock is already
+        held; otherwise acquires and yields. Releases on exit.
+
+        Not task-reentrant: if the calling task already holds the lock,
+        this still raises. Callers that need reentry use :meth:`acquire`.
+
+        TOCTOU note: ``lock.locked()`` then ``lock.acquire()`` would have
+        a check/use window in a multi-threaded world, but asyncio is
+        single-threaded per loop and there is no ``await`` between the
+        check and the acquire — same-loop callers cannot interleave.
+        Cross-thread callers must not use this registry.
+        """
+        slot = self._slot(session_id)
+        if slot.lock.locked():
+            raise SessionBusy(session_id)
+        await slot.lock.acquire()
+        slot.owner = asyncio.current_task()
+        slot.depth = 1
+        try:
+            yield
+        finally:
+            slot.depth -= 1
+            if slot.depth == 0:
+                slot.owner = None
+                slot.lock.release()
