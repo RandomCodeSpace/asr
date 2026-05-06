@@ -260,6 +260,7 @@ def _make_stub_orch(store, registry):
             self._locks = r
             self._retries_in_flight: set[str] = set()
         _finalize_session_status = Orchestrator._finalize_session_status
+        _finalize_session_status_async = Orchestrator._finalize_session_status_async
         _save_or_yield = Orchestrator._save_or_yield
 
     return _StubOrch(store, registry)
@@ -294,8 +295,14 @@ async def test_retry_session_concurrent_double_invoke_rejects_second(
     """Concurrent retry_session calls on the same session must fast-fail
     the second one with retry_rejected(reason='retry already in progress').
 
-    Pins PVC-09 / D-14: _retries_in_flight fast-fail check fires before
-    the lock acquire, so the second caller is never blocked.
+    Pins PVC-09 / D-14: while task A holds the per-session lock AND has
+    added itself to ``_retries_in_flight``, task B's attempt — launched
+    concurrently via ``asyncio.create_task`` and gated on a ready_event —
+    observes the in-flight membership and emits ``retry_rejected``
+    without ever entering the lock-protected section. Deletion-test
+    invariant: replacing ``SessionLockRegistry.acquire`` with
+    ``contextlib.nullcontext`` lets task B race past the membership
+    check before A adds itself, breaking this assertion.
     """
     orch = _make_stub_orch(store, registry)
     inc = store.create(
@@ -306,33 +313,70 @@ async def test_retry_session_concurrent_double_invoke_rejects_second(
     inc.status = "error"
     store.save(inc)
 
-    # Manually simulate what retry_session does: add to in-flight set
-    # BEFORE the lock, so a second caller sees it immediately.
-    orch._retries_in_flight.add(session_id)
+    a_added = asyncio.Event()       # A signals: lock held + membership added
+    a_release = asyncio.Event()     # test signals: A may exit critical section
+    b_observed = asyncio.Event()    # B signals: rejection event emitted
+    a_events: list[dict] = []
+    b_events: list[dict] = []
 
-    # Second caller — fast-fail path (no lock involved).
-    events = []
-    async def _retry():
-        # Replicate just the fast-fail check from retry_session
+    async def _task_a() -> None:
+        """Mimic the lock-protected branch of retry_session: take the
+        lock, add membership, signal, wait for the test to release."""
+        async with registry.acquire(session_id):
+            orch._retries_in_flight.add(session_id)
+            a_added.set()
+            await a_release.wait()
+            orch._retries_in_flight.discard(session_id)
+            a_events.append({"event": "retry_completed",
+                             "incident_id": session_id})
+
+    async def _task_b() -> None:
+        """Mimic the fast-fail (pre-lock) branch of retry_session: peek
+        ``_retries_in_flight`` BEFORE taking the lock and reject."""
+        await a_added.wait()
+        # The fast-fail must NOT acquire the lock — verifies the
+        # membership check in retry_session fires before the acquire,
+        # so the second caller is never blocked behind the holder.
+        assert registry.is_locked(session_id) is True
         if session_id in orch._retries_in_flight:
-            events.append({"event": "retry_rejected",
-                           "reason": "retry already in progress"})
-            return
+            b_events.append({"event": "retry_rejected",
+                             "incident_id": session_id,
+                             "reason": "retry already in progress"})
+            b_observed.set()
 
-    await _retry()
-    assert len(events) == 1
-    assert events[0]["event"] == "retry_rejected"
-    assert events[0]["reason"] == "retry already in progress"
+    a = asyncio.create_task(_task_a())
+    b = asyncio.create_task(_task_b())
 
-    # Cleanup
-    orch._retries_in_flight.discard(session_id)
+    # B must observe the rejection BEFORE A is released — this proves
+    # B did not interleave A's critical section.
+    await asyncio.wait_for(b_observed.wait(), timeout=1.0)
+    assert b_events == [{
+        "event": "retry_rejected",
+        "incident_id": session_id,
+        "reason": "retry already in progress",
+    }]
+    assert a_events == [], "A must still be inside its critical section"
+
+    a_release.set()
+    await asyncio.wait_for(asyncio.gather(a, b), timeout=1.0)
+    # After A releases, _retries_in_flight is clean and lock is free.
+    assert session_id not in orch._retries_in_flight
+    assert registry.is_locked(session_id) is False
 
 
 async def test_retry_after_failed_retry_increments_count(store, registry):
     """After a failed graph turn, retry_count must increment on each retry
     so every attempt gets a distinct LangGraph thread_id.
 
-    Pins D-14: extra_fields['retry_count'] monotonically increases.
+    Pins D-14 + PVC-09: while task A (a graph turn that ends in 'error')
+    holds the per-session lock, task B's increment is launched but must
+    not run until A releases — proven by ``is_locked`` observation
+    *before* release, the absence of A-and-B interleave in the count
+    sequence, and the final monotonic count of 2. Deletion-test
+    invariant: replacing ``acquire`` with ``nullcontext`` lets B
+    increment before A finalises the 'error' write, producing a
+    transient ``retry_count=1`` on a stale row and racing the
+    ``active_thread_id`` write.
     """
     inc = store.create(
         query="oom kill", environment="staging",
@@ -340,24 +384,63 @@ async def test_retry_after_failed_retry_increments_count(store, registry):
     )
     session_id = inc.id
 
-    # Simulate what _retry_session_locked does: bump retry_count each time.
-    for expected_count in (1, 2):
-        inc = store.load(session_id)
-        inc.status = "error"
-        retry_count = int(inc.extra_fields.get("retry_count", 0)) + 1
-        inc.extra_fields["retry_count"] = retry_count
-        inc.extra_fields["active_thread_id"] = f"{session_id}:retry-{retry_count}"
-        inc.status = "in_progress"
-        store.save(inc)
+    a_holding = asyncio.Event()
+    a_release = asyncio.Event()
+    b_count_observed: list[int] = []
 
+    async def _task_a_failed_turn() -> None:
+        """Hold the lock for one 'failed graph turn' and write status='error'."""
+        async with registry.acquire(session_id):
+            a_holding.set()
+            await a_release.wait()
+            row = store.load(session_id)
+            row.status = "error"
+            store.save(row)
+
+    async def _task_b_increment(expected_count: int) -> None:
+        """Mimic _retry_session_locked: must take the lock to increment.
+        While A holds it, B's ``async with`` blocks until A releases."""
+        async with registry.acquire(session_id):
+            row = store.load(session_id)
+            assert row.status == "error", (
+                "B must observe A's terminal 'error' write — it could only see "
+                "this value if A's write committed before B entered the lock"
+            )
+            new_count = int(row.extra_fields.get("retry_count", 0)) + 1
+            row.extra_fields["retry_count"] = new_count
+            row.extra_fields["active_thread_id"] = f"{session_id}:retry-{new_count}"
+            row.status = "in_progress"
+            store.save(row)
+            b_count_observed.append(new_count)
+
+    for expected_count in (1, 2):
+        a_holding.clear()
+        a_release.clear()
+        a = asyncio.create_task(_task_a_failed_turn())
+        await asyncio.wait_for(a_holding.wait(), timeout=1.0)
+        # B must wait — A still holds the lock.
+        b = asyncio.create_task(_task_b_increment(expected_count))
+        # Give B a real chance to mis-acquire if the lock were a no-op.
+        await asyncio.sleep(0.02)
+        assert registry.is_locked(session_id) is True
+        assert b_count_observed == [], (
+            "B must NOT have entered the critical section while A holds the lock"
+        )
+        a_release.set()
+        await asyncio.wait_for(asyncio.gather(a, b), timeout=1.0)
+        # Post-release: B has run, count is monotonic.
         loaded = store.load(session_id)
         assert loaded.extra_fields["retry_count"] == expected_count
         assert loaded.extra_fields["active_thread_id"] == (
             f"{session_id}:retry-{expected_count}"
         )
-        # Reset to error for the next iteration.
+        assert b_count_observed == [expected_count]
+        b_count_observed.clear()
+        # Reset to 'error' for the next iteration (outside the lock —
+        # A is already finished, no contention).
         loaded.status = "error"
         store.save(loaded)
+        assert registry.is_locked(session_id) is False
 
 
 async def test_finalize_does_not_clobber_escalated(store, registry):
@@ -365,7 +448,19 @@ async def test_finalize_does_not_clobber_escalated(store, registry):
     status (escalated) untouched — the guard ``if inc.status not in
     ('new','in_progress'): return None`` must fire.
 
-    Pins PVC-09 / C2: second concurrent finalize loses the race cleanly.
+    Pins PVC-09 / C2: while task A holds the per-session lock and
+    writes ``escalated``, task B's concurrent
+    ``_finalize_session_status_async`` is launched — its
+    ``async with self._locks.acquire(...)`` must block until A releases.
+    After release, B reloads inside the lock, sees ``escalated``, and
+    returns ``None`` (no clobber to ``resolved``). Mirrors the exemplar
+    at ``test_auto_resolved_does_not_race_with_retry_finalize`` (line
+    344, unchanged) but explicitly launches B *during* A's hold so the
+    blocking-on-acquire path is exercised. Deletion-test invariant:
+    with a no-op registry, B reloads BEFORE A's escalated write
+    commits, sees ``in_progress``, and overwrites with ``needs_review`` /
+    a different terminal — failing the post-release ``escalated``
+    assertion.
     """
     orch = _make_stub_orch(store, registry)
     inc = store.create(
@@ -373,30 +468,63 @@ async def test_finalize_does_not_clobber_escalated(store, registry):
         reporter_id="u3", reporter_team="security",
     )
     session_id = inc.id
-
-    # First finalize: set escalated via direct write (simulates first
-    # concurrent finalize winning the race).
     inc = store.load(session_id)
-    inc.status = "escalated"
-    inc.extra_fields["escalated_to"] = "security-oncall"
+    inc.status = "in_progress"   # finalize-eligible status
     store.save(inc)
 
-    # Now call _finalize_session_status — must return None (no transition).
-    result = orch._finalize_session_status(session_id)
-    assert result is None
+    a_holding = asyncio.Event()
+    a_release = asyncio.Event()
 
-    # Status must remain escalated.
+    async def _task_a_writes_escalated() -> None:
+        """Hold the lock and commit ``escalated`` while B is queued behind."""
+        async with registry.acquire(session_id):
+            a_holding.set()
+            await a_release.wait()
+            row = store.load(session_id)
+            row.status = "escalated"
+            row.extra_fields["escalated_to"] = "security-oncall"
+            store.save(row)
+
+    b_result: list = []
+
+    async def _task_b_finalize() -> None:
+        """B uses the lock-guarded async wrapper — must wait for A."""
+        b_result.append(await orch._finalize_session_status_async(session_id))
+
+    a = asyncio.create_task(_task_a_writes_escalated())
+    await asyncio.wait_for(a_holding.wait(), timeout=1.0)
+    b = asyncio.create_task(_task_b_finalize())
+    # Give B a real chance to barge past a hypothetical no-op lock.
+    await asyncio.sleep(0.02)
+    assert registry.is_locked(session_id) is True
+    assert b_result == [], "B must not have completed while A holds the lock"
+
+    a_release.set()
+    await asyncio.wait_for(asyncio.gather(a, b), timeout=1.0)
+
+    # B saw 'escalated' and returned None — no clobber.
+    assert b_result == [None]
     loaded = store.load(session_id)
     assert loaded.status == "escalated"
     assert loaded.extra_fields.get("escalated_to") == "security-oncall"
+    assert registry.is_locked(session_id) is False
 
 
 async def test_finalize_with_notify_oncall_in_history_marks_escalated_not_resolved(
     store, registry,
 ):
     """A session whose last executed tool was notify_oncall must finalize
-    to 'escalated', not 'resolved'. Pins PVC-09 / C1: _infer_terminal_decision
-    reads tool_calls before _finalize_session_status commits.
+    to 'escalated', not 'resolved'.
+
+    Pins PVC-09 / C1: while task A holds the per-session lock and
+    appends a ``notify_oncall`` tool_call, task B's concurrent
+    ``_finalize_session_status_async`` is queued behind A's lock.
+    After release, B's lock-guarded reload sees the ``notify_oncall``
+    in tool_calls and ``_infer_terminal_decision`` resolves to
+    ``escalated``. Deletion-test invariant: with a no-op lock B's
+    reload happens before A's ``store.save`` commits, the tool_calls
+    list is empty when ``_infer_terminal_decision`` runs, B falls
+    through to ``needs_review``, and the ``escalated`` assertion fails.
     """
     orch = _make_stub_orch(store, registry)
     inc = store.create(
@@ -404,26 +532,47 @@ async def test_finalize_with_notify_oncall_in_history_marks_escalated_not_resolv
         reporter_id="u4", reporter_team="payments",
     )
     session_id = inc.id
-
-    # Add a notify_oncall ToolCall (legacy escalation path).
     inc = store.load(session_id)
-    inc.tool_calls.append(ToolCall(
-        agent="resolution",
-        tool="notify_oncall",
-        args={"team": "payments-oncall", "message": "p0 outage"},
-        result={"status": "paged"},
-        ts="2024-01-01T00:00:00Z",
-        status="executed",
-    ))
-    # status must be in_progress for finalize to fire
     inc.status = "in_progress"
     store.save(inc)
 
-    result = orch._finalize_session_status(session_id)
-    assert result == "escalated"
+    a_holding = asyncio.Event()
+    a_release = asyncio.Event()
 
+    async def _task_a_writes_notify_oncall() -> None:
+        async with registry.acquire(session_id):
+            a_holding.set()
+            await a_release.wait()
+            row = store.load(session_id)
+            row.tool_calls.append(ToolCall(
+                agent="resolution",
+                tool="notify_oncall",
+                args={"team": "payments-oncall", "message": "p0 outage"},
+                result={"status": "paged"},
+                ts="2024-01-01T00:00:00Z",
+                status="executed",
+            ))
+            store.save(row)
+
+    b_result: list = []
+
+    async def _task_b_finalize() -> None:
+        b_result.append(await orch._finalize_session_status_async(session_id))
+
+    a = asyncio.create_task(_task_a_writes_notify_oncall())
+    await asyncio.wait_for(a_holding.wait(), timeout=1.0)
+    b = asyncio.create_task(_task_b_finalize())
+    await asyncio.sleep(0.02)
+    assert registry.is_locked(session_id) is True
+    assert b_result == [], "B blocked behind A's lock"
+
+    a_release.set()
+    await asyncio.wait_for(asyncio.gather(a, b), timeout=1.0)
+
+    assert b_result == ["escalated"]
     loaded = store.load(session_id)
     assert loaded.status == "escalated"
+    assert registry.is_locked(session_id) is False
 
 
 async def test_auto_resolved_does_not_race_with_retry_finalize(
@@ -476,27 +625,69 @@ async def test_retry_rejects_session_in_progress(store, registry):
     not 'error' — an in_progress session is still running and must not be
     restarted.
 
-    Pins D-14: _retry_session_locked status guard.
+    Pins D-14 / PVC-09: while task A (a mid-turn graph run) holds the
+    per-session lock and writes ``status="in_progress"``, task B's
+    retry attempt must wait on the lock; after acquiring, it observes
+    the ``in_progress`` status (not the pre-acquire ``error`` snapshot)
+    and emits ``retry_rejected``. Deletion-test invariant: with a no-op
+    lock, B's reload happens before A's status write commits, so B sees
+    the still-stale value (``error`` or ``new``) and would proceed —
+    the rejection assertion would fail.
     """
     inc = store.create(
         query="slow query", environment="staging",
         reporter_id="u6", reporter_team="db",
     )
     session_id = inc.id
-    # status is 'new' by default — not 'error', so retry must reject.
+    # Pre-state: 'error' would normally be retryable. The whole point of
+    # this test is that A flips it to 'in_progress' under the lock,
+    # blocking B's retry decision.
     inc = store.load(session_id)
-    inc.status = "in_progress"
+    inc.status = "error"
     store.save(inc)
 
-    # Replicate the guard from _retry_session_locked
-    loaded = store.load(session_id)
-    assert loaded.status != "error", "precondition: not in error state"
+    a_holding = asyncio.Event()
+    a_release = asyncio.Event()
 
-    event = {"event": "retry_rejected",
-              "incident_id": session_id,
-              "reason": f"not in error state (status={loaded.status})"}
-    assert event["event"] == "retry_rejected"
-    assert "not in error state" in event["reason"]
+    async def _task_a_starts_turn() -> None:
+        """Mimic a graph turn: take the lock and write status='in_progress'."""
+        async with registry.acquire(session_id):
+            row = store.load(session_id)
+            row.status = "in_progress"
+            store.save(row)
+            a_holding.set()
+            await a_release.wait()
+
+    b_events: list[dict] = []
+
+    async def _task_b_retry() -> None:
+        """Mimic _retry_session_locked: take the lock, reload, check status,
+        emit retry_rejected if not 'error'."""
+        async with registry.acquire(session_id):
+            row = store.load(session_id)
+            if row.status != "error":
+                b_events.append({
+                    "event": "retry_rejected",
+                    "incident_id": session_id,
+                    "reason": f"not in error state (status={row.status})",
+                })
+
+    a = asyncio.create_task(_task_a_starts_turn())
+    await asyncio.wait_for(a_holding.wait(), timeout=1.0)
+    b = asyncio.create_task(_task_b_retry())
+    await asyncio.sleep(0.02)
+    assert registry.is_locked(session_id) is True
+    assert b_events == [], "B must not have observed any status while A holds the lock"
+
+    a_release.set()
+    await asyncio.wait_for(asyncio.gather(a, b), timeout=1.0)
+
+    assert len(b_events) == 1
+    assert b_events[0]["event"] == "retry_rejected"
+    assert b_events[0]["incident_id"] == session_id
+    assert "not in error state" in b_events[0]["reason"]
+    assert "in_progress" in b_events[0]["reason"]
+    assert registry.is_locked(session_id) is False
 
 
 async def test_watchdog_skips_resume_when_session_locked(store, registry):
