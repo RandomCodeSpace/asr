@@ -239,6 +239,56 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
+# NOTE: Hard-coding app-specific tool names here is a layering inversion —
+# the runtime should not need to know app-level tool identities. Task 9.1
+# (per-orchestrator MCP server) will move this to a registration mechanism
+# on the tool definition itself.
+_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
+    "mark_resolved", "mark_escalated", "submit_hypothesis",
+})
+
+
+def _harvest_typed_terminal(
+    tc_args: dict,
+    state: tuple[float | None, str | None, str | None],
+    valid_signals: frozenset[str] | None,
+) -> tuple[float | None, str | None, str | None]:
+    """Apply a typed-terminal tool call's args to the harvest state."""
+    conf, rat, sig = state
+    new_conf = _coerce_confidence(tc_args.get("confidence"))
+    if new_conf is not None:
+        conf = new_conf
+    new_rat = _coerce_rationale(tc_args.get("confidence_rationale"))
+    if new_rat is not None:
+        rat = new_rat
+    terminal = _coerce_signal("success", valid_signals)
+    if terminal is not None:
+        sig = terminal
+    return conf, rat, sig
+
+
+def _harvest_update_incident(
+    tc_args: dict,
+    state: tuple[float | None, str | None, str | None],
+    terminal_locked: bool,
+    valid_signals: frozenset[str] | None,
+) -> tuple[float | None, str | None, str | None]:
+    """Apply an ``update_incident.patch`` to the harvest state.
+
+    When ``terminal_locked`` is True (a typed-terminal call already
+    fired this session), confidence/rationale are pinned; only signal
+    can flow through.
+    """
+    conf, rat, sig = state
+    patch = tc_args.get("patch") or {}
+    merged_conf, merged_rat, merged_sig = _merge_patch_metadata(
+        patch, conf, rat, sig, valid_signals,
+    )
+    if not terminal_locked:
+        conf, rat = merged_conf, merged_rat
+    return conf, rat, merged_sig
+
+
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
@@ -247,37 +297,47 @@ def _harvest_tool_calls_and_patches(
     valid_signals: frozenset[str] | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Iterate agent messages, record ToolCall entries on the incident, and
-    harvest any confidence / confidence_rationale / signal from update_incident
-    patches.
+    harvest confidence / confidence_rationale / signal from typed terminal
+    tools or legacy update_incident patches.
+
+    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
+    carry confidence and rationale as flat kwargs; they imply
+    ``signal=success`` since invoking a terminal tool is the agent's
+    declaration that *its stage* completed cleanly — not that the
+    session itself was successfully resolved. The session-level
+    distinction (resolved vs escalated) is inferred separately from
+    tool_calls history by ``_finalize_session_status``. Non-terminal
+    agents emit routing signal via ``update_incident.patch.signal``.
+
+    Once a typed terminal tool has fired, its confidence/rationale are
+    authoritative — a same-message update_incident.patch must not
+    override them. Signal still flows from later patches so triage-style
+    routing remains expressive.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
-    agent_confidence: float | None = None
-    agent_rationale: str | None = None
-    agent_signal: str | None = None
+    state: tuple[float | None, str | None, str | None] = (None, None, None)
+    terminal_locked = False
     for msg in messages:
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        for tc in tool_calls:
+        for tc in (getattr(msg, "tool_calls", None) or []):
             tc_name = tc.get("name", "unknown")
             tc_args = tc.get("args", {}) or {}
-            # Tool names are now namespaced as ``<server>:<original>``;
-            # match on the un-prefixed suffix so the bare and prefixed
-            # forms both harvest confidence/signal patches.
+            # MCP tools follow ``<server>:<tool>`` with exactly one
+            # colon; rsplit on the rightmost colon recovers the bare
+            # tool name for both prefixed and unprefixed forms.
             tc_original = tc_name.rsplit(":", 1)[-1]
             incident.tool_calls.append(ToolCall(
-                agent=skill_name,
-                tool=tc_name,
-                args=tc_args,
-                result=None,
-                ts=ts,
+                agent=skill_name, tool=tc_name, args=tc_args,
+                result=None, ts=ts,
             ))
-            if tc_original == "update_incident":
-                patch = tc_args.get("patch") or {}
-                agent_confidence, agent_rationale, agent_signal = _merge_patch_metadata(
-                    patch, agent_confidence, agent_rationale, agent_signal,
-                    valid_signals,
+            if tc_original in _TYPED_TERMINAL_TOOLS:
+                state = _harvest_typed_terminal(tc_args, state, valid_signals)
+                terminal_locked = True
+            elif tc_original == "update_incident":
+                state = _harvest_update_incident(
+                    tc_args, state, terminal_locked, valid_signals,
                 )
-    return agent_confidence, agent_rationale, agent_signal
+    return state
 
 
 def _pair_tool_responses(messages: list, incident: Session) -> None:
@@ -337,6 +397,10 @@ def _handle_agent_failure(
         summary=f"agent failed: {exc}",
         token_usage=TokenUsage(),
     ))
+    # Mark the session as terminally failed so the UI can render a
+    # retry control. The retry path (``Orchestrator.retry_session``)
+    # is the only documented way to move out of this state.
+    incident.status = "error"
     store.save(incident)
     return {"session": incident, "next_route": None,
             "last_agent": skill_name, "error": str(exc)}
@@ -407,7 +471,7 @@ def make_agent_node(
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name)
+                          agent_name=skill.name, store=store)
                 for t in tools
             ]
         else:

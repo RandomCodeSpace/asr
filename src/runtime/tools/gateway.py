@@ -19,12 +19,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from langchain_core.tools import BaseTool
 
 from runtime.config import GatewayConfig
 from runtime.state import Session, ToolCall
+
+if TYPE_CHECKING:
+    from runtime.storage.session_store import SessionStore
 
 GatewayAction = Literal["auto", "notify", "approve"]
 
@@ -56,23 +59,38 @@ def effective_action(
          ``low->auto``, ``medium->notify``, ``high->approve``.
       4. No policy entry -> ``"auto"`` (safe default).
 
+    Tool-name lookups try the fully-qualified name (``<server>:<tool>``,
+    as registered by ``runtime.mcp_loader``) FIRST, then the bare
+    suffix as a fallback. This lets app config use bare names without
+    knowing the server prefix while keeping prefixed-form policy keys
+    deterministically more specific. Globs in
+    ``resolution_trigger_tools`` are matched against both forms for
+    the same reason, prefixed first.
+
     The function is pure: same inputs always yield the same output and
     no argument is mutated.
     """
     if gateway_cfg is None:
         return "auto"
 
+    bare = tool_name.split(":", 1)[1] if ":" in tool_name else None
+
     overrides = gateway_cfg.prod_overrides
-    if overrides is not None and env:
-        if env in overrides.prod_environments:
-            for pattern in overrides.resolution_trigger_tools:
-                if fnmatchcase(tool_name, pattern):
-                    return "approve"
+    if overrides is not None and env and env in overrides.prod_environments:
+        for pattern in overrides.resolution_trigger_tools:
+            if fnmatchcase(tool_name, pattern):
+                return "approve"
+            if bare is not None and fnmatchcase(bare, pattern):
+                return "approve"
 
     risk = gateway_cfg.policy.get(tool_name)
-    if risk is None:
-        return "auto"
-    return _RISK_TO_ACTION[risk]
+    if risk is not None:
+        return _RISK_TO_ACTION[risk]
+    if bare is not None:
+        risk = gateway_cfg.policy.get(bare)
+        if risk is not None:
+            return _RISK_TO_ACTION[risk]
+    return "auto"
 
 
 def _now_iso() -> str:
@@ -146,6 +164,7 @@ def wrap_tool(
     session: Session,
     gateway_cfg: GatewayConfig | None,
     agent_name: str = "",
+    store: "SessionStore | None" = None,
 ) -> BaseTool:
     """Wrap ``base_tool`` so every invocation passes through the gateway.
 
@@ -224,6 +243,14 @@ def wrap_tool(
                             status="pending_approval",
                         )
                     )
+                    # CRITICAL: persist the pending_approval row BEFORE
+                    # raising interrupt() so the approval-timeout
+                    # watchdog (which reads from the DB) and the
+                    # /approvals UI can see the pending state. Without
+                    # this save the in-memory mutation is invisible to
+                    # any out-of-process observer.
+                    if store is not None:
+                        store.save(session)
                 payload = {
                     "kind": "tool_approval",
                     "tool": inner.name,
@@ -347,6 +374,12 @@ def wrap_tool(
                             status="pending_approval",
                         )
                     )
+                    # CRITICAL: persist the pending_approval row BEFORE
+                    # raising interrupt() so the approval-timeout
+                    # watchdog (which reads from the DB) and the
+                    # /approvals UI can see the pending state.
+                    if store is not None:
+                        store.save(session)
                 payload = {
                     "kind": "tool_approval",
                     "tool": inner.name,

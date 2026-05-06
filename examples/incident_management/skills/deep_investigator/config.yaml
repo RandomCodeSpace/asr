@@ -1,7 +1,7 @@
-description: Perform diagnostic deep-dive — pull logs, metrics, propose hypotheses
+description: Diagnostic deep-dive — pull logs, metrics, propose hypotheses
 kind: responsive
 tools:
-  local: ["get_logs", "get_metrics", "update_incident"]
+  local: ["get_logs", "get_metrics", "submit_hypothesis"]
 routes:
   - when: success
     next: resolution

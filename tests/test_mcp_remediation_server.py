@@ -18,5 +18,6 @@ async def test_apply_fix_returns_status():
 
 @pytest.mark.asyncio
 async def test_notify_oncall_returns_page_id():
-    out = await notify_oncall(incident_id="INC-1", message="escalating")
+    out = await notify_oncall(incident_id="INC-1", message="escalating",
+                              team="platform-oncall")
     assert "page_id" in out

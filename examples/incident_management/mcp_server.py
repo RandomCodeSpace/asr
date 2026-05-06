@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, TypedDict
 
 from fastmcp import FastMCP
+from pydantic import BaseModel, ConfigDict, Field
 
 from runtime.intake import (
     compose_runners,
@@ -47,6 +48,72 @@ from runtime.storage.history_store import HistoryStore
 from runtime.storage.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas for typed terminal tools
+# ---------------------------------------------------------------------------
+
+
+class _TerminalPatchBase(BaseModel):
+    """Common fields shared by all terminal tool requests.
+
+    ``extra="forbid"`` is set so an LLM that types ``confidance`` (or
+    any other non-allowed field) gets a ValidationError back rather
+    than a silent drop.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    confidence_rationale: str = Field(min_length=1)
+
+
+class ResolveRequest(_TerminalPatchBase):
+    """Payload for ``mark_resolved`` — terminal close to status=resolved."""
+    resolution_summary: str = Field(min_length=1)
+
+
+class EscalateRequest(_TerminalPatchBase):
+    """Payload for ``mark_escalated`` — terminal close to status=escalated.
+
+    ``team`` MUST be one of the framework's configured
+    ``escalation_teams``; the runtime validates that at the tool layer.
+    """
+    team: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class HypothesisSubmission(_TerminalPatchBase):
+    """Payload for ``submit_hypothesis`` — used by the deep_investigator
+    agent to record ranked hypotheses + confidence in a single typed call.
+
+    ``findings_for`` defaults to ``"deep_investigator"``; other agents
+    that submit hypotheses set it to their own name.
+    """
+    hypotheses: str = Field(min_length=1)
+    findings_for: str = Field(default="deep_investigator")
+
+
+class UpdateIncidentPatch(BaseModel):
+    """Patch shape for non-terminal session updates.
+
+    Status / resolution / escalation fields are NOT here — those move
+    through the typed terminal tools (``mark_resolved`` /
+    ``mark_escalated``). ``signal`` is permitted because non-terminal
+    agents (triage, intake) use it to drive graph routing; terminal
+    tools imply ``signal=success`` automatically and don't need to
+    set it on a separate update_incident call.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    severity: str | None = None
+    category: str | None = None
+    summary: str | None = None
+    tags: list[str] | None = None
+    matched_prior_inc: str | None = None
+    findings: dict[str, str] | None = None
+    signal: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +588,7 @@ class IncidentMCPServer:
     # ``AppConfig.framework`` in the YAML). Bare default of ``{}``
     # keeps direct dataclass construction working in unit tests.
     severity_aliases: dict[str, str] = field(default_factory=dict)
+    escalation_teams: list[str] = field(default_factory=list)
     mcp: FastMCP = field(init=False)
 
     def __post_init__(self) -> None:
@@ -528,17 +596,23 @@ class IncidentMCPServer:
         self.mcp.tool(name="lookup_similar_incidents")(self._tool_lookup_similar_incidents)
         self.mcp.tool(name="create_incident")(self._tool_create_incident)
         self.mcp.tool(name="update_incident")(self._tool_update_incident)
+        self.mcp.tool(name="mark_resolved")(self._tool_mark_resolved)
+        self.mcp.tool(name="mark_escalated")(self._tool_mark_escalated)
+        self.mcp.tool(name="submit_hypothesis")(self._tool_submit_hypothesis)
 
     def configure(
         self, *,
         store: SessionStore,
         history: HistoryStore | None = None,
         severity_aliases: dict[str, str] | None = None,
+        escalation_teams: list[str] | None = None,
     ) -> None:
         self.store = store
         self.history = history
         if severity_aliases is not None:
             self.severity_aliases = severity_aliases
+        if escalation_teams is not None:
+            self.escalation_teams = list(escalation_teams)
 
     def _require_store(self) -> SessionStore:
         if self.store is None:
@@ -614,43 +688,173 @@ class IncidentMCPServer:
         return inc.model_dump()
 
     async def _tool_update_incident(self, incident_id: str, patch: dict) -> dict:
-        """Apply a flat patch to an INC.
+        """Apply a typed patch to an INC.
 
-        Allowed keys:
-          - status, severity, category, summary, tags, matched_prior_inc, resolution, escalated_to
-          - findings_<agent_name> — writes ``inc.findings[<agent_name>] = value``.
+        Allowed keys are declared by ``UpdateIncidentPatch``. Unknown
+        keys raise ``ValueError`` so the LLM gets a recoverable tool
+        error and can retry.
+
+        Status transitions (``resolved`` / ``escalated``), resolution
+        text, and the escalated-to team are NOT writeable here — they
+        flow through the typed terminal tools ``mark_resolved`` and
+        ``mark_escalated``. The legacy ``findings_<agent>`` underscore
+        pattern is replaced by the typed ``findings: dict[str, str]``
+        field.
         """
+        try:
+            typed = UpdateIncidentPatch(**patch)
+        except Exception as exc:  # pydantic ValidationError + others
+            raise ValueError(
+                f"invalid update_incident patch: {exc}. "
+                f"Status/resolution/escalation use mark_resolved or mark_escalated; "
+                f"per-agent findings use the typed `findings` dict."
+            ) from exc
+
         store = self._require_store()
         inc = store.load(incident_id)
-        if "status" in patch:
-            inc.status = patch["status"]
-        if "severity" in patch:
+        if typed.severity is not None:
             inc.extra_fields["severity"] = normalize_severity(
-                patch["severity"], self.severity_aliases
+                typed.severity, self.severity_aliases,
             )
-        if "category" in patch:
-            inc.extra_fields["category"] = patch["category"]
-        if "summary" in patch:
-            inc.extra_fields["summary"] = patch["summary"]
-        if "tags" in patch:
-            inc.extra_fields["tags"] = list(patch["tags"])
-        if "matched_prior_inc" in patch:
-            inc.extra_fields["matched_prior_inc"] = patch["matched_prior_inc"]
-        if "resolution" in patch:
-            inc.extra_fields["resolution"] = patch["resolution"]
-        if "escalated_to" in patch:
-            inc.extra_fields["escalated_to"] = patch["escalated_to"]
-        for key, value in patch.items():
-            if key.startswith("findings_"):
-                inc.findings[key[len("findings_"):]] = value
+        if typed.category is not None:
+            inc.extra_fields["category"] = typed.category
+        if typed.summary is not None:
+            inc.extra_fields["summary"] = typed.summary
+        if typed.tags is not None:
+            inc.extra_fields["tags"] = list(typed.tags)
+        if typed.matched_prior_inc is not None:
+            inc.extra_fields["matched_prior_inc"] = typed.matched_prior_inc
+        if typed.findings:
+            for agent_name, finding in typed.findings.items():
+                inc.findings[agent_name] = finding
         store.save(inc)
         return inc.model_dump()
 
+    async def _tool_mark_resolved(
+        self,
+        incident_id: str,
+        resolution_summary: str,
+        confidence: float,
+        confidence_rationale: str,
+    ) -> dict:
+        """Terminal close → status=resolved.
+
+        This is the only sanctioned path to a ``resolved`` status. The
+        legacy ``update_incident({"status":"resolved"})`` path no longer
+        works (Task 3.5 locks down ``update_incident.patch`` to a typed
+        schema that excludes ``status``).
+        """
+        req = ResolveRequest(
+            incident_id=incident_id,
+            resolution_summary=resolution_summary,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+        )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.status = "resolved"
+        inc.extra_fields["resolution"] = req.resolution_summary
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "status": "resolved",
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
+
+    async def _tool_mark_escalated(
+        self,
+        incident_id: str,
+        team: str,
+        reason: str,
+        confidence: float,
+        confidence_rationale: str,
+    ) -> dict:
+        """Terminal close → status=escalated.
+
+        Validates ``team`` against the configured roster (when one is
+        set) so an LLM that emits a non-existent team gets a recoverable
+        ToolError back instead of silently routing a page to nowhere.
+        When ``escalation_teams`` is empty (e.g. test config), any
+        non-empty team string is accepted.
+        """
+        req = EscalateRequest(
+            incident_id=incident_id,
+            team=team,
+            reason=reason,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+        )
+        if self.escalation_teams and req.team not in self.escalation_teams:
+            raise ValueError(
+                f"team {req.team!r} not in escalation_teams "
+                f"({self.escalation_teams})"
+            )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.status = "escalated"
+        inc.extra_fields["escalated_to"] = req.team
+        inc.extra_fields["escalation_reason"] = req.reason
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "status": "escalated",
+            "team": req.team,
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
+
+    async def _tool_submit_hypothesis(
+        self,
+        incident_id: str,
+        hypotheses: str,
+        confidence: float,
+        confidence_rationale: str,
+        findings_for: str = "deep_investigator",
+    ) -> dict:
+        """Submit ranked hypotheses + confidence in a single typed call.
+
+        Replaces the free-form ``update_incident({"findings_*", ...})``
+        path used by the deep_investigator. ``confidence`` is required
+        (Pydantic validation) so the agent cannot omit it; the graph's
+        AgentRun harvester will read confidence + rationale from the
+        typed return value.
+        """
+        req = HypothesisSubmission(
+            incident_id=incident_id,
+            hypotheses=hypotheses,
+            confidence=confidence,
+            confidence_rationale=confidence_rationale,
+            findings_for=findings_for,
+        )
+        store = self._require_store()
+        inc = store.load(req.incident_id)
+        inc.findings[req.findings_for] = req.hypotheses
+        store.save(inc)
+        return {
+            "incident_id": inc.id,
+            "findings_for": req.findings_for,
+            "confidence": req.confidence,
+            "confidence_rationale": req.confidence_rationale,
+        }
+
 
 # ---------------------------------------------------------------------------
-# Module-level default server (back-compat for the MCP loader path).
-# The MCP loader imports ``mcp`` from this module by name; this keeps that
-# contract working unchanged.
+# Module-level default server.
+#
+# The MCP loader (``runtime.mcp_loader:137``) imports the module by name
+# and reads ``getattr(mod, "mcp")`` to find the FastMCP instance to wire
+# tools through. This singleton is purely a *loader-side default* —
+# every concurrent orchestrator can and should construct its own fresh
+# ``IncidentMCPServer()`` and ``configure(...)`` it against its own
+# store. State on the class is held PER-INSTANCE; the singleton does
+# not bleed into separate instances. ``tests/test_mcp_per_session_context.py``
+# locks that guarantee.
+#
+# A future loader API (``register_in_process_server``) could let the
+# orchestrator wire its own ``IncidentMCPServer`` instance instead of
+# this singleton. Until then, ``set_state`` configures *the loader's
+# default*, which is what the bundled example apps actually use.
 # ---------------------------------------------------------------------------
 
 _default_server = IncidentMCPServer()
@@ -660,7 +864,13 @@ mcp = _default_server.mcp
 def set_state(*, store: SessionStore,
               history: HistoryStore | None = None,
               severity_aliases: dict[str, str] | None = None) -> None:
-    """Configure the default IncidentMCPServer instance."""
+    """Configure the loader's default IncidentMCPServer instance.
+
+    Per-orchestrator isolation is enforced at the class level, not via
+    this function. Apps that need multiple isolated servers in the
+    same process should construct ``IncidentMCPServer()`` instances
+    directly and configure each.
+    """
     _default_server.configure(
         store=store,
         history=history,

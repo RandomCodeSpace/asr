@@ -38,15 +38,26 @@ async def apply_fix(proposal_id: str, environment: str) -> dict:
     }
 
 
-@mcp.tool()
-async def notify_oncall(incident_id: str, message: str,
-                       team: str = "") -> dict:
-    """Page the oncall engineer for the named team.
+_escalation_teams: list[str] = []
 
-    ``team`` should be one of the framework's configured
-    ``escalation_teams``. The result echoes ``team`` so callers and the
-    UI can record which roster was paged.
+
+def set_escalation_teams(teams: list[str]) -> None:
+    """Bind the allowed escalation_teams roster from app config."""
+    global _escalation_teams
+    _escalation_teams = list(teams)
+
+
+@mcp.tool()
+async def notify_oncall(incident_id: str, message: str, team: str) -> dict:
+    """Page the oncall engineer for the named team. ``team`` is REQUIRED
+    and must be in the configured escalation_teams roster.
     """
+    if not team:
+        raise ValueError("team is required (got empty string)")
+    if _escalation_teams and team not in _escalation_teams:
+        raise ValueError(
+            f"team {team!r} not in escalation_teams ({_escalation_teams})"
+        )
     return {
         "incident_id": incident_id,
         "team": team,

@@ -40,7 +40,12 @@ def test_playbook_translates_remediation_steps_to_tool_calls() -> None:
         "id": "pb-x",
         "remediation": [
             {"tool": "remediation:restart_service", "args": {"service": "payments"}},
-            {"tool": "update_incident", "args": {"patch": {"status": "resolved"}}},
+            {"tool": "mark_resolved", "args": {
+                "incident_id": "INC-1",
+                "resolution_summary": "restarted service",
+                "confidence": 0.9,
+                "confidence_rationale": "service recovered after restart",
+            }},
         ],
         "required_approval": True,
     }
@@ -49,7 +54,7 @@ def test_playbook_translates_remediation_steps_to_tool_calls() -> None:
     assert calls[0]["tool"] == "remediation:restart_service"
     assert calls[0]["args"] == {"service": "payments"}
     assert calls[0]["requires_approval"] is True
-    assert calls[1]["tool"] == "update_incident"
+    assert calls[1]["tool"] == "mark_resolved"
 
 
 def test_playbook_with_no_remediation_returns_empty() -> None:
@@ -194,14 +199,22 @@ def test_config_yaml_loads_with_locked_gateway_block(monkeypatch) -> None:
     gw = cfg.runtime.gateway
     assert gw is not None
     assert gw.policy.get("update_incident") == "medium"
-    assert gw.policy.get("remediation:restart_service") == "high"
+    assert gw.policy.get("apply_fix") == "high"
     assert gw.prod_overrides is not None
     assert "production" in gw.prod_overrides.prod_environments
     assert "update_incident" in gw.prod_overrides.resolution_trigger_tools
-    assert "remediation:*" in gw.prod_overrides.resolution_trigger_tools
-    # And the runtime contract still holds.
+    assert "apply_fix" in gw.prod_overrides.resolution_trigger_tools
+    # The runtime contract still holds — bare AND prefixed tool names
+    # both resolve to ``approve`` in production via the candidate-list
+    # fallback in ``effective_action``.
     assert effective_action(
         "update_incident", env="production", gateway_cfg=gw,
+    ) == "approve"
+    assert effective_action(
+        "local_inc:update_incident", env="production", gateway_cfg=gw,
+    ) == "approve"
+    assert effective_action(
+        "local_remediation:apply_fix", env="production", gateway_cfg=gw,
     ) == "approve"
 
 

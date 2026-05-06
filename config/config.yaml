@@ -140,12 +140,18 @@ runtime:
   # only TIGHTENS — it can never relax a higher-risk tool to ``auto``.
   gateway:
     policy:
+      # Tool-name lookups try the server-prefixed (``<server>:<tool>``)
+      # AND bare forms — config can use either. Bare names below are
+      # easier to keep aligned with the MCP source.
       update_incident: medium
-      "remediation:restart_service": high
-      "remediation:rollback": high
+      apply_fix: high
     prod_overrides:
       prod_environments:
         - production
+      # Tools that ALWAYS require human approval in production. ``apply_fix``
+      # is the only currently-implemented remediation; ``update_incident``
+      # gates resolution closures (status: resolved/escalated). Globs are
+      # matched against the prefixed and bare forms.
       resolution_trigger_tools:
         - update_incident
-        - "remediation:*"
+        - apply_fix

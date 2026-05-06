@@ -27,6 +27,8 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from runtime.locks import SessionBusy  # noqa: TCH001 — needed at runtime for except clause
+
 if TYPE_CHECKING:
     from runtime.service import OrchestratorService
 
@@ -120,12 +122,16 @@ class ApprovalWatchdog:
         """
         if self._stop_event is not None:
             self._stop_event.set()
-        task = self._task
+        task = self._task  # LOCAL variable — guards against concurrent stop() calls
         if task is not None and not task.done():
             try:
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
+                try:
+                    await task  # drain LOCAL task ref; suppresses CancelledError
+                except asyncio.CancelledError:
+                    pass
         self._task = None
         self._stop_event = None
 
@@ -182,9 +188,19 @@ class ApprovalWatchdog:
             stale = self._find_stale_pending(inc, now)
             if not stale:
                 continue
+            # No is_locked() peek here — try_acquire (inside
+            # _resume_with_timeout) is the single contention check, so
+            # there is no TOCTOU window between check and acquire. The
+            # SessionBusy handler below fires on real contention.
             try:
                 await self._resume_with_timeout(orch, session_id)
                 resumed += 1
+            except SessionBusy:
+                logger.debug(
+                    "approval watchdog: session %s SessionBusy at resume, skipping",
+                    session_id,
+                )
+                continue
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "approval watchdog: resume failed for session %s",
@@ -217,6 +233,14 @@ class ApprovalWatchdog:
         Uses ``Command(resume=...)`` against the same ``thread_id`` the
         approval API would use — the wrap_tool resume path updates the
         audit row to ``status="timeout"`` automatically.
+
+        Per D-18: the ``ainvoke`` call is wrapped in
+        ``orch._locks.try_acquire(session_id)`` so a concurrent user-
+        driven turn cannot interleave checkpoint writes for the same
+        ``thread_id``. If the lock is already held, ``try_acquire``
+        raises ``SessionBusy`` immediately (no waiting); the caller
+        (``run_once``) catches that and skips the tick — this is how
+        the watchdog tolerates a busy session without piling up.
         """
         from langgraph.types import Command  # local: heavy import
 
@@ -225,7 +249,8 @@ class ApprovalWatchdog:
             "approver": "system",
             "rationale": "approval window expired",
         }
-        await orch.graph.ainvoke(
-            Command(resume=decision_payload),
-            config=orch._thread_config(session_id),
-        )
+        async with orch._locks.try_acquire(session_id):
+            await orch.graph.ainvoke(
+                Command(resume=decision_payload),
+                config=orch._thread_config(session_id),
+            )

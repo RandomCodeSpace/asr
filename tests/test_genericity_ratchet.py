@@ -44,7 +44,13 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                docstrings keep the historical "incident" example for
 #                clarity). Net: +2 unavoidable tokens from generalising
 #                code that previously lived under ``examples/``.
-BASELINE_TOTAL = 146
+#   146 -> 147   ``Orchestrator.retry_session`` (post-failure manual retry)
+#                added a single ``incident_id`` reference via the existing
+#                ``_thread_config`` helper used to build the LangGraph
+#                thread-id. Generic session-id terminology elsewhere; the
+#                helper itself is older and keeps its parameter name for
+#                callers in the same file.
+BASELINE_TOTAL = 147
 
 
 def test_runtime_leaks_at_or_below_baseline():

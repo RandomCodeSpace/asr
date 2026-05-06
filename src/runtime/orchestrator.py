@@ -1,6 +1,7 @@
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 from __future__ import annotations
 import importlib
+import logging
 import warnings
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -38,8 +39,11 @@ from runtime.storage.engine import build_engine
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.history_store import HistoryStore
 from runtime.storage.models import Base
-from runtime.storage.session_store import SessionStore
+from runtime.storage.session_store import SessionStore, StaleVersionError
 from runtime.storage.vector import build_vector_store
+from runtime.locks import SessionLockRegistry
+
+_log = logging.getLogger("runtime.orchestrator")
 
 
 def _default_text_extractor(session) -> str:
@@ -191,6 +195,42 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
+# Map terminal-tool name -> (status_to_set, team_arg_keys_to_check).
+# Both bare and ``<server>:<tool>`` forms are matched via suffix check.
+_TERMINAL_TOOL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("mark_escalated", "escalated", ("args.team", "result.team")),
+    ("mark_resolved", "resolved", ()),
+    # Legacy / forward-compat: direct notify_oncall page = escalation.
+    ("notify_oncall", "escalated", ("args.team",)),
+)
+
+
+def _extract_team(tc, lookup_keys: tuple[str, ...]) -> str | None:
+    """Pull a ``team`` value from a ToolCall's args/result by ``"args.team"``
+    / ``"result.team"`` lookup hints. Returns the first non-falsy match."""
+    args = tc.args if isinstance(tc.args, dict) else {}
+    result = tc.result if isinstance(tc.result, dict) else {}
+    for key in lookup_keys:
+        scope, _, attr = key.partition(".")
+        source = args if scope == "args" else result
+        value = source.get(attr)
+        if value:
+            return value
+    return None
+
+
+def _infer_terminal_decision(tool_calls) -> tuple[str, str | None] | None:
+    """Walk executed tool_calls latest-first; return (new_status, team)
+    for the first matching terminal tool, or None if no rule fires."""
+    for tc in reversed([tc for tc in tool_calls
+                        if getattr(tc, "status", None) == "executed"]):
+        tool_name = tc.tool or ""
+        for bare, status, team_keys in _TERMINAL_TOOL_RULES:
+            if tool_name == bare or tool_name.endswith(f":{bare}"):
+                return status, _extract_team(tc, team_keys)
+    return None
+
+
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -245,6 +285,14 @@ class Orchestrator(Generic[StateT]):
         # on a generic FrameworkAppConfig the runtime can consume
         # without importing app-specific config modules.
         self.framework_cfg = framework_cfg or FrameworkAppConfig()
+        # Per-session asyncio.Lock keyed off session_id; serializes
+        # finalize and retry within a single process so concurrent
+        # streams cannot race on terminal-status transitions.
+        self._locks = SessionLockRegistry()
+        # Membership-tracked rejection of concurrent retry_session calls
+        # on the same session id. The set is mutated under self._locks
+        # so the in-flight check + add is atomic per session.
+        self._retries_in_flight: set[str] = set()
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
@@ -335,6 +383,21 @@ class Orchestrator(Generic[StateT]):
                         severity_aliases=framework_cfg.severity_aliases,
                     )
                     break
+            # Bind config-driven rosters into the observability and
+            # remediation MCP servers so out-of-roster values fail at
+            # the tool boundary with a recoverable ValueError instead
+            # of silently flowing to backends that have no policy
+            # entry for them.
+            try:
+                from runtime.mcp_servers import observability as _obs_mod
+                _obs_mod.set_environments(list(cfg.environments))
+            except Exception:
+                pass
+            try:
+                from runtime.mcp_servers import remediation as _rem_mod
+                _rem_mod.set_escalation_teams(list(framework_cfg.escalation_teams))
+            except Exception:
+                pass
             if cfg.paths.skills_dir is None:
                 raise RuntimeError(
                     "paths.skills_dir is not configured; apps must set it "
@@ -349,6 +412,18 @@ class Orchestrator(Generic[StateT]):
                         f"(known: {sorted(cfg.llm.models)})"
                     )
             registry = await load_tools(cfg.mcp, stack)
+            from runtime.skill_validator import (
+                validate_skill_routes,
+                validate_skill_tool_references,
+            )
+            registered = {e.name for e in registry.entries.values()}
+            validate_skill_tool_references(
+                {s.name: s.model_dump() for s in skills.values()},
+                registered,
+            )
+            validate_skill_routes(
+                {s.name: s.model_dump() for s in skills.values()},
+            )
             # Build the durable checkpointer once and pass it into the
             # compiled graph. Stays attached to the orchestrator so
             # aclose() can release the underlying connection / pool.
@@ -362,6 +437,13 @@ class Orchestrator(Generic[StateT]):
                     echo=cfg.storage.metadata.echo,
                 )
             )
+            from runtime.storage.checkpoint_gc import gc_orphaned_checkpoints
+            try:
+                removed = gc_orphaned_checkpoints(engine)
+                if removed:
+                    _log.info("checkpoint gc: removed %d orphaned threads", removed)
+            except Exception:
+                _log.exception("checkpoint gc failed (non-fatal)")
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry,
                                       checkpointer=checkpointer,
@@ -486,15 +568,81 @@ class Orchestrator(Generic[StateT]):
             for e in self.registry.entries.values()
         ]
 
+    def _finalize_session_status(self, session_id: str) -> str | None:
+        """Transition a graph-completed session to a terminal status by
+        INFERRING from tool-call history.
+
+        Inference rules (latest executed tool wins):
+          * ``mark_escalated`` -> ``escalated`` (with ``escalated_to``)
+          * ``mark_resolved``  -> ``resolved``
+          * ``notify_oncall`` (legacy direct path) -> ``escalated``
+          * Otherwise -> ``needs_review`` (graph ran to __end__ without
+            the agent declaring a terminal intent).
+
+        Sessions already in a terminal status are left untouched.
+        """
+        try:
+            inc = self.store.load(session_id)
+        except FileNotFoundError:
+            return None
+        if inc.status not in ("new", "in_progress"):
+            return None
+
+        decision = _infer_terminal_decision(inc.tool_calls)
+        if decision is None:
+            inc.status = "needs_review"
+            inc.extra_fields["needs_review_reason"] = (
+                "graph completed without terminal tool call"
+            )
+            return self._save_or_yield(inc, "needs_review")
+        new_status, team = decision
+        inc.status = new_status
+        if team:
+            inc.extra_fields["escalated_to"] = team
+        return self._save_or_yield(inc, new_status)
+
+    def _save_or_yield(self, inc, new_status: str) -> str | None:
+        """Save with stale-version protection. Returns ``new_status`` on
+        success or ``None`` if a concurrent finalize won the race.
+        """
+        try:
+            self.store.save(inc)
+            return new_status
+        except StaleVersionError:
+            return None
+
+    async def _finalize_session_status_async(
+        self, session_id: str,
+    ) -> str | None:
+        """Lock-guarded async wrapper around ``_finalize_session_status``.
+
+        All async call sites must use this one. The per-session lock
+        prevents two concurrent flows from each observing
+        pre-transition state and racing on the save. The second waiter
+        loads after the first commits, sees terminal status, and the
+        sync helper returns ``None`` (no transition).
+        """
+        async with self._locks.acquire(session_id):
+            return self._finalize_session_status(session_id)
+
     def _thread_config(self, incident_id: str) -> dict:
         """Build the LangGraph ``config`` dict for a per-session thread.
 
         With a checkpointer attached, every ``ainvoke`` / ``astream_events``
         call must carry a ``configurable.thread_id`` so LangGraph can scope
-        the durable state. Using the incident id keeps each INC's graph
-        state isolated and lets the checkpointer act as a resume index.
+        the durable state. The default thread id is the session id, but
+        ``retry_session`` rebinds the session to a fresh thread id (so
+        the graph runs from the entry rather than resuming a terminated
+        checkpoint). The chosen thread id is persisted on the session
+        in ``extra_fields["active_thread_id"]`` so subsequent resume
+        calls land on the correct paused checkpoint.
         """
-        return {"configurable": {"thread_id": incident_id}}
+        try:
+            inc = self.store.load(incident_id)
+            thread_id = (inc.extra_fields or {}).get("active_thread_id") or incident_id
+        except FileNotFoundError:
+            thread_id = incident_id
+        return {"configurable": {"thread_id": thread_id}}
 
     def get_session(self, incident_id: str) -> dict:
         """Load a session by id and return its serialized form."""
@@ -677,6 +825,10 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(inc.id),
         ):
             yield self._to_ui_event(ev, inc.id)
+        new_status = await self._finalize_session_status_async(inc.id)
+        if new_status:
+            yield {"event": "status_auto_finalized", "incident_id": inc.id,
+                   "status": new_status, "ts": _event_ts()}
         yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _event_ts()}
 
     async def stream_investigation(self, *, query: str, environment: str,
@@ -748,7 +900,8 @@ class Orchestrator(Generic[StateT]):
                 f"INC {incident_id} escalated by user — team {team}. "
                 "Confidence below threshold."
             )
-            tool_args = {"incident_id": incident_id, "message": message}
+            tool_args = {"incident_id": incident_id, "message": message,
+                         "team": team}
             tool_result = await self._invoke_tool("notify_oncall", tool_args)
             inc = self.store.load(incident_id)
             inc.tool_calls.append(ToolCall(
@@ -778,6 +931,101 @@ class Orchestrator(Generic[StateT]):
         """Deprecated alias for ``resume_session``."""
         async for event in self.resume_session(incident_id, decision):
             yield event
+
+    async def retry_session(self, session_id: str) -> AsyncIterator[dict]:
+        """Restart a failed/stopped session on a fresh LangGraph thread.
+
+        Rejects (with retry_rejected event) if a retry is already in
+        flight for this session id. The check is fast-fail BEFORE
+        acquiring the lock so the rejecting caller is not blocked.
+        """
+        if session_id in self._retries_in_flight:
+            _log.warning("retry_session rejected (fast-fail): %s already in flight",
+                         session_id)
+            yield {"event": "retry_rejected",
+                   "incident_id": session_id,
+                   "reason": "retry already in progress",
+                   "ts": _event_ts()}
+            return
+        async with self._locks.acquire(session_id):
+            # Re-check inside the lock to close the TOCTOU window
+            # between the membership check above and the acquire:
+            # task A could have completed its full retry-and-finally
+            # discard between this caller's outer check and acquire,
+            # but a third concurrent task could have entered and added
+            # itself between A's discard and B's acquire.
+            if session_id in self._retries_in_flight:
+                _log.warning("retry_session rejected (post-acquire): %s",
+                             session_id)
+                yield {"event": "retry_rejected",
+                       "incident_id": session_id,
+                       "reason": "retry already in progress",
+                       "ts": _event_ts()}
+                return
+            self._retries_in_flight.add(session_id)
+            try:
+                async for ev in self._retry_session_locked(session_id):
+                    yield ev
+            finally:
+                self._retries_in_flight.discard(session_id)
+
+    async def _retry_session_locked(self, session_id: str) -> AsyncIterator[dict]:
+        """Re-run the graph for a session that failed mid-flight.
+
+        Only sessions in ``status="error"`` are retryable — those are
+        the ones a graph node terminated with a recorded
+        ``agent failed: ...`` AgentRun (see
+        :func:`runtime.graph._handle_agent_failure`). The retry uses a
+        fresh LangGraph thread id so the compiled graph runs from the
+        entry node rather than resuming the terminated checkpoint.
+
+        Yields the same UI-event shape as ``stream_session`` plus
+        ``retry_started`` / ``retry_rejected`` / ``retry_completed``
+        envelopes so the UI can render a banner.
+        """
+        try:
+            inc = self.store.load(session_id)
+        except FileNotFoundError:
+            yield {"event": "retry_rejected", "incident_id": session_id,
+                   "reason": "session not found", "ts": _event_ts()}
+            return
+        if inc.status != "error":
+            yield {"event": "retry_rejected", "incident_id": session_id,
+                   "reason": f"not in error state (status={inc.status})",
+                   "ts": _event_ts()}
+            return
+        # Drop the failed AgentRun(s) so the timeline only retains
+        # successful runs. Retry attempts then append fresh runs.
+        inc.agents_run = [
+            r for r in inc.agents_run
+            if not (r.summary or "").startswith("agent failed:")
+        ]
+        # Bump retry counter for unique LangGraph thread id (the prior
+        # thread's checkpoint sits at a terminal node and would
+        # short-circuit a same-thread re-invocation).
+        retry_count = int(inc.extra_fields.get("retry_count", 0)) + 1
+        inc.extra_fields["retry_count"] = retry_count
+        thread_id = f"{session_id}:retry-{retry_count}"
+        # Pin the active thread id so any subsequent resume / approval
+        # call uses the new checkpoint, not the original session-id
+        # thread (which is at the terminated failure node).
+        inc.extra_fields["active_thread_id"] = thread_id
+        inc.status = "in_progress"
+        self.store.save(inc)
+        yield {"event": "retry_started", "incident_id": session_id,
+               "retry_count": retry_count, "ts": _event_ts()}
+        async for ev in self.graph.astream_events(
+            GraphState(session=inc, next_route=None, last_agent=None, error=None),
+            version="v2",
+            config=self._thread_config(session_id),
+        ):
+            yield self._to_ui_event(ev, session_id)
+        new_status = await self._finalize_session_status_async(session_id)
+        if new_status:
+            yield {"event": "status_auto_finalized", "incident_id": session_id,
+                   "status": new_status, "ts": _event_ts()}
+        yield {"event": "retry_completed", "incident_id": session_id,
+               "ts": _event_ts()}
 
     async def _resume_with_input(self, incident_id: str, inc, decision: dict):
         """Handle the resume_with_input action.

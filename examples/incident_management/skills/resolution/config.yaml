@@ -1,7 +1,7 @@
-description: Propose and (mock-)apply a fix; close the INC or escalate
+description: Close the INC via mark_resolved or escalate via mark_escalated.
 kind: responsive
 tools:
-  local: ["propose_fix", "apply_fix", "notify_oncall", "update_incident"]
+  local: ["propose_fix", "apply_fix", "update_incident", "mark_resolved", "mark_escalated"]
 routes:
   - when: success
     next: __end__

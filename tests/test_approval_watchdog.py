@@ -8,6 +8,7 @@ On resume, the wrap_tool path updates the audit row to
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,6 +24,7 @@ from runtime.config import (
     RuntimeConfig,
     StorageConfig,
 )
+from runtime.locks import SessionLockRegistry
 from runtime.service import OrchestratorService
 from runtime.state import ToolCall
 from runtime.tools.approval_watchdog import ApprovalWatchdog
@@ -67,6 +69,7 @@ def _build_watchdog(*, timeout_seconds: int = 3600,
     orch.store.load = lambda sid: sessions[sid]
     orch._thread_config = lambda sid: {"configurable": {"thread_id": sid}}
     orch.graph.ainvoke = AsyncMock(return_value={})
+    orch._locks = SessionLockRegistry()  # real registry so is_locked() works correctly
     service._orch = orch
 
     wd = ApprovalWatchdog(
@@ -290,3 +293,32 @@ def test_watchdog_not_started_when_gateway_unconfigured(tmp_path):
         assert svc._approval_watchdog is None
     finally:
         svc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Tests — HARD-06 cancellation hygiene
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_drains_cancelled_task_no_pending_at_teardown():
+    """HARD-06: ApprovalWatchdog.stop() must await the cancelled task.
+
+    After stop() returns, asyncio.all_tasks() should not contain the
+    watchdog task. Without the drain (await task) added in this fix,
+    ``Task was destroyed but it is pending`` warnings escape to
+    Python's warnings stream at event-loop teardown.
+    """
+    wd, _service, _orch = _build_watchdog(timeout_seconds=3600)
+    # We are already inside an asyncio event loop (asyncio_mode = "auto"),
+    # so arm the watchdog directly rather than via run_coroutine_threadsafe.
+    wd._stop_event = asyncio.Event()
+    wd._task = asyncio.create_task(wd._run(), name="approval_watchdog")
+    # Yield to let the polling loop's first iteration start before we stop.
+    await asyncio.sleep(0)
+    await wd.stop()
+    # After stop(), no task referencing the watchdog should remain.
+    pending = [
+        t for t in asyncio.all_tasks()
+        if "approval_watchdog" in (t.get_name() or "")
+    ]
+    assert pending == [], f"watchdog leaked tasks: {pending!r}"

@@ -101,6 +101,9 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "memory/playbook_store.py"),
     (RUNTIME_ROOT, "memory/hypothesis.py"),
     (RUNTIME_ROOT, "memory/resolution.py"),
+    # Per-session task-reentrant asyncio locks + SessionBusy exception.
+    # Must precede orchestrator.py which instantiates SessionLockRegistry.
+    (RUNTIME_ROOT, "locks.py"),
     (RUNTIME_ROOT, "orchestrator.py"),
     (RUNTIME_ROOT, "api.py"),
     # Retraction routes are a side-car router so they don't bloat

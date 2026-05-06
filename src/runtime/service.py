@@ -443,28 +443,36 @@ class OrchestratorService:
             self._registry[session_id] = entry
 
             async def _run() -> None:
-                try:
-                    await orch.graph.ainvoke(
-                        GraphState(
-                            session=inc,
-                            next_route=None,
-                            last_agent=None,
-                            error=None,
-                        ),
-                        config=orch._thread_config(session_id),
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    # Mark the registry entry so any concurrent snapshot
-                    # observes the failure before the done-callback
-                    # evicts it. The exception itself is preserved on
-                    # the task object for ``stop_session`` and any
-                    # other observer that holds a Task reference.
-                    e = self._registry.get(session_id)
-                    if e is not None:
-                        e.status = "error"
-                    raise
+                # Fail-fast on contention (D-03): if another task already
+                # holds the session lock, refuse the new turn immediately.
+                if orch._locks.is_locked(session_id):
+                    from runtime.locks import SessionBusy  # noqa: PLC0415
+                    raise SessionBusy(session_id)
+                # Hold the per-session lock for the full graph turn,
+                # including any HITL interrupt() pause (D-01).
+                async with orch._locks.acquire(session_id):
+                    try:
+                        await orch.graph.ainvoke(
+                            GraphState(
+                                session=inc,
+                                next_route=None,
+                                last_agent=None,
+                                error=None,
+                            ),
+                            config=orch._thread_config(session_id),
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        # Mark the registry entry so any concurrent snapshot
+                        # observes the failure before the done-callback
+                        # evicts it. The exception itself is preserved on
+                        # the task object for ``stop_session`` and any
+                        # other observer that holds a Task reference.
+                        e = self._registry.get(session_id)
+                        if e is not None:
+                            e.status = "error"
+                        raise
 
             task = asyncio.create_task(_run(), name=f"session:{session_id}")
             entry.task = task

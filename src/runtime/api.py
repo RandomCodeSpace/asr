@@ -295,10 +295,14 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 },
             )
         except Exception as e:  # noqa: BLE001
-            # ``SessionCapExceeded`` is matched by class name to avoid a
-            # hard import dependency at module-load time.
-            if e.__class__.__name__ == "SessionCapExceeded":
-                raise HTTPException(status_code=429, detail=str(e)) from e
+            # ``SessionCapExceeded`` and ``SessionBusy`` are matched by class
+            # name to avoid a hard import dependency at module-load time.
+            if e.__class__.__name__ in ("SessionCapExceeded", "SessionBusy"):
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(e),
+                    headers={"Retry-After": "1"},
+                ) from e
             raise
         return InvestigateResponse(incident_id=sid)
 
@@ -362,8 +366,12 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 submitter=body.submitter,
             )
         except Exception as e:  # noqa: BLE001
-            if e.__class__.__name__ == "SessionCapExceeded":
-                raise HTTPException(status_code=429, detail=str(e)) from e
+            if e.__class__.__name__ in ("SessionCapExceeded", "SessionBusy"):
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(e),
+                    headers={"Retry-After": "1"},
+                ) from e
             raise
         return SessionStartResponse(session_id=sid)
 
@@ -457,10 +465,20 @@ def build_app(cfg: AppConfig) -> FastAPI:
         async def _resume() -> None:
             from langgraph.types import Command
 
-            await orch.graph.ainvoke(
-                Command(resume=decision_payload),
-                config=orch._thread_config(session_id),
-            )
+            # Per D-20: wrap the ainvoke in the per-session lock so an
+            # approval submission cannot interleave checkpoint writes
+            # against any other turn on the same thread_id. Uses the
+            # blocking ``acquire`` (not ``try_acquire``) — if a turn is
+            # mid-flight the approval waits for it to release; the
+            # service loop's overall request deadline bounds wait.
+            # Future fail-fast switch is a one-line change to
+            # try_acquire (the existing 429 handler at L484-489 already
+            # routes ``SessionBusy`` to HTTP 429).
+            async with orch._locks.acquire(session_id):
+                await orch.graph.ainvoke(
+                    Command(resume=decision_payload),
+                    config=orch._thread_config(session_id),
+                )
 
         # Submit the resume onto the long-lived service loop so we
         # don't fight the lifespan thread for the same FastMCP/SQLite
@@ -470,7 +488,16 @@ def build_app(cfg: AppConfig) -> FastAPI:
         # ``httpx.AsyncClient + ASGITransport``, or any single-loop
         # deployment): blocking that loop while waiting for work
         # scheduled onto it would deadlock.
-        await svc.submit_async(_resume())
+        try:
+            await svc.submit_async(_resume())
+        except Exception as e:  # noqa: BLE001
+            if e.__class__.__name__ == "SessionBusy":
+                raise HTTPException(
+                    status_code=429,
+                    detail=str(e),
+                    headers={"Retry-After": "1"},
+                ) from e
+            raise
         return {
             "session_id": session_id,
             "tool_call_id": tool_call_id,
