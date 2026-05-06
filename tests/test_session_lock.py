@@ -253,17 +253,61 @@ def registry():
 
 def _make_stub_orch(store, registry):
     """Return a minimal object with the attributes _finalize_session_status
-    and _retries_in_flight need, without spinning up a full Orchestrator."""
+    and _retries_in_flight need, without spinning up a full Orchestrator.
+
+    Phase 6 (DECOUPLE-02): the finalize path now reads
+    ``self.cfg.orchestrator.terminal_tools`` etc. — provide a registry-
+    populated ``OrchestratorConfig`` so finalize behaves the same as the
+    incident_management YAML registration would.
+    """
+    from runtime.config import (
+        AppConfig,
+        LLMConfig,
+        MCPConfig,
+        OrchestratorConfig,
+    )
+    from runtime.terminal_tools import StatusDef, TerminalToolRule
+
+    statuses = {
+        "open":         StatusDef(name="open",         terminal=False, kind="pending"),
+        "escalated":    StatusDef(name="escalated",    terminal=True,  kind="escalation"),
+        "resolved":     StatusDef(name="resolved",     terminal=True,  kind="success"),
+        "needs_review": StatusDef(name="needs_review", terminal=True,  kind="needs_review"),
+    }
+    rules = [
+        TerminalToolRule(tool_name="mark_resolved", status="resolved"),
+        TerminalToolRule(
+            tool_name="mark_escalated", status="escalated",
+            extract_fields={"team": ["args.team", "result.team"]},
+        ),
+        TerminalToolRule(
+            tool_name="notify_oncall", status="escalated",
+            extract_fields={"team": ["args.team"]},
+        ),
+    ]
+    cfg = AppConfig(
+        llm=LLMConfig(),
+        mcp=MCPConfig(),
+        orchestrator=OrchestratorConfig(
+            statuses=statuses,
+            terminal_tools=rules,
+            default_terminal_status="needs_review",
+        ),
+    )
+
     class _StubOrch:
-        def __init__(self, s, r):
+        def __init__(self, s, r, c):
             self.store = s
             self._locks = r
+            self.cfg = c
             self._retries_in_flight: set[str] = set()
         _finalize_session_status = Orchestrator._finalize_session_status
         _finalize_session_status_async = Orchestrator._finalize_session_status_async
         _save_or_yield = Orchestrator._save_or_yield
+        _infer_terminal_decision = Orchestrator._infer_terminal_decision
+        _extract_field = Orchestrator._extract_field
 
-    return _StubOrch(store, registry)
+    return _StubOrch(store, registry, cfg)
 
 
 async def _faked_graph_turn(

@@ -142,8 +142,8 @@ class OrchestratorConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
     entry_agent: str = "intake"
-    # Signals an agent may emit (via ``update_incident.patch.signal``) that
-    # the router will accept and look up against the skill's ``routes`` table.
+    # Signals an agent may emit (via the configured patch tool's ``patch.signal``)
+    # that the router will accept and look up against the skill's ``routes`` table.
     # Anything outside this set falls through to ``when: default``. Override
     # in YAML to extend the vocabulary; the default keeps current behaviour.
     signals: list[str] = Field(
@@ -173,6 +173,40 @@ class OrchestratorConfig(BaseModel):
     # this name — ``incident_management`` uses ``needs_review``,
     # ``code_review`` uses ``unreviewed`` (D-06-06).
     default_terminal_status: str | None = None
+
+    # Tool names whose ``args.patch`` blob the harvester should fold
+    # into agent confidence/signal/rationale (DECOUPLE-02 generalization
+    # of the v1.0 single-tool path). Empty default means "no patch
+    # tools" so unconfigured apps pay nothing. Apps populate this in
+    # YAML alongside ``terminal_tools``; staying off the framework
+    # hardcoded path keeps generic-runtime free of app vocabulary
+    # leaks.
+    patch_tools: list[str] = Field(default_factory=list)
+
+    # Tool names the harvester should treat as "typed-terminal"
+    # (carrying flat ``confidence``/``confidence_rationale`` args and
+    # implying ``signal=success``) WITHOUT the orchestrator's finalize
+    # path firing a status transition for them. Used for tools that
+    # mark an agent stage complete but do not themselves end the
+    # session. Empty default means "no harvest-only tools". Distinct
+    # from ``terminal_tools`` (which both harvest and transition
+    # status).
+    harvest_terminal_tools: list[str] = Field(default_factory=list)
+
+    # Optional MCP tool the orchestrator invokes when a user clicks
+    # ``Escalate`` from the awaiting_input gate. ``None`` (default)
+    # means the orchestrator skips the tool call entirely and only
+    # transitions the session to the rule-driven status. Apps that
+    # want a side-effect (page on-call, file ticket) set this to the
+    # bare tool name; the orchestrator looks up the matching rule in
+    # ``terminal_tools`` to determine the resulting status.
+    escalate_action_tool_name: str | None = None
+
+    # Default team to pass to the escalation tool when the user did
+    # not pick one. Only meaningful if ``escalate_action_tool_name``
+    # is set. Apps own this default (``incident_management`` defaults
+    # to ``platform-oncall``).
+    escalate_action_default_team: str | None = None
 
     @model_validator(mode="after")
     def _validate_terminal_tool_registry(self) -> "OrchestratorConfig":

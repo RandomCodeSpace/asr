@@ -1,11 +1,11 @@
 """Concept-level leak ratchet (DECOUPLE-06).
 
 Walks ``src/runtime/`` for incident-management-specific tool names
-and asserts zero matches. Complements the existing token-level
-ratchet (``tests/test_genericity_ratchet.py``) which counts
-``incident``/``severity``/``reporter`` references with a downward-
-only baseline. This ratchet is BINARY — adding any of these names
-to ``src/runtime/`` is always a regression (D-06-07).
+and asserts zero matches **except** for entries on a documented
+``RATCHET_ALLOWLIST``. Each allowlist entry is annotated with the
+phase that will remove it, so the ratchet tightens as Phase 7 +
+Phase 8 ship (Resolution B / Option 3 — staged ratchet with
+documented allowlist).
 
 Forbidden tokens are the 6 ASR-app terminal/typed tools that the
 Phase 6 refactor pushed out of the framework:
@@ -13,7 +13,13 @@ Phase 6 refactor pushed out of the framework:
     mark_resolved, mark_escalated, notify_oncall,
     submit_hypothesis, update_incident, apply_fix
 
-If this test fails, fix the leak — do NOT relax the list.
+If this test fails, fix the leak (or add an allowlist entry with
+a phase-handle). Do NOT relax the forbidden-token list.
+
+Companion meta-test ``test_allowlist_entries_actually_match``
+asserts every allowlist entry still matches a real line; when a
+relocation phase ships and the offending file is gone, the meta-
+test fails, forcing the developer to drop the stale entry.
 """
 from __future__ import annotations
 
@@ -39,6 +45,39 @@ PATTERN = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Allowlist (Resolution B — Option 3, staged ratchet).
+#
+# Each entry is keyed by ``(relative_path, matched_token)`` and maps to
+# the phase-handle that will REMOVE the leak. When the listed phase
+# ships, the entry MUST be deleted and the test re-run; the meta-test
+# below catches stale entries by asserting each pattern still has at
+# least one matching line in the file.
+#
+# Removing an allowlist entry without first removing the leak is
+# always a regression and will fail this ratchet.
+# ---------------------------------------------------------------------------
+RATCHET_ALLOWLIST: dict[tuple[str, str], str] = {
+    # Phase 7 (DECOUPLE-04) will move ``runtime/mcp_servers/remediation.py``
+    # out of the framework directory into ``examples/incident_management/``
+    # — the file itself is incident-vocabulary and shouldn't live under
+    # ``src/runtime/``.
+    ("src/runtime/mcp_servers/remediation.py", "apply_fix"): "Phase 7",
+    ("src/runtime/mcp_servers/remediation.py", "notify_oncall"): "Phase 7",
+
+    # Phase 8 (DECOUPLE-07) will scrub the remaining incident-vocabulary
+    # docstring examples from ``terminal_tools.py`` (the framework's
+    # registry types) and ``storage/event_log.py`` after the code_review
+    # e2e test ships and we have a non-incident vocabulary to use as
+    # the canonical doc-string example.
+    ("src/runtime/terminal_tools.py", "mark_escalated"): "Phase 8",
+    ("src/runtime/terminal_tools.py", "mark_resolved"): "Phase 8",
+    ("src/runtime/terminal_tools.py", "apply_fix"): "Phase 8",
+    ("src/runtime/terminal_tools.py", "notify_oncall"): "Phase 8",
+    ("src/runtime/storage/event_log.py", "mark_escalated"): "Phase 8",
+}
+
+
 def _iter_runtime_py_files() -> list[Path]:
     # Exclude ``__pycache__`` automatically (rglob skips dotted dirs
     # but not __pycache__; filter explicitly).
@@ -48,25 +87,68 @@ def _iter_runtime_py_files() -> list[Path]:
     ]
 
 
+def _collect_offenders() -> list[tuple[str, int, str, str]]:
+    """Return list of ``(rel_path, lineno, token, line_excerpt)`` for
+    every forbidden-token match under ``src/runtime/``.
+    """
+    offenders: list[tuple[str, int, str, str]] = []
+    for path in _iter_runtime_py_files():
+        rel = str(path.relative_to(REPO_ROOT))
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            for match in PATTERN.finditer(line):
+                offenders.append((rel, lineno, match.group(0),
+                                  line.strip()[:120]))
+    return offenders
+
+
 def test_runtime_dir_exists():
     assert RUNTIME_DIR.is_dir(), f"src/runtime/ not found at {RUNTIME_DIR}"
 
 
 def test_no_incident_specific_tool_leaks():
-    offenders: list[str] = []
-    for path in _iter_runtime_py_files():
-        text = path.read_text(encoding="utf-8")
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            for match in PATTERN.finditer(line):
-                offenders.append(
-                    f"{path.relative_to(REPO_ROOT)}:{lineno}: "
-                    f"{match.group(0)} (line: {line.strip()[:120]})"
-                )
-    assert not offenders, (
+    """All forbidden-token matches under ``src/runtime/`` MUST appear
+    in ``RATCHET_ALLOWLIST``. Anything else is a regression."""
+    unallowlisted: list[str] = []
+    for rel_path, lineno, token, excerpt in _collect_offenders():
+        if (rel_path, token) in RATCHET_ALLOWLIST:
+            continue
+        unallowlisted.append(
+            f"{rel_path}:{lineno}: {token} (line: {excerpt})"
+        )
+    assert not unallowlisted, (
         "src/runtime/ leaks incident-specific tool names "
-        "(DECOUPLE-06 ratchet violation). Move them to YAML or "
-        "examples/incident_management/. Offending references:\n  "
-        + "\n  ".join(offenders)
+        "(DECOUPLE-06 ratchet violation). Either move the leak to "
+        "YAML / examples/incident_management/ OR add a documented "
+        "RATCHET_ALLOWLIST entry with a phase-handle. Offending "
+        "references:\n  " + "\n  ".join(unallowlisted)
+    )
+
+
+def test_allowlist_entries_actually_match():
+    """Every allowlist entry must still match at least one real line.
+
+    When a relocation phase ships (e.g. Phase 7 moves
+    ``remediation.py`` out of the framework dir), the corresponding
+    file disappears and the matched-token count for that entry
+    drops to zero. This test then fails, forcing the developer to
+    delete the stale entry — the allowlist is *append-only* with a
+    forced-shrink mechanic, not a quiet drift surface.
+    """
+    matched_pairs: set[tuple[str, str]] = set()
+    for rel_path, _lineno, token, _excerpt in _collect_offenders():
+        matched_pairs.add((rel_path, token))
+
+    stale: list[str] = []
+    for (rel_path, token), phase in RATCHET_ALLOWLIST.items():
+        if (rel_path, token) not in matched_pairs:
+            stale.append(
+                f"{rel_path} [{token}] (declared cleanup: {phase})"
+            )
+    assert not stale, (
+        "RATCHET_ALLOWLIST contains entries that no longer match any "
+        "line under src/runtime/. The leak was already removed — "
+        "delete the stale allowlist entry:\n  " + "\n  ".join(stale)
     )
 
 
@@ -81,4 +163,18 @@ def test_forbidden_tokens_list_is_locked():
         "submit_hypothesis",
         "update_incident",
         "apply_fix",
+    )
+
+
+def test_allowlist_phases_are_well_known():
+    """All declared phase handles should be one of the planned
+    relocation phases. Catches typos like 'Phase  8' or 'phase7'.
+    """
+    valid_phases = {"Phase 7", "Phase 8"}
+    invalid = {
+        v for v in RATCHET_ALLOWLIST.values() if v not in valid_phases
+    }
+    assert not invalid, (
+        f"unknown phase handles in RATCHET_ALLOWLIST: {invalid}; "
+        f"expected one of {valid_phases}"
     )

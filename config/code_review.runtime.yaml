@@ -34,8 +34,24 @@ mcp:
 paths:
   skills_dir: examples/code_review/skills
   incidents_dir: code_reviews
+# Phase 6 placeholder: code_review's full terminal-tool registration
+# ships in Phase 8 (DECOUPLE-07 + DECOUPLE-05) alongside the e2e
+# test. For now the framework knows the app's status vocabulary
+# but has no rules to fire on — every code_review session finalizes
+# to ``unreviewed`` (the app's app-owned default per D-06-06).
 orchestrator:
   entry_agent: intake
+  default_terminal_status: unreviewed
+  statuses:
+    in_review:
+      name: in_review
+      terminal: false
+      kind: pending
+    unreviewed:
+      name: unreviewed
+      terminal: true
+      kind: needs_review
+  terminal_tools: []
 # Cross-cutting framework knobs read directly off AppConfig.framework.
 framework:
   # Per-app session-id prefix. Threaded through SessionStore into

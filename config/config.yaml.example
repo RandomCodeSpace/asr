@@ -87,6 +87,48 @@ paths:
   skills_dir: config/skills
   incidents_dir: incidents
 
+# Generic terminal-tool registry (Phase 6 / D-06-01..06).
+orchestrator:
+  entry_agent: intake
+  default_terminal_status: needs_review
+  statuses:
+    open:
+      name: open
+      terminal: false
+      kind: pending
+    escalated:
+      name: escalated
+      terminal: true
+      kind: escalation
+    resolved:
+      name: resolved
+      terminal: true
+      kind: success
+    needs_review:
+      name: needs_review
+      terminal: true
+      kind: needs_review
+  terminal_tools:
+    - tool_name: mark_resolved
+      status: resolved
+    - tool_name: mark_escalated
+      status: escalated
+      extract_fields:
+        team:
+          - args.team
+          - result.team
+    - tool_name: notify_oncall
+      status: escalated
+      extract_fields:
+        team:
+          - args.team
+  patch_tools:
+    - update_incident
+  harvest_terminal_tools:
+    - submit_hypothesis
+  escalate_action_tool_name: notify_oncall
+  escalate_action_default_team: platform-oncall
+
 intervention:
   # If the deep_investigator's reported confidence is below this threshold, the
   # graph pauses and surfaces an intervention prompt to the UI.

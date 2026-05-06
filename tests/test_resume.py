@@ -2,11 +2,12 @@
 import pytest
 
 from runtime.config import (
-    AppConfig, FrameworkAppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths,
-    RuntimeConfig,
+    AppConfig, FrameworkAppConfig, LLMConfig, MCPConfig, MCPServerConfig,
+    OrchestratorConfig, Paths, RuntimeConfig,
 )
 from runtime.state import AgentRun
 from runtime.orchestrator import Orchestrator
+from runtime.terminal_tools import StatusDef, TerminalToolRule
 
 
 @pytest.fixture
@@ -36,6 +37,33 @@ def cfg(tmp_path):
         framework=FrameworkAppConfig(
             confidence_threshold=0.75,
             escalation_teams=["platform-oncall", "data-oncall", "security-oncall"],
+        ),
+        # Phase 6 (DECOUPLE-02 / Resolution A): the escalate path is
+        # parameterised on the OrchestratorConfig fields; the test
+        # fixture mirrors the incident_management.yaml registration.
+        orchestrator=OrchestratorConfig(
+            statuses={
+                "open":         StatusDef(name="open",         terminal=False, kind="pending"),
+                "escalated":    StatusDef(name="escalated",    terminal=True,  kind="escalation"),
+                "resolved":     StatusDef(name="resolved",     terminal=True,  kind="success"),
+                "needs_review": StatusDef(name="needs_review", terminal=True,  kind="needs_review"),
+            },
+            terminal_tools=[
+                TerminalToolRule(tool_name="mark_resolved", status="resolved"),
+                TerminalToolRule(
+                    tool_name="mark_escalated", status="escalated",
+                    extract_fields={"team": ["args.team", "result.team"]},
+                ),
+                TerminalToolRule(
+                    tool_name="notify_oncall", status="escalated",
+                    extract_fields={"team": ["args.team"]},
+                ),
+            ],
+            patch_tools=["update_incident"],
+            harvest_terminal_tools=["submit_hypothesis"],
+            default_terminal_status="needs_review",
+            escalate_action_tool_name="notify_oncall",
+            escalate_action_default_team="platform-oncall",
         ),
         runtime=RuntimeConfig(state_class=None),
     )

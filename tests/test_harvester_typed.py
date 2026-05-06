@@ -4,11 +4,23 @@ tc_args and implies signal=success.
 
 This is the post-Task-3.5 contract: confidence is no longer carried inside
 update_incident.patch — it's a required arg on the typed terminal tools, and
-the harvester picks it up directly."""
+the harvester picks it up directly.
+
+Post Phase 6 (DECOUPLE-02), the typed-terminal recognition surface comes
+from ``OrchestratorConfig.terminal_tools`` + ``OrchestratorConfig.harvest_terminal_tools``;
+tests pass the names explicitly so they don't rely on a global registry."""
 from langchain_core.messages import AIMessage
 
 from runtime.graph import _harvest_tool_calls_and_patches
 from runtime.state import Session
+
+
+# The incident_management bare names — passed explicitly to mirror the
+# YAML registration. Test files are whitelisted by the leak ratchet.
+_INCIDENT_TERMINAL_NAMES = frozenset({
+    "mark_resolved", "mark_escalated", "submit_hypothesis",
+})
+_INCIDENT_PATCH_NAMES = frozenset({"update_incident"})
 
 
 def _make_inc(sid: str = "INC-1") -> Session:
@@ -39,6 +51,8 @@ def test_harvester_reads_confidence_from_submit_hypothesis_return():
     conf, rationale, signal = _harvest_tool_calls_and_patches(
         messages, "deep_investigator", inc, ts="2026-01-01T00:00:00Z",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     assert conf == 0.85
     assert rationale == "r"
@@ -64,6 +78,8 @@ def test_harvester_reads_confidence_from_mark_resolved():
     conf, rationale, signal = _harvest_tool_calls_and_patches(
         messages, "resolution", inc, ts="t",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     assert conf == 0.95
     assert rationale == "verified"
@@ -90,6 +106,8 @@ def test_harvester_reads_confidence_from_mark_escalated():
     conf, rationale, signal = _harvest_tool_calls_and_patches(
         messages, "resolution", inc, ts="t",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     assert conf == 0.4
     assert rationale == "weak"
@@ -117,6 +135,8 @@ def test_harvester_handles_prefixed_typed_tool_name():
     conf, _, signal = _harvest_tool_calls_and_patches(
         messages, "resolution", inc, ts="t",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     assert conf == 0.9
     assert signal == "success"
@@ -141,6 +161,8 @@ def test_harvester_still_reads_signal_from_update_incident_patch():
     _, _, signal = _harvest_tool_calls_and_patches(
         messages, "triage", inc, ts="t",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     assert signal == "success"
 
@@ -176,6 +198,8 @@ def test_typed_terminal_locks_confidence_against_same_message_patch():
     conf, rationale, _ = _harvest_tool_calls_and_patches(
         messages, "resolution", inc, ts="t",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     assert conf == 0.9
     assert rationale == "from-terminal"
@@ -209,6 +233,8 @@ def test_terminal_lock_does_not_block_signal_updates_from_later_patch():
     _, _, signal = _harvest_tool_calls_and_patches(
         messages, "resolution", inc, ts="t",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     assert signal == "failed"
 
@@ -225,6 +251,8 @@ def test_harvester_typed_tool_with_no_args_returns_none():
     conf, _, signal = _harvest_tool_calls_and_patches(
         messages, "resolution", inc, ts="t",
         valid_signals=frozenset({"success", "failed", "default"}),
+        terminal_tool_names=_INCIDENT_TERMINAL_NAMES,
+        patch_tool_names=_INCIDENT_PATCH_NAMES,
     )
     # Confidence missing → None preserved; signal=success still implied
     # because the call was attempted.

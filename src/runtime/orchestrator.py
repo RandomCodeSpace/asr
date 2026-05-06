@@ -929,9 +929,14 @@ class Orchestrator(Generic[StateT]):
             return
 
         if action == "escalate":
-            team = decision.get("team") or "platform-oncall"
+            tool_name = self.cfg.orchestrator.escalate_action_tool_name
+            default_team = self.cfg.orchestrator.escalate_action_default_team
+            team = decision.get("team") or default_team
             allowed = list(self.framework_cfg.escalation_teams)
-            if team not in allowed:
+            # Only enforce roster membership when the framework is
+            # actually configured with one — apps without a roster
+            # accept any team string.
+            if allowed and team is not None and team not in allowed:
                 # Reject the request entirely. The INC stays awaiting_input
                 # so the user can retry with a valid team. Logging the
                 # allowed roster on the event makes it actionable in the UI.
@@ -942,27 +947,71 @@ class Orchestrator(Generic[StateT]):
                        ),
                        "ts": _event_ts()}
                 return
-            message = (
-                f"INC {incident_id} escalated by user — team {team}. "
-                "Confidence below threshold."
-            )
-            tool_args = {"incident_id": incident_id, "message": message,
-                         "team": team}
-            tool_result = await self._invoke_tool("notify_oncall", tool_args)
-            inc = self.store.load(incident_id)
-            inc.tool_calls.append(ToolCall(
-                agent="orchestrator",
-                tool="notify_oncall",
-                args=tool_args,
-                result=tool_result,
-                ts=_event_ts(),
-            ))
-            inc.status = "escalated"
-            inc.extra_fields["escalated_to"] = team
-            inc.pending_intervention = None
-            self.store.save(inc)
-            yield {"event": "resume_completed", "incident_id": incident_id,
-                   "status": "escalated", "team": team, "ts": _event_ts()}
+
+            # Look up the rule for the configured escalation tool so
+            # status assignment and extra-field key are driven by the
+            # registry rather than hardcoded vocabulary.
+            rule = None
+            if tool_name is not None:
+                for r in self.cfg.orchestrator.terminal_tools:
+                    if r.tool_name == tool_name:
+                        rule = r
+                        break
+
+            inc_loaded = self.store.load(incident_id)
+            if tool_name is not None:
+                # App registered a side-effect tool; invoke it and record
+                # the tool-call so finalize-style introspection sees it.
+                message = (
+                    f"Session {incident_id} escalated by user"
+                    + (f" — team {team}." if team else ".")
+                    + " Confidence below threshold."
+                )
+                tool_args: dict = {"incident_id": incident_id, "message": message}
+                if team is not None:
+                    tool_args["team"] = team
+                tool_result = await self._invoke_tool(tool_name, tool_args)
+                inc_loaded.tool_calls.append(ToolCall(
+                    agent="orchestrator",
+                    tool=tool_name,
+                    args=tool_args,
+                    result=tool_result,
+                    ts=_event_ts(),
+                ))
+
+            # Status assignment: prefer the rule's declared status; fall
+            # back to default_terminal_status when no rule registered.
+            if rule is not None:
+                new_status = rule.status
+            else:
+                new_status = (
+                    self.cfg.orchestrator.default_terminal_status
+                    or inc_loaded.status
+                )
+            inc_loaded.status = new_status
+            # Capture team via the rule's first extract-field destination
+            # (typically ``team``). When no rule registered the field but
+            # team is present, fall back to ``team`` for stability.
+            if team is not None:
+                if rule is not None and rule.extract_fields:
+                    first_dest = next(iter(rule.extract_fields.keys()))
+                    inc_loaded.extra_fields[first_dest] = team
+                else:
+                    inc_loaded.extra_fields["team"] = team
+                # v1.0 compat: mirror to ``escalated_to`` when the new
+                # status is kind=escalation, matching finalize semantics.
+                status_def = self.cfg.orchestrator.statuses.get(new_status)
+                if status_def is not None and status_def.kind == "escalation":
+                    inc_loaded.extra_fields["escalated_to"] = team
+            inc_loaded.pending_intervention = None
+            self.store.save(inc_loaded)
+            event_payload: dict = {
+                "event": "resume_completed", "incident_id": incident_id,
+                "status": new_status, "ts": _event_ts(),
+            }
+            if team is not None:
+                event_payload["team"] = team
+            yield event_payload
             return
 
         if action == "resume_with_input":
@@ -1120,8 +1169,9 @@ class Orchestrator(Generic[StateT]):
         """Call an MCP tool by original name, going through the LangChain wrapper.
 
         Searches the registry for any entry whose original ``name`` matches.
-        Used for orchestrator-driven tool calls (e.g. notify_oncall on
-        escalate) that aren't initiated by an LLM.
+        Used for orchestrator-driven tool calls (e.g. an app-registered
+        escalation tool invoked from the awaiting_input gate) that aren't
+        initiated by an LLM.
         """
         entry = next(
             (e for e in self.registry.entries.values() if e.name == name),

@@ -184,6 +184,7 @@ async def test_gate_pauses_when_string_label_confidence_below_threshold(tmp_path
     di_node = make_agent_node(
         skill=skill, llm=llm, tools=[],
         decide_route=lambda i: "default", store=store,
+        patch_tool_names=frozenset({"update_incident"}),
     )
     await di_node(GraphState(session=inc, next_route=None,
                              last_agent=None, error=None))

@@ -45,6 +45,8 @@ def make_agent_node(
     store: SessionStore,
     valid_signals: frozenset[str] | None = None,
     gateway_cfg: GatewayConfig | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ):
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -107,9 +109,9 @@ def make_agent_node(
                 inc_id=inc_id, store=store, fallback=incident,
             )
 
-        # Tools (e.g. update_incident) write straight to disk. Reload so the
-        # node's own append of agent_run + tool_calls happens against the
-        # tool-mutated state.
+        # Tools (e.g. registered patch tools) write straight to disk.
+        # Reload so the node's own append of agent_run + tool_calls
+        # happens against the tool-mutated state.
         incident = store.load(inc_id)
 
         messages = result.get("messages", [])
@@ -117,6 +119,8 @@ def make_agent_node(
 
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
             messages, skill.name, incident, ts, valid_signals,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
         )
         _pair_tool_responses(messages, incident)
 

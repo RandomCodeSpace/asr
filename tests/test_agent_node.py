@@ -12,6 +12,14 @@ from runtime.storage.engine import build_engine
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore
 
+# Phase 6 (DECOUPLE-02): the harvester recognition surface comes from
+# OrchestratorConfig.terminal_tools / patch_tools / harvest_terminal_tools.
+# Tests pass them explicitly so they don't depend on a global registry.
+_TEST_TERMINAL_NAMES = frozenset({
+    "mark_resolved", "mark_escalated", "submit_hypothesis",
+})
+_TEST_PATCH_NAMES = frozenset({"update_incident"})
+
 
 def _make_repo(tmp_path):
     eng = build_engine(MetadataConfig(url=f"sqlite:///{tmp_path}/test.db"))
@@ -43,6 +51,8 @@ async def test_agent_node_runs_llm_records_agent_run_and_routes(incident):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     out = await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     assert out["next_route"] == "triage"
@@ -91,6 +101,8 @@ async def test_agent_node_captures_confidence_from_update_incident(incident):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
@@ -124,6 +136,8 @@ def _build_node_with_confidence_patch(inc, store, *, conf_value):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
 
 
@@ -207,6 +221,8 @@ async def test_agent_node_captures_signal_from_update_incident(incident):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
@@ -240,6 +256,8 @@ async def test_agent_node_signal_normalises_case(incident, raw, expected):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
     reloaded = store.load(inc.id)
@@ -267,6 +285,8 @@ async def test_agent_node_signal_unknown_string_is_none(incident, caplog):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
         await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
@@ -296,6 +316,8 @@ async def test_agent_node_signal_rejects_bool(incident, caplog):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     with caplog.at_level(logging.WARNING, logger="orchestrator.graph"):
         await node(GraphState(session=inc, next_route=None, last_agent=None, error=None))
@@ -331,6 +353,8 @@ async def test_agent_node_routes_on_emitted_signal(incident):
         skill=skill, llm=llm, tools=[],
         decide_route=_decide_from_signal,
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     out = await node(GraphState(session=inc, next_route=None,
                                 last_agent=None, error=None))
@@ -356,6 +380,8 @@ async def test_agent_node_falls_back_to_default_when_no_signal(incident):
         skill=skill, llm=llm, tools=[],
         decide_route=_decide_from_signal,
         store=store,
+        terminal_tool_names=_TEST_TERMINAL_NAMES,
+        patch_tool_names=_TEST_PATCH_NAMES,
     )
     out = await node(GraphState(session=inc, next_route=None,
                                 last_agent=None, error=None))
