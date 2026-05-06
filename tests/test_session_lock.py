@@ -1016,3 +1016,256 @@ async def test_api_resume_session_busy_returns_429_with_retry_after():
             assert sid in res.text
         finally:
             OrchestratorService._reset_singleton()
+
+
+# ---------------------------------------------------------------------------
+# Phase 01.1 — R4 (D-01 verification): lock cycle around interrupt() pause
+# ---------------------------------------------------------------------------
+#
+# CONTEXT D-01 (phase 01) read: "the per-session lock is held across the
+# HITL pause." Phase 01-REVIEW.md flagged this was never directly observed
+# — the existing exemplars only proved "lock held during a turn" and
+# "watchdog skips when lock is held," neither of which exercises the
+# interrupt() boundary inside a real LangGraph compiled graph.
+#
+# This test observes — does NOT assume — what LangGraph actually does at
+# interrupt(). Outcome (Path A vs Path B) is documented in
+# 01.1-CONTEXT.md / 01.1-03-SUMMARY.md.
+#
+#   Path A: lock IS released when ainvoke returns at the interrupt
+#           boundary (the ``async with`` exits in _run / _resume), and
+#           the api ``_resume`` path's blocking ``acquire`` cleanly
+#           re-acquires for the resume's ainvoke. The OBSERVABLE
+#           invariant the test pins is "no two ainvoke calls hold the
+#           same thread_id simultaneously":
+#             1. before _run: is_locked False
+#             2. inside the node, BEFORE interrupt(): is_locked True
+#             3. after _run returns (graph paused at interrupt): False
+#             4. inside the node, AFTER resume returns from interrupt():
+#                is_locked True again
+#             5. after _resume completes: is_locked False
+#
+#   Path B: if observed behaviour deviates (e.g. LangGraph holds the
+#           lock across pause for some reason the planner did not
+#           foresee, or interrupt short-circuits the ``async with`` in
+#           a way that breaks observation), the test asserts the
+#           replacement invariant and 01.1-CONTEXT.md D-01 is updated
+#           to record the supersession with an explicit
+#           ``langgraph.__version__`` citation.
+# ---------------------------------------------------------------------------
+
+
+async def test_d01_lock_cycle_around_interrupt_pause_resume(store, registry):
+    """R4 — observe lock transitions across the interrupt() boundary.
+
+    Drive a real ``langgraph.graph.StateGraph`` compiled with
+    ``InMemorySaver`` (mirrors the existing pattern in
+    ``tests/test_gateway_persistence.py``). The single faked node calls
+    ``langgraph.types.interrupt(payload)`` exactly once and records
+    ``registry.is_locked(session_id)`` BEFORE the interrupt and AFTER
+    the interrupt returns the resume value.
+
+    Phase 1 (mimics ``Orchestrator._run``): wrap ``ainvoke`` in
+    ``async with registry.acquire(session_id)`` and run until the graph
+    pauses at interrupt — ainvoke returns, the ``async with`` exits, the
+    lock is released.
+
+    Phase 2 (mimics ``api.submit_approval_decision._resume``): wrap a
+    second ``ainvoke(Command(resume=...))`` in
+    ``async with registry.acquire(session_id)`` and observe the lock
+    flips True for the duration of the resume turn, then False after.
+
+    The recorder list captures ``is_locked`` from inside the node,
+    proving the OBSERVED invariant is the one the production lock
+    contract claims (and not coincidentally satisfied by external
+    state).
+
+    Pins R4 / D-01: per-session lock cycle around the interrupt boundary.
+    Failure messages cite ``langgraph.__version__`` so a future drift in
+    LangGraph's interrupt semantics fails loud, not silent (T-01.1-10).
+    """
+    from importlib.metadata import version as pkg_version
+    from typing import TypedDict
+
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, StateGraph
+    from langgraph.types import Command, interrupt
+
+    lg_version = pkg_version("langgraph")
+
+    # Use a fresh session_id (no DB row needed — the graph state is
+    # opaque to the lock; we just need a stable thread_id key).
+    inc = store.create(
+        query="d01-lock-cycle",
+        environment="staging",
+        reporter_id="r1",
+        reporter_team="platform",
+    )
+    session_id = inc.id
+
+    # Recorder of observed is_locked values — populated from inside the
+    # node, so the test sees the lock state at the EXACT moment the
+    # graph runtime is mid-turn (not before/after, where ``async with``
+    # boundaries make the result trivially predictable).
+    is_locked_before_interrupt: list[bool] = []
+    is_locked_after_resume: list[bool] = []
+
+    class _S(TypedDict, total=False):
+        result: object
+
+    async def _node(state: _S) -> dict:
+        # OBSERVATION POINT 1 — mid-turn, before interrupt:
+        # The outer caller (Phase 1 OR Phase 2) wraps ainvoke in
+        # ``async with registry.acquire(session_id)``. So when this
+        # line executes, the lock MUST be held. If D-01 holds, this
+        # appends True both times the node runs (initial turn AND
+        # post-resume turn).
+        is_locked_before_interrupt.append(registry.is_locked(session_id))
+
+        # Pause for HITL. interrupt() raises GraphInterrupt; ainvoke
+        # returns control to the caller with __interrupt__ in the
+        # result. When Command(resume=...) is later supplied, the node
+        # re-runs from the top and ``decision`` receives the resume
+        # value.
+        decision = interrupt({"reason": "test_d01"})
+
+        # OBSERVATION POINT 2 — mid-turn, AFTER resume returns:
+        # On the resume run, the outer caller is the Phase-2
+        # ``async with registry.acquire(session_id)`` — so the lock
+        # MUST be held here too.
+        is_locked_after_resume.append(registry.is_locked(session_id))
+
+        return {"result": decision}
+
+    sg = StateGraph(_S)
+    sg.add_node("n", _node)
+    sg.set_entry_point("n")
+    sg.add_edge("n", END)
+    compiled = sg.compile(checkpointer=InMemorySaver())
+
+    cfg: RunnableConfig = {"configurable": {"thread_id": session_id}}
+
+    # ----- baseline: lock free -----
+    assert registry.is_locked(session_id) is False, (
+        f"precondition: lock should be free at test start "
+        f"(langgraph={lg_version})"
+    )
+
+    # ----- Phase 1: _run-equivalent — turn pauses at interrupt -----
+    # This mirrors src/runtime/service.py:453-463 where the per-session
+    # lock wraps ainvoke for the full turn including any HITL pause.
+    async with registry.acquire(session_id):
+        # OBSERVATION POINT 0 — mid-_run, BEFORE ainvoke:
+        # the lock is held by THIS task; is_locked must be True.
+        assert registry.is_locked(session_id) is True, (
+            f"Phase 1: lock should be held by the acquire() context "
+            f"before ainvoke runs (langgraph={lg_version})"
+        )
+        result = await asyncio.wait_for(
+            compiled.ainvoke({}, config=cfg),
+            timeout=2.0,
+        )
+
+    # The ``async with`` exited because ainvoke returned at the
+    # interrupt boundary. The faked node ran exactly once and recorded
+    # is_locked=True at the pre-interrupt observation point.
+    assert is_locked_before_interrupt == [True], (
+        f"D-01 Path A asserts the lock is held across the node body "
+        f"during the initial turn (langgraph={lg_version}); "
+        f"observed: {is_locked_before_interrupt}. If False, the node "
+        f"ran outside the acquire() context — impossible without a "
+        f"LangGraph executor that runs nodes on a different task; "
+        f"investigate before claiming D-01 superseded."
+    )
+    assert is_locked_after_resume == [], (
+        "post-resume observation should NOT have fired yet (the graph "
+        "is paused, no Command(resume=...) has been delivered)"
+    )
+
+    # ainvoke returned; the graph is paused at interrupt(). LangGraph
+    # surfaces this via ``__interrupt__`` in the result dict.
+    assert isinstance(result, dict) and "__interrupt__" in result, (
+        f"expected ainvoke to return with __interrupt__ at the pause "
+        f"boundary (langgraph={lg_version}); got {result!r}"
+    )
+
+    # ----- D-01 PRIMARY OBSERVATION — lock state at the boundary -----
+    # After ainvoke returns at the pause, the ``async with`` exits and
+    # the lock is released. This is the OBSERVED behaviour Path A
+    # records: the lock is NOT held across the pause-resume gap; the
+    # GUARANTEE that holds is "no two ainvoke calls overlap on the
+    # same thread_id" — Phase 2 below proves the resume re-acquires
+    # cleanly without contention.
+    assert registry.is_locked(session_id) is False, (
+        f"D-01 Path A: at the interrupt() boundary, the per-session "
+        f"lock is released because ainvoke returned and the "
+        f"``async with registry.acquire()`` block exited "
+        f"(langgraph={lg_version}). If True, LangGraph somehow held "
+        f"the lock across pause — Path B applies and 01.1-CONTEXT.md "
+        f"D-01 must be updated."
+    )
+
+    # ----- Phase 2: api ``_resume``-equivalent — resume the paused turn -----
+    # Mirrors src/runtime/api.py:465-481 (the _resume closure). The api
+    # path uses the BLOCKING ``acquire`` (D-20) — fresh acquisition
+    # because Phase 1 released. We also assert mid-resume that the
+    # lock is observably held by THIS task (no overlap with any other
+    # ainvoke).
+    decision_payload = {"decision": "approve", "approver": "alice"}
+    async with registry.acquire(session_id):
+        assert registry.is_locked(session_id) is True, (
+            f"Phase 2: api _resume re-acquired the lock cleanly "
+            f"(langgraph={lg_version})"
+        )
+        result2 = await asyncio.wait_for(
+            compiled.ainvoke(Command(resume=decision_payload), config=cfg),
+            timeout=2.0,
+        )
+
+    # The node ran a SECOND time (from the top, per LangGraph's
+    # interrupt semantics) — the recorder appended a second entry to
+    # is_locked_before_interrupt, and the post-interrupt observation
+    # finally fired with the resume value delivered.
+    assert is_locked_before_interrupt == [True, True], (
+        f"second turn must have run inside the Phase-2 acquire() "
+        f"context (langgraph={lg_version}); "
+        f"observed: {is_locked_before_interrupt}"
+    )
+    assert is_locked_after_resume == [True], (
+        f"post-interrupt observation must have fired exactly once "
+        f"with is_locked=True (langgraph={lg_version}); "
+        f"observed: {is_locked_after_resume}"
+    )
+
+    # The graph reached END this time — result2 carries the
+    # node's return value (no __interrupt__).
+    assert isinstance(result2, dict)
+    assert "__interrupt__" not in result2, (
+        f"resume turn should run to END (langgraph={lg_version}); "
+        f"got {result2!r}"
+    )
+    assert result2.get("result") == decision_payload, (
+        f"interrupt(payload) must return the Command(resume=...) value "
+        f"unchanged (langgraph={lg_version}); got {result2!r}"
+    )
+
+    # ----- final state: lock released cleanly, no leak -----
+    assert registry.is_locked(session_id) is False, (
+        f"after _resume completes, the lock must be released "
+        f"(langgraph={lg_version})"
+    )
+
+    # ----- D-01 OUTCOME (Path A) -----
+    # The OBSERVED INVARIANT (replacing D-01's literal "lock held across
+    # the pause" wording) is:
+    #   "no two ainvoke calls hold the same thread_id simultaneously"
+    # which this test pins via the 5 transitions above
+    # (False → True → False → True → False) and the recorder showing
+    # both turns ran inside an acquire() context.
+    #
+    # If a future LangGraph release changes this (e.g. interrupt no
+    # longer returns control to the caller, or pre-interrupt is_locked
+    # observes False), the relevant assertion above fails with a
+    # message that prints langgraph version — easy to file as a
+    # supersession bump.
