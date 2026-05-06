@@ -465,10 +465,20 @@ def build_app(cfg: AppConfig) -> FastAPI:
         async def _resume() -> None:
             from langgraph.types import Command
 
-            await orch.graph.ainvoke(
-                Command(resume=decision_payload),
-                config=orch._thread_config(session_id),
-            )
+            # Per D-20: wrap the ainvoke in the per-session lock so an
+            # approval submission cannot interleave checkpoint writes
+            # against any other turn on the same thread_id. Uses the
+            # blocking ``acquire`` (not ``try_acquire``) — if a turn is
+            # mid-flight the approval waits for it to release; the
+            # service loop's overall request deadline bounds wait.
+            # Future fail-fast switch is a one-line change to
+            # try_acquire (the existing 429 handler at L484-489 already
+            # routes ``SessionBusy`` to HTTP 429).
+            async with orch._locks.acquire(session_id):
+                await orch.graph.ainvoke(
+                    Command(resume=decision_payload),
+                    config=orch._thread_config(session_id),
+                )
 
         # Submit the resume onto the long-lived service loop so we
         # don't fight the lifespan thread for the same FastMCP/SQLite

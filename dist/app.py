@@ -7158,6 +7158,36 @@ class SessionLockRegistry:
                 slot.owner = None
                 slot.lock.release()
 
+    @asynccontextmanager
+    async def try_acquire(self, session_id: str) -> AsyncIterator[None]:
+        """Acquire-or-fail. TOCTOU-free single-shot.
+
+        Raises :class:`SessionBusy` immediately if the lock is already
+        held; otherwise acquires and yields. Releases on exit.
+
+        Not task-reentrant: if the calling task already holds the lock,
+        this still raises. Callers that need reentry use :meth:`acquire`.
+
+        TOCTOU note: ``lock.locked()`` then ``lock.acquire()`` would have
+        a check/use window in a multi-threaded world, but asyncio is
+        single-threaded per loop and there is no ``await`` between the
+        check and the acquire — same-loop callers cannot interleave.
+        Cross-thread callers must not use this registry.
+        """
+        slot = self._slot(session_id)
+        if slot.lock.locked():
+            raise SessionBusy(session_id)
+        await slot.lock.acquire()
+        slot.owner = asyncio.current_task()
+        slot.depth = 1
+        try:
+            yield
+        finally:
+            slot.depth -= 1
+            if slot.depth == 0:
+                slot.owner = None
+                slot.lock.release()
+
 # ====== module: runtime/orchestrator.py ======
 
 if TYPE_CHECKING:
@@ -8670,10 +8700,20 @@ def build_app(cfg: AppConfig) -> FastAPI:
         async def _resume() -> None:
             from langgraph.types import Command
 
-            await orch.graph.ainvoke(
-                Command(resume=decision_payload),
-                config=orch._thread_config(session_id),
-            )
+            # Per D-20: wrap the ainvoke in the per-session lock so an
+            # approval submission cannot interleave checkpoint writes
+            # against any other turn on the same thread_id. Uses the
+            # blocking ``acquire`` (not ``try_acquire``) — if a turn is
+            # mid-flight the approval waits for it to release; the
+            # service loop's overall request deadline bounds wait.
+            # Future fail-fast switch is a one-line change to
+            # try_acquire (the existing 429 handler at L484-489 already
+            # routes ``SessionBusy`` to HTTP 429).
+            async with orch._locks.acquire(session_id):
+                await orch.graph.ainvoke(
+                    Command(resume=decision_payload),
+                    config=orch._thread_config(session_id),
+                )
 
         # Submit the resume onto the long-lived service loop so we
         # don't fight the lifespan thread for the same FastMCP/SQLite
