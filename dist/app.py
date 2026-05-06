@@ -1091,8 +1091,8 @@ class OrchestratorConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
     entry_agent: str = "intake"
-    # Signals an agent may emit (via ``update_incident.patch.signal``) that
-    # the router will accept and look up against the skill's ``routes`` table.
+    # Signals an agent may emit (via the configured patch tool's ``patch.signal``)
+    # that the router will accept and look up against the skill's ``routes`` table.
     # Anything outside this set falls through to ``when: default``. Override
     # in YAML to extend the vocabulary; the default keeps current behaviour.
     signals: list[str] = Field(
@@ -1122,6 +1122,40 @@ class OrchestratorConfig(BaseModel):
     # this name — ``incident_management`` uses ``needs_review``,
     # ``code_review`` uses ``unreviewed`` (D-06-06).
     default_terminal_status: str | None = None
+
+    # Tool names whose ``args.patch`` blob the harvester should fold
+    # into agent confidence/signal/rationale (DECOUPLE-02 generalization
+    # of the v1.0 single-tool path). Empty default means "no patch
+    # tools" so unconfigured apps pay nothing. Apps populate this in
+    # YAML alongside ``terminal_tools``; staying off the framework
+    # hardcoded path keeps generic-runtime free of app vocabulary
+    # leaks.
+    patch_tools: list[str] = Field(default_factory=list)
+
+    # Tool names the harvester should treat as "typed-terminal"
+    # (carrying flat ``confidence``/``confidence_rationale`` args and
+    # implying ``signal=success``) WITHOUT the orchestrator's finalize
+    # path firing a status transition for them. Used for tools that
+    # mark an agent stage complete but do not themselves end the
+    # session. Empty default means "no harvest-only tools". Distinct
+    # from ``terminal_tools`` (which both harvest and transition
+    # status).
+    harvest_terminal_tools: list[str] = Field(default_factory=list)
+
+    # Optional MCP tool the orchestrator invokes when a user clicks
+    # ``Escalate`` from the awaiting_input gate. ``None`` (default)
+    # means the orchestrator skips the tool call entirely and only
+    # transitions the session to the rule-driven status. Apps that
+    # want a side-effect (page on-call, file ticket) set this to the
+    # bare tool name; the orchestrator looks up the matching rule in
+    # ``terminal_tools`` to determine the resulting status.
+    escalate_action_tool_name: str | None = None
+
+    # Default team to pass to the escalation tool when the user did
+    # not pick one. Only meaningful if ``escalate_action_tool_name``
+    # is set. Apps own this default (``incident_management`` defaults
+    # to ``platform-oncall``).
+    escalate_action_default_team: str | None = None
 
     @model_validator(mode="after")
     def _validate_terminal_tool_registry(self) -> "OrchestratorConfig":
@@ -4156,15 +4190,6 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
-# NOTE: Hard-coding app-specific tool names here is a layering inversion —
-# the runtime should not need to know app-level tool identities. Task 9.1
-# (per-orchestrator MCP server) will move this to a registration mechanism
-# on the tool definition itself.
-_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
-    "mark_resolved", "mark_escalated", "submit_hypothesis",
-})
-
-
 def _harvest_typed_terminal(
     tc_args: dict,
     state: tuple[float | None, str | None, str | None],
@@ -4184,17 +4209,20 @@ def _harvest_typed_terminal(
     return conf, rat, sig
 
 
-def _harvest_update_incident(
+def _harvest_patch_tool(
     tc_args: dict,
     state: tuple[float | None, str | None, str | None],
     terminal_locked: bool,
     valid_signals: frozenset[str] | None,
 ) -> tuple[float | None, str | None, str | None]:
-    """Apply an ``update_incident.patch`` to the harvest state.
+    """Apply a configured patch-tool's ``args.patch`` blob to the
+    harvest state.
 
     When ``terminal_locked`` is True (a typed-terminal call already
     fired this session), confidence/rationale are pinned; only signal
-    can flow through.
+    can flow through. Generalises the v1.0 single-tool path —
+    apps register patch-tool names via
+    ``OrchestratorConfig.patch_tools``.
     """
     conf, rat, sig = state
     patch = tc_args.get("patch") or {}
@@ -4212,24 +4240,33 @@ def _harvest_tool_calls_and_patches(
     incident: Session,
     ts: str,
     valid_signals: frozenset[str] | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ) -> tuple[float | None, str | None, str | None]:
-    """Iterate agent messages, record ToolCall entries on the incident, and
+    """Iterate agent messages, record ToolCall entries on the session, and
     harvest confidence / confidence_rationale / signal from typed terminal
-    tools or legacy update_incident patches.
+    tools or app-declared patch tools.
 
-    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
-    carry confidence and rationale as flat kwargs; they imply
-    ``signal=success`` since invoking a terminal tool is the agent's
-    declaration that *its stage* completed cleanly — not that the
-    session itself was successfully resolved. The session-level
-    distinction (resolved vs escalated) is inferred separately from
-    tool_calls history by ``_finalize_session_status``. Non-terminal
-    agents emit routing signal via ``update_incident.patch.signal``.
+    Typed terminal tools (those whose bare name is in
+    ``terminal_tool_names``, supplied by the caller from
+    ``OrchestratorConfig.terminal_tools``) carry confidence and rationale
+    as flat kwargs; they imply ``signal=success`` since invoking a
+    terminal tool is the agent's declaration that *its stage* completed
+    cleanly — not that the session itself was successfully resolved.
+    The session-level outcome is inferred separately from tool_calls
+    history by ``_finalize_session_status``. Non-terminal agents emit
+    routing signal via patch-tool args.
+
+    ``patch_tool_names`` lists the bare tool names that ship a
+    ``patch:`` arg the harvester should merge. Empty default means
+    "no patch tools" so unconfigured apps pay nothing. Generalises
+    the v1.0 single-tool path; apps register patch-tool names via
+    ``OrchestratorConfig.patch_tools``.
 
     Once a typed terminal tool has fired, its confidence/rationale are
-    authoritative — a same-message update_incident.patch must not
-    override them. Signal still flows from later patches so triage-style
-    routing remains expressive.
+    authoritative — a same-message patch must not override them.
+    Signal still flows from later patches so triage-style routing
+    remains expressive.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
@@ -4247,11 +4284,11 @@ def _harvest_tool_calls_and_patches(
                 agent=skill_name, tool=tc_name, args=tc_args,
                 result=None, ts=ts,
             ))
-            if tc_original in _TYPED_TERMINAL_TOOLS:
+            if tc_original in terminal_tool_names:
                 state = _harvest_typed_terminal(tc_args, state, valid_signals)
                 terminal_locked = True
-            elif tc_original == "update_incident":
-                state = _harvest_update_incident(
+            elif tc_original in patch_tool_names:
+                state = _harvest_patch_tool(
                     tc_args, state, terminal_locked, valid_signals,
                 )
     return state
@@ -4361,6 +4398,8 @@ def make_agent_node(
     store: SessionStore,
     valid_signals: frozenset[str] | None = None,
     gateway_cfg: GatewayConfig | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -4374,6 +4413,13 @@ def make_agent_node(
     :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so
     the closure captures the live ``Session`` per agent invocation.
     When ``None``, tools are passed through untouched.
+
+    ``terminal_tool_names`` and ``patch_tool_names`` are the bare tool
+    names the harvester should treat as typed-terminal /
+    patch-emitting (sourced from ``OrchestratorConfig.terminal_tools``
+    union ``OrchestratorConfig.harvest_terminal_tools`` /
+    ``OrchestratorConfig.patch_tools``). Empty defaults preserve the
+    "no harvester recognition" behavior for legacy callers.
     """
 
     async def node(state: GraphState) -> dict:
@@ -4408,18 +4454,21 @@ def make_agent_node(
                 inc_id=inc_id, store=store, fallback=incident,
             )
 
-        # Tools (e.g. update_incident) write straight to disk. Reload so the
-        # node's own append of agent_run + tool_calls happens against the
-        # tool-mutated state — otherwise saving the stale in-memory object
-        # clobbers the tools' writes.
+        # Tools (e.g. registered patch tools) write straight to disk.
+        # Reload so the node's own append of agent_run + tool_calls
+        # happens against the tool-mutated state — otherwise saving
+        # the stale in-memory object clobbers the tools' writes.
         incident = store.load(inc_id)
 
         messages = result.get("messages", [])
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
-        # Record tool calls and harvest confidence/signal from update_incident patches.
+        # Record tool calls and harvest confidence/signal from configured
+        # patch / typed-terminal tools.
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
             messages, skill.name, incident, ts, valid_signals,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
         )
 
         # Pair tool responses with their tool calls.
@@ -4447,7 +4496,7 @@ def _decide_from_signal(inc: Session) -> str:
     """Return the latest agent's emitted signal, or "default" if absent.
 
     Agents emit one of {success, failed, needs_input} via the ``signal``
-    key of their final ``update_incident`` patch (see ``_coerce_signal``).
+    key of a configured patch tool (see ``_coerce_signal``).
     The node harvests it onto ``AgentRun.signal``; this decider then reads
     the *most recent* run (which is the one that just finished, since the
     node has already appended it). If no signal is present we return
@@ -4636,6 +4685,15 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     valid_signals = frozenset(cfg.orchestrator.signals)
     gateway_cfg = getattr(cfg.runtime, "gateway", None)
+    # Build the harvester's tool-name sets once per graph-build. The
+    # union of ``terminal_tools`` (status-transitioning) and
+    # ``harvest_terminal_tools`` (harvest-only) gives the full
+    # typed-terminal recognition surface for confidence/rationale
+    # capture; ``patch_tools`` carries the patch-blob harvester path.
+    terminal_tool_names = frozenset(
+        r.tool_name for r in cfg.orchestrator.terminal_tools
+    ) | frozenset(cfg.orchestrator.harvest_terminal_tools)
+    patch_tool_names = frozenset(cfg.orchestrator.patch_tools)
     nodes: dict = {}
     for agent_name, skill in skills.items():
         kind = getattr(skill, "kind", "responsive")
@@ -4668,6 +4726,8 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             decide_route=decide, store=store,
             valid_signals=valid_signals,
             gateway_cfg=gateway_cfg,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
         )
     return nodes
 
@@ -7489,42 +7549,6 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
-# Map terminal-tool name -> (status_to_set, team_arg_keys_to_check).
-# Both bare and ``<server>:<tool>`` forms are matched via suffix check.
-_TERMINAL_TOOL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("mark_escalated", "escalated", ("args.team", "result.team")),
-    ("mark_resolved", "resolved", ()),
-    # Legacy / forward-compat: direct notify_oncall page = escalation.
-    ("notify_oncall", "escalated", ("args.team",)),
-)
-
-
-def _extract_team(tc, lookup_keys: tuple[str, ...]) -> str | None:
-    """Pull a ``team`` value from a ToolCall's args/result by ``"args.team"``
-    / ``"result.team"`` lookup hints. Returns the first non-falsy match."""
-    args = tc.args if isinstance(tc.args, dict) else {}
-    result = tc.result if isinstance(tc.result, dict) else {}
-    for key in lookup_keys:
-        scope, _, attr = key.partition(".")
-        source = args if scope == "args" else result
-        value = source.get(attr)
-        if value:
-            return value
-    return None
-
-
-def _infer_terminal_decision(tool_calls) -> tuple[str, str | None] | None:
-    """Walk executed tool_calls latest-first; return (new_status, team)
-    for the first matching terminal tool, or None if no rule fires."""
-    for tc in reversed([tc for tc in tool_calls
-                        if getattr(tc, "status", None) == "executed"]):
-        tool_name = tc.tool or ""
-        for bare, status, team_keys in _TERMINAL_TOOL_RULES:
-            if tool_name == bare or tool_name.endswith(f":{bare}"):
-                return status, _extract_team(tc, team_keys)
-    return None
-
-
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -7864,12 +7888,20 @@ class Orchestrator(Generic[StateT]):
         """Transition a graph-completed session to a terminal status by
         INFERRING from tool-call history.
 
-        Inference rules (latest executed tool wins):
-          * ``mark_escalated`` -> ``escalated`` (with ``escalated_to``)
-          * ``mark_resolved``  -> ``resolved``
-          * ``notify_oncall`` (legacy direct path) -> ``escalated``
-          * Otherwise -> ``needs_review`` (graph ran to __end__ without
-            the agent declaring a terminal intent).
+        Inference walks the configured terminal-tool rules in
+        ``self.cfg.orchestrator.terminal_tools`` (D-06-01, D-06-08) and
+        the latest executed tool call wins. When no rule fires, the
+        session falls through to
+        ``self.cfg.orchestrator.default_terminal_status`` — apps own
+        this name (D-06-06).
+
+        Per-rule ``extract_fields`` populate ``inc.extra_fields`` with
+        whatever metadata the app declared (D-06-02; preserves the
+        v1.0 ``team`` capture for the escalation flow). When the
+        matched rule's status has ``kind="escalation"``, the
+        ``team`` extract is mirrored to ``extra_fields["escalated_to"]``
+        so existing UIs reading the v1.0 key continue to work
+        (D-06-05 — kind-based dispatch).
 
         Sessions already in a terminal status are left untouched.
         """
@@ -7880,18 +7912,91 @@ class Orchestrator(Generic[StateT]):
         if inc.status not in ("new", "in_progress"):
             return None
 
-        decision = _infer_terminal_decision(inc.tool_calls)
+        decision = self._infer_terminal_decision(inc.tool_calls)
         if decision is None:
-            inc.status = "needs_review"
+            default = self.cfg.orchestrator.default_terminal_status
+            if default is None:
+                # App did not declare a default — leave the session
+                # alone rather than blind-coerce. Production apps
+                # always configure it (cross-validated at config-load
+                # whenever ``statuses`` is populated).
+                return None
+            inc.status = default
             inc.extra_fields["needs_review_reason"] = (
                 "graph completed without terminal tool call"
             )
-            return self._save_or_yield(inc, "needs_review")
-        new_status, team = decision
+            return self._save_or_yield(inc, default)
+
+        new_status, extracted = decision
         inc.status = new_status
-        if team:
-            inc.extra_fields["escalated_to"] = team
+        for key, value in extracted.items():
+            if value:
+                inc.extra_fields[key] = value
+        # v1.0 compatibility: mirror ``team`` into the historical
+        # ``escalated_to`` extra-field key when the matched status is
+        # an escalation (D-06-05 kind-based dispatch). Keeps generic-
+        # framework code free of escalation vocabulary while preserving
+        # the contract existing UIs read.
+        status_def = self.cfg.orchestrator.statuses.get(new_status)
+        if status_def is not None and status_def.kind == "escalation":
+            team = extracted.get("team")
+            if team:
+                inc.extra_fields["escalated_to"] = team
         return self._save_or_yield(inc, new_status)
+
+    def _infer_terminal_decision(
+        self, tool_calls,
+    ) -> tuple[str, dict[str, str]] | None:
+        """Walk executed tool_calls latest-first; return
+        ``(new_status, extracted_fields_dict)`` for the first matching
+        configured rule, or ``None`` if no rule fires.
+
+        Replaces the v1.0 module-level ``_infer_terminal_decision``;
+        instance-method shape (D-06-08) lets us read ``self.cfg``
+        without constructor plumbing. Empty
+        ``self.cfg.orchestrator.terminal_tools`` (the framework
+        default) short-circuits to ``None`` so unconfigured apps
+        behave as if no rule fires.
+        """
+        rules = self.cfg.orchestrator.terminal_tools
+        if not rules:
+            return None
+        executed = [
+            tc for tc in tool_calls
+            if getattr(tc, "status", None) == "executed"
+        ]
+        for tc in reversed(executed):
+            tool_name = tc.tool or ""
+            for rule in rules:
+                bare = rule.tool_name
+                if tool_name == bare or tool_name.endswith(f":{bare}"):
+                    extracted = {
+                        dest: self._extract_field(tc, lookup_keys)
+                        for dest, lookup_keys in rule.extract_fields.items()
+                    }
+                    return rule.status, {
+                        k: v for k, v in extracted.items() if v
+                    }
+        return None
+
+    def _extract_field(
+        self, tc, lookup_keys: list[str],
+    ) -> str | None:
+        """Pull a field value from a ToolCall's args/result via
+        ``args.X`` / ``result.X`` lookup hints. Returns the first
+        non-falsy match, or ``None``. Generalised from v1.0
+        ``_extract_team`` (D-06-02, D-06-08) — same lookup syntax,
+        no longer pinned to the ``team`` field name.
+        """
+        args = tc.args if isinstance(tc.args, dict) else {}
+        result = tc.result if isinstance(tc.result, dict) else {}
+        for key in lookup_keys:
+            scope, _, attr = key.partition(".")
+            source = args if scope == "args" else result
+            value = source.get(attr)
+            if value:
+                return value
+        return None
 
     def _save_or_yield(self, inc, new_status: str) -> str | None:
         """Save with stale-version protection. Returns ``new_status`` on
@@ -8175,9 +8280,14 @@ class Orchestrator(Generic[StateT]):
             return
 
         if action == "escalate":
-            team = decision.get("team") or "platform-oncall"
+            tool_name = self.cfg.orchestrator.escalate_action_tool_name
+            default_team = self.cfg.orchestrator.escalate_action_default_team
+            team = decision.get("team") or default_team
             allowed = list(self.framework_cfg.escalation_teams)
-            if team not in allowed:
+            # Only enforce roster membership when the framework is
+            # actually configured with one — apps without a roster
+            # accept any team string.
+            if allowed and team is not None and team not in allowed:
                 # Reject the request entirely. The INC stays awaiting_input
                 # so the user can retry with a valid team. Logging the
                 # allowed roster on the event makes it actionable in the UI.
@@ -8188,27 +8298,71 @@ class Orchestrator(Generic[StateT]):
                        ),
                        "ts": _event_ts()}
                 return
-            message = (
-                f"INC {incident_id} escalated by user — team {team}. "
-                "Confidence below threshold."
-            )
-            tool_args = {"incident_id": incident_id, "message": message,
-                         "team": team}
-            tool_result = await self._invoke_tool("notify_oncall", tool_args)
-            inc = self.store.load(incident_id)
-            inc.tool_calls.append(ToolCall(
-                agent="orchestrator",
-                tool="notify_oncall",
-                args=tool_args,
-                result=tool_result,
-                ts=_event_ts(),
-            ))
-            inc.status = "escalated"
-            inc.extra_fields["escalated_to"] = team
-            inc.pending_intervention = None
-            self.store.save(inc)
-            yield {"event": "resume_completed", "incident_id": incident_id,
-                   "status": "escalated", "team": team, "ts": _event_ts()}
+
+            # Look up the rule for the configured escalation tool so
+            # status assignment and extra-field key are driven by the
+            # registry rather than hardcoded vocabulary.
+            rule = None
+            if tool_name is not None:
+                for r in self.cfg.orchestrator.terminal_tools:
+                    if r.tool_name == tool_name:
+                        rule = r
+                        break
+
+            inc_loaded = self.store.load(incident_id)
+            if tool_name is not None:
+                # App registered a side-effect tool; invoke it and record
+                # the tool-call so finalize-style introspection sees it.
+                message = (
+                    f"Session {incident_id} escalated by user"
+                    + (f" — team {team}." if team else ".")
+                    + " Confidence below threshold."
+                )
+                tool_args: dict = {"incident_id": incident_id, "message": message}
+                if team is not None:
+                    tool_args["team"] = team
+                tool_result = await self._invoke_tool(tool_name, tool_args)
+                inc_loaded.tool_calls.append(ToolCall(
+                    agent="orchestrator",
+                    tool=tool_name,
+                    args=tool_args,
+                    result=tool_result,
+                    ts=_event_ts(),
+                ))
+
+            # Status assignment: prefer the rule's declared status; fall
+            # back to default_terminal_status when no rule registered.
+            if rule is not None:
+                new_status = rule.status
+            else:
+                new_status = (
+                    self.cfg.orchestrator.default_terminal_status
+                    or inc_loaded.status
+                )
+            inc_loaded.status = new_status
+            # Capture team via the rule's first extract-field destination
+            # (typically ``team``). When no rule registered the field but
+            # team is present, fall back to ``team`` for stability.
+            if team is not None:
+                if rule is not None and rule.extract_fields:
+                    first_dest = next(iter(rule.extract_fields.keys()))
+                    inc_loaded.extra_fields[first_dest] = team
+                else:
+                    inc_loaded.extra_fields["team"] = team
+                # v1.0 compat: mirror to ``escalated_to`` when the new
+                # status is kind=escalation, matching finalize semantics.
+                status_def = self.cfg.orchestrator.statuses.get(new_status)
+                if status_def is not None and status_def.kind == "escalation":
+                    inc_loaded.extra_fields["escalated_to"] = team
+            inc_loaded.pending_intervention = None
+            self.store.save(inc_loaded)
+            event_payload: dict = {
+                "event": "resume_completed", "incident_id": incident_id,
+                "status": new_status, "ts": _event_ts(),
+            }
+            if team is not None:
+                event_payload["team"] = team
+            yield event_payload
             return
 
         if action == "resume_with_input":
@@ -8366,8 +8520,9 @@ class Orchestrator(Generic[StateT]):
         """Call an MCP tool by original name, going through the LangChain wrapper.
 
         Searches the registry for any entry whose original ``name`` matches.
-        Used for orchestrator-driven tool calls (e.g. notify_oncall on
-        escalate) that aren't initiated by an LLM.
+        Used for orchestrator-driven tool calls (e.g. an app-registered
+        escalation tool invoked from the awaiting_input gate) that aren't
+        initiated by an LLM.
         """
         entry = next(
             (e for e in self.registry.entries.values() if e.name == name),
