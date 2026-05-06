@@ -345,6 +345,7 @@ class Orchestrator(Generic[StateT]):
                              if cfg.storage.vector.backend == "faiss" else None),
                 vector_index_name=cfg.storage.vector.collection_name,
                 distance_strategy=cfg.storage.vector.distance_strategy,
+                id_prefix=framework_cfg.session_id_prefix,
             )
             history = HistoryStore(
                 engine=engine,

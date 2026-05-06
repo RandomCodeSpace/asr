@@ -73,6 +73,9 @@ paths:
 # ``config/incident_management.yaml`` carries — kept here so the
 # bundled deployment config is self-contained.
 framework:
+  # Per-app session-id prefix. Threaded through SessionStore into
+  # Session.id_format so this app's rows look like INC-YYYYMMDD-NNN.
+  session_id_prefix: INC
   confidence_threshold: 0.75
   similarity_threshold: 0.2
   escalation_teams:

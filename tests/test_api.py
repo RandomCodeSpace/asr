@@ -96,7 +96,11 @@ async def test_investigate_endpoint_creates_incident(cfg):
         )
     assert res.status_code == 200
     body = res.json()
-    assert body["incident_id"].startswith("INC-")
+    # The test fixture builds AppConfig without overriding
+    # ``session_id_prefix``, so the framework default ``SES`` applies.
+    # Real deployments (config/incident_management.yaml) set
+    # ``session_id_prefix: INC`` and get ``INC-`` ids.
+    assert body["incident_id"].startswith("SES-")
 
 
 @pytest.mark.asyncio

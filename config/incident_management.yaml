@@ -12,6 +12,9 @@ similarity_method: keyword
 
 # Cross-cutting framework knobs the runtime consumes directly.
 framework:
+  # Per-app session-id prefix. Threaded through SessionStore into
+  # Session.id_format so this app's rows look like INC-YYYYMMDD-NNN.
+  session_id_prefix: INC
   confidence_threshold: 0.75
   similarity_threshold: 0.2
   escalation_teams:

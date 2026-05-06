@@ -62,7 +62,10 @@ async def test_start_investigation_creates_incident_and_runs_graph(cfg):
     orch = await Orchestrator.create(cfg)
     try:
         inc_id = await orch.start_investigation(query="api latency", environment="production")
-        assert inc_id.startswith("INC-")
+        # Test fixture builds AppConfig without overriding
+        # ``session_id_prefix``, so the framework default ``SES``
+        # applies. Real deployments configure this in YAML.
+        assert inc_id.startswith("SES-")
         inc = orch.get_incident(inc_id)
         # Stub LLM emits no confidence → gate halts and marks awaiting_input.
         assert inc["status"] in {

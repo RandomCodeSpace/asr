@@ -32,9 +32,10 @@ def store(tmp_path) -> SessionStore:
 def test_create_assigns_sequential_ids(store):
     inc1 = store.create(query="A", environment="dev", reporter_id="u1", reporter_team="t")
     inc2 = store.create(query="B", environment="dev", reporter_id="u1", reporter_team="t")
-    # Both must match INC-YYYYMMDD-NNN pattern and be sequential
-    assert inc1.id.startswith("INC-")
-    assert inc2.id.startswith("INC-")
+    # Both must match the framework default PREFIX-YYYYMMDD-NNN shape
+    # (``SES-`` — apps configure their own via session_id_prefix).
+    assert inc1.id.startswith("SES-")
+    assert inc2.id.startswith("SES-")
     seq1 = int(inc1.id.rsplit("-", 1)[1])
     seq2 = int(inc2.id.rsplit("-", 1)[1])
     assert seq2 == seq1 + 1

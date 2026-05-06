@@ -38,6 +38,10 @@ orchestrator:
   entry_agent: intake
 # Cross-cutting framework knobs read directly off AppConfig.framework.
 framework:
+  # Per-app session-id prefix. Threaded through SessionStore into
+  # Session.id_format so this app's rows look like REVIEW-YYYYMMDD-NNN
+  # — disjoint from the incident-management ``INC-`` namespace.
+  session_id_prefix: REVIEW
   confidence_threshold: 0.7
   similarity_threshold: 0.3
   escalation_teams: []

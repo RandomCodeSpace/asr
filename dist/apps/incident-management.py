@@ -6,10 +6,15 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
 
 
+# Session-id prefix grammar. The framework mints session ids of the form
+# ``{PREFIX}-YYYYMMDD-NNN`` (see ``runtime.state.Session.id_format``);
+# the prefix is the only piece an app picks. Allow alphanumerics + hyphens,
+# bound the length so the id stays scannable in logs and DB indexes, and
+# refuse the empty string so the resulting id never starts with a stray ``-``.
 # ----- imports for runtime/state.py -----
 """Generic session model — the framework's unit of work.
 
@@ -103,7 +108,6 @@ instead of at runtime. Three kinds are supported:
 
 import ast
 from typing import Any, Callable, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ----- imports for runtime/llm.py -----
@@ -664,6 +668,7 @@ each example app's YAML opts in.
 import enum
 from typing import Any, Callable, Generic, Literal, TYPE_CHECKING, TypeVar
 
+from pydantic import BaseModel, Field, model_validator
 
 # ----- imports for runtime/intake.py -----
 """Framework default intake runner.
@@ -990,6 +995,9 @@ from typing import Any, Callable, TypedDict
 
 # ====== module: runtime/config.py ======
 
+_SESSION_ID_PREFIX_RE = re.compile(r"^[A-Za-z0-9-]{1,16}$")
+
+
 ProviderKind = Literal["ollama", "azure_openai", "stub"]
 
 
@@ -1292,11 +1300,28 @@ class FrameworkAppConfig(BaseModel):
     # Intake runner knobs: forwarded into IntakeContext at graph-build time.
     intake_top_k: int = 3
     intake_similarity_threshold: float = 0.7
+    # Per-app session-id prefix. Threaded through ``SessionStore`` to
+    # ``Session.id_format`` so each app picks its own id namespace
+    # (``INC`` for incident management, ``REVIEW`` for code review,
+    # ``HR`` for HR cases, ...). Default ``"SES"`` keeps unconfigured
+    # apps generic. Validated as 1-16 chars of alphanumerics and
+    # hyphens so the resulting id stays scannable.
+    session_id_prefix: str = "SES"
     # UI rendering knobs surfaced to the generic runtime UI. Mirrors
     # AppConfig.ui — the FrameworkAppConfig provider can either copy
     # AppConfig.ui or supply its own. Defaults to empty so apps that
     # don't render with the generic UI pay nothing.
     ui: UIConfig = Field(default_factory=UIConfig)
+
+    @field_validator("session_id_prefix")
+    @classmethod
+    def _validate_session_id_prefix(cls, v: str) -> str:
+        if not _SESSION_ID_PREFIX_RE.match(v):
+            raise ValueError(
+                f"session_id_prefix={v!r} must be 1-16 chars of "
+                "alphanumerics and hyphens (no whitespace, no symbols)"
+            )
+        return v
 
 
 def resolve_framework_app_config(
@@ -1572,14 +1597,15 @@ class Session(BaseModel):
     # App-overridable session id minting hook.
     # ------------------------------------------------------------------
     @classmethod
-    def id_format(cls, *, seq: int) -> str:
+    def id_format(cls, *, seq: int, prefix: str = "SES") -> str:
         """Return the canonical session id for the given sequence number.
 
-        Apps override this on their ``Session`` subclass to produce an
-        id format that suits their domain (e.g. ``PR-{repo}-{number}``
-        for code review). The framework default keeps the legacy
-        ``INC-YYYYMMDD-NNN`` shape so existing on-disk rows and any app
-        that has not opted in continue to round-trip cleanly.
+        ``prefix`` is supplied by ``SessionStore._next_id`` from
+        ``FrameworkAppConfig.session_id_prefix`` so each app picks its
+        own namespace via plain config (e.g. ``INC`` for incident
+        management, ``REVIEW`` for code review, ``HR`` for HR cases,
+        ...). Apps with truly bespoke id shapes can still override this
+        classmethod on their ``Session`` subclass and ignore ``prefix``.
 
         ``seq`` is the per-day monotonic sequence supplied by
         ``SessionStore._next_id``; it lets the default format produce
@@ -1589,7 +1615,7 @@ class Session(BaseModel):
         from datetime import datetime, timezone
 
         today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        return f"INC-{today}-{seq:03d}"
+        return f"{prefix}-{today}-{seq:03d}"
 
 # ====== module: runtime/state_resolver.py ======
 
@@ -2876,6 +2902,7 @@ class SessionStore(Generic[StateT]):
         vector_path: Optional[str] = None,
         vector_index_name: str = "incidents",
         distance_strategy: str = "cosine",
+        id_prefix: str = "SES",
     ) -> None:
         self.engine = engine
         self._state_cls = state_cls
@@ -2884,24 +2911,30 @@ class SessionStore(Generic[StateT]):
         self.vector_path = vector_path
         self.vector_index_name = vector_index_name
         self.distance_strategy = distance_strategy
+        # Per-app session-id namespace. Threaded into
+        # ``state_cls.id_format`` so each app's rows share a stable
+        # ``PREFIX-YYYYMMDD-NNN`` shape. Default ``"SES"`` keeps the
+        # bare-Session path framework-neutral; apps configure this
+        # via ``FrameworkAppConfig.session_id_prefix``.
+        self._id_prefix = id_prefix
 
     # ---------- ID minting ----------
     def _next_id(self, session: SqlSession) -> str:
         """Mint a new session id via ``state_cls.id_format(seq=...)``.
 
-        The per-app id format lives on the ``Session`` subclass so each
-        app picks its own prefix (``INC-`` for incidents, ``CR-`` for
-        code-review, anything else custom apps want). The store still
-        owns the monotonic sequence — it scans for prior rows whose id
-        starts with the same ``PREFIX-YYYYMMDD-`` stem and returns
-        ``max(seq) + 1``.
+        The per-app id namespace is supplied as ``self._id_prefix`` (from
+        ``FrameworkAppConfig.session_id_prefix``); ``id_format`` may
+        also be overridden on the state subclass for fully bespoke
+        shapes. The store still owns the monotonic sequence — it scans
+        for prior rows whose id starts with the same ``PREFIX-YYYYMMDD-``
+        stem and returns ``max(seq) + 1``.
         """
         # Probe today's prefix by asking the state class to format seq=1
         # and stripping the ``-001`` suffix. Apps that override
         # ``id_format`` to return a non-``PREFIX-YYYYMMDD-NNN`` shape
         # (e.g. opaque ULIDs) fall through to the simple count path
         # below.
-        sample = self._state_cls.id_format(seq=1)
+        sample = self._state_cls.id_format(seq=1, prefix=self._id_prefix)
         m = _SESSION_ID_RE.match(sample)
         if m is None:
             # Custom format — count all rows as the sequence base. Apps
@@ -2910,7 +2943,9 @@ class SessionStore(Generic[StateT]):
             count = session.execute(
                 select(IncidentRow.id)
             ).scalars().all()
-            return self._state_cls.id_format(seq=len(count) + 1)
+            return self._state_cls.id_format(
+                seq=len(count) + 1, prefix=self._id_prefix,
+            )
 
         # Extract the ``PREFIX-YYYYMMDD-`` stem (everything up to and
         # including the second hyphen).
@@ -2925,7 +2960,9 @@ class SessionStore(Generic[StateT]):
                 max_seq = max(max_seq, int(r.rsplit("-", 1)[1]))
             except (ValueError, IndexError):
                 continue
-        return self._state_cls.id_format(seq=max_seq + 1)
+        return self._state_cls.id_format(
+            seq=max_seq + 1, prefix=self._id_prefix,
+        )
 
     # ---------- public API ----------
     def create(self, *, query: str, environment: str,
@@ -7546,6 +7583,7 @@ class Orchestrator(Generic[StateT]):
                              if cfg.storage.vector.backend == "faiss" else None),
                 vector_index_name=cfg.storage.vector.collection_name,
                 distance_strategy=cfg.storage.vector.distance_strategy,
+                id_prefix=framework_cfg.session_id_prefix,
             )
             history = HistoryStore(
                 engine=engine,

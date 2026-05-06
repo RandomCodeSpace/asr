@@ -4,8 +4,16 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
+
+
+# Session-id prefix grammar. The framework mints session ids of the form
+# ``{PREFIX}-YYYYMMDD-NNN`` (see ``runtime.state.Session.id_format``);
+# the prefix is the only piece an app picks. Allow alphanumerics + hyphens,
+# bound the length so the id stays scannable in logs and DB indexes, and
+# refuse the empty string so the resulting id never starts with a stray ``-``.
+_SESSION_ID_PREFIX_RE = re.compile(r"^[A-Za-z0-9-]{1,16}$")
 
 
 ProviderKind = Literal["ollama", "azure_openai", "stub"]
@@ -310,11 +318,28 @@ class FrameworkAppConfig(BaseModel):
     # Intake runner knobs: forwarded into IntakeContext at graph-build time.
     intake_top_k: int = 3
     intake_similarity_threshold: float = 0.7
+    # Per-app session-id prefix. Threaded through ``SessionStore`` to
+    # ``Session.id_format`` so each app picks its own id namespace
+    # (``INC`` for incident management, ``REVIEW`` for code review,
+    # ``HR`` for HR cases, ...). Default ``"SES"`` keeps unconfigured
+    # apps generic. Validated as 1-16 chars of alphanumerics and
+    # hyphens so the resulting id stays scannable.
+    session_id_prefix: str = "SES"
     # UI rendering knobs surfaced to the generic runtime UI. Mirrors
     # AppConfig.ui — the FrameworkAppConfig provider can either copy
     # AppConfig.ui or supply its own. Defaults to empty so apps that
     # don't render with the generic UI pay nothing.
     ui: UIConfig = Field(default_factory=UIConfig)
+
+    @field_validator("session_id_prefix")
+    @classmethod
+    def _validate_session_id_prefix(cls, v: str) -> str:
+        if not _SESSION_ID_PREFIX_RE.match(v):
+            raise ValueError(
+                f"session_id_prefix={v!r} must be 1-16 chars of "
+                "alphanumerics and hyphens (no whitespace, no symbols)"
+            )
+        return v
 
 
 def resolve_framework_app_config(
