@@ -1,6 +1,7 @@
 """LangGraph state, routing helpers, and node runner."""
 from __future__ import annotations
 import asyncio
+import json
 import logging
 from typing import Any, TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
@@ -416,6 +417,50 @@ def _sum_token_usage(messages: list) -> TokenUsage:
     )
 
 
+def _try_recover_envelope_from_raw(raw: str) -> AgentTurnOutput | None:
+    """Attempt to extract an :class:`AgentTurnOutput` from a raw LLM
+    string when LangGraph's structured-output pass raised
+    ``OutputParserException``.
+
+    Strategy:
+    1. Parse the whole string as JSON.
+    2. If that fails, scan for the first balanced ``{...}`` substring
+       and try parsing that (handles markdown-fenced JSON or trailing
+       chatter).
+    3. Validate the parsed dict against :class:`AgentTurnOutput`.
+
+    Returns the parsed envelope on success, ``None`` on any failure.
+    """
+    if not raw or not raw.strip():
+        return None
+    candidates: list[str] = [raw]
+    # Markdown-fenced JSON: ```json\n{...}\n```
+    if "```" in raw:
+        for chunk in raw.split("```"):
+            stripped = chunk.strip()
+            if stripped.startswith("json"):
+                stripped = stripped[4:].lstrip()
+            if stripped.startswith("{"):
+                candidates.append(stripped)
+    # Greedy: first '{' through last '}'
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if 0 <= first < last:
+        candidates.append(raw[first:last + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            return AgentTurnOutput.model_validate(payload)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def _handle_agent_failure(
     *,
     skill_name: str,
@@ -630,10 +675,46 @@ def make_agent_node(
             # interrupt-aware bridge, NOT _handle_agent_failure.
             raise
         except Exception as exc:  # noqa: BLE001
-            return _handle_agent_failure(
-                skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
-            )
+            # Phase 10 follow-up: when LangGraph's structured-output pass
+            # raises ``OutputParserException`` (Ollama / non-OpenAI
+            # providers don't always honor ``response_format`` cleanly),
+            # try to recover by parsing the raw LLM output ourselves.
+            # The exception's ``llm_output`` carries the model's reply
+            # verbatim; if it contains JSON matching the envelope schema,
+            # build a synthetic ``result`` and continue. On unrecoverable
+            # failure, log the raw output for diagnosis and fall through
+            # to ``_handle_agent_failure``.
+            try:
+                from langchain_core.exceptions import OutputParserException
+            except ImportError:  # pragma: no cover — langchain always present
+                OutputParserException = ()  # type: ignore[assignment]
+            if isinstance(exc, OutputParserException):
+                raw = getattr(exc, "llm_output", "") or ""
+                logger.warning(
+                    "agent.structured_output_parse_failure agent=%s "
+                    "raw_len=%d raw_preview=%r",
+                    skill.name, len(raw), raw[:500],
+                )
+                recovered = _try_recover_envelope_from_raw(raw)
+                if recovered is not None:
+                    logger.info(
+                        "agent.structured_output_recovered agent=%s",
+                        skill.name,
+                    )
+                    result = {
+                        "messages": [],
+                        "structured_response": recovered,
+                    }
+                else:
+                    return _handle_agent_failure(
+                        skill_name=skill.name, started_at=started_at, exc=exc,
+                        inc_id=inc_id, store=store, fallback=incident,
+                    )
+            else:
+                return _handle_agent_failure(
+                    skill_name=skill.name, started_at=started_at, exc=exc,
+                    inc_id=inc_id, store=store, fallback=incident,
+                )
 
         # Tools (e.g. registered patch tools) write straight to disk.
         # Reload so the node's own append of agent_run + tool_calls

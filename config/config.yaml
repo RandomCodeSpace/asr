@@ -24,7 +24,7 @@ llm:
   models:
     workhorse:
       provider: ollama_cloud
-      model: gpt-oss:120b
+      model: gemma4:31b-cloud
       temperature: 0.0
     cheap:
       provider: ollama_cloud

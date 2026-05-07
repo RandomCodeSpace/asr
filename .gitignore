@@ -54,6 +54,8 @@ docs/
 REVIEW_*.md
 review_*.md
 .planning/
+# Dev integration test driver (out-of-repo tool, runs against live UI).
+scripts/integration_scenarios.py
 
 # Coverage / CI artefacts
 coverage.xml

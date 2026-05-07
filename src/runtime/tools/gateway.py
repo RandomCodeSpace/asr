@@ -260,6 +260,19 @@ def wrap_tool(
     else:
         _llm_visible_schema = inner.args_schema
 
+    # Phase 9 follow-up: compute the set of param names the inner tool
+    # actually accepts so injection skips keys the target tool doesn't
+    # declare. Without this filter, a config-wide ``injected_args``
+    # entry like ``session_id: session.id`` is unconditionally written
+    # to every tool's kwargs — tools that don't accept ``session_id``
+    # then raise pydantic ``unexpected_keyword`` errors at the FastMCP
+    # validation boundary.
+    _full_schema = inner.args_schema
+    if _full_schema is not None and hasattr(_full_schema, "model_fields"):
+        _accepted_params: frozenset[str] = frozenset(_full_schema.model_fields.keys())
+    else:
+        _accepted_params = frozenset()
+
     def _sync_invoke_inner(payload: Any) -> Any:
         """Sync-invoke the inner tool, translating BaseTool's
         default-``_run`` ``NotImplementedError`` into a clearer message
@@ -297,6 +310,7 @@ def wrap_tool(
                     session=session,
                     injected_args_cfg=inject_cfg,
                     tool_name=inner.name,
+                    accepted_params=_accepted_params or None,
                 )
             # Phase 11 (FOC-04): pure-policy gating boundary. Call
             # should_gate to decide whether to pause for HITL approval;
@@ -458,6 +472,7 @@ def wrap_tool(
                     session=session,
                     injected_args_cfg=inject_cfg,
                     tool_name=inner.name,
+                    accepted_params=_accepted_params or None,
                 )
             # Phase 11 (FOC-04): pure-policy gating boundary. Mirror of
             # the sync ``_run`` -- consult should_gate via

@@ -134,6 +134,7 @@ def inject_injected_args(
     session: Session,
     injected_args_cfg: dict[str, str],
     tool_name: str,
+    accepted_params: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Return a NEW dict with each injected arg resolved from ``session``.
 
@@ -151,9 +152,30 @@ def inject_injected_args(
     * Missing/None resolutions are skipped. The arg is left absent so
       the tool's own default-handling (or the MCP server's required-arg
       validator) decides what to do — never silently ``None``.
+    * When ``accepted_params`` is provided, injected keys not present in
+      that set are skipped. Prevents writing kwargs the target tool
+      doesn't accept (which would raise pydantic ``unexpected_keyword``
+      validation errors at the FastMCP boundary).
     """
     out = dict(tool_args)
     for arg_name, path in injected_args_cfg.items():
+        if accepted_params is not None and arg_name not in accepted_params:
+            # The tool doesn't declare this injectable param. Strip any
+            # LLM-supplied value too — the LLM shouldn't be emitting it
+            # (Phase 9 strips injectable keys from the LLM-visible sig)
+            # and forwarding it to the tool would raise pydantic
+            # ``unexpected_keyword`` at the FastMCP boundary.
+            if arg_name in out:
+                _LOG.info(
+                    "tool_call.injected_arg_dropped tool=%s arg=%s "
+                    "llm_value=%r reason=not_accepted_by_tool session_id=%s",
+                    tool_name,
+                    arg_name,
+                    out[arg_name],
+                    getattr(session, "id", "?"),
+                )
+                del out[arg_name]
+            continue
         framework_value = _resolve_dotted(session, path)
         if framework_value is None:
             continue
