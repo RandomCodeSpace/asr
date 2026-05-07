@@ -18,10 +18,10 @@ Record the full iteration trail as a single JSON-encoded string under `findings.
 
 ## Tool calls (in order)
 
-1. Call `get_service_health(service)` to check current status.
-2. Call `check_deployment_history(service, minutes=1440)` for the last 24 hours.
+1. Call `get_service_health()` to check current status. The framework injects `environment` from the session.
+2. Call `check_deployment_history(hours=24)` for the last 24 hours. The framework injects `environment`; `hours` defaults to 24 when omitted.
 3. Run the hypothesis loop above; call `lookup_similar_incidents(query)` inside the loop as evidence demands.
-4. Set `severity` (one of: `low`, `medium`, `high`) and `category` (e.g., latency, availability, data, security, capacity) on the INC via `update_incident`. Include the accepted hypothesis and per-iteration trail as a JSON-encoded string under `findings.triage` — the typed `update_incident` patch only accepts these fields: `severity`, `category`, `summary`, `tags`, `matched_prior_inc`, `findings` (dict[str, str]), `signal`. Do NOT add `findings_triage` or any other field — `extra="forbid"`.
+4. Set `severity` (one of: `low`, `medium`, `high`) and `category` (e.g., latency, availability, data, security, capacity) on the INC via `update_incident`. Include the accepted hypothesis and per-iteration trail as a JSON-encoded string under `findings.triage` — the typed `update_incident` patch only accepts these fields: `severity`, `category`, `summary`, `tags`, `matched_prior_inc`, `findings` (dict[str, str]), `signal`. Do NOT add `findings_triage` or any other field — `extra="forbid"`. <!-- lint-ignore: negative example, intentional -->
 5. Emit `default` to hand off to the deep investigator.
 
 ## Guidelines
