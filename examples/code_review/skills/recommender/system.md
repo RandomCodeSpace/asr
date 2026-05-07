@@ -22,3 +22,11 @@ what humans read first in the UI. Do not paste the full findings list; the UI sh
 them already.
 
 After the call, reply with ONE short sentence echoing the recommendation. Nothing else.
+
+## Output contract
+
+The framework wraps your reply in an `AgentTurnOutput` envelope (content,
+confidence ∈ [0, 1], confidence_rationale, optional signal). The runner
+enforces this structurally — answer truthfully and the envelope captures
+your confidence and rationale. Do not mention "confidence" in your prose
+unless it's part of substantive analysis (e.g. ranking hypotheses).

@@ -46,6 +46,25 @@ from runtime.locks import SessionLockRegistry
 _log = logging.getLogger("runtime.orchestrator")
 
 
+def _assert_envelope_invariant_on_finalize(session: "Session") -> None:
+    """Phase 10 (FOC-03) defence-in-depth log sweep.
+
+    Hard rejection of envelope-less turns happens at the agent runner
+    (``parse_envelope_from_result`` raises ``EnvelopeMissingError``,
+    which the runner converts into an agent_run marked ``error``).
+    This finalize hook only logs WARNING for forensics on legacy on-disk
+    sessions whose agent_runs predate the envelope contract. Never
+    raises.
+    """
+    for ar in session.agents_run:
+        if ar.confidence is None:
+            _log.warning(
+                "agent_run.envelope_missing agent=%s session_id=%s",
+                ar.agent,
+                session.id,
+            )
+
+
 def _default_text_extractor(session) -> str:
     """Default text extraction for the incident-management example.
 
@@ -611,6 +630,12 @@ class Orchestrator(Generic[StateT]):
             return None
         if inc.status not in ("new", "in_progress"):
             return None
+
+        # Phase 10 (FOC-03) defence-in-depth: hard rejection of envelope-less
+        # turns happens at the agent runner; this hook only logs WARNING for
+        # forensics on legacy on-disk sessions whose agent_runs predate the
+        # envelope contract. Never raises.
+        _assert_envelope_invariant_on_finalize(inc)
 
         decision = self._infer_terminal_decision(inc.tool_calls)
         if decision is None:

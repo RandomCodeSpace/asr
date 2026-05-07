@@ -50,7 +50,15 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                thread-id. Generic session-id terminology elsewhere; the
 #                helper itself is older and keeps its parameter name for
 #                callers in the same file.
-BASELINE_TOTAL = 147
+#   147 -> 149   Phase 10 (FOC-03): mandatory per-turn confidence wrapped
+#                each ``create_react_agent`` call site (graph.py, responsive.py)
+#                in an envelope-parse + reconcile + EnvelopeMissingError-handler
+#                block. The two new ``_handle_agent_failure(..., fallback=incident)``
+#                calls reuse the pre-existing local ``incident`` variable name
+#                (the runner's domain Session) on the new envelope-error
+#                branch — no new domain concept, just two new uses of the
+#                existing variable on a structurally required code path.
+BASELINE_TOTAL = 149
 
 
 def test_runtime_leaks_at_or_below_baseline():

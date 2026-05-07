@@ -22,10 +22,21 @@ class StubChatModel(BaseChatModel):
     """Deterministic chat model for tests/CI. Returns canned text per role.
 
     Optionally emits one tool call on first invocation if `tool_call_plan` is set.
+
+    Phase 10 (FOC-03): also honours
+    ``llm.with_structured_output(AgentTurnOutput)`` so stub-driven tests
+    survive the runner's envelope contract. The structured response is
+    derived from the same canned text + a default 0.85 confidence; tests
+    that need a specific envelope shape can override
+    ``stub_envelope_confidence`` / ``stub_envelope_rationale`` /
+    ``stub_envelope_signal``.
     """
     role: str = "default"
     canned_responses: dict[str, str] = Field(default_factory=dict)
     tool_call_plan: list[dict] | None = None
+    stub_envelope_confidence: float = 0.85
+    stub_envelope_rationale: str = "stub envelope rationale"
+    stub_envelope_signal: str | None = None
     _called_once: bool = False
 
     @property
@@ -50,6 +61,53 @@ class StubChatModel(BaseChatModel):
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         """No-op binder: stub emits tool calls only via `tool_call_plan`, not via real binding."""
         return self
+
+    def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
+        """Phase 10 (FOC-03): honour LangGraph's structured-output pass.
+
+        ``create_react_agent(..., response_format=schema)`` calls this after
+        the tool loop completes. We return a Runnable-like that yields a
+        valid ``schema`` instance derived from the stub's canned text and
+        the per-instance envelope configuration. Tests can tune
+        ``stub_envelope_confidence`` etc. to drive gate / reconcile paths.
+        """
+        text = self.canned_responses.get(self.role, f"[stub:{self.role}] no canned response")
+        confidence = self.stub_envelope_confidence
+        rationale = self.stub_envelope_rationale
+        signal = self.stub_envelope_signal
+
+        class _StructuredRunnable:
+            def __init__(self, schema_cls):
+                self._schema = schema_cls
+
+            def _build(self):
+                # Construct an instance of whatever schema was passed.
+                # Common case: AgentTurnOutput; permissive fallback handles
+                # other pydantic schemas the test may pass.
+                try:
+                    return self._schema(
+                        content=text or ".",
+                        confidence=confidence,
+                        confidence_rationale=rationale,
+                        signal=signal,
+                    )
+                except Exception:
+                    # Permissive fallback for unfamiliar schemas: try
+                    # model_validate on a minimal dict.
+                    return self._schema.model_validate({
+                        "content": text or ".",
+                        "confidence": confidence,
+                        "confidence_rationale": rationale,
+                        "signal": signal,
+                    })
+
+            def invoke(self, *_args, **_kwargs):
+                return self._build()
+
+            async def ainvoke(self, *_args, **_kwargs):
+                return self._build()
+
+        return _StructuredRunnable(schema)
 
 
 def _build_ollama_chat(provider: ProviderConfig, model_id: str,
@@ -87,12 +145,19 @@ def _build_azure_chat(provider: ProviderConfig, model: ModelConfig) -> BaseChatM
 def get_llm(cfg: LLMConfig, model_name: str | None = None, *,
             role: str = "default",
             stub_canned: dict[str, str] | None = None,
-            stub_tool_plan: list[dict] | None = None) -> BaseChatModel:
+            stub_tool_plan: list[dict] | None = None,
+            stub_envelope_confidence: float | None = None,
+            stub_envelope_rationale: str | None = None,
+            stub_envelope_signal: str | None = None) -> BaseChatModel:
     """Build a chat model by named entry from ``cfg.models``.
 
     ``model_name`` defaults to ``cfg.default``. Validation that the name
     exists is enforced by ``LLMConfig`` itself (model_validator), so a
     missing name here means caller passed a typo — raise loudly.
+
+    Phase 10 (FOC-03): stub callers can now tune the canned envelope
+    (confidence / rationale / signal) so gate-trigger tests preserve their
+    pre-Phase-10 semantics by emitting a low-confidence envelope.
     """
     name = model_name or cfg.default
     model = cfg.models.get(name)
@@ -104,11 +169,18 @@ def get_llm(cfg: LLMConfig, model_name: str | None = None, *,
     provider = cfg.providers[model.provider]  # validated at config load
 
     if provider.kind == "stub":
-        return StubChatModel(
-            role=role,
-            canned_responses=stub_canned or {},
-            tool_call_plan=stub_tool_plan,
-        )
+        kwargs: dict[str, Any] = {
+            "role": role,
+            "canned_responses": stub_canned or {},
+            "tool_call_plan": stub_tool_plan,
+        }
+        if stub_envelope_confidence is not None:
+            kwargs["stub_envelope_confidence"] = stub_envelope_confidence
+        if stub_envelope_rationale is not None:
+            kwargs["stub_envelope_rationale"] = stub_envelope_rationale
+        if stub_envelope_signal is not None:
+            kwargs["stub_envelope_signal"] = stub_envelope_signal
+        return StubChatModel(**kwargs)
     if provider.kind == "ollama":
         return _build_ollama_chat(provider, model.model, model.temperature)
     if provider.kind == "azure_openai":

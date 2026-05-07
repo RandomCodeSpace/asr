@@ -685,11 +685,16 @@ def _fmt_duration(seconds: int) -> str:
 def _fmt_confidence_badge(conf: float | None) -> str:
     """Inline coloured badge for an agent confidence value.
 
-    Green ≥0.75, amber 0.5–0.75, red <0.5, grey when None. Markdown only —
-    no HTML — so the badge survives Streamlit's sanitizer.
+    Green ≥0.75, amber 0.5–0.75, red <0.5. Markdown only — no HTML — so the
+    badge survives Streamlit's sanitizer.
+
+    Phase 10 (FOC-03): None now indicates a structural failure (envelope
+    missing) — visually flag with a red 🛑 hard-error badge, never the
+    silent ⚪ fallback. The runner rejects envelope-less turns upfront;
+    None here means a legacy on-disk row predating the envelope contract.
     """
     if conf is None:
-        return "⚪ confidence —"
+        return "🛑 confidence missing"
     if conf >= 0.75:
         glyph = "🟢"
     elif conf >= 0.5:

@@ -23,6 +23,12 @@ from runtime.llm import get_llm
 from runtime.mcp_loader import ToolRegistry
 from runtime.storage.session_store import SessionStore
 from runtime.tools.gateway import wrap_tool
+from runtime.agents.turn_output import (
+    AgentTurnOutput,
+    EnvelopeMissingError,
+    parse_envelope_from_result,
+    reconcile_confidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +367,30 @@ def _extract_final_text(messages: list) -> str:
     return ""
 
 
+def _first_terminal_tool_called_this_turn(
+    messages: list,
+    terminal_tool_names: frozenset[str],
+) -> str | None:
+    """Return the bare name of the first typed-terminal tool called this turn.
+
+    Phase 10 (FOC-03 / D-10-03): used to label the reconciliation log so
+    operators can correlate envelope-vs-tool-arg confidence divergences
+    against a specific tool. Tool names may be MCP-prefixed
+    (``<server>:<tool>``); we rsplit on the rightmost colon to recover the
+    bare name and match against the configured ``terminal_tool_names``.
+    Returns None when no terminal tool fired this turn.
+    """
+    if not terminal_tool_names:
+        return None
+    for msg in messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            name = tc.get("name", "")
+            bare = name.rsplit(":", 1)[-1]
+            if bare in terminal_tool_names:
+                return bare
+    return None
+
+
 def _sum_token_usage(messages: list) -> TokenUsage:
     """Sum input/output token counts across all messages that report usage_metadata."""
     agent_in = agent_out = 0
@@ -557,8 +587,13 @@ def make_agent_node(
             ]
         else:
             run_tools = visible_tools
+        # Phase 10 (FOC-03 / D-10-02): every responsive agent invocation is
+        # wrapped in an AgentTurnOutput envelope. LangGraph internally calls
+        # llm.with_structured_output(AgentTurnOutput) on a final pass after
+        # the tool loop completes, populating result["structured_response"].
         agent_executor = create_react_agent(
             llm, run_tools, prompt=skill.system_prompt,
+            response_format=AgentTurnOutput,
         )
 
         try:
@@ -592,14 +627,40 @@ def make_agent_node(
         # Pair tool responses with their tool calls.
         _pair_tool_responses(messages, incident)
 
+        # Phase 10 (FOC-03 / D-10-03): parse the structural envelope and
+        # reconcile its confidence against any typed-terminal-tool arg
+        # confidence harvested above. Envelope failure is a hard error —
+        # mark the agent_run failed with structured cause.
+        try:
+            envelope = parse_envelope_from_result(result, agent=skill.name)
+        except EnvelopeMissingError as exc:
+            return _handle_agent_failure(
+                skill_name=skill.name, started_at=started_at, exc=exc,
+                inc_id=inc_id, store=store, fallback=incident,
+            )
+
+        terminal_tool_for_log = _first_terminal_tool_called_this_turn(
+            messages, terminal_tool_names,
+        )
+        final_confidence = reconcile_confidence(
+            envelope.confidence,
+            agent_confidence,
+            agent=skill.name,
+            session_id=inc_id,
+            tool_name=terminal_tool_for_log,
+        )
+        final_rationale = agent_rationale or envelope.confidence_rationale
+        final_signal = agent_signal if agent_signal is not None else envelope.signal
+
         # Final summary text and token usage.
-        final_text = _extract_final_text(messages)
+        # Envelope content takes precedence over last AIMessage scrape.
+        final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
-            confidence=agent_confidence, rationale=agent_rationale, signal=agent_signal,
+            confidence=final_confidence, rationale=final_rationale, signal=final_signal,
             store=store,
         )
         next_route_signal = decide_route(incident)
@@ -633,6 +694,16 @@ _DEFAULT_STUB_CANNED: dict[str, str] = {
     "triage": "Severity medium, category latency. No recent deploys correlate.",
     "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
     "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
+}
+
+# Phase 10 (FOC-03): per-agent default envelope confidence for the stub
+# LLM. Pre-Phase-10 the deep_investigator stub emitted no confidence at
+# all, so the gate (threshold 0.75) always interrupted on the first
+# call. Post-Phase-10 every agent must emit a confidence value — drive
+# DI's stub envelope below threshold to preserve gate-pause behavior in
+# existing tests. Other agents default to 0.85 (above threshold).
+_DEFAULT_STUB_ENVELOPE_CONFIDENCE: dict[str, float] = {
+    "deep_investigator": 0.30,
 }
 
 
@@ -831,11 +902,15 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             stub_canned = {agent_name: _DEFAULT_STUB_CANNED[agent_name]}
         else:
             stub_canned = None
+        # Phase 10 (FOC-03): wire a per-agent default envelope confidence
+        # into the stub so pre-Phase-10 gate-pause-on-DI tests still pass.
+        stub_env_conf = _DEFAULT_STUB_ENVELOPE_CONFIDENCE.get(agent_name)
         llm = get_llm(
             cfg.llm,
             skill.model,
             role=agent_name,
             stub_canned=stub_canned,
+            stub_envelope_confidence=stub_env_conf,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal

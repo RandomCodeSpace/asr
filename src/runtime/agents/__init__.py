@@ -20,6 +20,12 @@ from .monitor import (
     make_monitor_callable,
     safe_eval,
 )
+from .turn_output import (
+    AgentTurnOutput,
+    EnvelopeMissingError,
+    parse_envelope_from_result,
+    reconcile_confidence,
+)
 
 __all__ = [
     "make_agent_node",
@@ -29,4 +35,8 @@ __all__ = [
     "SafeEvalError",
     "make_monitor_callable",
     "safe_eval",
+    "AgentTurnOutput",
+    "EnvelopeMissingError",
+    "parse_envelope_from_result",
+    "reconcile_confidence",
 ]

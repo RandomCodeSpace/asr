@@ -67,9 +67,13 @@ async def test_agent_node_runs_llm_records_agent_run_and_routes(incident):
     assert intake_runs[0].token_usage.total_tokens == 0
     assert isinstance(reloaded.token_usage, TokenUsage)
     assert reloaded.token_usage.total_tokens == 0
-    # Stub does not emit a confidence patch, so AgentRun.confidence stays None.
-    assert intake_runs[0].confidence is None
-    assert intake_runs[0].confidence_rationale is None
+    # Phase 10 (FOC-03): the runner now wraps every turn in an
+    # AgentTurnOutput envelope; StubChatModel.with_structured_output
+    # populates result["structured_response"] with the configured
+    # default envelope (0.85 confidence, "stub envelope rationale").
+    # The runner stamps these onto the AgentRun.
+    assert intake_runs[0].confidence == approx(0.85)
+    assert intake_runs[0].confidence_rationale == "stub envelope rationale"
 
 
 @pytest.mark.asyncio
@@ -150,8 +154,12 @@ async def test_confidence_rejects_bool(incident, caplog):
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
-    # bool must be rejected — confidence stays None
-    assert triage_runs[0].confidence is None
+    # The bool patch-tool-arg confidence must be rejected (harvested → None).
+    # Phase 10 (FOC-03): when the harvest yields None, the envelope's
+    # confidence becomes the recorded value (reconcile_confidence falls
+    # through to the envelope when tool_arg_value is None). The bool
+    # rejection itself is still asserted via the WARN log.
+    assert triage_runs[0].confidence == approx(0.85)
     assert any("bool" in rec.getMessage().lower() for rec in caplog.records)
 
 
@@ -195,7 +203,11 @@ async def test_confidence_unknown_string_is_none(incident, caplog):
     reloaded = store.load(inc.id)
     triage_runs = [r for r in reloaded.agents_run if r.agent == "triage"]
     assert triage_runs
-    assert triage_runs[0].confidence is None
+    # Unknown-string patch-tool-arg confidence is rejected (harvested → None).
+    # Phase 10 (FOC-03): the envelope's confidence becomes the recorded value
+    # via reconcile_confidence's tool_arg_value=None fallthrough. The
+    # WARN log still names the offending value.
+    assert triage_runs[0].confidence == approx(0.85)
     assert any("meh" in rec.getMessage() for rec in caplog.records)
 
 

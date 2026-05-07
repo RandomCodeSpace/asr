@@ -32,6 +32,12 @@ from runtime.skill import Skill
 from runtime.state import Session, _UTC_TS_FMT
 from runtime.storage.session_store import SessionStore
 from runtime.tools.gateway import wrap_tool
+from runtime.agents.turn_output import (
+    AgentTurnOutput,
+    EnvelopeMissingError,
+    parse_envelope_from_result,
+    reconcile_confidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +80,7 @@ def make_agent_node(
         _harvest_tool_calls_and_patches,
         _pair_tool_responses,
         _extract_final_text,
+        _first_terminal_tool_called_this_turn,
         _sum_token_usage,
         _record_success_run,
         route_from_skill,
@@ -94,8 +101,13 @@ def make_agent_node(
             ]
         else:
             run_tools = tools
+        # Phase 10 (FOC-03 / D-10-02): every responsive agent invocation
+        # is wrapped in an AgentTurnOutput envelope. LangGraph internally
+        # calls llm.with_structured_output(AgentTurnOutput) on a final pass
+        # after the tool loop, populating result["structured_response"].
         agent_executor = create_react_agent(
             llm, run_tools, prompt=skill.system_prompt,
+            response_format=AgentTurnOutput,
         )
 
         try:
@@ -124,14 +136,38 @@ def make_agent_node(
         )
         _pair_tool_responses(messages, incident)
 
-        final_text = _extract_final_text(messages)
+        # Phase 10 (FOC-03 / D-10-03): parse envelope; reconcile against
+        # any typed-terminal-tool-arg confidence. Envelope failure is a
+        # structured agent_run error.
+        try:
+            envelope = parse_envelope_from_result(result, agent=skill.name)
+        except EnvelopeMissingError as exc:
+            return _handle_agent_failure(
+                skill_name=skill.name, started_at=started_at, exc=exc,
+                inc_id=inc_id, store=store, fallback=incident,
+            )
+
+        terminal_tool_for_log = _first_terminal_tool_called_this_turn(
+            messages, terminal_tool_names,
+        )
+        final_confidence = reconcile_confidence(
+            envelope.confidence,
+            agent_confidence,
+            agent=skill.name,
+            session_id=inc_id,
+            tool_name=terminal_tool_for_log,
+        )
+        final_rationale = agent_rationale or envelope.confidence_rationale
+        final_signal = agent_signal if agent_signal is not None else envelope.signal
+
+        final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
-            confidence=agent_confidence, rationale=agent_rationale,
-            signal=agent_signal,
+            confidence=final_confidence, rationale=final_rationale,
+            signal=final_signal,
             store=store,
         )
         next_route_signal = decide_route(incident)

@@ -317,6 +317,7 @@ from langgraph.graph import StateGraph, END
 
 
 
+
 # ----- imports for runtime/checkpointer_postgres.py -----
 """Postgres checkpointer wrapper.
 
@@ -2406,10 +2407,21 @@ class StubChatModel(BaseChatModel):
     """Deterministic chat model for tests/CI. Returns canned text per role.
 
     Optionally emits one tool call on first invocation if `tool_call_plan` is set.
+
+    Phase 10 (FOC-03): also honours
+    ``llm.with_structured_output(AgentTurnOutput)`` so stub-driven tests
+    survive the runner's envelope contract. The structured response is
+    derived from the same canned text + a default 0.85 confidence; tests
+    that need a specific envelope shape can override
+    ``stub_envelope_confidence`` / ``stub_envelope_rationale`` /
+    ``stub_envelope_signal``.
     """
     role: str = "default"
     canned_responses: dict[str, str] = Field(default_factory=dict)
     tool_call_plan: list[dict] | None = None
+    stub_envelope_confidence: float = 0.85
+    stub_envelope_rationale: str = "stub envelope rationale"
+    stub_envelope_signal: str | None = None
     _called_once: bool = False
 
     @property
@@ -2434,6 +2446,53 @@ class StubChatModel(BaseChatModel):
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         """No-op binder: stub emits tool calls only via `tool_call_plan`, not via real binding."""
         return self
+
+    def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
+        """Phase 10 (FOC-03): honour LangGraph's structured-output pass.
+
+        ``create_react_agent(..., response_format=schema)`` calls this after
+        the tool loop completes. We return a Runnable-like that yields a
+        valid ``schema`` instance derived from the stub's canned text and
+        the per-instance envelope configuration. Tests can tune
+        ``stub_envelope_confidence`` etc. to drive gate / reconcile paths.
+        """
+        text = self.canned_responses.get(self.role, f"[stub:{self.role}] no canned response")
+        confidence = self.stub_envelope_confidence
+        rationale = self.stub_envelope_rationale
+        signal = self.stub_envelope_signal
+
+        class _StructuredRunnable:
+            def __init__(self, schema_cls):
+                self._schema = schema_cls
+
+            def _build(self):
+                # Construct an instance of whatever schema was passed.
+                # Common case: AgentTurnOutput; permissive fallback handles
+                # other pydantic schemas the test may pass.
+                try:
+                    return self._schema(
+                        content=text or ".",
+                        confidence=confidence,
+                        confidence_rationale=rationale,
+                        signal=signal,
+                    )
+                except Exception:
+                    # Permissive fallback for unfamiliar schemas: try
+                    # model_validate on a minimal dict.
+                    return self._schema.model_validate({
+                        "content": text or ".",
+                        "confidence": confidence,
+                        "confidence_rationale": rationale,
+                        "signal": signal,
+                    })
+
+            def invoke(self, *_args, **_kwargs):
+                return self._build()
+
+            async def ainvoke(self, *_args, **_kwargs):
+                return self._build()
+
+        return _StructuredRunnable(schema)
 
 
 def _build_ollama_chat(provider: ProviderConfig, model_id: str,
@@ -2471,12 +2530,19 @@ def _build_azure_chat(provider: ProviderConfig, model: ModelConfig) -> BaseChatM
 def get_llm(cfg: LLMConfig, model_name: str | None = None, *,
             role: str = "default",
             stub_canned: dict[str, str] | None = None,
-            stub_tool_plan: list[dict] | None = None) -> BaseChatModel:
+            stub_tool_plan: list[dict] | None = None,
+            stub_envelope_confidence: float | None = None,
+            stub_envelope_rationale: str | None = None,
+            stub_envelope_signal: str | None = None) -> BaseChatModel:
     """Build a chat model by named entry from ``cfg.models``.
 
     ``model_name`` defaults to ``cfg.default``. Validation that the name
     exists is enforced by ``LLMConfig`` itself (model_validator), so a
     missing name here means caller passed a typo — raise loudly.
+
+    Phase 10 (FOC-03): stub callers can now tune the canned envelope
+    (confidence / rationale / signal) so gate-trigger tests preserve their
+    pre-Phase-10 semantics by emitting a low-confidence envelope.
     """
     name = model_name or cfg.default
     model = cfg.models.get(name)
@@ -2488,11 +2554,18 @@ def get_llm(cfg: LLMConfig, model_name: str | None = None, *,
     provider = cfg.providers[model.provider]  # validated at config load
 
     if provider.kind == "stub":
-        return StubChatModel(
-            role=role,
-            canned_responses=stub_canned or {},
-            tool_call_plan=stub_tool_plan,
-        )
+        kwargs: dict[str, Any] = {
+            "role": role,
+            "canned_responses": stub_canned or {},
+            "tool_call_plan": stub_tool_plan,
+        }
+        if stub_envelope_confidence is not None:
+            kwargs["stub_envelope_confidence"] = stub_envelope_confidence
+        if stub_envelope_rationale is not None:
+            kwargs["stub_envelope_rationale"] = stub_envelope_rationale
+        if stub_envelope_signal is not None:
+            kwargs["stub_envelope_signal"] = stub_envelope_signal
+        return StubChatModel(**kwargs)
     if provider.kind == "ollama":
         return _build_ollama_chat(provider, model.model, model.temperature)
     if provider.kind == "azure_openai":
@@ -4220,6 +4293,30 @@ def _extract_final_text(messages: list) -> str:
     return ""
 
 
+def _first_terminal_tool_called_this_turn(
+    messages: list,
+    terminal_tool_names: frozenset[str],
+) -> str | None:
+    """Return the bare name of the first typed-terminal tool called this turn.
+
+    Phase 10 (FOC-03 / D-10-03): used to label the reconciliation log so
+    operators can correlate envelope-vs-tool-arg confidence divergences
+    against a specific tool. Tool names may be MCP-prefixed
+    (``<server>:<tool>``); we rsplit on the rightmost colon to recover the
+    bare name and match against the configured ``terminal_tool_names``.
+    Returns None when no terminal tool fired this turn.
+    """
+    if not terminal_tool_names:
+        return None
+    for msg in messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            name = tc.get("name", "")
+            bare = name.rsplit(":", 1)[-1]
+            if bare in terminal_tool_names:
+                return bare
+    return None
+
+
 def _sum_token_usage(messages: list) -> TokenUsage:
     """Sum input/output token counts across all messages that report usage_metadata."""
     agent_in = agent_out = 0
@@ -4413,8 +4510,13 @@ def make_agent_node(
             ]
         else:
             run_tools = visible_tools
+        # Phase 10 (FOC-03 / D-10-02): every responsive agent invocation is
+        # wrapped in an AgentTurnOutput envelope. LangGraph internally calls
+        # llm.with_structured_output(AgentTurnOutput) on a final pass after
+        # the tool loop completes, populating result["structured_response"].
         agent_executor = create_react_agent(
             llm, run_tools, prompt=skill.system_prompt,
+            response_format=AgentTurnOutput,
         )
 
         try:
@@ -4448,14 +4550,40 @@ def make_agent_node(
         # Pair tool responses with their tool calls.
         _pair_tool_responses(messages, incident)
 
+        # Phase 10 (FOC-03 / D-10-03): parse the structural envelope and
+        # reconcile its confidence against any typed-terminal-tool arg
+        # confidence harvested above. Envelope failure is a hard error —
+        # mark the agent_run failed with structured cause.
+        try:
+            envelope = parse_envelope_from_result(result, agent=skill.name)
+        except EnvelopeMissingError as exc:
+            return _handle_agent_failure(
+                skill_name=skill.name, started_at=started_at, exc=exc,
+                inc_id=inc_id, store=store, fallback=incident,
+            )
+
+        terminal_tool_for_log = _first_terminal_tool_called_this_turn(
+            messages, terminal_tool_names,
+        )
+        final_confidence = reconcile_confidence(
+            envelope.confidence,
+            agent_confidence,
+            agent=skill.name,
+            session_id=inc_id,
+            tool_name=terminal_tool_for_log,
+        )
+        final_rationale = agent_rationale or envelope.confidence_rationale
+        final_signal = agent_signal if agent_signal is not None else envelope.signal
+
         # Final summary text and token usage.
-        final_text = _extract_final_text(messages)
+        # Envelope content takes precedence over last AIMessage scrape.
+        final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
-            confidence=agent_confidence, rationale=agent_rationale, signal=agent_signal,
+            confidence=final_confidence, rationale=final_rationale, signal=final_signal,
             store=store,
         )
         next_route_signal = decide_route(incident)
@@ -4489,6 +4617,16 @@ _DEFAULT_STUB_CANNED: dict[str, str] = {
     "triage": "Severity medium, category latency. No recent deploys correlate.",
     "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
     "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
+}
+
+# Phase 10 (FOC-03): per-agent default envelope confidence for the stub
+# LLM. Pre-Phase-10 the deep_investigator stub emitted no confidence at
+# all, so the gate (threshold 0.75) always interrupted on the first
+# call. Post-Phase-10 every agent must emit a confidence value — drive
+# DI's stub envelope below threshold to preserve gate-pause behavior in
+# existing tests. Other agents default to 0.85 (above threshold).
+_DEFAULT_STUB_ENVELOPE_CONFIDENCE: dict[str, float] = {
+    "deep_investigator": 0.30,
 }
 
 
@@ -4687,11 +4825,15 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             stub_canned = {agent_name: _DEFAULT_STUB_CANNED[agent_name]}
         else:
             stub_canned = None
+        # Phase 10 (FOC-03): wire a per-agent default envelope confidence
+        # into the stub so pre-Phase-10 gate-pause-on-DI tests still pass.
+        stub_env_conf = _DEFAULT_STUB_ENVELOPE_CONFIDENCE.get(agent_name)
         llm = get_llm(
             cfg.llm,
             skill.model,
             role=agent_name,
             stub_canned=stub_canned,
+            stub_envelope_confidence=stub_env_conf,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal
@@ -7375,6 +7517,25 @@ from langgraph.types import Command
 _log = logging.getLogger("runtime.orchestrator")
 
 
+def _assert_envelope_invariant_on_finalize(session: "Session") -> None:
+    """Phase 10 (FOC-03) defence-in-depth log sweep.
+
+    Hard rejection of envelope-less turns happens at the agent runner
+    (``parse_envelope_from_result`` raises ``EnvelopeMissingError``,
+    which the runner converts into an agent_run marked ``error``).
+    This finalize hook only logs WARNING for forensics on legacy on-disk
+    sessions whose agent_runs predate the envelope contract. Never
+    raises.
+    """
+    for ar in session.agents_run:
+        if ar.confidence is None:
+            _log.warning(
+                "agent_run.envelope_missing agent=%s session_id=%s",
+                ar.agent,
+                session.id,
+            )
+
+
 def _default_text_extractor(session) -> str:
     """Default text extraction for the incident-management example.
 
@@ -7937,6 +8098,12 @@ class Orchestrator(Generic[StateT]):
             return None
         if inc.status not in ("new", "in_progress"):
             return None
+
+        # Phase 10 (FOC-03) defence-in-depth: hard rejection of envelope-less
+        # turns happens at the agent runner; this hook only logs WARNING for
+        # forensics on legacy on-disk sessions whose agent_runs predate the
+        # envelope contract. Never raises.
+        _assert_envelope_invariant_on_finalize(inc)
 
         decision = self._infer_terminal_decision(inc.tool_calls)
         if decision is None:
