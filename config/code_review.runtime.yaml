@@ -52,6 +52,12 @@ orchestrator:
       terminal: true
       kind: needs_review
   terminal_tools: []
+  # App-MCP-server discovery (Phase 7 / DECOUPLE-04 / D-07-02). Empty
+  # list = code-review boots without app-owned MCP servers; framework
+  # treats the empty branch gracefully (the orchestrator's discovery
+  # loop simply iterates zero times). Phase 8 may populate this for
+  # code-review-specific tools.
+  mcp_servers: []
 # Cross-cutting framework knobs read directly off AppConfig.framework.
 framework:
   # Per-app session-id prefix. Threaded through SessionStore into

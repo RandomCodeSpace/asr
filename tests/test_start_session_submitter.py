@@ -51,19 +51,19 @@ def cfg_full(tmp_path):
                 MCPServerConfig(
                     name="local_obs",
                     transport="in_process",
-                    module="runtime.mcp_servers.observability",
+                    module="examples.incident_management.mcp_servers.observability",
                     category="observability",
                 ),
                 MCPServerConfig(
                     name="local_rem",
                     transport="in_process",
-                    module="runtime.mcp_servers.remediation",
+                    module="examples.incident_management.mcp_servers.remediation",
                     category="remediation",
                 ),
                 MCPServerConfig(
                     name="local_user",
                     transport="in_process",
-                    module="runtime.mcp_servers.user_context",
+                    module="examples.incident_management.mcp_servers.user_context",
                     category="user_context",
                 ),
             ]

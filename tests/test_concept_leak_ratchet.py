@@ -58,13 +58,6 @@ PATTERN = re.compile(
 # always a regression and will fail this ratchet.
 # ---------------------------------------------------------------------------
 RATCHET_ALLOWLIST: dict[tuple[str, str], str] = {
-    # Phase 7 (DECOUPLE-04) will move ``runtime/mcp_servers/remediation.py``
-    # out of the framework directory into ``examples/incident_management/``
-    # — the file itself is incident-vocabulary and shouldn't live under
-    # ``src/runtime/``.
-    ("src/runtime/mcp_servers/remediation.py", "apply_fix"): "Phase 7",
-    ("src/runtime/mcp_servers/remediation.py", "notify_oncall"): "Phase 7",
-
     # Phase 8 (DECOUPLE-07) will scrub the remaining incident-vocabulary
     # docstring examples from ``terminal_tools.py`` (the framework's
     # registry types) and ``storage/event_log.py`` after the code_review

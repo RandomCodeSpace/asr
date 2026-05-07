@@ -1,5 +1,5 @@
 import pytest
-from runtime.mcp_servers.remediation import propose_fix, apply_fix, notify_oncall
+from examples.incident_management.mcp_servers.remediation import propose_fix, apply_fix, notify_oncall
 
 
 @pytest.mark.asyncio

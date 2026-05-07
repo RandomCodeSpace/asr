@@ -57,33 +57,48 @@ def build_environment_validator(allowed: list[str]):
     return Annotated[str, BeforeValidator(_validate)]
 
 
-_environments: list[str] = []
-
-
-def set_environments(envs: list[str]) -> None:
-    """Bind the allowed environments roster from app config.
-
-    Called once by the orchestrator at create()-time after MCP servers
-    load. Tools defined below use ``_validate_environment`` (defined
-    below) which reads this module-level list at call time.
+def _make_environment_validator(environments: list[str]):
+    """Build a per-registration env validator that closes over a snapshot
+    of the configured environments. No module-level mutable state.
     """
-    global _environments
-    _environments = list(envs)
+    snapshot = list(environments)
+
+    def _validate_environment(env: str) -> str:
+        if not snapshot:
+            return env
+        canonical = env.lower() if isinstance(env, str) else env
+        allowed_lower = {e.lower() for e in snapshot}
+        if canonical not in allowed_lower:
+            raise ValueError(
+                f"environment {env!r} not in {sorted(allowed_lower)}"
+            )
+        return canonical
+
+    return _validate_environment
 
 
-def _validate_environment(env: str) -> str:
-    """In-tool guard: raise ValueError if env not in the bound roster.
-    No-op if the roster is empty (test/early-init scenarios).
+# Default no-op validator used when tools are attached at module import
+# time (`@mcp.tool()` decorators below). `register(mcp_app, cfg)` swaps
+# the binding for one that closes over the configured roster.
+_validate_environment = _make_environment_validator([])
+
+
+def register(mcp_app, cfg) -> None:
+    """App-MCP-server discovery contract: bind config-derived state.
+
+    Called once by the orchestrator at create()-time. Reads the
+    environments roster from ``cfg.environments`` and replaces the
+    module-level ``_validate_environment`` reference with one that
+    closes over the snapshot. Idempotent: re-binding overwrites the
+    previous closure.
+
+    ``mcp_app`` is the framework's primary FastMCP instance — accepted
+    for contract uniformity but not used here (this module exposes its
+    own ``mcp`` instance composed by the loader).
     """
-    if not _environments:
-        return env
-    canonical = env.lower() if isinstance(env, str) else env
-    allowed_lower = {e.lower() for e in _environments}
-    if canonical not in allowed_lower:
-        raise ValueError(
-            f"environment {env!r} not in {sorted(allowed_lower)}"
-        )
-    return canonical
+    global _validate_environment
+    envs = list(getattr(cfg, "environments", []) or [])
+    _validate_environment = _make_environment_validator(envs)
 
 
 def _seed(*parts: str) -> int:

@@ -19,13 +19,13 @@ def cfg(tmp_path):
                             module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
-                            module="runtime.mcp_servers.observability",
+                            module="examples.incident_management.mcp_servers.observability",
                             category="observability"),
             MCPServerConfig(name="local_rem", transport="in_process",
-                            module="runtime.mcp_servers.remediation",
+                            module="examples.incident_management.mcp_servers.remediation",
                             category="remediation"),
             MCPServerConfig(name="local_user", transport="in_process",
-                            module="runtime.mcp_servers.user_context",
+                            module="examples.incident_management.mcp_servers.user_context",
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
@@ -61,6 +61,17 @@ def cfg(tmp_path):
             ],
             patch_tools=["update_incident"],
             harvest_terminal_tools=["submit_hypothesis"],
+            # Phase 7 (DECOUPLE-04 / D-07-02): orchestrator imports and
+            # binds these app-MCP-server modules at create()-time. Each
+            # exposes ``register(mcp_app, cfg)`` which closes over the
+            # fixture's ``framework.escalation_teams`` /
+            # ``environments`` rosters so the per-tool guards line up
+            # with what the test asserts on.
+            mcp_servers=[
+                "examples.incident_management.mcp_servers.observability",
+                "examples.incident_management.mcp_servers.remediation",
+                "examples.incident_management.mcp_servers.user_context",
+            ],
             default_terminal_status="needs_review",
             escalate_action_tool_name="notify_oncall",
             escalate_action_default_team="platform-oncall",
@@ -340,13 +351,13 @@ async def test_cold_restart_resume(tmp_path):
                             module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
-                            module="runtime.mcp_servers.observability",
+                            module="examples.incident_management.mcp_servers.observability",
                             category="observability"),
             MCPServerConfig(name="local_rem", transport="in_process",
-                            module="runtime.mcp_servers.remediation",
+                            module="examples.incident_management.mcp_servers.remediation",
                             category="remediation"),
             MCPServerConfig(name="local_user", transport="in_process",
-                            module="runtime.mcp_servers.user_context",
+                            module="examples.incident_management.mcp_servers.user_context",
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),

@@ -63,9 +63,15 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "storage/vector.py"),
     (RUNTIME_ROOT, "storage/history_store.py"),
     (RUNTIME_ROOT, "storage/session_store.py"),
-    (RUNTIME_ROOT, "mcp_servers/observability.py"),
-    (RUNTIME_ROOT, "mcp_servers/remediation.py"),
-    (RUNTIME_ROOT, "mcp_servers/user_context.py"),
+    # NOTE: the per-tool mcp_server modules
+    # (observability/remediation/user_context) were relocated under
+    # ``examples/incident_management/mcp_servers/`` in Phase 7
+    # (DECOUPLE-04 / D-07-01). They no longer live under
+    # ``src/runtime/`` and are bundled into the incident-management app
+    # via ``INCIDENT_APP_MODULE_ORDER`` below — NOT into the
+    # framework-only ``dist/app.py`` bundle. ``dist/apps/code-review.py``
+    # consequently boots without any incident-vocabulary MCP servers
+    # (its ``orchestrator.mcp_servers`` list is empty).
     (RUNTIME_ROOT, "mcp_loader.py"),
     (RUNTIME_ROOT, "graph.py"),
     (RUNTIME_ROOT, "checkpointer_postgres.py"),
@@ -123,6 +129,15 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 # the framework helpers to incident_management's stores + active-session
 # lookup now lives inside ``mcp_server.py``.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
+    # Per-tool MCP servers — relocated under
+    # ``examples/incident_management/`` in Phase 7 (DECOUPLE-04 /
+    # D-07-01). Bundled before mcp_server.py so the dotted-path
+    # discovery loop in orchestrator.py (``cfg.orchestrator.mcp_servers``)
+    # imports them out of the bundle without falling back to the
+    # now-deleted framework-internal location.
+    (EXAMPLES_ROOT, "incident_management/mcp_servers/observability.py"),
+    (EXAMPLES_ROOT, "incident_management/mcp_servers/remediation.py"),
+    (EXAMPLES_ROOT, "incident_management/mcp_servers/user_context.py"),
     (EXAMPLES_ROOT, "incident_management/mcp_server.py"),
 ]
 

@@ -53,15 +53,15 @@ mcp:
       category: incident_management
     - name: local_observability
       transport: in_process
-      module: runtime.mcp_servers.observability
+      module: examples.incident_management.mcp_servers.observability
       category: observability
     - name: local_remediation
       transport: in_process
-      module: runtime.mcp_servers.remediation
+      module: examples.incident_management.mcp_servers.remediation
       category: remediation
     - name: local_user_context
       transport: in_process
-      module: runtime.mcp_servers.user_context
+      module: examples.incident_management.mcp_servers.user_context
       category: user_context
     # Example remote MCP — disabled by default
     - name: external_ticketing
@@ -126,6 +126,11 @@ orchestrator:
     - update_incident
   harvest_terminal_tools:
     - submit_hypothesis
+  # App-MCP-server discovery (Phase 7 / DECOUPLE-04 / D-07-02).
+  mcp_servers:
+    - examples.incident_management.mcp_servers.observability
+    - examples.incident_management.mcp_servers.remediation
+    - examples.incident_management.mcp_servers.user_context
   escalate_action_tool_name: notify_oncall
   escalate_action_default_team: platform-oncall
 

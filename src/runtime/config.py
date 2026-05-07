@@ -193,6 +193,16 @@ class OrchestratorConfig(BaseModel):
     # status).
     harvest_terminal_tools: list[str] = Field(default_factory=list)
 
+    # Dotted module paths the orchestrator imports at create()-time and
+    # binds via each module's ``register(mcp_app, cfg)`` callable. Empty
+    # list = no app MCP servers (framework-only). Order is preserved.
+    # Replaces the v1.0 hardcoded framework-internal MCP-server imports
+    # plus ``set_environments`` / ``set_escalation_teams`` setter calls
+    # in orchestrator.py (DECOUPLE-04 / D-07-02 / D-07-03). Apps declare
+    # their per-tool servers under ``orchestrator.mcp_servers`` in YAML;
+    # framework no longer hardcodes incident-vocabulary modules.
+    mcp_servers: list[str] = Field(default_factory=list)
+
     # Optional MCP tool the orchestrator invokes when a user clicks
     # ``Escalate`` from the awaiting_input gate. ``None`` (default)
     # means the orchestrator skips the tool call entirely and only

@@ -59,6 +59,14 @@ orchestrator:
   # complete signal, not a session-end signal).
   harvest_terminal_tools:
     - submit_hypothesis
+  # App-MCP-server discovery (Phase 7 / DECOUPLE-04 / D-07-02). Each
+  # entry is a dotted module path imported at orchestrator boot; each
+  # module exposes ``register(mcp_app, cfg)``. Replaces the v1.0
+  # hardcoded framework-internal MCP-server imports + setter calls.
+  mcp_servers:
+    - examples.incident_management.mcp_servers.observability
+    - examples.incident_management.mcp_servers.remediation
+    - examples.incident_management.mcp_servers.user_context
   # Parameterized escalate path (Resolution A — Option B).
   escalate_action_tool_name: notify_oncall
   escalate_action_default_team: platform-oncall

@@ -348,21 +348,25 @@ class Orchestrator(Generic[StateT]):
                         severity_aliases=framework_cfg.severity_aliases,
                     )
                     break
-            # Bind config-driven rosters into the observability and
-            # remediation MCP servers so out-of-roster values fail at
-            # the tool boundary with a recoverable ValueError instead
-            # of silently flowing to backends that have no policy
-            # entry for them.
-            try:
-                from runtime.mcp_servers import observability as _obs_mod
-                _obs_mod.set_environments(list(cfg.environments))
-            except Exception:
-                pass
-            try:
-                from runtime.mcp_servers import remediation as _rem_mod
-                _rem_mod.set_escalation_teams(list(framework_cfg.escalation_teams))
-            except Exception:
-                pass
+            # Generic app-MCP-server discovery (DECOUPLE-04 / D-07-02 /
+            # D-07-03). Each module listed in
+            # ``cfg.orchestrator.mcp_servers`` is imported and asked to
+            # bind its config-derived state via the
+            # ``register(mcp_app, cfg)`` contract. The framework no
+            # longer hardcodes incident-vocabulary module paths or
+            # setter names. ``mcp_app`` is ``None`` here — modules
+            # expose their own per-module FastMCP instance composed by
+            # the loader; the parameter exists for contract uniformity
+            # and future composition needs.
+            for module_path in cfg.orchestrator.mcp_servers:
+                mod = importlib.import_module(module_path)
+                reg = getattr(mod, "register", None)
+                if reg is None:
+                    raise RuntimeError(
+                        f"orchestrator.mcp_servers entry {module_path!r} does "
+                        f"not expose a `register(mcp_app, cfg)` callable"
+                    )
+                reg(None, cfg)
             if cfg.paths.skills_dir is None:
                 raise RuntimeError(
                     "paths.skills_dir is not configured; apps must set it "
