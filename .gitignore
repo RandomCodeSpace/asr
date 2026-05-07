@@ -50,7 +50,10 @@ Thumbs.db
 # --- Claude tooling artifacts ----------------------------------------
 AGENTS.md
 ASR.md
-docs/
+# docs/AIRGAP_INSTALL.md is the shipped air-gap install doc (Phase 14, HARD-02).
+# Everything else under docs/ is Claude scratch.
+docs/*
+!docs/AIRGAP_INSTALL.md
 REVIEW_*.md
 review_*.md
 .planning/

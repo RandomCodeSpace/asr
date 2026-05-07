@@ -21,13 +21,26 @@ jobs:
         uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv version for reproducible CI; bump deliberately when bumping locally.
+          version: "0.11.7"
+          enable-cache: true
+
+      - name: Lockfile freshness gate (HARD-02)
+        # Fails the build if pyproject.toml drifts from uv.lock — no silent
+        # resolves on CI, no surprise transitive upgrades. Phase 14 / SC-4.
+        run: uv lock --check
+
+      - name: Install dependencies (from lockfile)
+        # `--frozen` forbids re-resolving; uv installs the exact set pinned in
+        # uv.lock with hash verification. Phase 14 / SC-3.
+        run: uv sync --frozen --extra dev
 
       - name: Lint (ruff)
-        run: ruff check src/ tests/
+        run: uv run ruff check src/ tests/
 
       - name: Type check (pyright)
         # Pyright was previously pointed at src/orchestrator (a shim layer
@@ -36,10 +49,10 @@ jobs:
         # and surfaces ~41 pre-existing generic/typed-dict issues. Don't
         # block the build on those; track via the follow-up cleanup plan.
         continue-on-error: true
-        run: pyright src/runtime
+        run: uv run pyright src/runtime
 
       - name: Test with coverage
-        run: pytest --cov=src/runtime --cov-report=xml --junitxml=junit.xml
+        run: uv run pytest --cov=src/runtime --cov-report=xml --junitxml=junit.xml
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v8.0.0
