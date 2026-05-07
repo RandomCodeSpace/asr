@@ -1020,7 +1020,10 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
         if kind == "supervisor":
             llm = None
             if skill.dispatch_strategy == "llm":
-                llm = get_llm(cfg.llm, skill.model, role=agent_name)
+                llm = get_llm(
+                    cfg.llm, skill.model, role=agent_name,
+                    default_llm_request_timeout=cfg.orchestrator.default_llm_request_timeout,
+                )
             nodes[agent_name] = make_supervisor_node(skill=skill, llm=llm)
             continue
         # Default / "responsive" path.
@@ -1039,6 +1042,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             role=agent_name,
             stub_canned=stub_canned,
             stub_envelope_confidence=stub_env_conf,
+            default_llm_request_timeout=cfg.orchestrator.default_llm_request_timeout,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal

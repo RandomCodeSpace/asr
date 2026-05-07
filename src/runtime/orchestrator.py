@@ -504,10 +504,14 @@ class Orchestrator(Generic[StateT]):
                 if dedup_cfg.stage2_model in cfg.llm.models:
                     _llm_cfg_capture = cfg.llm
                     _model_name = dedup_cfg.stage2_model
+                    _default_timeout_capture = (
+                        cfg.orchestrator.default_llm_request_timeout
+                    )
 
                     def _factory():
                         return get_llm(
                             _llm_cfg_capture, _model_name, role="dedup",
+                            default_llm_request_timeout=_default_timeout_capture,
                         )
 
                     dedup_pipeline = DedupPipeline(

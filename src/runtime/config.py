@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 import yaml
 
 from runtime.terminal_tools import StatusDef, TerminalToolRule
+from runtime.errors import LLMConfigError   # NEW Phase 13 (D-13-05/06)
 
 
 # Session-id prefix grammar. The framework mints session ids of the form
@@ -26,12 +27,35 @@ class ProviderConfig(BaseModel):
 
     Multiple named ``ModelConfig`` entries can reference the same provider
     so that, e.g., two Ollama models share a single base_url + api_key.
+
+    Phase 13 (HARD-01 / D-13-01): per-provider ``request_timeout``
+    override (None means "use OrchestratorConfig.default_llm_request_timeout").
+    Phase 13 (HARD-05 / D-13-06): ollama providers MUST declare
+    ``base_url``; the @model_validator below catches the omission at
+    config-load and raises ``LLMConfigError``. The hardcoded public
+    Ollama fallback in ``runtime.llm`` is removed in the same phase.
     """
     kind: ProviderKind
-    base_url: str | None = None       # ollama
+    base_url: str | None = None       # ollama (REQUIRED via validator)
     api_key: str | None = None        # ollama, azure_openai
-    endpoint: str | None = None       # azure_openai
+    endpoint: str | None = None       # azure_openai (validated lazily in builder)
     api_version: str | None = None    # azure_openai
+    request_timeout: float | None = Field(
+        default=None, gt=0, le=600,
+    )  # NEW Phase 13 (D-13-01) — None -> OrchestratorConfig default
+
+    @model_validator(mode="after")
+    def _validate_required_fields(self) -> "ProviderConfig":
+        # D-13-06: only ollama is promoted to config-load validation in
+        # Phase 13. azure_openai (`endpoint`) and openai_compat
+        # (`base_url` + `api_key`) keep their existing first-request
+        # ValueError raises in `_build_*_chat`. Promoting them is a
+        # potential follow-up; see CONTEXT.md "Deferred Ideas".
+        if self.kind == "ollama" and not self.base_url:
+            raise LLMConfigError(
+                provider="ollama", missing_field="base_url",
+            )
+        return self
 
 
 class ModelConfig(BaseModel):
@@ -321,6 +345,16 @@ class OrchestratorConfig(BaseModel):
     # (max_retries=2, transient retries enabled, confidence floor 0.4).
     retry_policy: "RetryPolicy" = Field(
         default_factory=lambda: RetryPolicy(),
+    )
+
+    # Phase 13 (HARD-01 / D-13-02): framework-default LLM HTTP request
+    # timeout in seconds. Per-provider ``ProviderConfig.request_timeout``
+    # overrides this; ``None`` on the provider means "use this default".
+    # Bounded to catch indefinite hangs (CONCERNS C1) while leaving room
+    # for slow CPU Ollama runs (e.g., gpt-oss:120b). 600s upper bound
+    # prevents accidentally-disabling the protection.
+    default_llm_request_timeout: float = Field(
+        default=120.0, gt=0, le=600,
     )
 
     @field_validator("state_overrides_schema")

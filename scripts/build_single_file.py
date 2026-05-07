@@ -51,6 +51,11 @@ OUT_CODE_REVIEW_APP = Path("dist/apps/code-review.py")
 # are included only in the incident-management app bundle (not in the
 # runtime-only bundle).
 RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
+    # Phase 13 (HARD-01/HARD-05): typed runtime errors. Leaf module
+    # (no runtime.* imports). MUST precede config.py because
+    # config.py imports LLMConfigError for the ProviderConfig
+    # @model_validator (D-13-05/06).
+    (RUNTIME_ROOT, "errors.py"),
     (RUNTIME_ROOT, "config.py"),
     (RUNTIME_ROOT, "state.py"),
     (RUNTIME_ROOT, "state_resolver.py"),
