@@ -73,9 +73,6 @@ class _ActiveSession:
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-_lock = threading.Lock()
-_instance: "OrchestratorService | None" = None
-
 
 class SessionCapExceeded(RuntimeError):
     """Raised by ``start_session`` when the service is already running
@@ -100,7 +97,21 @@ class OrchestratorService:
     Surface: construction, singleton accessor, ``start()`` /
     ``shutdown()``, coroutine submission bridge, and the shared MCP
     client pool.
+
+    Thread-safety (HARD-06): ``get_or_create()`` and
+    ``_reset_singleton()`` serialise singleton mutation through a
+    class-level ``threading.Lock``. Concurrent first-callers
+    (Streamlit warmup + FastAPI startup hook racing during process
+    boot) all observe the same instance — the loser of the race blocks
+    on the lock briefly, then short-circuits on the
+    ``_instance is None`` check inside the critical section.
     """
+
+    # Class-level singleton state. Guarded by ``_lock`` so concurrent
+    # ``get_or_create()`` callers can't double-construct the service.
+    # Reset on ``shutdown()`` via :meth:`_reset_singleton`.
+    _lock: threading.Lock = threading.Lock()
+    _instance: "OrchestratorService | None" = None
 
     def __init__(
         self,
@@ -153,12 +164,17 @@ class OrchestratorService:
         existing instance — there is exactly one orchestrator service per
         Python process. To rebuild with a new config, call
         ``shutdown()`` first.
+
+        Thread-safe (HARD-06): the check-and-construct pair runs inside
+        a class-level ``threading.Lock``. A concurrent second caller
+        either blocks until the first caller's ``__init__`` returns and
+        then short-circuits on the ``_instance is not None`` check, or
+        wins the race and constructs alone — no double construction.
         """
-        global _instance
-        with _lock:
-            if _instance is None:
-                _instance = cls(cfg)
-            return _instance
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls(cfg)
+            return cls._instance
 
     def start(self) -> None:
         """Spin up the background thread + asyncio loop.
@@ -695,8 +711,11 @@ class OrchestratorService:
         self._mcp_locks.clear()
         self._mcp_build_locks.clear()
 
-    @staticmethod
-    def _reset_singleton() -> None:
-        global _instance
-        with _lock:
-            _instance = None
+    @classmethod
+    def _reset_singleton(cls) -> None:
+        """Clear the class-level singleton under the same lock that
+        ``get_or_create`` uses — so a reset racing with a fresh
+        ``get_or_create`` call cannot leak the stale instance.
+        """
+        with cls._lock:
+            cls._instance = None
