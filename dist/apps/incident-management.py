@@ -300,6 +300,30 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 
 
+# ----- imports for runtime/agents/turn_output.py -----
+"""Phase 10 (FOC-03) — AgentTurnOutput envelope + reconciliation helpers.
+
+The envelope is the structural contract every responsive agent invocation
+must satisfy: content + confidence ∈ [0,1] + confidence_rationale + optional signal.
+LangGraph's `create_react_agent(..., response_format=AgentTurnOutput)` enforces
+the schema at the LLM boundary; the framework reads the resulting
+``result["structured_response"]`` and persists it onto the ``AgentRun`` row.
+
+D-10-02 — pydantic envelope wrapped via ``response_format``.
+D-10-03 — when a typed-terminal-tool was called this turn, the framework
+reconciles its ``confidence`` arg against the envelope's. Tolerance 0.05
+inclusive; tool-arg wins on mismatch with an INFO log.
+
+This is a leaf module: no imports from ``runtime.graph`` or
+``runtime.orchestrator``. Both of those depend on it; the dependency
+graph is acyclic.
+"""
+
+
+import logging
+
+from pydantic import BaseModel, ConfigDict, Field
+
 # ----- imports for runtime/policy.py -----
 """Pure HITL gating policy (Phase 11 / FOC-04).
 
@@ -351,7 +375,6 @@ from pydantic import BaseModel, ConfigDict
 """LangGraph state, routing helpers, and node runner."""
 
 import asyncio
-import logging
 from typing import Any, TypedDict, Callable, Awaitable
 
 from langchain_core.messages import HumanMessage
@@ -754,7 +777,6 @@ MCP tools is not exposed.
 """
 
 
-from pydantic import BaseModel, ConfigDict, Field
 
 
 # ----- imports for runtime/memory/knowledge_graph.py -----
@@ -1222,6 +1244,39 @@ class GatePolicy(BaseModel):
     )
 
 
+class RetryPolicy(BaseModel):
+    """Phase 12 (FOC-05): declarative retry policy.
+
+    Drives the framework's pure ``should_retry`` boundary. The LLM never
+    sees this config -- flow control is a framework decision, not a
+    skill-prompt incantation. Mirrors GatePolicy's shape so the
+    OrchestratorConfig surface stays uniform.
+
+    ``max_retries`` is the absolute cap on automatic retries (compared
+    with ``retry_count`` via ``>=``). 0 disables auto-retry entirely;
+    the recommended default 2 mirrors the v1.2 ROADMAP sketch and the
+    existing transient-5xx auto-retry budget in graph.py.
+
+    ``retry_on_transient`` lets apps with strict SLOs disable framework
+    auto-retry of transient errors entirely (escalate immediately
+    instead).
+
+    ``retry_low_confidence_threshold`` is the strict-less-than predicate
+    for "the LLM gave up; don't burn budget on a retry". Defaults to
+    0.4 -- well below the typical gate_policy 0.7-0.8 threshold so a
+    low-confidence escalation triggers HITL intervention before the
+    retry path even considers it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_retries: int = Field(default=2, ge=0, le=10)
+    retry_on_transient: bool = True
+    retry_low_confidence_threshold: float = Field(
+        default=0.4, ge=0.0, le=1.0,
+    )
+
+
 class OrchestratorConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -1327,6 +1382,15 @@ class OrchestratorConfig(BaseModel):
     # this struct and the LLM never sees it. Default keeps v1.1
     # behaviour (production gates "approve"-risk tools, threshold 0.7).
     gate_policy: "GatePolicy" = Field(default_factory=lambda: GatePolicy())
+
+    # Phase 12 (FOC-05): declarative retry policy. Apps tune
+    # max_retries / retry_on_transient / low-confidence threshold in
+    # YAML; the framework's should_retry boundary reads this struct
+    # and the LLM never sees it. Default keeps v1.2 behaviour
+    # (max_retries=2, transient retries enabled, confidence floor 0.4).
+    retry_policy: "RetryPolicy" = Field(
+        default_factory=lambda: RetryPolicy(),
+    )
 
     @field_validator("state_overrides_schema")
     @classmethod
@@ -4061,6 +4125,176 @@ async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
             ))
     return registry
 
+# ====== module: runtime/agents/turn_output.py ======
+
+_LOG = logging.getLogger("runtime.orchestrator")
+
+# D-10-03 — heuristic tolerance for envelope-vs-tool-arg confidence mismatch.
+# Inclusive boundary (|env - tool| <= 0.05 is silent). Documented for future
+# tuning; widening is cheap, narrowing requires care because the LLM's
+# self-reported turn confidence is naturally ~5pp noisier than its
+# tool-call-time confidence.
+_DEFAULT_TOLERANCE: float = 0.05
+
+
+class AgentTurnOutput(BaseModel):
+    """Structural envelope every agent invocation MUST emit.
+
+    The framework wires this as ``response_format=AgentTurnOutput`` on both
+    ``create_react_agent`` call sites (``runtime.graph`` and
+    ``runtime.agents.responsive``). Pydantic's ``extra="forbid"`` keeps the
+    contract narrow — adding fields is a deliberate schema migration, not a
+    free-for-all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(
+        min_length=1,
+        description="Final user-facing message text.",
+    )
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Calibrated confidence in this turn's output: "
+            "0.85+ strong, 0.5 hedged, <0.4 weak."
+        ),
+    )
+    confidence_rationale: str = Field(
+        min_length=1,
+        description="One-sentence explanation of the confidence value.",
+    )
+    signal: str | None = Field(
+        default=None,
+        description=(
+            "Optional next-state signal "
+            "(e.g. success | failed | needs_input | default). "
+            "Routing layer validates the vocabulary."
+        ),
+    )
+
+
+class EnvelopeMissingError(Exception):
+    """Raised by :func:`parse_envelope_from_result` when neither
+    ``result["structured_response"]`` nor a JSON-shaped final AIMessage
+    yields a valid :class:`AgentTurnOutput`.
+
+    Carries structured cause attributes (``agent``, ``field``) so the
+    runner can mark the agent_run as ``error`` with a precise reason.
+    """
+
+    def __init__(self, *, agent: str, field: str, message: str | None = None):
+        self.agent = agent
+        self.field = field
+        super().__init__(message or f"envelope_missing: {field} (agent={agent})")
+
+
+def parse_envelope_from_result(
+    result: dict,
+    *,
+    agent: str,
+) -> AgentTurnOutput:
+    """Extract an :class:`AgentTurnOutput` from a ``create_react_agent`` result.
+
+    Three-step defensive fallback (Risk #1 — Ollama may not honor
+    ``response_format`` cleanly across all providers):
+
+    1. ``result["structured_response"]`` — preferred path; LangGraph 1.1.x
+       populates it when ``response_format`` is set and the LLM honors
+       structured output.
+    2. ``result["messages"][-1].content`` parsed as JSON, validated against
+       :class:`AgentTurnOutput` — covers providers that stuff envelope JSON
+       in the AIMessage body instead of a separate structured field.
+    3. Both fail → :class:`EnvelopeMissingError` so the runner marks
+       agent_run ``error`` with a structured cause.
+    """
+    # Path 1: structured_response (preferred)
+    sr = result.get("structured_response")
+    if isinstance(sr, AgentTurnOutput):
+        return sr
+    if isinstance(sr, dict):
+        try:
+            return AgentTurnOutput.model_validate(sr)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Path 2: JSON-parse last AIMessage content
+    messages = result.get("messages") or []
+    for msg in reversed(messages):
+        if msg.__class__.__name__ != "AIMessage":
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            return AgentTurnOutput.model_validate(payload)
+        except Exception:  # noqa: BLE001
+            continue
+        break
+
+    # Path 3: fail loudly
+    raise EnvelopeMissingError(
+        agent=agent,
+        field="structured_response",
+        message=(
+            f"envelope_missing: no structured_response or JSON-decodable "
+            f"AIMessage envelope found (agent={agent})"
+        ),
+    )
+
+
+def reconcile_confidence(
+    envelope_value: float,
+    tool_arg_value: float | None,
+    *,
+    agent: str,
+    session_id: str,
+    tool_name: str | None,
+    tolerance: float = _DEFAULT_TOLERANCE,
+) -> float:
+    """Reconcile envelope confidence against typed-terminal-tool-arg confidence.
+
+    D-10-03 contract:
+    - When ``tool_arg_value`` is None: return envelope value silently.
+    - When both present and ``|envelope - tool_arg| <= tolerance``: return
+      tool-arg silently (tool-arg wins on the return regardless — it's the
+      finer-grained, gated value).
+    - When both present and ``|envelope - tool_arg| > tolerance``: log INFO
+      with the verbatim format from CONTEXT.md / D-10-03 and return tool-arg.
+
+    Log shape (preserved verbatim for grep-based observability assertions):
+        ``runtime.orchestrator: turn.confidence_mismatch agent={a} turn_value={e:.2f} tool_value={t:.2f} tool={tn} session_id={sid}``
+    """
+    if tool_arg_value is None:
+        return envelope_value
+    diff = abs(envelope_value - tool_arg_value)
+    if diff > tolerance:
+        _LOG.info(
+            "turn.confidence_mismatch "
+            "agent=%s turn_value=%.2f tool_value=%.2f tool=%s session_id=%s",
+            agent,
+            envelope_value,
+            tool_arg_value,
+            tool_name,
+            session_id,
+        )
+    return tool_arg_value
+
+
+__all__ = [
+    "AgentTurnOutput",
+    "EnvelopeMissingError",
+    "parse_envelope_from_result",
+    "reconcile_confidence",
+]
+
 # ====== module: runtime/policy.py ======
 
 if TYPE_CHECKING:  # pragma: no cover -- type checking only
@@ -4141,7 +4375,149 @@ def should_gate(
     return GateDecision(gate=False, reason="auto")
 
 
-__all__ = ["GateDecision", "GateReason", "should_gate"]
+# ---------------------------------------------------------------
+# Phase 12 (FOC-05): pure should_retry policy.
+# ---------------------------------------------------------------
+
+import asyncio as _asyncio
+
+import pydantic as _pydantic
+
+
+RetryReason = Literal[
+    "auto_retry",
+    "max_retries_exceeded",
+    "permanent_error",
+    "low_confidence_no_retry",
+    "transient_disabled",
+]
+
+
+class RetryDecision(BaseModel):
+    """Outcome of a single retry-policy evaluation.
+
+    Pure surface: produced by :func:`should_retry` from
+    ``(retry_count, error, confidence, cfg)``. The orchestrator's
+    ``_retry_session_locked`` consults this BEFORE running the retry;
+    the UI consults the same value via
+    ``Orchestrator.preview_retry_decision`` to render the button label /
+    disabled state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    retry: bool
+    reason: RetryReason
+
+
+# Whitelist of exception types that are NEVER auto-retryable.
+# Schema/validation errors -- the LLM produced bad data; retrying
+# without addressing root cause burns budget. Adding a new entry is a
+# one-line PR (D-12-02 explicit choice -- no new ToolError ABC).
+_PERMANENT_TYPES: tuple[type[BaseException], ...] = (
+    _pydantic.ValidationError,
+    EnvelopeMissingError,
+)
+
+# Whitelist of exception types that are ALWAYS auto-retryable
+# (subject to max_retries). Network blips, asyncio timeouts,
+# filesystem/socket transients. httpx is NOT imported because the
+# runtime does not raise httpx errors today; built-in TimeoutError
+# covers asyncio's 3.11+ alias.
+_TRANSIENT_TYPES: tuple[type[BaseException], ...] = (
+    _asyncio.TimeoutError,
+    TimeoutError,
+    OSError,
+    ConnectionError,
+)
+
+
+def _is_permanent_error(error: Exception | None) -> bool:
+    if error is None:
+        return False
+    return isinstance(error, _PERMANENT_TYPES)
+
+
+def _is_transient_error(error: Exception | None) -> bool:
+    if error is None:
+        return False
+    return isinstance(error, _TRANSIENT_TYPES)
+
+
+def should_retry(
+    retry_count: int,
+    error: Exception | None,
+    confidence: float | None,
+    cfg: "OrchestratorConfig",
+) -> RetryDecision:
+    """Decide whether the framework should auto-retry a failed turn.
+
+    Pure -- same inputs always yield identical RetryDecision.
+
+    Precedence (descending; first match wins):
+      1. ``retry_count >= cfg.retry_policy.max_retries``
+         -> ``RetryDecision(retry=False, reason="max_retries_exceeded")``
+      2. ``error`` matches ``_PERMANENT_TYPES``
+         -> ``RetryDecision(retry=False, reason="permanent_error")``
+      3. ``confidence is not None`` AND
+         ``confidence < cfg.retry_policy.retry_low_confidence_threshold``
+         AND ``error`` is NOT in ``_TRANSIENT_TYPES``
+         -> ``RetryDecision(retry=False, reason="low_confidence_no_retry")``
+      4. ``error`` matches ``_TRANSIENT_TYPES`` AND
+         ``cfg.retry_policy.retry_on_transient is False``
+         -> ``RetryDecision(retry=False, reason="transient_disabled")``
+      5. ``error`` matches ``_TRANSIENT_TYPES`` AND
+         ``cfg.retry_policy.retry_on_transient is True``
+         -> ``RetryDecision(retry=True, reason="auto_retry")``
+      6. Default fall-through (no match) -> ``RetryDecision(
+         retry=False, reason="permanent_error")`` -- fail-closed
+         conservative default (D-12-02).
+
+    ``retry_count`` is the count of PRIOR retries (0 on the first
+    retry attempt). Caller is responsible for the bump.
+
+    ``error`` may be ``None`` (caller has no exception object); that is
+    treated as a permanent error for safety.
+
+    ``confidence`` is the last AgentRun.confidence for the failed turn;
+    ``None`` means "no signal recorded" and skips the low-confidence
+    gate.
+    """
+    # 1. absolute cap -- regardless of error class
+    if retry_count >= cfg.retry_policy.max_retries:
+        return RetryDecision(retry=False, reason="max_retries_exceeded")
+
+    # 2. permanent errors -- never auto-retry
+    if _is_permanent_error(error):
+        return RetryDecision(retry=False, reason="permanent_error")
+
+    is_transient = _is_transient_error(error)
+
+    # 3. low-confidence -- only when error is NOT transient (transient
+    # errors are mechanical; the LLM's confidence in the business
+    # decision is still trustworthy on retry).
+    if (confidence is not None
+            and confidence < cfg.retry_policy.retry_low_confidence_threshold
+            and not is_transient):
+        return RetryDecision(
+            retry=False, reason="low_confidence_no_retry",
+        )
+
+    # 4 + 5. transient classification
+    if is_transient:
+        if not cfg.retry_policy.retry_on_transient:
+            return RetryDecision(retry=False, reason="transient_disabled")
+        return RetryDecision(retry=True, reason="auto_retry")
+
+    # 6. fail-closed default
+    return RetryDecision(retry=False, reason="permanent_error")
+
+
+__all__ = [
+    # Phase 11
+    "GateDecision", "GateReason", "should_gate",
+    # Phase 12
+    "RetryDecision", "RetryReason", "should_retry",
+]
 
 # ====== module: runtime/graph.py ======
 
@@ -7738,6 +8114,7 @@ from langgraph.types import Command
 
 
 
+
 _log = logging.getLogger("runtime.orchestrator")
 
 
@@ -8449,6 +8826,105 @@ class Orchestrator(Generic[StateT]):
         """
         return isinstance(exc, GraphInterrupt)
 
+    @staticmethod
+    def _extract_last_error(inc: "Session") -> Exception | None:
+        """Reconstruct the last error from a Session in status='error'.
+
+        The graph runner stores failures as an AgentRun with
+        ``summary='agent failed: <repr>'`` (graph.py:_handle_agent_failure).
+        We can't recover the original Exception type, so we return a
+        synthetic representative whose CLASS matches a _PERMANENT_TYPES
+        / _TRANSIENT_TYPES whitelist entry where possible -- that's all
+        :func:`runtime.policy.should_retry` needs (it does isinstance
+        checks).
+
+        Mapping (first match wins per AgentRun.summary scan, newest
+        first):
+
+          - "EnvelopeMissingError" in body -> EnvelopeMissingError
+          - "ValidationError"     in body -> pydantic.ValidationError
+          - "TimeoutError" / "timed out"  -> TimeoutError
+          - "OSError" / "ConnectionError" -> OSError
+          - everything else               -> RuntimeError (falls
+            through to permanent_error per fail-closed default in
+            should_retry)
+        """
+
+        import pydantic as _pydantic
+        for run in reversed(inc.agents_run):
+            summary = (run.summary or "")
+            if not summary.startswith("agent failed:"):
+                continue
+            body = summary.removeprefix("agent failed:").strip()
+            if "EnvelopeMissingError" in body:
+                return _EnvelopeMissingError(
+                    agent=run.agent or "unknown",
+                    field="confidence",
+                    message=body,
+                )
+            if "ValidationError" in body or "validation error" in body:
+                # Build a synthetic ValidationError; pydantic v2 supports
+                # ValidationError.from_exception_data.
+                try:
+                    return _pydantic.ValidationError.from_exception_data(
+                        title="reconstructed", line_errors=[],
+                    )
+                except Exception:  # pragma: no cover -- pydantic API drift
+                    return RuntimeError(body)
+            if ("TimeoutError" in body or "timed out" in body
+                    or "asyncio.TimeoutError" in body):
+                return TimeoutError(body)
+            if "OSError" in body or "ConnectionError" in body:
+                return OSError(body)
+            return RuntimeError(body)
+        return None
+
+    @staticmethod
+    def _extract_last_confidence(inc: "Session") -> float | None:
+        """Return the last recorded turn-level confidence on the session,
+        or None if no AgentRun carries one. should_retry treats None as
+        'no signal yet' and skips the low-confidence gate.
+        """
+        for run in reversed(inc.agents_run):
+            if run.confidence is not None:
+                return run.confidence
+        return None
+
+    def preview_retry_decision(
+        self, session_id: str,
+    ) -> "RetryDecision":
+        """Phase 12 (FOC-05 / D-12-04): return the framework's retry
+        decision WITHOUT executing anything. The UI calls this to render
+        the retry button label + disabled state.
+
+        Pure: same inputs always yield identical RetryDecision. Loads
+        the session from store; reads (retry_count, last_error,
+        last_confidence) and consults the same policy
+        ``runtime.policy.should_retry`` that ``_retry_session_locked``
+        uses. No mutation, no thread-id bump, no lock acquired.
+
+        For sessions whose status is not "error" (i.e. nothing to
+        retry), returns ``RetryDecision(retry=False,
+        reason="permanent_error")`` -- a defensive caller-friendly
+        outcome that lets the UI render a "cannot auto-retry" state
+        without inventing a new reason value.
+        """
+        try:
+            inc = self.store.load(session_id)
+        except FileNotFoundError:
+            return RetryDecision(retry=False, reason="permanent_error")
+        if inc.status != "error":
+            return RetryDecision(retry=False, reason="permanent_error")
+        retry_count = int(inc.extra_fields.get("retry_count", 0))
+        last_error = self._extract_last_error(inc)
+        last_confidence = self._extract_last_confidence(inc)
+        return should_retry(
+            retry_count=retry_count,
+            error=last_error,
+            confidence=last_confidence,
+            cfg=self.cfg.orchestrator,
+        )
+
     async def _finalize_session_status_async(
         self, session_id: str,
     ) -> str | None:
@@ -8897,6 +9373,30 @@ class Orchestrator(Generic[StateT]):
             yield {"event": "retry_rejected", "incident_id": session_id,
                    "reason": f"not in error state (status={inc.status})",
                    "ts": _event_ts()}
+            return
+        # Phase 12 (FOC-05 / D-12-04): consult the framework's pure
+        # retry policy BEFORE mutating session state. The decision is
+        # derived from (retry_count, last_error, last_turn_confidence,
+        # cfg) -- LLM intent is not consulted. On retry=False, emit
+        # retry_rejected with the policy's reason and DO NOT bump the
+        # retry_count or thread id (preserves the "not retryable"
+        # state on disk for UI re-rendering and retry-budget audits).
+        prior_retry_count = int(inc.extra_fields.get("retry_count", 0))
+        last_error = self._extract_last_error(inc)
+        last_confidence = self._extract_last_confidence(inc)
+        decision = should_retry(
+            retry_count=prior_retry_count,
+            error=last_error,
+            confidence=last_confidence,
+            cfg=self.cfg.orchestrator,
+        )
+        if not decision.retry:
+            _log.info(
+                "retry_session policy-rejected: id=%s reason=%s",
+                session_id, decision.reason,
+            )
+            yield {"event": "retry_rejected", "incident_id": session_id,
+                   "reason": decision.reason, "ts": _event_ts()}
             return
         # Drop the failed AgentRun(s) so the timeline only retains
         # successful runs. Retry attempts then append fresh runs.

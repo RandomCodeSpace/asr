@@ -24,6 +24,16 @@ orchestrator:
     confidence_threshold: 0.8
     gated_environments: [production]
     gated_risk_actions: [approve]
+  # Phase 12 (FOC-05): declarative retry policy. Default
+  # max_retries=2 mirrors the v1.2 ROADMAP. retry_on_transient=true
+  # keeps current auto-retry-on-network-blip behaviour.
+  # retry_low_confidence_threshold=0.4 sits below the gate_policy
+  # confidence_threshold (0.8) so the gate fires HITL approval
+  # before the retry path even considers a low-confidence give-up.
+  retry_policy:
+    max_retries: 2
+    retry_on_transient: true
+    retry_low_confidence_threshold: 0.4
   entry_agent: intake
   default_terminal_status: needs_review
   statuses:

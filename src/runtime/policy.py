@@ -123,4 +123,147 @@ def should_gate(
     return GateDecision(gate=False, reason="auto")
 
 
-__all__ = ["GateDecision", "GateReason", "should_gate"]
+# ---------------------------------------------------------------
+# Phase 12 (FOC-05): pure should_retry policy.
+# ---------------------------------------------------------------
+
+import asyncio as _asyncio
+
+import pydantic as _pydantic
+
+from runtime.agents.turn_output import EnvelopeMissingError
+
+RetryReason = Literal[
+    "auto_retry",
+    "max_retries_exceeded",
+    "permanent_error",
+    "low_confidence_no_retry",
+    "transient_disabled",
+]
+
+
+class RetryDecision(BaseModel):
+    """Outcome of a single retry-policy evaluation.
+
+    Pure surface: produced by :func:`should_retry` from
+    ``(retry_count, error, confidence, cfg)``. The orchestrator's
+    ``_retry_session_locked`` consults this BEFORE running the retry;
+    the UI consults the same value via
+    ``Orchestrator.preview_retry_decision`` to render the button label /
+    disabled state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    retry: bool
+    reason: RetryReason
+
+
+# Whitelist of exception types that are NEVER auto-retryable.
+# Schema/validation errors -- the LLM produced bad data; retrying
+# without addressing root cause burns budget. Adding a new entry is a
+# one-line PR (D-12-02 explicit choice -- no new ToolError ABC).
+_PERMANENT_TYPES: tuple[type[BaseException], ...] = (
+    _pydantic.ValidationError,
+    EnvelopeMissingError,
+)
+
+# Whitelist of exception types that are ALWAYS auto-retryable
+# (subject to max_retries). Network blips, asyncio timeouts,
+# filesystem/socket transients. httpx is NOT imported because the
+# runtime does not raise httpx errors today; built-in TimeoutError
+# covers asyncio's 3.11+ alias.
+_TRANSIENT_TYPES: tuple[type[BaseException], ...] = (
+    _asyncio.TimeoutError,
+    TimeoutError,
+    OSError,
+    ConnectionError,
+)
+
+
+def _is_permanent_error(error: Exception | None) -> bool:
+    if error is None:
+        return False
+    return isinstance(error, _PERMANENT_TYPES)
+
+
+def _is_transient_error(error: Exception | None) -> bool:
+    if error is None:
+        return False
+    return isinstance(error, _TRANSIENT_TYPES)
+
+
+def should_retry(
+    retry_count: int,
+    error: Exception | None,
+    confidence: float | None,
+    cfg: "OrchestratorConfig",
+) -> RetryDecision:
+    """Decide whether the framework should auto-retry a failed turn.
+
+    Pure -- same inputs always yield identical RetryDecision.
+
+    Precedence (descending; first match wins):
+      1. ``retry_count >= cfg.retry_policy.max_retries``
+         -> ``RetryDecision(retry=False, reason="max_retries_exceeded")``
+      2. ``error`` matches ``_PERMANENT_TYPES``
+         -> ``RetryDecision(retry=False, reason="permanent_error")``
+      3. ``confidence is not None`` AND
+         ``confidence < cfg.retry_policy.retry_low_confidence_threshold``
+         AND ``error`` is NOT in ``_TRANSIENT_TYPES``
+         -> ``RetryDecision(retry=False, reason="low_confidence_no_retry")``
+      4. ``error`` matches ``_TRANSIENT_TYPES`` AND
+         ``cfg.retry_policy.retry_on_transient is False``
+         -> ``RetryDecision(retry=False, reason="transient_disabled")``
+      5. ``error`` matches ``_TRANSIENT_TYPES`` AND
+         ``cfg.retry_policy.retry_on_transient is True``
+         -> ``RetryDecision(retry=True, reason="auto_retry")``
+      6. Default fall-through (no match) -> ``RetryDecision(
+         retry=False, reason="permanent_error")`` -- fail-closed
+         conservative default (D-12-02).
+
+    ``retry_count`` is the count of PRIOR retries (0 on the first
+    retry attempt). Caller is responsible for the bump.
+
+    ``error`` may be ``None`` (caller has no exception object); that is
+    treated as a permanent error for safety.
+
+    ``confidence`` is the last AgentRun.confidence for the failed turn;
+    ``None`` means "no signal recorded" and skips the low-confidence
+    gate.
+    """
+    # 1. absolute cap -- regardless of error class
+    if retry_count >= cfg.retry_policy.max_retries:
+        return RetryDecision(retry=False, reason="max_retries_exceeded")
+
+    # 2. permanent errors -- never auto-retry
+    if _is_permanent_error(error):
+        return RetryDecision(retry=False, reason="permanent_error")
+
+    is_transient = _is_transient_error(error)
+
+    # 3. low-confidence -- only when error is NOT transient (transient
+    # errors are mechanical; the LLM's confidence in the business
+    # decision is still trustworthy on retry).
+    if (confidence is not None
+            and confidence < cfg.retry_policy.retry_low_confidence_threshold
+            and not is_transient):
+        return RetryDecision(
+            retry=False, reason="low_confidence_no_retry",
+        )
+
+    # 4 + 5. transient classification
+    if is_transient:
+        if not cfg.retry_policy.retry_on_transient:
+            return RetryDecision(retry=False, reason="transient_disabled")
+        return RetryDecision(retry=True, reason="auto_retry")
+
+    # 6. fail-closed default
+    return RetryDecision(retry=False, reason="permanent_error")
+
+
+__all__ = [
+    # Phase 11
+    "GateDecision", "GateReason", "should_gate",
+    # Phase 12
+    "RetryDecision", "RetryReason", "should_retry",
+]

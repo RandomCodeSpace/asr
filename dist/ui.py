@@ -1307,15 +1307,91 @@ async def _resume_async(cfg: AppConfig, session_id: str, decision: dict,
     return outcome
 
 
+def _retry_button_state_for(
+    *,
+    reason: str,
+    retry_count: int,
+    cap: int,
+    last_confidence: float | None,
+    threshold: float,
+) -> tuple[str, bool]:
+    """Phase 12 (FOC-05 / D-12-04): pure helper that maps a
+    :class:`runtime.policy.RetryDecision` reason to a
+    ``(button_label, disabled)`` tuple. Mirrors the 5-case map.
+
+    Extracted from ``_render_retry_block`` so the mapping can be unit-
+    tested without spinning up Streamlit. Returns:
+
+      ``auto_retry``              -> ("Retry",                                False)
+      ``max_retries_exceeded``    -> ("Max retries reached (rc/cap)",        True)
+      ``permanent_error``         -> ("Permanent error -- cannot auto-retry", True)
+      ``low_confidence_no_retry`` -> ("Confidence too low (N% < th%)",       True)
+      ``transient_disabled``      -> ("Auto-retry disabled in policy",       True)
+    """
+    if reason == "auto_retry":
+        return "Retry", False
+    if reason == "max_retries_exceeded":
+        return f"Max retries reached ({retry_count}/{cap})", True
+    if reason == "permanent_error":
+        return "Permanent error -- cannot auto-retry", True
+    if reason == "low_confidence_no_retry":
+        conf_pct = (
+            f"{last_confidence*100:.0f}%"
+            if isinstance(last_confidence, (int, float))
+            else "?"
+        )
+        th_pct = f"{threshold*100:.0f}%"
+        return f"Confidence too low ({conf_pct} < {th_pct})", True
+    if reason == "transient_disabled":
+        return "Auto-retry disabled in policy", True
+    # Future-proof against new reasons added without UI update.
+    return f"Cannot retry ({reason})", True
+
+
+def _preview_retry_decision_sync(cfg, session_id: str):
+    """Phase 12 (FOC-05 / D-12-04): call
+    ``Orchestrator.preview_retry_decision`` from a sync Streamlit
+    render-pass. Pure read; no mutation; no lock.
+
+    ``Orchestrator.create()`` is async (it builds engines / vector
+    stores / MCP loaders), so we run it in a transient event loop --
+    the same pattern ``_retry_async`` uses on click. The cost is one
+    SessionStore.load() + a few isinstance() checks per render-pass on
+    a terminally-failed session; rebuilding the orchestrator is the
+    expensive part. Apps that profile this hot can wrap the call in
+    ``st.cache_resource`` keyed on (cfg fingerprint, session_id).
+
+    Returns a :class:`runtime.policy.RetryDecision`.
+    """
+
+    async def _build_and_query():
+        orch = await Orchestrator.create(cfg)
+        try:
+            return orch.preview_retry_decision(session_id)
+        finally:
+            await orch.aclose()
+
+    return asyncio.run(_build_and_query())
+
+
 def _render_retry_block(sess: dict, session_id: str,
                         agent_names: frozenset[str] = frozenset()) -> None:
     """Render a retry control for failed sessions.
 
-    Sessions land in ``status="error"`` when a graph node raises and
-    the framework's auto-retry on transient 5xxs (see
-    :data:`runtime.graph._TRANSIENT_MARKERS`) has already been
-    exhausted. Surfaces the failed agent + the recorded exception so
-    the operator can decide whether to retry.
+    Phase 12 (FOC-05 / D-12-04): the framework's pure
+    ``runtime.policy.should_retry`` policy decides whether retry is
+    permitted. The UI surfaces that decision (button label + disabled
+    state) but never drives it -- if a user somehow clicks an enabled
+    button concurrently with a policy change, the orchestrator's
+    ``_retry_session_locked`` re-runs the check and emits
+    ``retry_rejected`` with the same reason.
+
+    The 5-case label/disabled map mirrors RetryDecision.reason:
+      auto_retry              -> enabled, "Retry"
+      max_retries_exceeded    -> disabled, "Max retries reached (rc/cap)"
+      permanent_error         -> disabled, "Permanent error -- cannot auto-retry"
+      low_confidence_no_retry -> disabled, "Confidence too low (N% < th%)"
+      transient_disabled      -> disabled, "Auto-retry disabled in policy"
     """
     cfg = load_config(CONFIG_PATH)
     failed_run = next(
@@ -1326,6 +1402,19 @@ def _render_retry_block(sess: dict, session_id: str,
     failed_agent = (failed_run or {}).get("agent", "unknown")
     failure_msg = ((failed_run or {}).get("summary") or "").removeprefix("agent failed:").strip()
     retry_count = int((sess.get("extra_fields") or {}).get("retry_count", 0))
+
+    # Phase 12: read the framework's preview decision.
+    decision = _preview_retry_decision_sync(cfg, session_id)
+    rp = cfg.orchestrator.retry_policy
+    last_conf = (failed_run or {}).get("confidence")
+    label, disabled = _retry_button_state_for(
+        reason=decision.reason,
+        retry_count=retry_count,
+        cap=rp.max_retries,
+        last_confidence=last_conf,
+        threshold=rp.retry_low_confidence_threshold,
+    )
+
     with st.container(border=True):
         st.markdown(f"#### 🔴 Agent failed — `{failed_agent}`")
         if failure_msg:
@@ -1333,12 +1422,16 @@ def _render_retry_block(sess: dict, session_id: str,
         if retry_count:
             st.caption(f"Previous retry attempts: {retry_count}")
         st.caption(
-            "Retry re-runs the graph from the entry node. The framework "
-            "already retried transient 5xx errors automatically — this "
-            "is for cases where the underlying issue may now be cleared "
-            "(provider hiccup, transient network, etc.)."
+            "Retry re-runs the graph from the entry node. The framework's "
+            "retry_policy decides whether auto-retry is permitted -- this "
+            "surface mirrors that decision."
         )
-        if st.button("Retry", type="primary", key=f"retry_btn_{session_id}"):
+        clicked = st.button(
+            label, type="primary",
+            key=f"retry_btn_{session_id}",
+            disabled=disabled,
+        )
+        if clicked and not disabled:
             log_area = st.empty()
             lines: list[str] = []
             outcome = asyncio.run(_retry_async(

@@ -73,6 +73,13 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # consequently boots without any incident-vocabulary MCP servers
     # (its ``orchestrator.mcp_servers`` list is empty).
     (RUNTIME_ROOT, "mcp_loader.py"),
+    # Phase 10 (FOC-03): AgentTurnOutput envelope + EnvelopeMissingError.
+    # Phase 12 (FOC-05) bundles policy.py with a module-level reference
+    # to EnvelopeMissingError in _PERMANENT_TYPES, so turn_output MUST
+    # precede policy.py in the bundle. (Pre-Phase-12 dists referenced
+    # EnvelopeMissingError only inside function bodies, where the strip-
+    # plus-rebuild order didn't surface a NameError at import time.)
+    (RUNTIME_ROOT, "agents/turn_output.py"),
     # Phase 11 (FOC-04): pure-policy HITL gating boundary. Imported by
     # tools.gateway, which graph.py uses -- so policy.py must precede
     # graph.py in the bundle.

@@ -34,6 +34,7 @@ from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
 from runtime.graph import build_graph, GraphState
+from runtime.policy import RetryDecision, should_retry
 from runtime.state import Session, ToolCall
 from runtime.state_resolver import resolve_state_class
 from runtime.storage.engine import build_engine
@@ -758,6 +759,107 @@ class Orchestrator(Generic[StateT]):
         """
         return isinstance(exc, GraphInterrupt)
 
+    @staticmethod
+    def _extract_last_error(inc: "Session") -> Exception | None:
+        """Reconstruct the last error from a Session in status='error'.
+
+        The graph runner stores failures as an AgentRun with
+        ``summary='agent failed: <repr>'`` (graph.py:_handle_agent_failure).
+        We can't recover the original Exception type, so we return a
+        synthetic representative whose CLASS matches a _PERMANENT_TYPES
+        / _TRANSIENT_TYPES whitelist entry where possible -- that's all
+        :func:`runtime.policy.should_retry` needs (it does isinstance
+        checks).
+
+        Mapping (first match wins per AgentRun.summary scan, newest
+        first):
+
+          - "EnvelopeMissingError" in body -> EnvelopeMissingError
+          - "ValidationError"     in body -> pydantic.ValidationError
+          - "TimeoutError" / "timed out"  -> TimeoutError
+          - "OSError" / "ConnectionError" -> OSError
+          - everything else               -> RuntimeError (falls
+            through to permanent_error per fail-closed default in
+            should_retry)
+        """
+        from runtime.agents.turn_output import (
+            EnvelopeMissingError as _EnvelopeMissingError,
+        )
+        import pydantic as _pydantic
+        for run in reversed(inc.agents_run):
+            summary = (run.summary or "")
+            if not summary.startswith("agent failed:"):
+                continue
+            body = summary.removeprefix("agent failed:").strip()
+            if "EnvelopeMissingError" in body:
+                return _EnvelopeMissingError(
+                    agent=run.agent or "unknown",
+                    field="confidence",
+                    message=body,
+                )
+            if "ValidationError" in body or "validation error" in body:
+                # Build a synthetic ValidationError; pydantic v2 supports
+                # ValidationError.from_exception_data.
+                try:
+                    return _pydantic.ValidationError.from_exception_data(
+                        title="reconstructed", line_errors=[],
+                    )
+                except Exception:  # pragma: no cover -- pydantic API drift
+                    return RuntimeError(body)
+            if ("TimeoutError" in body or "timed out" in body
+                    or "asyncio.TimeoutError" in body):
+                return TimeoutError(body)
+            if "OSError" in body or "ConnectionError" in body:
+                return OSError(body)
+            return RuntimeError(body)
+        return None
+
+    @staticmethod
+    def _extract_last_confidence(inc: "Session") -> float | None:
+        """Return the last recorded turn-level confidence on the session,
+        or None if no AgentRun carries one. should_retry treats None as
+        'no signal yet' and skips the low-confidence gate.
+        """
+        for run in reversed(inc.agents_run):
+            if run.confidence is not None:
+                return run.confidence
+        return None
+
+    def preview_retry_decision(
+        self, session_id: str,
+    ) -> "RetryDecision":
+        """Phase 12 (FOC-05 / D-12-04): return the framework's retry
+        decision WITHOUT executing anything. The UI calls this to render
+        the retry button label + disabled state.
+
+        Pure: same inputs always yield identical RetryDecision. Loads
+        the session from store; reads (retry_count, last_error,
+        last_confidence) and consults the same policy
+        ``runtime.policy.should_retry`` that ``_retry_session_locked``
+        uses. No mutation, no thread-id bump, no lock acquired.
+
+        For sessions whose status is not "error" (i.e. nothing to
+        retry), returns ``RetryDecision(retry=False,
+        reason="permanent_error")`` -- a defensive caller-friendly
+        outcome that lets the UI render a "cannot auto-retry" state
+        without inventing a new reason value.
+        """
+        try:
+            inc = self.store.load(session_id)
+        except FileNotFoundError:
+            return RetryDecision(retry=False, reason="permanent_error")
+        if inc.status != "error":
+            return RetryDecision(retry=False, reason="permanent_error")
+        retry_count = int(inc.extra_fields.get("retry_count", 0))
+        last_error = self._extract_last_error(inc)
+        last_confidence = self._extract_last_confidence(inc)
+        return should_retry(
+            retry_count=retry_count,
+            error=last_error,
+            confidence=last_confidence,
+            cfg=self.cfg.orchestrator,
+        )
+
     async def _finalize_session_status_async(
         self, session_id: str,
     ) -> str | None:
@@ -1206,6 +1308,30 @@ class Orchestrator(Generic[StateT]):
             yield {"event": "retry_rejected", "incident_id": session_id,
                    "reason": f"not in error state (status={inc.status})",
                    "ts": _event_ts()}
+            return
+        # Phase 12 (FOC-05 / D-12-04): consult the framework's pure
+        # retry policy BEFORE mutating session state. The decision is
+        # derived from (retry_count, last_error, last_turn_confidence,
+        # cfg) -- LLM intent is not consulted. On retry=False, emit
+        # retry_rejected with the policy's reason and DO NOT bump the
+        # retry_count or thread id (preserves the "not retryable"
+        # state on disk for UI re-rendering and retry-budget audits).
+        prior_retry_count = int(inc.extra_fields.get("retry_count", 0))
+        last_error = self._extract_last_error(inc)
+        last_confidence = self._extract_last_confidence(inc)
+        decision = should_retry(
+            retry_count=prior_retry_count,
+            error=last_error,
+            confidence=last_confidence,
+            cfg=self.cfg.orchestrator,
+        )
+        if not decision.retry:
+            _log.info(
+                "retry_session policy-rejected: id=%s reason=%s",
+                session_id, decision.reason,
+            )
+            yield {"event": "retry_rejected", "incident_id": session_id,
+                   "reason": decision.reason, "ts": _event_ts()}
             return
         # Drop the failed AgentRun(s) so the timeline only retains
         # successful runs. Retry attempts then append fresh runs.

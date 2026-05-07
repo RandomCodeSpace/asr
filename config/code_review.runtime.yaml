@@ -49,6 +49,12 @@ orchestrator:
     confidence_threshold: 0.7
     gated_environments: [production]
     gated_risk_actions: [approve]
+  # Phase 12 (FOC-05): declarative retry policy. Framework default --
+  # max_retries=2, transient retries on, confidence floor 0.4.
+  retry_policy:
+    max_retries: 2
+    retry_on_transient: true
+    retry_low_confidence_threshold: 0.4
   entry_agent: intake
   default_terminal_status: unreviewed
   statuses:

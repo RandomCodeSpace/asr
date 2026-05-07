@@ -175,6 +175,39 @@ class GatePolicy(BaseModel):
     )
 
 
+class RetryPolicy(BaseModel):
+    """Phase 12 (FOC-05): declarative retry policy.
+
+    Drives the framework's pure ``should_retry`` boundary. The LLM never
+    sees this config -- flow control is a framework decision, not a
+    skill-prompt incantation. Mirrors GatePolicy's shape so the
+    OrchestratorConfig surface stays uniform.
+
+    ``max_retries`` is the absolute cap on automatic retries (compared
+    with ``retry_count`` via ``>=``). 0 disables auto-retry entirely;
+    the recommended default 2 mirrors the v1.2 ROADMAP sketch and the
+    existing transient-5xx auto-retry budget in graph.py.
+
+    ``retry_on_transient`` lets apps with strict SLOs disable framework
+    auto-retry of transient errors entirely (escalate immediately
+    instead).
+
+    ``retry_low_confidence_threshold`` is the strict-less-than predicate
+    for "the LLM gave up; don't burn budget on a retry". Defaults to
+    0.4 -- well below the typical gate_policy 0.7-0.8 threshold so a
+    low-confidence escalation triggers HITL intervention before the
+    retry path even considers it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_retries: int = Field(default=2, ge=0, le=10)
+    retry_on_transient: bool = True
+    retry_low_confidence_threshold: float = Field(
+        default=0.4, ge=0.0, le=1.0,
+    )
+
+
 class OrchestratorConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -280,6 +313,15 @@ class OrchestratorConfig(BaseModel):
     # this struct and the LLM never sees it. Default keeps v1.1
     # behaviour (production gates "approve"-risk tools, threshold 0.7).
     gate_policy: "GatePolicy" = Field(default_factory=lambda: GatePolicy())
+
+    # Phase 12 (FOC-05): declarative retry policy. Apps tune
+    # max_retries / retry_on_transient / low-confidence threshold in
+    # YAML; the framework's should_retry boundary reads this struct
+    # and the LLM never sees it. Default keeps v1.2 behaviour
+    # (max_retries=2, transient retries enabled, confidence floor 0.4).
+    retry_policy: "RetryPolicy" = Field(
+        default_factory=lambda: RetryPolicy(),
+    )
 
     @field_validator("state_overrides_schema")
     @classmethod
