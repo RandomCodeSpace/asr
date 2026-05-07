@@ -25,7 +25,10 @@ def repo(tmp_path):
 def test_create_assigns_id_and_persists(repo):
     inc = repo.create(query="redis OOM", environment="production",
                       reporter_id="u1", reporter_team="platform")
-    assert inc.id.startswith("INC-")
+    # SessionStore default ``id_prefix`` is the framework-generic
+    # ``SES``. Apps thread their own prefix in via
+    # ``FrameworkAppConfig.session_id_prefix``.
+    assert inc.id.startswith("SES-")
     loaded = repo.load(inc.id)
     assert loaded.id == inc.id
     assert loaded.status == "new"

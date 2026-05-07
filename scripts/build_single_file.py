@@ -63,9 +63,15 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "storage/vector.py"),
     (RUNTIME_ROOT, "storage/history_store.py"),
     (RUNTIME_ROOT, "storage/session_store.py"),
-    (RUNTIME_ROOT, "mcp_servers/observability.py"),
-    (RUNTIME_ROOT, "mcp_servers/remediation.py"),
-    (RUNTIME_ROOT, "mcp_servers/user_context.py"),
+    # NOTE: the per-tool mcp_server modules
+    # (observability/remediation/user_context) were relocated under
+    # ``examples/incident_management/mcp_servers/`` in Phase 7
+    # (DECOUPLE-04 / D-07-01). They no longer live under
+    # ``src/runtime/`` and are bundled into the incident-management app
+    # via ``INCIDENT_APP_MODULE_ORDER`` below — NOT into the
+    # framework-only ``dist/app.py`` bundle. ``dist/apps/code-review.py``
+    # consequently boots without any incident-vocabulary MCP servers
+    # (its ``orchestrator.mcp_servers`` list is empty).
     (RUNTIME_ROOT, "mcp_loader.py"),
     (RUNTIME_ROOT, "graph.py"),
     (RUNTIME_ROOT, "checkpointer_postgres.py"),
@@ -123,6 +129,20 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 # the framework helpers to incident_management's stores + active-session
 # lookup now lives inside ``mcp_server.py``.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
+    # state.py — pydantic ``IncidentStateOverrides`` schema
+    # (DECOUPLE-05 / D-08-01). Bundled FIRST so any later module's
+    # ``from examples.incident_management.state import …`` resolves
+    # against the in-bundle definition (Phase 8).
+    (EXAMPLES_ROOT, "incident_management/state.py"),
+    # Per-tool MCP servers — relocated under
+    # ``examples/incident_management/`` in Phase 7 (DECOUPLE-04 /
+    # D-07-01). Bundled before mcp_server.py so the dotted-path
+    # discovery loop in orchestrator.py (``cfg.orchestrator.mcp_servers``)
+    # imports them out of the bundle without falling back to the
+    # now-deleted framework-internal location.
+    (EXAMPLES_ROOT, "incident_management/mcp_servers/observability.py"),
+    (EXAMPLES_ROOT, "incident_management/mcp_servers/remediation.py"),
+    (EXAMPLES_ROOT, "incident_management/mcp_servers/user_context.py"),
     (EXAMPLES_ROOT, "incident_management/mcp_server.py"),
 ]
 
@@ -132,6 +152,11 @@ INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
 # files were removed in the framework/dedup/environments YAML
 # migration; cross-cutting knobs now live on AppConfig directly.
 CODE_REVIEW_APP_MODULE_ORDER: list[tuple[Path, str]] = [
+    # state.py — pydantic ``CodeReviewStateOverrides`` schema
+    # (DECOUPLE-05 / D-08-01). Bundled FIRST so any later module's
+    # ``from examples.code_review.state import …`` resolves against
+    # the in-bundle definition (Phase 8).
+    (EXAMPLES_ROOT, "code_review/state.py"),
     (EXAMPLES_ROOT, "code_review/mcp_server.py"),
 ]
 

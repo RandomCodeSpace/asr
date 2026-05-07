@@ -49,7 +49,7 @@ def test_session_store_create_returns_incident(store):
         query="payments latency", environment="production",
         reporter_id="user-1", reporter_team="platform",
     )
-    assert inc.id.startswith("INC-")
+    assert inc.id.startswith("SES-")  # framework default prefix
     assert inc.status == "new"
 
 

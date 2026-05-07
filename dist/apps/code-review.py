@@ -6,10 +6,16 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
 
 
+
+# Session-id prefix grammar. The framework mints session ids of the form
+# ``{PREFIX}-YYYYMMDD-NNN`` (see ``runtime.state.Session.id_format``);
+# the prefix is the only piece an app picks. Allow alphanumerics + hyphens,
+# bound the length so the id stays scannable in logs and DB indexes, and
+# refuse the empty string so the resulting id never starts with a stray ``-``.
 # ----- imports for runtime/state.py -----
 """Generic session model — the framework's unit of work.
 
@@ -103,7 +109,6 @@ instead of at runtime. Three kinds are supported:
 
 import ast
 from typing import Any, Callable, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ----- imports for runtime/llm.py -----
@@ -266,22 +271,6 @@ from sqlalchemy.orm import Session as SqlSession
 # hook existed. New rows are validated by ``_SESSION_ID_RE`` which
 # accepts any ``PREFIX-YYYYMMDD-NNN`` shape the app's ``id_format`` may
 # emit (e.g. ``CR-...`` for code-review).
-# ----- imports for runtime/mcp_servers/observability.py -----
-"""FastMCP server: observability mock tools."""
-
-from datetime import datetime, timezone, timedelta
-from typing import Annotated
-from fastmcp import FastMCP
-from pydantic import BeforeValidator
-
-# ----- imports for runtime/mcp_servers/remediation.py -----
-"""FastMCP server: remediation mock tools."""
-
-
-# ----- imports for runtime/mcp_servers/user_context.py -----
-"""FastMCP server: user_context mock tool."""
-
-
 # ----- imports for runtime/mcp_loader.py -----
 """Load MCP servers (in_process / stdio / http / sse) and build a tool registry.
 
@@ -461,6 +450,7 @@ required, matching the existing P3 pattern):
 
 import threading
 from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import DateTime, String, delete, select
 from sqlalchemy.orm import Mapped, Session as SqlaSession, mapped_column
@@ -664,6 +654,7 @@ each example app's YAML opts in.
 import enum
 from typing import Any, Callable, Generic, Literal, TYPE_CHECKING, TypeVar
 
+from pydantic import BaseModel, Field, model_validator
 
 # ----- imports for runtime/intake.py -----
 """Framework default intake runner.
@@ -954,6 +945,19 @@ status flip via :meth:`SessionStore.un_duplicate`.
 from fastapi import FastAPI, HTTPException
 
 
+# ----- imports for examples/code_review/state.py -----
+"""Code-review state-overrides schema (DECOUPLE-05 / D-08-01).
+
+Registered via ``OrchestratorConfig.state_overrides_schema`` in
+``config/code_review.runtime.yaml``. Fields mirror the contract of
+``examples/code_review/mcp_server.py:_tool_fetch_pr_diff(repo, number)``
+and the legacy ``PullRequest`` shape stored in
+``Session.extra_fields["pr"]``.
+"""
+
+
+
+
 # ----- imports for examples/code_review/mcp_server.py -----
 """FastMCP server: code_review tools, backed by ``SessionStore``.
 
@@ -984,6 +988,7 @@ and ``review_summary``.
 
 
 
+from fastmcp import FastMCP
 
 
 
@@ -996,6 +1001,9 @@ and ``review_summary``.
 
 
 # ====== module: runtime/config.py ======
+
+_SESSION_ID_PREFIX_RE = re.compile(r"^[A-Za-z0-9-]{1,16}$")
+
 
 ProviderKind = Literal["ollama", "azure_openai", "stub"]
 
@@ -1118,14 +1126,189 @@ class Paths(BaseModel):
 
 
 class OrchestratorConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+
     entry_agent: str = "intake"
-    # Signals an agent may emit (via ``update_incident.patch.signal``) that
-    # the router will accept and look up against the skill's ``routes`` table.
+    # Signals an agent may emit (via the configured patch tool's ``patch.signal``)
+    # that the router will accept and look up against the skill's ``routes`` table.
     # Anything outside this set falls through to ``when: default``. Override
     # in YAML to extend the vocabulary; the default keeps current behaviour.
     signals: list[str] = Field(
         default_factory=lambda: ["success", "failed", "needs_input"],
     )
+
+    # Generic terminal-tool registry — apps declare which tool calls
+    # transition the session to which status, plus optional per-rule
+    # extra-field extraction. Replaces the v1.0 hardcoded
+    # ``_TERMINAL_TOOL_RULES`` table in ``orchestrator.py`` (D-06-01,
+    # D-06-02). Empty list = framework cannot infer any terminal
+    # status -> every session falls through to
+    # ``default_terminal_status``.
+    terminal_tools: list[TerminalToolRule] = Field(default_factory=list)
+
+    # Status vocabulary the app exposes. Keys are the status names
+    # the app uses (``resolved``, ``escalated``, ``approved``,
+    # ``changes_requested``, ...). Empty dict is allowed for the
+    # framework default ``OrchestratorConfig()`` so unconfigured apps
+    # still validate (real apps populate this in their YAML).
+    # D-06-03, D-06-05.
+    statuses: dict[str, StatusDef] = Field(default_factory=dict)
+
+    # Status assigned when the graph runs to ``__end__`` and no
+    # ``terminal_tools`` rule fires. Required when ``statuses`` is
+    # non-empty; must reference a key in ``statuses``. Apps own
+    # this name — ``incident_management`` uses ``needs_review``,
+    # ``code_review`` uses ``unreviewed`` (D-06-06).
+    default_terminal_status: str | None = None
+
+    # Tool names whose ``args.patch`` blob the harvester should fold
+    # into agent confidence/signal/rationale (DECOUPLE-02 generalization
+    # of the v1.0 single-tool path). Empty default means "no patch
+    # tools" so unconfigured apps pay nothing. Apps populate this in
+    # YAML alongside ``terminal_tools``; staying off the framework
+    # hardcoded path keeps generic-runtime free of app vocabulary
+    # leaks.
+    patch_tools: list[str] = Field(default_factory=list)
+
+    # Tool names the harvester should treat as "typed-terminal"
+    # (carrying flat ``confidence``/``confidence_rationale`` args and
+    # implying ``signal=success``) WITHOUT the orchestrator's finalize
+    # path firing a status transition for them. Used for tools that
+    # mark an agent stage complete but do not themselves end the
+    # session. Empty default means "no harvest-only tools". Distinct
+    # from ``terminal_tools`` (which both harvest and transition
+    # status).
+    harvest_terminal_tools: list[str] = Field(default_factory=list)
+
+    # Dotted module paths the orchestrator imports at create()-time and
+    # binds via each module's ``register(mcp_app, cfg)`` callable. Empty
+    # list = no app MCP servers (framework-only). Order is preserved.
+    # Replaces the v1.0 hardcoded framework-internal MCP-server imports
+    # plus ``set_environments`` / ``set_escalation_teams`` setter calls
+    # in orchestrator.py (DECOUPLE-04 / D-07-02 / D-07-03). Apps declare
+    # their per-tool servers under ``orchestrator.mcp_servers`` in YAML;
+    # framework no longer hardcodes incident-vocabulary modules.
+    mcp_servers: list[str] = Field(default_factory=list)
+
+    # Optional MCP tool the orchestrator invokes when a user clicks
+    # ``Escalate`` from the awaiting_input gate. ``None`` (default)
+    # means the orchestrator skips the tool call entirely and only
+    # transitions the session to the rule-driven status. Apps that
+    # want a side-effect (page on-call, file ticket) set this to the
+    # bare tool name; the orchestrator looks up the matching rule in
+    # ``terminal_tools`` to determine the resulting status.
+    escalate_action_tool_name: str | None = None
+
+    # Default team to pass to the escalation tool when the user did
+    # not pick one. Only meaningful if ``escalate_action_tool_name``
+    # is set. Apps own this default (``incident_management`` defaults
+    # to ``platform-oncall``).
+    escalate_action_default_team: str | None = None
+
+    # Dotted path to a pydantic BaseModel subclass that validates the
+    # ``state_overrides=`` dict passed to ``Orchestrator.start_session``.
+    # Format: ``module.path:ClassName`` OR ``module.path.ClassName`` (both
+    # accepted; ``:`` is the canonical entry-point form). ``None`` (default)
+    # = no validation; ``start_session(state_overrides=...)`` passes the
+    # dict through unchanged (D-08-02 backward-compat). Resolved at
+    # ``Orchestrator.create()`` via ``importlib.import_module`` + ``getattr``;
+    # bad path raises at boot with a useful message (DECOUPLE-05 / D-08-01).
+    state_overrides_schema: str | None = None
+
+    @field_validator("state_overrides_schema")
+    @classmethod
+    def _validate_state_overrides_schema_format(
+        cls, v: str | None,
+    ) -> str | None:
+        """String-format sanity check for the dotted-path schema reference.
+
+        Real importlib resolution happens at ``Orchestrator.create()``
+        time so config-load doesn't drag the schema module into every
+        consumer. This validator only catches obviously-malformed
+        strings (whitespace, hyphens, missing class component) so the
+        actual ImportError/AttributeError is the only reason boot
+        ever fails (DECOUPLE-05 / D-08-01).
+        """
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError(
+                "state_overrides_schema must be non-empty when set"
+            )
+        # Accept either ``mod.path:ClassName`` or ``mod.path.ClassName``.
+        # Each component must be a Python identifier; the trailing
+        # element MUST be a class name (no further dots after the
+        # separator).
+        if not re.fullmatch(
+            r"[A-Za-z_][\w.]*[:.][A-Za-z_]\w*", v,
+        ):
+            raise ValueError(
+                f"state_overrides_schema={v!r} is not a valid dotted "
+                f"path (expected `module.path:ClassName` or "
+                f"`module.path.ClassName`)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_terminal_tool_registry(self) -> "OrchestratorConfig":
+        """Cross-field invariants for the terminal-tool registry.
+
+        * If ``statuses`` is non-empty, ``default_terminal_status``
+          must be set and reference an existing status name.
+        * The status referenced by ``default_terminal_status`` must
+          be ``terminal=True`` (a non-terminal default makes no
+          sense).
+        * Every ``terminal_tools[i].status`` must reference an
+          existing status name.
+
+        Empty ``statuses`` (the framework's bare default) skips
+        these checks so ``OrchestratorConfig()`` still constructs.
+        Apps with ``statuses`` populated cross-validate at boot per
+        D-06-03 / D-06-06.
+        """
+        if not self.statuses:
+            # Bare framework default: nothing to cross-validate. If
+            # ``default_terminal_status`` is set without ``statuses``
+            # the app made a config mistake — flag it.
+            if self.default_terminal_status is not None:
+                raise ValueError(
+                    "default_terminal_status is set but statuses is "
+                    "empty; declare the status vocabulary first"
+                )
+            if self.terminal_tools:
+                raise ValueError(
+                    "terminal_tools is non-empty but statuses is "
+                    "empty; declare the status vocabulary first"
+                )
+            return self
+
+        if self.default_terminal_status is None:
+            raise ValueError(
+                "default_terminal_status is required when statuses "
+                "is non-empty"
+            )
+        if self.default_terminal_status not in self.statuses:
+            valid = sorted(self.statuses.keys())
+            raise ValueError(
+                f"default_terminal_status={self.default_terminal_status!r} "
+                f"is not a declared status; valid statuses: {valid}"
+            )
+        default_def = self.statuses[self.default_terminal_status]
+        if not default_def.terminal:
+            raise ValueError(
+                f"default_terminal_status={self.default_terminal_status!r} "
+                f"references a non-terminal status (terminal=False); "
+                f"the default must be terminal"
+            )
+        for idx, rule in enumerate(self.terminal_tools):
+            if rule.status not in self.statuses:
+                valid = sorted(self.statuses.keys())
+                raise ValueError(
+                    f"terminal_tools[{idx}].status={rule.status!r} "
+                    f"(tool_name={rule.tool_name!r}) is not a "
+                    f"declared status; valid statuses: {valid}"
+                )
+        return self
 
 
 RiskLevel = Literal["low", "medium", "high"]
@@ -1299,11 +1482,28 @@ class FrameworkAppConfig(BaseModel):
     # Intake runner knobs: forwarded into IntakeContext at graph-build time.
     intake_top_k: int = 3
     intake_similarity_threshold: float = 0.7
+    # Per-app session-id prefix. Threaded through ``SessionStore`` to
+    # ``Session.id_format`` so each app picks its own id namespace
+    # (``INC`` for incident management, ``REVIEW`` for code review,
+    # ``HR`` for HR cases, ...). Default ``"SES"`` keeps unconfigured
+    # apps generic. Validated as 1-16 chars of alphanumerics and
+    # hyphens so the resulting id stays scannable.
+    session_id_prefix: str = "SES"
     # UI rendering knobs surfaced to the generic runtime UI. Mirrors
     # AppConfig.ui — the FrameworkAppConfig provider can either copy
     # AppConfig.ui or supply its own. Defaults to empty so apps that
     # don't render with the generic UI pay nothing.
     ui: UIConfig = Field(default_factory=UIConfig)
+
+    @field_validator("session_id_prefix")
+    @classmethod
+    def _validate_session_id_prefix(cls, v: str) -> str:
+        if not _SESSION_ID_PREFIX_RE.match(v):
+            raise ValueError(
+                f"session_id_prefix={v!r} must be 1-16 chars of "
+                "alphanumerics and hyphens (no whitespace, no symbols)"
+            )
+        return v
 
 
 def resolve_framework_app_config(
@@ -1579,14 +1779,15 @@ class Session(BaseModel):
     # App-overridable session id minting hook.
     # ------------------------------------------------------------------
     @classmethod
-    def id_format(cls, *, seq: int) -> str:
+    def id_format(cls, *, seq: int, prefix: str = "SES") -> str:
         """Return the canonical session id for the given sequence number.
 
-        Apps override this on their ``Session`` subclass to produce an
-        id format that suits their domain (e.g. ``PR-{repo}-{number}``
-        for code review). The framework default keeps the legacy
-        ``INC-YYYYMMDD-NNN`` shape so existing on-disk rows and any app
-        that has not opted in continue to round-trip cleanly.
+        ``prefix`` is supplied by ``SessionStore._next_id`` from
+        ``FrameworkAppConfig.session_id_prefix`` so each app picks its
+        own namespace via plain config (e.g. ``INC`` for incident
+        management, ``REVIEW`` for code review, ``HR`` for HR cases,
+        ...). Apps with truly bespoke id shapes can still override this
+        classmethod on their ``Session`` subclass and ignore ``prefix``.
 
         ``seq`` is the per-day monotonic sequence supplied by
         ``SessionStore._next_id``; it lets the default format produce
@@ -1596,7 +1797,7 @@ class Session(BaseModel):
         from datetime import datetime, timezone
 
         today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        return f"INC-{today}-{seq:03d}"
+        return f"{prefix}-{today}-{seq:03d}"
 
 # ====== module: runtime/state_resolver.py ======
 
@@ -2883,6 +3084,7 @@ class SessionStore(Generic[StateT]):
         vector_path: Optional[str] = None,
         vector_index_name: str = "incidents",
         distance_strategy: str = "cosine",
+        id_prefix: str = "SES",
     ) -> None:
         self.engine = engine
         self._state_cls = state_cls
@@ -2891,24 +3093,30 @@ class SessionStore(Generic[StateT]):
         self.vector_path = vector_path
         self.vector_index_name = vector_index_name
         self.distance_strategy = distance_strategy
+        # Per-app session-id namespace. Threaded into
+        # ``state_cls.id_format`` so each app's rows share a stable
+        # ``PREFIX-YYYYMMDD-NNN`` shape. Default ``"SES"`` keeps the
+        # bare-Session path framework-neutral; apps configure this
+        # via ``FrameworkAppConfig.session_id_prefix``.
+        self._id_prefix = id_prefix
 
     # ---------- ID minting ----------
     def _next_id(self, session: SqlSession) -> str:
         """Mint a new session id via ``state_cls.id_format(seq=...)``.
 
-        The per-app id format lives on the ``Session`` subclass so each
-        app picks its own prefix (``INC-`` for incidents, ``CR-`` for
-        code-review, anything else custom apps want). The store still
-        owns the monotonic sequence — it scans for prior rows whose id
-        starts with the same ``PREFIX-YYYYMMDD-`` stem and returns
-        ``max(seq) + 1``.
+        The per-app id namespace is supplied as ``self._id_prefix`` (from
+        ``FrameworkAppConfig.session_id_prefix``); ``id_format`` may
+        also be overridden on the state subclass for fully bespoke
+        shapes. The store still owns the monotonic sequence — it scans
+        for prior rows whose id starts with the same ``PREFIX-YYYYMMDD-``
+        stem and returns ``max(seq) + 1``.
         """
         # Probe today's prefix by asking the state class to format seq=1
         # and stripping the ``-001`` suffix. Apps that override
         # ``id_format`` to return a non-``PREFIX-YYYYMMDD-NNN`` shape
         # (e.g. opaque ULIDs) fall through to the simple count path
         # below.
-        sample = self._state_cls.id_format(seq=1)
+        sample = self._state_cls.id_format(seq=1, prefix=self._id_prefix)
         m = _SESSION_ID_RE.match(sample)
         if m is None:
             # Custom format — count all rows as the sequence base. Apps
@@ -2917,7 +3125,9 @@ class SessionStore(Generic[StateT]):
             count = session.execute(
                 select(IncidentRow.id)
             ).scalars().all()
-            return self._state_cls.id_format(seq=len(count) + 1)
+            return self._state_cls.id_format(
+                seq=len(count) + 1, prefix=self._id_prefix,
+            )
 
         # Extract the ``PREFIX-YYYYMMDD-`` stem (everything up to and
         # including the second hyphen).
@@ -2932,7 +3142,9 @@ class SessionStore(Generic[StateT]):
                 max_seq = max(max_seq, int(r.rsplit("-", 1)[1]))
             except (ValueError, IndexError):
                 continue
-        return self._state_cls.id_format(seq=max_seq + 1)
+        return self._state_cls.id_format(
+            seq=max_seq + 1, prefix=self._id_prefix,
+        )
 
     # ---------- public API ----------
     def create(self, *, query: str, environment: str,
@@ -3421,238 +3633,6 @@ class SessionStore(Generic[StateT]):
             "version": getattr(inc, "version", 1),
         }
 
-# ====== module: runtime/mcp_servers/observability.py ======
-
-mcp = FastMCP("observability")
-
-
-def _coerce_int(default: int):
-    """Build a BeforeValidator that coerces LLM-supplied junk to ``default``.
-
-    LLMs occasionally pass placeholder strings (``"??"``, ``""``,
-    ``"unknown"``) into numeric tool args. Strict pydantic validation
-    aborts the tool call and the agent often abandons the turn instead
-    of retrying. Coercing to a sane default keeps the investigation
-    moving with the documented lookback window.
-    """
-    def _coerce(v: object) -> int:
-        if v is None or v == "":
-            return default
-        if isinstance(v, bool):
-            return default
-        try:
-            return int(v)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return default
-    return _coerce
-
-
-_Minutes = Annotated[int, BeforeValidator(_coerce_int(15))]
-_Hours = Annotated[int, BeforeValidator(_coerce_int(24))]
-
-
-def build_environment_validator(allowed: list[str]):
-    """Return an Annotated[str, BeforeValidator] that lowercases input
-    and rejects values not in ``allowed``. Bound at server-init time
-    from the framework env list. Tools using this type get a
-    recoverable 422 from FastMCP when the LLM emits ``"prod"`` instead
-    of ``"production"`` instead of silently passing through to a
-    backend that has no policy entry for the typo.
-    """
-    allowed_lower = {a.lower() for a in allowed}
-
-    def _validate(v: object) -> str:
-        if not isinstance(v, str):
-            raise ValueError(f"environment must be a string, got {type(v).__name__}")
-        canonical = v.lower()
-        if canonical not in allowed_lower:
-            raise ValueError(
-                f"environment {v!r} not in {sorted(allowed_lower)}"
-            )
-        return canonical
-
-    return Annotated[str, BeforeValidator(_validate)]
-
-
-_environments: list[str] = []
-
-
-def set_environments(envs: list[str]) -> None:
-    """Bind the allowed environments roster from app config.
-
-    Called once by the orchestrator at create()-time after MCP servers
-    load. Tools defined below use ``_validate_environment`` (defined
-    below) which reads this module-level list at call time.
-    """
-    global _environments
-    _environments = list(envs)
-
-
-def _validate_environment(env: str) -> str:
-    """In-tool guard: raise ValueError if env not in the bound roster.
-    No-op if the roster is empty (test/early-init scenarios).
-    """
-    if not _environments:
-        return env
-    canonical = env.lower() if isinstance(env, str) else env
-    allowed_lower = {e.lower() for e in _environments}
-    if canonical not in allowed_lower:
-        raise ValueError(
-            f"environment {env!r} not in {sorted(allowed_lower)}"
-        )
-    return canonical
-
-
-def _seed(*parts: str) -> int:
-    return int(hashlib.sha1("|".join(parts).encode()).hexdigest()[:8], 16)
-
-
-@mcp.tool()
-async def get_logs(service: str, environment: str, minutes: _Minutes = 15) -> dict:
-    """Return canned recent log lines for a service in an environment."""
-    environment = _validate_environment(environment)
-    seed = _seed(service, environment, str(minutes))
-    rng = (seed >> 4) % 4
-    base = [
-        f"{datetime.now(timezone.utc).isoformat()} INFO {service} request_id=abc123 path=/v1/items dur=42ms",
-        f"{datetime.now(timezone.utc).isoformat()} WARN {service} slow_query duration=820ms table=orders",
-        f"{datetime.now(timezone.utc).isoformat()} ERROR {service} upstream_timeout target=payments duration=5000ms",
-        f"{datetime.now(timezone.utc).isoformat()} INFO {service} cache_miss key=user:42",
-    ]
-    return {"service": service, "environment": environment, "lines": base[rng:] + base[:rng]}
-
-
-@mcp.tool()
-async def get_metrics(service: str, environment: str, minutes: _Minutes = 15) -> dict:
-    """Return canned metrics snapshot."""
-    environment = _validate_environment(environment)
-    seed = _seed(service, environment)
-    return {
-        "service": service,
-        "environment": environment,
-        "window_minutes": minutes,
-        "p50_latency_ms": 50 + (seed % 50),
-        "p99_latency_ms": 800 + (seed % 1500),
-        "error_rate": round(((seed % 100) / 100) * 0.05, 4),
-        "rps": 120 + (seed % 300),
-        "cpu_pct": 30 + (seed % 60),
-        "mem_pct": 40 + (seed % 50),
-    }
-
-
-@mcp.tool()
-async def get_service_health(environment: str) -> dict:
-    """Return overall environment health summary."""
-    environment = _validate_environment(environment)
-    seed = _seed(environment)
-    statuses = ["healthy", "degraded", "unhealthy"]
-    status = statuses[seed % 3]
-    return {
-        "environment": environment,
-        "status": status,
-        "services": {
-            "api": "healthy" if status == "healthy" else status,
-            "db": "healthy",
-            "cache": "healthy",
-            "queue": status,
-        },
-    }
-
-
-@mcp.tool()
-async def check_deployment_history(environment: str, hours: _Hours = 24) -> dict:
-    """Return canned recent deployments."""
-    environment = _validate_environment(environment)
-    now = datetime.now(timezone.utc)
-    seed = _seed(environment, str(hours))
-    deployments = [
-        {"service": "api", "version": f"v1.{(seed % 50) + 100}", "deployed_at":
-         (now - timedelta(hours=2)).isoformat(), "deployer": "deploy-bot"},
-        {"service": "worker", "version": f"v2.{(seed % 30) + 50}", "deployed_at":
-         (now - timedelta(hours=8)).isoformat(), "deployer": "deploy-bot"},
-    ]
-    return {"environment": environment, "window_hours": hours, "deployments": deployments}
-
-# ====== module: runtime/mcp_servers/remediation.py ======
-
-mcp = FastMCP("remediation")
-
-
-def _seed(*parts: str) -> int:
-    return int(hashlib.sha1("|".join(parts).encode()).hexdigest()[:8], 16)
-
-
-@mcp.tool()
-async def propose_fix(hypothesis: str, environment: str) -> dict:
-    """Generate a remediation proposal for a hypothesis. Returns auto_apply_safe flag."""
-    seed = _seed(hypothesis, environment)
-    safe = (seed % 3) == 0  # ~33% of mock proposals are auto-safe
-    return {
-        "proposal_id": f"prop-{seed % 1000:03d}",
-        "proposal": f"Restart the affected service in {environment}; investigate {hypothesis}.",
-        "auto_apply_safe": safe,
-        "estimated_impact": "low" if safe else "medium",
-    }
-
-
-@mcp.tool()
-async def apply_fix(proposal_id: str, environment: str) -> dict:
-    """Apply a previously proposed fix. Mock returns success/failure deterministically."""
-    seed = _seed(proposal_id, environment)
-    success = (seed % 4) != 0
-    return {
-        "proposal_id": proposal_id,
-        "environment": environment,
-        "status": "applied" if success else "failed",
-        "applied_at": datetime.now(timezone.utc).isoformat(),
-        "details": "Mock remediation completed." if success else "Mock remediation failed.",
-    }
-
-
-_escalation_teams: list[str] = []
-
-
-def set_escalation_teams(teams: list[str]) -> None:
-    """Bind the allowed escalation_teams roster from app config."""
-    global _escalation_teams
-    _escalation_teams = list(teams)
-
-
-@mcp.tool()
-async def notify_oncall(incident_id: str, message: str, team: str) -> dict:
-    """Page the oncall engineer for the named team. ``team`` is REQUIRED
-    and must be in the configured escalation_teams roster.
-    """
-    if not team:
-        raise ValueError("team is required (got empty string)")
-    if _escalation_teams and team not in _escalation_teams:
-        raise ValueError(
-            f"team {team!r} not in escalation_teams ({_escalation_teams})"
-        )
-    return {
-        "incident_id": incident_id,
-        "team": team,
-        "page_id": f"page-{abs(hash(incident_id + team)) % 10000:04d}",
-        "delivered_at": datetime.now(timezone.utc).isoformat(),
-        "message": message,
-    }
-
-# ====== module: runtime/mcp_servers/user_context.py ======
-
-mcp = FastMCP("user_context")
-
-
-@mcp.tool()
-async def get_user_context(user_id: str) -> dict:
-    """Return canned user metadata."""
-    return {
-        "user_id": user_id,
-        "team": "platform",
-        "role": "engineer",
-        "manager": "manager-mock",
-        "timezone": "UTC",
-    }
-
 # ====== module: runtime/mcp_loader.py ======
 
 @dataclass
@@ -4070,15 +4050,6 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
-# NOTE: Hard-coding app-specific tool names here is a layering inversion —
-# the runtime should not need to know app-level tool identities. Task 9.1
-# (per-orchestrator MCP server) will move this to a registration mechanism
-# on the tool definition itself.
-_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
-    "mark_resolved", "mark_escalated", "submit_hypothesis",
-})
-
-
 def _harvest_typed_terminal(
     tc_args: dict,
     state: tuple[float | None, str | None, str | None],
@@ -4098,17 +4069,20 @@ def _harvest_typed_terminal(
     return conf, rat, sig
 
 
-def _harvest_update_incident(
+def _harvest_patch_tool(
     tc_args: dict,
     state: tuple[float | None, str | None, str | None],
     terminal_locked: bool,
     valid_signals: frozenset[str] | None,
 ) -> tuple[float | None, str | None, str | None]:
-    """Apply an ``update_incident.patch`` to the harvest state.
+    """Apply a configured patch-tool's ``args.patch`` blob to the
+    harvest state.
 
     When ``terminal_locked`` is True (a typed-terminal call already
     fired this session), confidence/rationale are pinned; only signal
-    can flow through.
+    can flow through. Generalises the v1.0 single-tool path —
+    apps register patch-tool names via
+    ``OrchestratorConfig.patch_tools``.
     """
     conf, rat, sig = state
     patch = tc_args.get("patch") or {}
@@ -4126,24 +4100,33 @@ def _harvest_tool_calls_and_patches(
     incident: Session,
     ts: str,
     valid_signals: frozenset[str] | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ) -> tuple[float | None, str | None, str | None]:
-    """Iterate agent messages, record ToolCall entries on the incident, and
+    """Iterate agent messages, record ToolCall entries on the session, and
     harvest confidence / confidence_rationale / signal from typed terminal
-    tools or legacy update_incident patches.
+    tools or app-declared patch tools.
 
-    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
-    carry confidence and rationale as flat kwargs; they imply
-    ``signal=success`` since invoking a terminal tool is the agent's
-    declaration that *its stage* completed cleanly — not that the
-    session itself was successfully resolved. The session-level
-    distinction (resolved vs escalated) is inferred separately from
-    tool_calls history by ``_finalize_session_status``. Non-terminal
-    agents emit routing signal via ``update_incident.patch.signal``.
+    Typed terminal tools (those whose bare name is in
+    ``terminal_tool_names``, supplied by the caller from
+    ``OrchestratorConfig.terminal_tools``) carry confidence and rationale
+    as flat kwargs; they imply ``signal=success`` since invoking a
+    terminal tool is the agent's declaration that *its stage* completed
+    cleanly — not that the session itself was successfully resolved.
+    The session-level outcome is inferred separately from tool_calls
+    history by ``_finalize_session_status``. Non-terminal agents emit
+    routing signal via patch-tool args.
+
+    ``patch_tool_names`` lists the bare tool names that ship a
+    ``patch:`` arg the harvester should merge. Empty default means
+    "no patch tools" so unconfigured apps pay nothing. Generalises
+    the v1.0 single-tool path; apps register patch-tool names via
+    ``OrchestratorConfig.patch_tools``.
 
     Once a typed terminal tool has fired, its confidence/rationale are
-    authoritative — a same-message update_incident.patch must not
-    override them. Signal still flows from later patches so triage-style
-    routing remains expressive.
+    authoritative — a same-message patch must not override them.
+    Signal still flows from later patches so triage-style routing
+    remains expressive.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
@@ -4161,11 +4144,11 @@ def _harvest_tool_calls_and_patches(
                 agent=skill_name, tool=tc_name, args=tc_args,
                 result=None, ts=ts,
             ))
-            if tc_original in _TYPED_TERMINAL_TOOLS:
+            if tc_original in terminal_tool_names:
                 state = _harvest_typed_terminal(tc_args, state, valid_signals)
                 terminal_locked = True
-            elif tc_original == "update_incident":
-                state = _harvest_update_incident(
+            elif tc_original in patch_tool_names:
+                state = _harvest_patch_tool(
                     tc_args, state, terminal_locked, valid_signals,
                 )
     return state
@@ -4275,6 +4258,8 @@ def make_agent_node(
     store: SessionStore,
     valid_signals: frozenset[str] | None = None,
     gateway_cfg: GatewayConfig | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -4288,6 +4273,13 @@ def make_agent_node(
     :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so
     the closure captures the live ``Session`` per agent invocation.
     When ``None``, tools are passed through untouched.
+
+    ``terminal_tool_names`` and ``patch_tool_names`` are the bare tool
+    names the harvester should treat as typed-terminal /
+    patch-emitting (sourced from ``OrchestratorConfig.terminal_tools``
+    union ``OrchestratorConfig.harvest_terminal_tools`` /
+    ``OrchestratorConfig.patch_tools``). Empty defaults preserve the
+    "no harvester recognition" behavior for legacy callers.
     """
 
     async def node(state: GraphState) -> dict:
@@ -4322,18 +4314,21 @@ def make_agent_node(
                 inc_id=inc_id, store=store, fallback=incident,
             )
 
-        # Tools (e.g. update_incident) write straight to disk. Reload so the
-        # node's own append of agent_run + tool_calls happens against the
-        # tool-mutated state — otherwise saving the stale in-memory object
-        # clobbers the tools' writes.
+        # Tools (e.g. registered patch tools) write straight to disk.
+        # Reload so the node's own append of agent_run + tool_calls
+        # happens against the tool-mutated state — otherwise saving
+        # the stale in-memory object clobbers the tools' writes.
         incident = store.load(inc_id)
 
         messages = result.get("messages", [])
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
-        # Record tool calls and harvest confidence/signal from update_incident patches.
+        # Record tool calls and harvest confidence/signal from configured
+        # patch / typed-terminal tools.
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
             messages, skill.name, incident, ts, valid_signals,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
         )
 
         # Pair tool responses with their tool calls.
@@ -4361,7 +4356,7 @@ def _decide_from_signal(inc: Session) -> str:
     """Return the latest agent's emitted signal, or "default" if absent.
 
     Agents emit one of {success, failed, needs_input} via the ``signal``
-    key of their final ``update_incident`` patch (see ``_coerce_signal``).
+    key of a configured patch tool (see ``_coerce_signal``).
     The node harvests it onto ``AgentRun.signal``; this decider then reads
     the *most recent* run (which is the one that just finished, since the
     node has already appended it). If no signal is present we return
@@ -4550,6 +4545,15 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     valid_signals = frozenset(cfg.orchestrator.signals)
     gateway_cfg = getattr(cfg.runtime, "gateway", None)
+    # Build the harvester's tool-name sets once per graph-build. The
+    # union of ``terminal_tools`` (status-transitioning) and
+    # ``harvest_terminal_tools`` (harvest-only) gives the full
+    # typed-terminal recognition surface for confidence/rationale
+    # capture; ``patch_tools`` carries the patch-blob harvester path.
+    terminal_tool_names = frozenset(
+        r.tool_name for r in cfg.orchestrator.terminal_tools
+    ) | frozenset(cfg.orchestrator.harvest_terminal_tools)
+    patch_tool_names = frozenset(cfg.orchestrator.patch_tools)
     nodes: dict = {}
     for agent_name, skill in skills.items():
         kind = getattr(skill, "kind", "responsive")
@@ -4582,6 +4586,8 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             decide_route=decide, store=store,
             valid_signals=valid_signals,
             gateway_cfg=gateway_cfg,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
         )
     return nodes
 
@@ -7403,42 +7409,6 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
-# Map terminal-tool name -> (status_to_set, team_arg_keys_to_check).
-# Both bare and ``<server>:<tool>`` forms are matched via suffix check.
-_TERMINAL_TOOL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("mark_escalated", "escalated", ("args.team", "result.team")),
-    ("mark_resolved", "resolved", ()),
-    # Legacy / forward-compat: direct notify_oncall page = escalation.
-    ("notify_oncall", "escalated", ("args.team",)),
-)
-
-
-def _extract_team(tc, lookup_keys: tuple[str, ...]) -> str | None:
-    """Pull a ``team`` value from a ToolCall's args/result by ``"args.team"``
-    / ``"result.team"`` lookup hints. Returns the first non-falsy match."""
-    args = tc.args if isinstance(tc.args, dict) else {}
-    result = tc.result if isinstance(tc.result, dict) else {}
-    for key in lookup_keys:
-        scope, _, attr = key.partition(".")
-        source = args if scope == "args" else result
-        value = source.get(attr)
-        if value:
-            return value
-    return None
-
-
-def _infer_terminal_decision(tool_calls) -> tuple[str, str | None] | None:
-    """Walk executed tool_calls latest-first; return (new_status, team)
-    for the first matching terminal tool, or None if no rule fires."""
-    for tc in reversed([tc for tc in tool_calls
-                        if getattr(tc, "status", None) == "executed"]):
-        tool_name = tc.tool or ""
-        for bare, status, team_keys in _TERMINAL_TOOL_RULES:
-            if tool_name == bare or tool_name.endswith(f":{bare}"):
-                return status, _extract_team(tc, team_keys)
-    return None
-
-
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -7501,6 +7471,13 @@ class Orchestrator(Generic[StateT]):
         # on the same session id. The set is mutated under self._locks
         # so the in-flight check + add is atomic per session.
         self._retries_in_flight: set[str] = set()
+        # Resolved app-declared pydantic schema for the
+        # ``state_overrides=`` kwarg of ``start_session``. ``None``
+        # (default) means no validation — start_session passes the
+        # dict through unchanged (DECOUPLE-05 / D-08-02 backward-
+        # compat). Set by ``Orchestrator.create()`` after importlib
+        # resolution of ``cfg.orchestrator.state_overrides_schema``.
+        self._state_overrides_cls: type[BaseModel] | None = None
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
@@ -7520,6 +7497,41 @@ class Orchestrator(Generic[StateT]):
                 )
             else:
                 framework_cfg = cfg.framework
+            # DECOUPLE-05 / D-08-01: resolve the app-declared
+            # state-overrides pydantic schema once at boot. ``None``
+            # means no validation (D-08-02 backward-compat). The
+            # config-load layer already format-validated the dotted
+            # path; importlib failures here surface as a clear boot
+            # error naming the path AND the underlying cause.
+            state_overrides_cls: type[BaseModel] | None = None
+            schema_path = cfg.orchestrator.state_overrides_schema
+            if schema_path is not None:
+                if ":" in schema_path:
+                    module_path, _, class_name = schema_path.rpartition(":")
+                else:
+                    module_path, _, class_name = schema_path.rpartition(".")
+                try:
+                    schema_module = importlib.import_module(module_path)
+                except ImportError as exc:
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"failed to import module {module_path!r}: {exc}"
+                    ) from exc
+                try:
+                    state_overrides_cls = getattr(schema_module, class_name)
+                except AttributeError as exc:
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"module {module_path!r} has no attribute "
+                        f"{class_name!r}"
+                    ) from exc
+                if not (isinstance(state_overrides_cls, type)
+                        and issubclass(state_overrides_cls, BaseModel)):
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"{class_name!r} is not a pydantic BaseModel "
+                        f"subclass"
+                    )
             # Resolve the app state class once. ``None`` (default) keeps the
             # framework-default ``Session`` shape; apps point this at e.g.
             # ``examples.incident_management.state.IncidentState`` via YAML.
@@ -7553,6 +7565,7 @@ class Orchestrator(Generic[StateT]):
                              if cfg.storage.vector.backend == "faiss" else None),
                 vector_index_name=cfg.storage.vector.collection_name,
                 distance_strategy=cfg.storage.vector.distance_strategy,
+                id_prefix=framework_cfg.session_id_prefix,
             )
             history = HistoryStore(
                 engine=engine,
@@ -7591,21 +7604,25 @@ class Orchestrator(Generic[StateT]):
                         severity_aliases=framework_cfg.severity_aliases,
                     )
                     break
-            # Bind config-driven rosters into the observability and
-            # remediation MCP servers so out-of-roster values fail at
-            # the tool boundary with a recoverable ValueError instead
-            # of silently flowing to backends that have no policy
-            # entry for them.
-            try:
-
-                _obs_mod.set_environments(list(cfg.environments))
-            except Exception:
-                pass
-            try:
-
-                _rem_mod.set_escalation_teams(list(framework_cfg.escalation_teams))
-            except Exception:
-                pass
+            # Generic app-MCP-server discovery (DECOUPLE-04 / D-07-02 /
+            # D-07-03). Each module listed in
+            # ``cfg.orchestrator.mcp_servers`` is imported and asked to
+            # bind its config-derived state via the
+            # ``register(mcp_app, cfg)`` contract. The framework no
+            # longer hardcodes incident-vocabulary module paths or
+            # setter names. ``mcp_app`` is ``None`` here — modules
+            # expose their own per-module FastMCP instance composed by
+            # the loader; the parameter exists for contract uniformity
+            # and future composition needs.
+            for module_path in cfg.orchestrator.mcp_servers:
+                mod = importlib.import_module(module_path)
+                reg = getattr(mod, "register", None)
+                if reg is None:
+                    raise RuntimeError(
+                        f"orchestrator.mcp_servers entry {module_path!r} does "
+                        f"not expose a `register(mcp_app, cfg)` callable"
+                    )
+                reg(None, cfg)
             if cfg.paths.skills_dir is None:
                 raise RuntimeError(
                     "paths.skills_dir is not configured; apps must set it "
@@ -7697,13 +7714,18 @@ class Orchestrator(Generic[StateT]):
             # No bespoke resume graph — resume runs through the main
             # graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrating paused state.
-            return cls(cfg, store, skills, registry, graph,
-                       stack, framework_cfg=framework_cfg,
-                       state_cls=repo_state_cls,
-                       history=history,
-                       checkpointer=checkpointer,
-                       checkpointer_close=checkpointer_close,
-                       dedup_pipeline=dedup_pipeline)
+            instance = cls(cfg, store, skills, registry, graph,
+                           stack, framework_cfg=framework_cfg,
+                           state_cls=repo_state_cls,
+                           history=history,
+                           checkpointer=checkpointer,
+                           checkpointer_close=checkpointer_close,
+                           dedup_pipeline=dedup_pipeline)
+            # DECOUPLE-05 / D-08-01: stash the resolved schema class
+            # so ``start_session`` can run ``model_validate`` on the
+            # ``state_overrides=`` kwarg.
+            instance._state_overrides_cls = state_overrides_cls
+            return instance
         except BaseException:
             # Best-effort: close the checkpointer connection if it was
             # built before we hit the failure, so we don't leak FDs.
@@ -7777,12 +7799,20 @@ class Orchestrator(Generic[StateT]):
         """Transition a graph-completed session to a terminal status by
         INFERRING from tool-call history.
 
-        Inference rules (latest executed tool wins):
-          * ``mark_escalated`` -> ``escalated`` (with ``escalated_to``)
-          * ``mark_resolved``  -> ``resolved``
-          * ``notify_oncall`` (legacy direct path) -> ``escalated``
-          * Otherwise -> ``needs_review`` (graph ran to __end__ without
-            the agent declaring a terminal intent).
+        Inference walks the configured terminal-tool rules in
+        ``self.cfg.orchestrator.terminal_tools`` (D-06-01, D-06-08) and
+        the latest executed tool call wins. When no rule fires, the
+        session falls through to
+        ``self.cfg.orchestrator.default_terminal_status`` — apps own
+        this name (D-06-06).
+
+        Per-rule ``extract_fields`` populate ``inc.extra_fields`` with
+        whatever metadata the app declared (D-06-02; preserves the
+        v1.0 ``team`` capture for the escalation flow). When the
+        matched rule's status has ``kind="escalation"``, the
+        ``team`` extract is mirrored to ``extra_fields["escalated_to"]``
+        so existing UIs reading the v1.0 key continue to work
+        (D-06-05 — kind-based dispatch).
 
         Sessions already in a terminal status are left untouched.
         """
@@ -7793,18 +7823,104 @@ class Orchestrator(Generic[StateT]):
         if inc.status not in ("new", "in_progress"):
             return None
 
-        decision = _infer_terminal_decision(inc.tool_calls)
+        decision = self._infer_terminal_decision(inc.tool_calls)
         if decision is None:
-            inc.status = "needs_review"
+            default = self.cfg.orchestrator.default_terminal_status
+            if default is None:
+                # App did not declare a default — leave the session
+                # alone rather than blind-coerce. Production apps
+                # always configure it (cross-validated at config-load
+                # whenever ``statuses`` is populated).
+                return None
+            inc.status = default
             inc.extra_fields["needs_review_reason"] = (
                 "graph completed without terminal tool call"
             )
-            return self._save_or_yield(inc, "needs_review")
-        new_status, team = decision
+            return self._save_or_yield(inc, default)
+
+        new_status, extracted = decision
         inc.status = new_status
-        if team:
-            inc.extra_fields["escalated_to"] = team
+        for key, value in extracted.items():
+            if value:
+                inc.extra_fields[key] = value
+        # v1.0 compatibility: mirror ``team`` into the historical
+        # ``escalated_to`` extra-field key when the matched status is
+        # an escalation (D-06-05 kind-based dispatch). Keeps generic-
+        # framework code free of escalation vocabulary while preserving
+        # the contract existing UIs read.
+        status_def = self.cfg.orchestrator.statuses.get(new_status)
+        if status_def is not None and status_def.kind == "escalation":
+            team = extracted.get("team")
+            if team:
+                inc.extra_fields["escalated_to"] = team
         return self._save_or_yield(inc, new_status)
+
+    def _infer_terminal_decision(
+        self, tool_calls,
+    ) -> tuple[str, dict[str, str]] | None:
+        """Walk executed tool_calls latest-first; return
+        ``(new_status, extracted_fields_dict)`` for the first matching
+        configured rule, or ``None`` if no rule fires.
+
+        Replaces the v1.0 module-level ``_infer_terminal_decision``;
+        instance-method shape (D-06-08) lets us read ``self.cfg``
+        without constructor plumbing. Empty
+        ``self.cfg.orchestrator.terminal_tools`` (the framework
+        default) short-circuits to ``None`` so unconfigured apps
+        behave as if no rule fires.
+        """
+        rules = self.cfg.orchestrator.terminal_tools
+        if not rules:
+            return None
+        executed = [
+            tc for tc in tool_calls
+            if getattr(tc, "status", None) == "executed"
+        ]
+        for tc in reversed(executed):
+            tool_name = tc.tool or ""
+            for rule in rules:
+                bare = rule.tool_name
+                if not (tool_name == bare or tool_name.endswith(f":{bare}")):
+                    continue
+                # DECOUPLE-07 / D-08-03: optional argument-value
+                # discriminator. When ``match_args`` is non-empty
+                # the rule applies only if EVERY (key, value) pair
+                # matches ``tc.args[key]`` exactly. Empty default
+                # matches any args (v1.0 single-rule shape).
+                if rule.match_args:
+                    args = tc.args if isinstance(tc.args, dict) else {}
+                    if not all(
+                        args.get(k) == v
+                        for k, v in rule.match_args.items()
+                    ):
+                        continue
+                extracted = {
+                    dest: self._extract_field(tc, lookup_keys)
+                    for dest, lookup_keys in rule.extract_fields.items()
+                }
+                return rule.status, {
+                    k: v for k, v in extracted.items() if v
+                }
+        return None
+
+    def _extract_field(
+        self, tc, lookup_keys: list[str],
+    ) -> str | None:
+        """Pull a field value from a ToolCall's args/result via
+        ``args.X`` / ``result.X`` lookup hints. Returns the first
+        non-falsy match, or ``None``. Generalised from v1.0
+        ``_extract_team`` (D-06-02, D-06-08) — same lookup syntax,
+        no longer pinned to the ``team`` field name.
+        """
+        args = tc.args if isinstance(tc.args, dict) else {}
+        result = tc.result if isinstance(tc.result, dict) else {}
+        for key in lookup_keys:
+            scope, _, attr = key.partition(".")
+            source = args if scope == "args" else result
+            value = source.get(attr)
+            if value:
+                return value
+        return None
 
     def _save_or_yield(self, inc, new_status: str) -> str | None:
         """Save with stale-version protection. Returns ``new_status`` on
@@ -7956,6 +8072,15 @@ class Orchestrator(Generic[StateT]):
         agent graph is skipped entirely.
         """
         state_overrides = _coerce_state_overrides(state_overrides, environment)
+        # DECOUPLE-05 / D-08-01: validate against the app-registered
+        # pydantic schema if configured. ``None`` (D-08-02) skips
+        # validation entirely so the legacy v1.0 free-form dict
+        # surface still works for unconfigured apps. ``getattr`` with
+        # a default keeps tests that build the orchestrator via
+        # ``__new__`` (bypassing ``__init__``) working.
+        state_overrides_cls = getattr(self, "_state_overrides_cls", None)
+        if state_overrides_cls is not None and state_overrides is not None:
+            state_overrides_cls.model_validate(state_overrides)
         submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
         sub_id = (submitter or {}).get("id", "user-mock")
         sub_team = (submitter or {}).get("team", "platform")
@@ -8088,9 +8213,14 @@ class Orchestrator(Generic[StateT]):
             return
 
         if action == "escalate":
-            team = decision.get("team") or "platform-oncall"
+            tool_name = self.cfg.orchestrator.escalate_action_tool_name
+            default_team = self.cfg.orchestrator.escalate_action_default_team
+            team = decision.get("team") or default_team
             allowed = list(self.framework_cfg.escalation_teams)
-            if team not in allowed:
+            # Only enforce roster membership when the framework is
+            # actually configured with one — apps without a roster
+            # accept any team string.
+            if allowed and team is not None and team not in allowed:
                 # Reject the request entirely. The INC stays awaiting_input
                 # so the user can retry with a valid team. Logging the
                 # allowed roster on the event makes it actionable in the UI.
@@ -8101,27 +8231,71 @@ class Orchestrator(Generic[StateT]):
                        ),
                        "ts": _event_ts()}
                 return
-            message = (
-                f"INC {incident_id} escalated by user — team {team}. "
-                "Confidence below threshold."
-            )
-            tool_args = {"incident_id": incident_id, "message": message,
-                         "team": team}
-            tool_result = await self._invoke_tool("notify_oncall", tool_args)
-            inc = self.store.load(incident_id)
-            inc.tool_calls.append(ToolCall(
-                agent="orchestrator",
-                tool="notify_oncall",
-                args=tool_args,
-                result=tool_result,
-                ts=_event_ts(),
-            ))
-            inc.status = "escalated"
-            inc.extra_fields["escalated_to"] = team
-            inc.pending_intervention = None
-            self.store.save(inc)
-            yield {"event": "resume_completed", "incident_id": incident_id,
-                   "status": "escalated", "team": team, "ts": _event_ts()}
+
+            # Look up the rule for the configured escalation tool so
+            # status assignment and extra-field key are driven by the
+            # registry rather than hardcoded vocabulary.
+            rule = None
+            if tool_name is not None:
+                for r in self.cfg.orchestrator.terminal_tools:
+                    if r.tool_name == tool_name:
+                        rule = r
+                        break
+
+            inc_loaded = self.store.load(incident_id)
+            if tool_name is not None:
+                # App registered a side-effect tool; invoke it and record
+                # the tool-call so finalize-style introspection sees it.
+                message = (
+                    f"Session {incident_id} escalated by user"
+                    + (f" — team {team}." if team else ".")
+                    + " Confidence below threshold."
+                )
+                tool_args: dict = {"incident_id": incident_id, "message": message}
+                if team is not None:
+                    tool_args["team"] = team
+                tool_result = await self._invoke_tool(tool_name, tool_args)
+                inc_loaded.tool_calls.append(ToolCall(
+                    agent="orchestrator",
+                    tool=tool_name,
+                    args=tool_args,
+                    result=tool_result,
+                    ts=_event_ts(),
+                ))
+
+            # Status assignment: prefer the rule's declared status; fall
+            # back to default_terminal_status when no rule registered.
+            if rule is not None:
+                new_status = rule.status
+            else:
+                new_status = (
+                    self.cfg.orchestrator.default_terminal_status
+                    or inc_loaded.status
+                )
+            inc_loaded.status = new_status
+            # Capture team via the rule's first extract-field destination
+            # (typically ``team``). When no rule registered the field but
+            # team is present, fall back to ``team`` for stability.
+            if team is not None:
+                if rule is not None and rule.extract_fields:
+                    first_dest = next(iter(rule.extract_fields.keys()))
+                    inc_loaded.extra_fields[first_dest] = team
+                else:
+                    inc_loaded.extra_fields["team"] = team
+                # v1.0 compat: mirror to ``escalated_to`` when the new
+                # status is kind=escalation, matching finalize semantics.
+                status_def = self.cfg.orchestrator.statuses.get(new_status)
+                if status_def is not None and status_def.kind == "escalation":
+                    inc_loaded.extra_fields["escalated_to"] = team
+            inc_loaded.pending_intervention = None
+            self.store.save(inc_loaded)
+            event_payload: dict = {
+                "event": "resume_completed", "incident_id": incident_id,
+                "status": new_status, "ts": _event_ts(),
+            }
+            if team is not None:
+                event_payload["team"] = team
+            yield event_payload
             return
 
         if action == "resume_with_input":
@@ -8279,8 +8453,9 @@ class Orchestrator(Generic[StateT]):
         """Call an MCP tool by original name, going through the LangChain wrapper.
 
         Searches the registry for any entry whose original ``name`` matches.
-        Used for orchestrator-driven tool calls (e.g. notify_oncall on
-        escalate) that aren't initiated by an LLM.
+        Used for orchestrator-driven tool calls (e.g. an app-registered
+        escalation tool invoked from the awaiting_input gate) that aren't
+        initiated by an LLM.
         """
         entry = next(
             (e for e in self.registry.entries.values() if e.name == name),
@@ -8916,6 +9091,23 @@ def register_dedup_routes(
             retracted_by=payload.retracted_by,
             note=payload.note,
         )
+
+# ====== module: examples/code_review/state.py ======
+
+class CodeReviewStateOverrides(BaseModel):
+    """Per-session overrides for code_review.
+
+    All fields are Optional so callers can stamp only what they have
+    at session-start (e.g. a webhook trigger may know the PR URL but
+    not the base branch). ``extra='forbid'`` catches typos.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    pr_url: str | None = None
+    repo: str | None = None
+    base_branch: str | None = None
+    pr_number: int | None = None
 
 # ====== module: examples/code_review/mcp_server.py ======
 

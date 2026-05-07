@@ -2,11 +2,12 @@
 import pytest
 
 from runtime.config import (
-    AppConfig, FrameworkAppConfig, LLMConfig, MCPConfig, MCPServerConfig, Paths,
-    RuntimeConfig,
+    AppConfig, FrameworkAppConfig, LLMConfig, MCPConfig, MCPServerConfig,
+    OrchestratorConfig, Paths, RuntimeConfig,
 )
 from runtime.state import AgentRun
 from runtime.orchestrator import Orchestrator
+from runtime.terminal_tools import StatusDef, TerminalToolRule
 
 
 @pytest.fixture
@@ -18,13 +19,13 @@ def cfg(tmp_path):
                             module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
-                            module="runtime.mcp_servers.observability",
+                            module="examples.incident_management.mcp_servers.observability",
                             category="observability"),
             MCPServerConfig(name="local_rem", transport="in_process",
-                            module="runtime.mcp_servers.remediation",
+                            module="examples.incident_management.mcp_servers.remediation",
                             category="remediation"),
             MCPServerConfig(name="local_user", transport="in_process",
-                            module="runtime.mcp_servers.user_context",
+                            module="examples.incident_management.mcp_servers.user_context",
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
@@ -36,6 +37,44 @@ def cfg(tmp_path):
         framework=FrameworkAppConfig(
             confidence_threshold=0.75,
             escalation_teams=["platform-oncall", "data-oncall", "security-oncall"],
+        ),
+        # Phase 6 (DECOUPLE-02 / Resolution A): the escalate path is
+        # parameterised on the OrchestratorConfig fields; the test
+        # fixture mirrors the incident_management.yaml registration.
+        orchestrator=OrchestratorConfig(
+            statuses={
+                "open":         StatusDef(name="open",         terminal=False, kind="pending"),
+                "escalated":    StatusDef(name="escalated",    terminal=True,  kind="escalation"),
+                "resolved":     StatusDef(name="resolved",     terminal=True,  kind="success"),
+                "needs_review": StatusDef(name="needs_review", terminal=True,  kind="needs_review"),
+            },
+            terminal_tools=[
+                TerminalToolRule(tool_name="mark_resolved", status="resolved"),
+                TerminalToolRule(
+                    tool_name="mark_escalated", status="escalated",
+                    extract_fields={"team": ["args.team", "result.team"]},
+                ),
+                TerminalToolRule(
+                    tool_name="notify_oncall", status="escalated",
+                    extract_fields={"team": ["args.team"]},
+                ),
+            ],
+            patch_tools=["update_incident"],
+            harvest_terminal_tools=["submit_hypothesis"],
+            # Phase 7 (DECOUPLE-04 / D-07-02): orchestrator imports and
+            # binds these app-MCP-server modules at create()-time. Each
+            # exposes ``register(mcp_app, cfg)`` which closes over the
+            # fixture's ``framework.escalation_teams`` /
+            # ``environments`` rosters so the per-tool guards line up
+            # with what the test asserts on.
+            mcp_servers=[
+                "examples.incident_management.mcp_servers.observability",
+                "examples.incident_management.mcp_servers.remediation",
+                "examples.incident_management.mcp_servers.user_context",
+            ],
+            default_terminal_status="needs_review",
+            escalate_action_tool_name="notify_oncall",
+            escalate_action_default_team="platform-oncall",
         ),
         runtime=RuntimeConfig(state_class=None),
     )
@@ -312,13 +351,13 @@ async def test_cold_restart_resume(tmp_path):
                             module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
-                            module="runtime.mcp_servers.observability",
+                            module="examples.incident_management.mcp_servers.observability",
                             category="observability"),
             MCPServerConfig(name="local_rem", transport="in_process",
-                            module="runtime.mcp_servers.remediation",
+                            module="examples.incident_management.mcp_servers.remediation",
                             category="remediation"),
             MCPServerConfig(name="local_user", transport="in_process",
-                            module="runtime.mcp_servers.user_context",
+                            module="examples.incident_management.mcp_servers.user_context",
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),

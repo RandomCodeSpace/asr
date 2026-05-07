@@ -140,14 +140,15 @@ class Session(BaseModel):
     # App-overridable session id minting hook.
     # ------------------------------------------------------------------
     @classmethod
-    def id_format(cls, *, seq: int) -> str:
+    def id_format(cls, *, seq: int, prefix: str = "SES") -> str:
         """Return the canonical session id for the given sequence number.
 
-        Apps override this on their ``Session`` subclass to produce an
-        id format that suits their domain (e.g. ``PR-{repo}-{number}``
-        for code review). The framework default keeps the legacy
-        ``INC-YYYYMMDD-NNN`` shape so existing on-disk rows and any app
-        that has not opted in continue to round-trip cleanly.
+        ``prefix`` is supplied by ``SessionStore._next_id`` from
+        ``FrameworkAppConfig.session_id_prefix`` so each app picks its
+        own namespace via plain config (e.g. ``INC`` for incident
+        management, ``REVIEW`` for code review, ``HR`` for HR cases,
+        ...). Apps with truly bespoke id shapes can still override this
+        classmethod on their ``Session`` subclass and ignore ``prefix``.
 
         ``seq`` is the per-day monotonic sequence supplied by
         ``SessionStore._next_id``; it lets the default format produce
@@ -157,4 +158,4 @@ class Session(BaseModel):
         from datetime import datetime, timezone
 
         today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        return f"INC-{today}-{seq:03d}"
+        return f"{prefix}-{today}-{seq:03d}"

@@ -30,11 +30,11 @@ def test_incident_mcp_server_has_six_tools():
 
 
 def test_runtime_mcp_servers_no_incident():
-    """The framework's runtime.mcp_servers package must not contain incident.py."""
+    """The framework's examples.incident_management.mcp_servers package must not contain incident.py."""
     import importlib.util
-    spec = importlib.util.find_spec("runtime.mcp_servers.incident")
+    spec = importlib.util.find_spec("examples.incident_management.mcp_servers.incident")
     assert spec is None, (
-        "runtime.mcp_servers.incident should not exist; "
+        "examples.incident_management.mcp_servers.incident should not exist; "
         "the incident MCP server now lives at examples.incident_management.mcp_server"
     )
 

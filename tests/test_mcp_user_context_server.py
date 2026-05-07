@@ -1,5 +1,5 @@
 import pytest
-from runtime.mcp_servers.user_context import get_user_context
+from examples.incident_management.mcp_servers.user_context import get_user_context
 
 
 @pytest.mark.asyncio

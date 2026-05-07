@@ -1,5 +1,5 @@
 import pytest
-from runtime.mcp_servers.observability import (
+from examples.incident_management.mcp_servers.observability import (
     get_logs, get_metrics, get_service_health, check_deployment_history,
 )
 

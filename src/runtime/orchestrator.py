@@ -195,42 +195,6 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
-# Map terminal-tool name -> (status_to_set, team_arg_keys_to_check).
-# Both bare and ``<server>:<tool>`` forms are matched via suffix check.
-_TERMINAL_TOOL_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("mark_escalated", "escalated", ("args.team", "result.team")),
-    ("mark_resolved", "resolved", ()),
-    # Legacy / forward-compat: direct notify_oncall page = escalation.
-    ("notify_oncall", "escalated", ("args.team",)),
-)
-
-
-def _extract_team(tc, lookup_keys: tuple[str, ...]) -> str | None:
-    """Pull a ``team`` value from a ToolCall's args/result by ``"args.team"``
-    / ``"result.team"`` lookup hints. Returns the first non-falsy match."""
-    args = tc.args if isinstance(tc.args, dict) else {}
-    result = tc.result if isinstance(tc.result, dict) else {}
-    for key in lookup_keys:
-        scope, _, attr = key.partition(".")
-        source = args if scope == "args" else result
-        value = source.get(attr)
-        if value:
-            return value
-    return None
-
-
-def _infer_terminal_decision(tool_calls) -> tuple[str, str | None] | None:
-    """Walk executed tool_calls latest-first; return (new_status, team)
-    for the first matching terminal tool, or None if no rule fires."""
-    for tc in reversed([tc for tc in tool_calls
-                        if getattr(tc, "status", None) == "executed"]):
-        tool_name = tc.tool or ""
-        for bare, status, team_keys in _TERMINAL_TOOL_RULES:
-            if tool_name == bare or tool_name.endswith(f":{bare}"):
-                return status, _extract_team(tc, team_keys)
-    return None
-
-
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -293,6 +257,13 @@ class Orchestrator(Generic[StateT]):
         # on the same session id. The set is mutated under self._locks
         # so the in-flight check + add is atomic per session.
         self._retries_in_flight: set[str] = set()
+        # Resolved app-declared pydantic schema for the
+        # ``state_overrides=`` kwarg of ``start_session``. ``None``
+        # (default) means no validation — start_session passes the
+        # dict through unchanged (DECOUPLE-05 / D-08-02 backward-
+        # compat). Set by ``Orchestrator.create()`` after importlib
+        # resolution of ``cfg.orchestrator.state_overrides_schema``.
+        self._state_overrides_cls: type[BaseModel] | None = None
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
@@ -312,6 +283,41 @@ class Orchestrator(Generic[StateT]):
                 )
             else:
                 framework_cfg = cfg.framework
+            # DECOUPLE-05 / D-08-01: resolve the app-declared
+            # state-overrides pydantic schema once at boot. ``None``
+            # means no validation (D-08-02 backward-compat). The
+            # config-load layer already format-validated the dotted
+            # path; importlib failures here surface as a clear boot
+            # error naming the path AND the underlying cause.
+            state_overrides_cls: type[BaseModel] | None = None
+            schema_path = cfg.orchestrator.state_overrides_schema
+            if schema_path is not None:
+                if ":" in schema_path:
+                    module_path, _, class_name = schema_path.rpartition(":")
+                else:
+                    module_path, _, class_name = schema_path.rpartition(".")
+                try:
+                    schema_module = importlib.import_module(module_path)
+                except ImportError as exc:
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"failed to import module {module_path!r}: {exc}"
+                    ) from exc
+                try:
+                    state_overrides_cls = getattr(schema_module, class_name)
+                except AttributeError as exc:
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"module {module_path!r} has no attribute "
+                        f"{class_name!r}"
+                    ) from exc
+                if not (isinstance(state_overrides_cls, type)
+                        and issubclass(state_overrides_cls, BaseModel)):
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"{class_name!r} is not a pydantic BaseModel "
+                        f"subclass"
+                    )
             # Resolve the app state class once. ``None`` (default) keeps the
             # framework-default ``Session`` shape; apps point this at e.g.
             # ``examples.incident_management.state.IncidentState`` via YAML.
@@ -345,6 +351,7 @@ class Orchestrator(Generic[StateT]):
                              if cfg.storage.vector.backend == "faiss" else None),
                 vector_index_name=cfg.storage.vector.collection_name,
                 distance_strategy=cfg.storage.vector.distance_strategy,
+                id_prefix=framework_cfg.session_id_prefix,
             )
             history = HistoryStore(
                 engine=engine,
@@ -383,21 +390,25 @@ class Orchestrator(Generic[StateT]):
                         severity_aliases=framework_cfg.severity_aliases,
                     )
                     break
-            # Bind config-driven rosters into the observability and
-            # remediation MCP servers so out-of-roster values fail at
-            # the tool boundary with a recoverable ValueError instead
-            # of silently flowing to backends that have no policy
-            # entry for them.
-            try:
-                from runtime.mcp_servers import observability as _obs_mod
-                _obs_mod.set_environments(list(cfg.environments))
-            except Exception:
-                pass
-            try:
-                from runtime.mcp_servers import remediation as _rem_mod
-                _rem_mod.set_escalation_teams(list(framework_cfg.escalation_teams))
-            except Exception:
-                pass
+            # Generic app-MCP-server discovery (DECOUPLE-04 / D-07-02 /
+            # D-07-03). Each module listed in
+            # ``cfg.orchestrator.mcp_servers`` is imported and asked to
+            # bind its config-derived state via the
+            # ``register(mcp_app, cfg)`` contract. The framework no
+            # longer hardcodes incident-vocabulary module paths or
+            # setter names. ``mcp_app`` is ``None`` here — modules
+            # expose their own per-module FastMCP instance composed by
+            # the loader; the parameter exists for contract uniformity
+            # and future composition needs.
+            for module_path in cfg.orchestrator.mcp_servers:
+                mod = importlib.import_module(module_path)
+                reg = getattr(mod, "register", None)
+                if reg is None:
+                    raise RuntimeError(
+                        f"orchestrator.mcp_servers entry {module_path!r} does "
+                        f"not expose a `register(mcp_app, cfg)` callable"
+                    )
+                reg(None, cfg)
             if cfg.paths.skills_dir is None:
                 raise RuntimeError(
                     "paths.skills_dir is not configured; apps must set it "
@@ -492,13 +503,18 @@ class Orchestrator(Generic[StateT]):
             # No bespoke resume graph — resume runs through the main
             # graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrating paused state.
-            return cls(cfg, store, skills, registry, graph,
-                       stack, framework_cfg=framework_cfg,
-                       state_cls=repo_state_cls,
-                       history=history,
-                       checkpointer=checkpointer,
-                       checkpointer_close=checkpointer_close,
-                       dedup_pipeline=dedup_pipeline)
+            instance = cls(cfg, store, skills, registry, graph,
+                           stack, framework_cfg=framework_cfg,
+                           state_cls=repo_state_cls,
+                           history=history,
+                           checkpointer=checkpointer,
+                           checkpointer_close=checkpointer_close,
+                           dedup_pipeline=dedup_pipeline)
+            # DECOUPLE-05 / D-08-01: stash the resolved schema class
+            # so ``start_session`` can run ``model_validate`` on the
+            # ``state_overrides=`` kwarg.
+            instance._state_overrides_cls = state_overrides_cls
+            return instance
         except BaseException:
             # Best-effort: close the checkpointer connection if it was
             # built before we hit the failure, so we don't leak FDs.
@@ -572,12 +588,20 @@ class Orchestrator(Generic[StateT]):
         """Transition a graph-completed session to a terminal status by
         INFERRING from tool-call history.
 
-        Inference rules (latest executed tool wins):
-          * ``mark_escalated`` -> ``escalated`` (with ``escalated_to``)
-          * ``mark_resolved``  -> ``resolved``
-          * ``notify_oncall`` (legacy direct path) -> ``escalated``
-          * Otherwise -> ``needs_review`` (graph ran to __end__ without
-            the agent declaring a terminal intent).
+        Inference walks the configured terminal-tool rules in
+        ``self.cfg.orchestrator.terminal_tools`` (D-06-01, D-06-08) and
+        the latest executed tool call wins. When no rule fires, the
+        session falls through to
+        ``self.cfg.orchestrator.default_terminal_status`` — apps own
+        this name (D-06-06).
+
+        Per-rule ``extract_fields`` populate ``inc.extra_fields`` with
+        whatever metadata the app declared (D-06-02; preserves the
+        v1.0 ``team`` capture for the escalation flow). When the
+        matched rule's status has ``kind="escalation"``, the
+        ``team`` extract is mirrored to ``extra_fields["escalated_to"]``
+        so existing UIs reading the v1.0 key continue to work
+        (D-06-05 — kind-based dispatch).
 
         Sessions already in a terminal status are left untouched.
         """
@@ -588,18 +612,104 @@ class Orchestrator(Generic[StateT]):
         if inc.status not in ("new", "in_progress"):
             return None
 
-        decision = _infer_terminal_decision(inc.tool_calls)
+        decision = self._infer_terminal_decision(inc.tool_calls)
         if decision is None:
-            inc.status = "needs_review"
+            default = self.cfg.orchestrator.default_terminal_status
+            if default is None:
+                # App did not declare a default — leave the session
+                # alone rather than blind-coerce. Production apps
+                # always configure it (cross-validated at config-load
+                # whenever ``statuses`` is populated).
+                return None
+            inc.status = default
             inc.extra_fields["needs_review_reason"] = (
                 "graph completed without terminal tool call"
             )
-            return self._save_or_yield(inc, "needs_review")
-        new_status, team = decision
+            return self._save_or_yield(inc, default)
+
+        new_status, extracted = decision
         inc.status = new_status
-        if team:
-            inc.extra_fields["escalated_to"] = team
+        for key, value in extracted.items():
+            if value:
+                inc.extra_fields[key] = value
+        # v1.0 compatibility: mirror ``team`` into the historical
+        # ``escalated_to`` extra-field key when the matched status is
+        # an escalation (D-06-05 kind-based dispatch). Keeps generic-
+        # framework code free of escalation vocabulary while preserving
+        # the contract existing UIs read.
+        status_def = self.cfg.orchestrator.statuses.get(new_status)
+        if status_def is not None and status_def.kind == "escalation":
+            team = extracted.get("team")
+            if team:
+                inc.extra_fields["escalated_to"] = team
         return self._save_or_yield(inc, new_status)
+
+    def _infer_terminal_decision(
+        self, tool_calls,
+    ) -> tuple[str, dict[str, str]] | None:
+        """Walk executed tool_calls latest-first; return
+        ``(new_status, extracted_fields_dict)`` for the first matching
+        configured rule, or ``None`` if no rule fires.
+
+        Replaces the v1.0 module-level ``_infer_terminal_decision``;
+        instance-method shape (D-06-08) lets us read ``self.cfg``
+        without constructor plumbing. Empty
+        ``self.cfg.orchestrator.terminal_tools`` (the framework
+        default) short-circuits to ``None`` so unconfigured apps
+        behave as if no rule fires.
+        """
+        rules = self.cfg.orchestrator.terminal_tools
+        if not rules:
+            return None
+        executed = [
+            tc for tc in tool_calls
+            if getattr(tc, "status", None) == "executed"
+        ]
+        for tc in reversed(executed):
+            tool_name = tc.tool or ""
+            for rule in rules:
+                bare = rule.tool_name
+                if not (tool_name == bare or tool_name.endswith(f":{bare}")):
+                    continue
+                # DECOUPLE-07 / D-08-03: optional argument-value
+                # discriminator. When ``match_args`` is non-empty
+                # the rule applies only if EVERY (key, value) pair
+                # matches ``tc.args[key]`` exactly. Empty default
+                # matches any args (v1.0 single-rule shape).
+                if rule.match_args:
+                    args = tc.args if isinstance(tc.args, dict) else {}
+                    if not all(
+                        args.get(k) == v
+                        for k, v in rule.match_args.items()
+                    ):
+                        continue
+                extracted = {
+                    dest: self._extract_field(tc, lookup_keys)
+                    for dest, lookup_keys in rule.extract_fields.items()
+                }
+                return rule.status, {
+                    k: v for k, v in extracted.items() if v
+                }
+        return None
+
+    def _extract_field(
+        self, tc, lookup_keys: list[str],
+    ) -> str | None:
+        """Pull a field value from a ToolCall's args/result via
+        ``args.X`` / ``result.X`` lookup hints. Returns the first
+        non-falsy match, or ``None``. Generalised from v1.0
+        ``_extract_team`` (D-06-02, D-06-08) — same lookup syntax,
+        no longer pinned to the ``team`` field name.
+        """
+        args = tc.args if isinstance(tc.args, dict) else {}
+        result = tc.result if isinstance(tc.result, dict) else {}
+        for key in lookup_keys:
+            scope, _, attr = key.partition(".")
+            source = args if scope == "args" else result
+            value = source.get(attr)
+            if value:
+                return value
+        return None
 
     def _save_or_yield(self, inc, new_status: str) -> str | None:
         """Save with stale-version protection. Returns ``new_status`` on
@@ -751,6 +861,15 @@ class Orchestrator(Generic[StateT]):
         agent graph is skipped entirely.
         """
         state_overrides = _coerce_state_overrides(state_overrides, environment)
+        # DECOUPLE-05 / D-08-01: validate against the app-registered
+        # pydantic schema if configured. ``None`` (D-08-02) skips
+        # validation entirely so the legacy v1.0 free-form dict
+        # surface still works for unconfigured apps. ``getattr`` with
+        # a default keeps tests that build the orchestrator via
+        # ``__new__`` (bypassing ``__init__``) working.
+        state_overrides_cls = getattr(self, "_state_overrides_cls", None)
+        if state_overrides_cls is not None and state_overrides is not None:
+            state_overrides_cls.model_validate(state_overrides)
         submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
         sub_id = (submitter or {}).get("id", "user-mock")
         sub_team = (submitter or {}).get("team", "platform")
@@ -883,9 +1002,14 @@ class Orchestrator(Generic[StateT]):
             return
 
         if action == "escalate":
-            team = decision.get("team") or "platform-oncall"
+            tool_name = self.cfg.orchestrator.escalate_action_tool_name
+            default_team = self.cfg.orchestrator.escalate_action_default_team
+            team = decision.get("team") or default_team
             allowed = list(self.framework_cfg.escalation_teams)
-            if team not in allowed:
+            # Only enforce roster membership when the framework is
+            # actually configured with one — apps without a roster
+            # accept any team string.
+            if allowed and team is not None and team not in allowed:
                 # Reject the request entirely. The INC stays awaiting_input
                 # so the user can retry with a valid team. Logging the
                 # allowed roster on the event makes it actionable in the UI.
@@ -896,27 +1020,71 @@ class Orchestrator(Generic[StateT]):
                        ),
                        "ts": _event_ts()}
                 return
-            message = (
-                f"INC {incident_id} escalated by user — team {team}. "
-                "Confidence below threshold."
-            )
-            tool_args = {"incident_id": incident_id, "message": message,
-                         "team": team}
-            tool_result = await self._invoke_tool("notify_oncall", tool_args)
-            inc = self.store.load(incident_id)
-            inc.tool_calls.append(ToolCall(
-                agent="orchestrator",
-                tool="notify_oncall",
-                args=tool_args,
-                result=tool_result,
-                ts=_event_ts(),
-            ))
-            inc.status = "escalated"
-            inc.extra_fields["escalated_to"] = team
-            inc.pending_intervention = None
-            self.store.save(inc)
-            yield {"event": "resume_completed", "incident_id": incident_id,
-                   "status": "escalated", "team": team, "ts": _event_ts()}
+
+            # Look up the rule for the configured escalation tool so
+            # status assignment and extra-field key are driven by the
+            # registry rather than hardcoded vocabulary.
+            rule = None
+            if tool_name is not None:
+                for r in self.cfg.orchestrator.terminal_tools:
+                    if r.tool_name == tool_name:
+                        rule = r
+                        break
+
+            inc_loaded = self.store.load(incident_id)
+            if tool_name is not None:
+                # App registered a side-effect tool; invoke it and record
+                # the tool-call so finalize-style introspection sees it.
+                message = (
+                    f"Session {incident_id} escalated by user"
+                    + (f" — team {team}." if team else ".")
+                    + " Confidence below threshold."
+                )
+                tool_args: dict = {"incident_id": incident_id, "message": message}
+                if team is not None:
+                    tool_args["team"] = team
+                tool_result = await self._invoke_tool(tool_name, tool_args)
+                inc_loaded.tool_calls.append(ToolCall(
+                    agent="orchestrator",
+                    tool=tool_name,
+                    args=tool_args,
+                    result=tool_result,
+                    ts=_event_ts(),
+                ))
+
+            # Status assignment: prefer the rule's declared status; fall
+            # back to default_terminal_status when no rule registered.
+            if rule is not None:
+                new_status = rule.status
+            else:
+                new_status = (
+                    self.cfg.orchestrator.default_terminal_status
+                    or inc_loaded.status
+                )
+            inc_loaded.status = new_status
+            # Capture team via the rule's first extract-field destination
+            # (typically ``team``). When no rule registered the field but
+            # team is present, fall back to ``team`` for stability.
+            if team is not None:
+                if rule is not None and rule.extract_fields:
+                    first_dest = next(iter(rule.extract_fields.keys()))
+                    inc_loaded.extra_fields[first_dest] = team
+                else:
+                    inc_loaded.extra_fields["team"] = team
+                # v1.0 compat: mirror to ``escalated_to`` when the new
+                # status is kind=escalation, matching finalize semantics.
+                status_def = self.cfg.orchestrator.statuses.get(new_status)
+                if status_def is not None and status_def.kind == "escalation":
+                    inc_loaded.extra_fields["escalated_to"] = team
+            inc_loaded.pending_intervention = None
+            self.store.save(inc_loaded)
+            event_payload: dict = {
+                "event": "resume_completed", "incident_id": incident_id,
+                "status": new_status, "ts": _event_ts(),
+            }
+            if team is not None:
+                event_payload["team"] = team
+            yield event_payload
             return
 
         if action == "resume_with_input":
@@ -1074,8 +1242,9 @@ class Orchestrator(Generic[StateT]):
         """Call an MCP tool by original name, going through the LangChain wrapper.
 
         Searches the registry for any entry whose original ``name`` matches.
-        Used for orchestrator-driven tool calls (e.g. notify_oncall on
-        escalate) that aren't initiated by an LLM.
+        Used for orchestrator-driven tool calls (e.g. an app-registered
+        escalation tool invoked from the awaiting_input gate) that aren't
+        initiated by an LLM.
         """
         entry = next(
             (e for e in self.registry.entries.values() if e.name == name),

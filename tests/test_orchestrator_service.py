@@ -67,19 +67,19 @@ def cfg_full(tmp_path):
                 MCPServerConfig(
                     name="local_obs",
                     transport="in_process",
-                    module="runtime.mcp_servers.observability",
+                    module="examples.incident_management.mcp_servers.observability",
                     category="observability",
                 ),
                 MCPServerConfig(
                     name="local_rem",
                     transport="in_process",
-                    module="runtime.mcp_servers.remediation",
+                    module="examples.incident_management.mcp_servers.remediation",
                     category="remediation",
                 ),
                 MCPServerConfig(
                     name="local_user",
                     transport="in_process",
-                    module="runtime.mcp_servers.user_context",
+                    module="examples.incident_management.mcp_servers.user_context",
                     category="user_context",
                 ),
             ]
@@ -436,8 +436,10 @@ def test_start_session_returns_id_immediately(service_full):
         submitter={"id": "u1", "team": "platform"},
     )
     assert isinstance(sid, str)
-    # IncidentRow ids follow ``INC-YYYYMMDD-NNN``.
-    assert sid.startswith("INC-")
+    # The ``cfg_full`` fixture doesn't override
+    # ``FrameworkAppConfig.session_id_prefix``, so the framework
+    # default ``SES-YYYYMMDD-NNN`` shape applies.
+    assert sid.startswith("SES-")
 
 
 def test_start_session_creates_persisted_row(service_full):

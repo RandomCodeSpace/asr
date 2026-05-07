@@ -132,6 +132,7 @@ class SessionStore(Generic[StateT]):
         vector_path: Optional[str] = None,
         vector_index_name: str = "incidents",
         distance_strategy: str = "cosine",
+        id_prefix: str = "SES",
     ) -> None:
         self.engine = engine
         self._state_cls = state_cls
@@ -140,24 +141,30 @@ class SessionStore(Generic[StateT]):
         self.vector_path = vector_path
         self.vector_index_name = vector_index_name
         self.distance_strategy = distance_strategy
+        # Per-app session-id namespace. Threaded into
+        # ``state_cls.id_format`` so each app's rows share a stable
+        # ``PREFIX-YYYYMMDD-NNN`` shape. Default ``"SES"`` keeps the
+        # bare-Session path framework-neutral; apps configure this
+        # via ``FrameworkAppConfig.session_id_prefix``.
+        self._id_prefix = id_prefix
 
     # ---------- ID minting ----------
     def _next_id(self, session: SqlSession) -> str:
         """Mint a new session id via ``state_cls.id_format(seq=...)``.
 
-        The per-app id format lives on the ``Session`` subclass so each
-        app picks its own prefix (``INC-`` for incidents, ``CR-`` for
-        code-review, anything else custom apps want). The store still
-        owns the monotonic sequence — it scans for prior rows whose id
-        starts with the same ``PREFIX-YYYYMMDD-`` stem and returns
-        ``max(seq) + 1``.
+        The per-app id namespace is supplied as ``self._id_prefix`` (from
+        ``FrameworkAppConfig.session_id_prefix``); ``id_format`` may
+        also be overridden on the state subclass for fully bespoke
+        shapes. The store still owns the monotonic sequence — it scans
+        for prior rows whose id starts with the same ``PREFIX-YYYYMMDD-``
+        stem and returns ``max(seq) + 1``.
         """
         # Probe today's prefix by asking the state class to format seq=1
         # and stripping the ``-001`` suffix. Apps that override
         # ``id_format`` to return a non-``PREFIX-YYYYMMDD-NNN`` shape
         # (e.g. opaque ULIDs) fall through to the simple count path
         # below.
-        sample = self._state_cls.id_format(seq=1)
+        sample = self._state_cls.id_format(seq=1, prefix=self._id_prefix)
         m = _SESSION_ID_RE.match(sample)
         if m is None:
             # Custom format — count all rows as the sequence base. Apps
@@ -166,7 +173,9 @@ class SessionStore(Generic[StateT]):
             count = session.execute(
                 select(IncidentRow.id)
             ).scalars().all()
-            return self._state_cls.id_format(seq=len(count) + 1)
+            return self._state_cls.id_format(
+                seq=len(count) + 1, prefix=self._id_prefix,
+            )
 
         # Extract the ``PREFIX-YYYYMMDD-`` stem (everything up to and
         # including the second hyphen).
@@ -181,7 +190,9 @@ class SessionStore(Generic[StateT]):
                 max_seq = max(max_seq, int(r.rsplit("-", 1)[1]))
             except (ValueError, IndexError):
                 continue
-        return self._state_cls.id_format(seq=max_seq + 1)
+        return self._state_cls.id_format(
+            seq=max_seq + 1, prefix=self._id_prefix,
+        )
 
     # ---------- public API ----------
     def create(self, *, query: str, environment: str,

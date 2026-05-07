@@ -239,15 +239,6 @@ def _merge_patch_metadata(
     return new_conf, new_rationale, new_signal
 
 
-# NOTE: Hard-coding app-specific tool names here is a layering inversion —
-# the runtime should not need to know app-level tool identities. Task 9.1
-# (per-orchestrator MCP server) will move this to a registration mechanism
-# on the tool definition itself.
-_TYPED_TERMINAL_TOOLS: frozenset[str] = frozenset({
-    "mark_resolved", "mark_escalated", "submit_hypothesis",
-})
-
-
 def _harvest_typed_terminal(
     tc_args: dict,
     state: tuple[float | None, str | None, str | None],
@@ -267,17 +258,20 @@ def _harvest_typed_terminal(
     return conf, rat, sig
 
 
-def _harvest_update_incident(
+def _harvest_patch_tool(
     tc_args: dict,
     state: tuple[float | None, str | None, str | None],
     terminal_locked: bool,
     valid_signals: frozenset[str] | None,
 ) -> tuple[float | None, str | None, str | None]:
-    """Apply an ``update_incident.patch`` to the harvest state.
+    """Apply a configured patch-tool's ``args.patch`` blob to the
+    harvest state.
 
     When ``terminal_locked`` is True (a typed-terminal call already
     fired this session), confidence/rationale are pinned; only signal
-    can flow through.
+    can flow through. Generalises the v1.0 single-tool path —
+    apps register patch-tool names via
+    ``OrchestratorConfig.patch_tools``.
     """
     conf, rat, sig = state
     patch = tc_args.get("patch") or {}
@@ -295,24 +289,33 @@ def _harvest_tool_calls_and_patches(
     incident: Session,
     ts: str,
     valid_signals: frozenset[str] | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ) -> tuple[float | None, str | None, str | None]:
-    """Iterate agent messages, record ToolCall entries on the incident, and
+    """Iterate agent messages, record ToolCall entries on the session, and
     harvest confidence / confidence_rationale / signal from typed terminal
-    tools or legacy update_incident patches.
+    tools or app-declared patch tools.
 
-    Typed terminal tools (mark_resolved, mark_escalated, submit_hypothesis)
-    carry confidence and rationale as flat kwargs; they imply
-    ``signal=success`` since invoking a terminal tool is the agent's
-    declaration that *its stage* completed cleanly — not that the
-    session itself was successfully resolved. The session-level
-    distinction (resolved vs escalated) is inferred separately from
-    tool_calls history by ``_finalize_session_status``. Non-terminal
-    agents emit routing signal via ``update_incident.patch.signal``.
+    Typed terminal tools (those whose bare name is in
+    ``terminal_tool_names``, supplied by the caller from
+    ``OrchestratorConfig.terminal_tools``) carry confidence and rationale
+    as flat kwargs; they imply ``signal=success`` since invoking a
+    terminal tool is the agent's declaration that *its stage* completed
+    cleanly — not that the session itself was successfully resolved.
+    The session-level outcome is inferred separately from tool_calls
+    history by ``_finalize_session_status``. Non-terminal agents emit
+    routing signal via patch-tool args.
+
+    ``patch_tool_names`` lists the bare tool names that ship a
+    ``patch:`` arg the harvester should merge. Empty default means
+    "no patch tools" so unconfigured apps pay nothing. Generalises
+    the v1.0 single-tool path; apps register patch-tool names via
+    ``OrchestratorConfig.patch_tools``.
 
     Once a typed terminal tool has fired, its confidence/rationale are
-    authoritative — a same-message update_incident.patch must not
-    override them. Signal still flows from later patches so triage-style
-    routing remains expressive.
+    authoritative — a same-message patch must not override them.
+    Signal still flows from later patches so triage-style routing
+    remains expressive.
 
     Returns ``(agent_confidence, agent_rationale, agent_signal)``.
     """
@@ -330,11 +333,11 @@ def _harvest_tool_calls_and_patches(
                 agent=skill_name, tool=tc_name, args=tc_args,
                 result=None, ts=ts,
             ))
-            if tc_original in _TYPED_TERMINAL_TOOLS:
+            if tc_original in terminal_tool_names:
                 state = _harvest_typed_terminal(tc_args, state, valid_signals)
                 terminal_locked = True
-            elif tc_original == "update_incident":
-                state = _harvest_update_incident(
+            elif tc_original in patch_tool_names:
+                state = _harvest_patch_tool(
                     tc_args, state, terminal_locked, valid_signals,
                 )
     return state
@@ -444,6 +447,8 @@ def make_agent_node(
     store: SessionStore,
     valid_signals: frozenset[str] | None = None,
     gateway_cfg: GatewayConfig | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -457,6 +462,13 @@ def make_agent_node(
     :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so
     the closure captures the live ``Session`` per agent invocation.
     When ``None``, tools are passed through untouched.
+
+    ``terminal_tool_names`` and ``patch_tool_names`` are the bare tool
+    names the harvester should treat as typed-terminal /
+    patch-emitting (sourced from ``OrchestratorConfig.terminal_tools``
+    union ``OrchestratorConfig.harvest_terminal_tools`` /
+    ``OrchestratorConfig.patch_tools``). Empty defaults preserve the
+    "no harvester recognition" behavior for legacy callers.
     """
 
     async def node(state: GraphState) -> dict:
@@ -491,18 +503,21 @@ def make_agent_node(
                 inc_id=inc_id, store=store, fallback=incident,
             )
 
-        # Tools (e.g. update_incident) write straight to disk. Reload so the
-        # node's own append of agent_run + tool_calls happens against the
-        # tool-mutated state — otherwise saving the stale in-memory object
-        # clobbers the tools' writes.
+        # Tools (e.g. registered patch tools) write straight to disk.
+        # Reload so the node's own append of agent_run + tool_calls
+        # happens against the tool-mutated state — otherwise saving
+        # the stale in-memory object clobbers the tools' writes.
         incident = store.load(inc_id)
 
         messages = result.get("messages", [])
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
-        # Record tool calls and harvest confidence/signal from update_incident patches.
+        # Record tool calls and harvest confidence/signal from configured
+        # patch / typed-terminal tools.
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
             messages, skill.name, incident, ts, valid_signals,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
         )
 
         # Pair tool responses with their tool calls.
@@ -530,7 +545,7 @@ def _decide_from_signal(inc: Session) -> str:
     """Return the latest agent's emitted signal, or "default" if absent.
 
     Agents emit one of {success, failed, needs_input} via the ``signal``
-    key of their final ``update_incident`` patch (see ``_coerce_signal``).
+    key of a configured patch tool (see ``_coerce_signal``).
     The node harvests it onto ``AgentRun.signal``; this decider then reads
     the *most recent* run (which is the one that just finished, since the
     node has already appended it). If no signal is present we return
@@ -719,6 +734,15 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     valid_signals = frozenset(cfg.orchestrator.signals)
     gateway_cfg = getattr(cfg.runtime, "gateway", None)
+    # Build the harvester's tool-name sets once per graph-build. The
+    # union of ``terminal_tools`` (status-transitioning) and
+    # ``harvest_terminal_tools`` (harvest-only) gives the full
+    # typed-terminal recognition surface for confidence/rationale
+    # capture; ``patch_tools`` carries the patch-blob harvester path.
+    terminal_tool_names = frozenset(
+        r.tool_name for r in cfg.orchestrator.terminal_tools
+    ) | frozenset(cfg.orchestrator.harvest_terminal_tools)
+    patch_tool_names = frozenset(cfg.orchestrator.patch_tools)
     nodes: dict = {}
     for agent_name, skill in skills.items():
         kind = getattr(skill, "kind", "responsive")
@@ -751,6 +775,8 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             decide_route=decide, store=store,
             valid_signals=valid_signals,
             gateway_cfg=gateway_cfg,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
         )
     return nodes
 

@@ -15,13 +15,13 @@ def cfg(tmp_path):
                             module="examples.incident_management.mcp_server",
                             category="incident_management"),
             MCPServerConfig(name="local_obs", transport="in_process",
-                            module="runtime.mcp_servers.observability",
+                            module="examples.incident_management.mcp_servers.observability",
                             category="observability"),
             MCPServerConfig(name="local_rem", transport="in_process",
-                            module="runtime.mcp_servers.remediation",
+                            module="examples.incident_management.mcp_servers.remediation",
                             category="remediation"),
             MCPServerConfig(name="local_user", transport="in_process",
-                            module="runtime.mcp_servers.user_context",
+                            module="examples.incident_management.mcp_servers.user_context",
                             category="user_context"),
         ]),
         paths=Paths(skills_dir="config/skills", incidents_dir=str(tmp_path)),
@@ -96,7 +96,11 @@ async def test_investigate_endpoint_creates_incident(cfg):
         )
     assert res.status_code == 200
     body = res.json()
-    assert body["incident_id"].startswith("INC-")
+    # The test fixture builds AppConfig without overriding
+    # ``session_id_prefix``, so the framework default ``SES`` applies.
+    # Real deployments (config/incident_management.yaml) set
+    # ``session_id_prefix: INC`` and get ``INC-`` ids.
+    assert body["incident_id"].startswith("SES-")
 
 
 @pytest.mark.asyncio

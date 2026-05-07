@@ -4,8 +4,18 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
+
+from runtime.terminal_tools import StatusDef, TerminalToolRule
+
+
+# Session-id prefix grammar. The framework mints session ids of the form
+# ``{PREFIX}-YYYYMMDD-NNN`` (see ``runtime.state.Session.id_format``);
+# the prefix is the only piece an app picks. Allow alphanumerics + hyphens,
+# bound the length so the id stays scannable in logs and DB indexes, and
+# refuse the empty string so the resulting id never starts with a stray ``-``.
+_SESSION_ID_PREFIX_RE = re.compile(r"^[A-Za-z0-9-]{1,16}$")
 
 
 ProviderKind = Literal["ollama", "azure_openai", "stub"]
@@ -129,14 +139,189 @@ class Paths(BaseModel):
 
 
 class OrchestratorConfig(BaseModel):
+    model_config = {"extra": "forbid"}
+
     entry_agent: str = "intake"
-    # Signals an agent may emit (via ``update_incident.patch.signal``) that
-    # the router will accept and look up against the skill's ``routes`` table.
+    # Signals an agent may emit (via the configured patch tool's ``patch.signal``)
+    # that the router will accept and look up against the skill's ``routes`` table.
     # Anything outside this set falls through to ``when: default``. Override
     # in YAML to extend the vocabulary; the default keeps current behaviour.
     signals: list[str] = Field(
         default_factory=lambda: ["success", "failed", "needs_input"],
     )
+
+    # Generic terminal-tool registry — apps declare which tool calls
+    # transition the session to which status, plus optional per-rule
+    # extra-field extraction. Replaces the v1.0 hardcoded
+    # ``_TERMINAL_TOOL_RULES`` table in ``orchestrator.py`` (D-06-01,
+    # D-06-02). Empty list = framework cannot infer any terminal
+    # status -> every session falls through to
+    # ``default_terminal_status``.
+    terminal_tools: list[TerminalToolRule] = Field(default_factory=list)
+
+    # Status vocabulary the app exposes. Keys are the status names
+    # the app uses (``resolved``, ``escalated``, ``approved``,
+    # ``changes_requested``, ...). Empty dict is allowed for the
+    # framework default ``OrchestratorConfig()`` so unconfigured apps
+    # still validate (real apps populate this in their YAML).
+    # D-06-03, D-06-05.
+    statuses: dict[str, StatusDef] = Field(default_factory=dict)
+
+    # Status assigned when the graph runs to ``__end__`` and no
+    # ``terminal_tools`` rule fires. Required when ``statuses`` is
+    # non-empty; must reference a key in ``statuses``. Apps own
+    # this name — ``incident_management`` uses ``needs_review``,
+    # ``code_review`` uses ``unreviewed`` (D-06-06).
+    default_terminal_status: str | None = None
+
+    # Tool names whose ``args.patch`` blob the harvester should fold
+    # into agent confidence/signal/rationale (DECOUPLE-02 generalization
+    # of the v1.0 single-tool path). Empty default means "no patch
+    # tools" so unconfigured apps pay nothing. Apps populate this in
+    # YAML alongside ``terminal_tools``; staying off the framework
+    # hardcoded path keeps generic-runtime free of app vocabulary
+    # leaks.
+    patch_tools: list[str] = Field(default_factory=list)
+
+    # Tool names the harvester should treat as "typed-terminal"
+    # (carrying flat ``confidence``/``confidence_rationale`` args and
+    # implying ``signal=success``) WITHOUT the orchestrator's finalize
+    # path firing a status transition for them. Used for tools that
+    # mark an agent stage complete but do not themselves end the
+    # session. Empty default means "no harvest-only tools". Distinct
+    # from ``terminal_tools`` (which both harvest and transition
+    # status).
+    harvest_terminal_tools: list[str] = Field(default_factory=list)
+
+    # Dotted module paths the orchestrator imports at create()-time and
+    # binds via each module's ``register(mcp_app, cfg)`` callable. Empty
+    # list = no app MCP servers (framework-only). Order is preserved.
+    # Replaces the v1.0 hardcoded framework-internal MCP-server imports
+    # plus ``set_environments`` / ``set_escalation_teams`` setter calls
+    # in orchestrator.py (DECOUPLE-04 / D-07-02 / D-07-03). Apps declare
+    # their per-tool servers under ``orchestrator.mcp_servers`` in YAML;
+    # framework no longer hardcodes incident-vocabulary modules.
+    mcp_servers: list[str] = Field(default_factory=list)
+
+    # Optional MCP tool the orchestrator invokes when a user clicks
+    # ``Escalate`` from the awaiting_input gate. ``None`` (default)
+    # means the orchestrator skips the tool call entirely and only
+    # transitions the session to the rule-driven status. Apps that
+    # want a side-effect (page on-call, file ticket) set this to the
+    # bare tool name; the orchestrator looks up the matching rule in
+    # ``terminal_tools`` to determine the resulting status.
+    escalate_action_tool_name: str | None = None
+
+    # Default team to pass to the escalation tool when the user did
+    # not pick one. Only meaningful if ``escalate_action_tool_name``
+    # is set. Apps own this default (``incident_management`` defaults
+    # to ``platform-oncall``).
+    escalate_action_default_team: str | None = None
+
+    # Dotted path to a pydantic BaseModel subclass that validates the
+    # ``state_overrides=`` dict passed to ``Orchestrator.start_session``.
+    # Format: ``module.path:ClassName`` OR ``module.path.ClassName`` (both
+    # accepted; ``:`` is the canonical entry-point form). ``None`` (default)
+    # = no validation; ``start_session(state_overrides=...)`` passes the
+    # dict through unchanged (D-08-02 backward-compat). Resolved at
+    # ``Orchestrator.create()`` via ``importlib.import_module`` + ``getattr``;
+    # bad path raises at boot with a useful message (DECOUPLE-05 / D-08-01).
+    state_overrides_schema: str | None = None
+
+    @field_validator("state_overrides_schema")
+    @classmethod
+    def _validate_state_overrides_schema_format(
+        cls, v: str | None,
+    ) -> str | None:
+        """String-format sanity check for the dotted-path schema reference.
+
+        Real importlib resolution happens at ``Orchestrator.create()``
+        time so config-load doesn't drag the schema module into every
+        consumer. This validator only catches obviously-malformed
+        strings (whitespace, hyphens, missing class component) so the
+        actual ImportError/AttributeError is the only reason boot
+        ever fails (DECOUPLE-05 / D-08-01).
+        """
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError(
+                "state_overrides_schema must be non-empty when set"
+            )
+        # Accept either ``mod.path:ClassName`` or ``mod.path.ClassName``.
+        # Each component must be a Python identifier; the trailing
+        # element MUST be a class name (no further dots after the
+        # separator).
+        if not re.fullmatch(
+            r"[A-Za-z_][\w.]*[:.][A-Za-z_]\w*", v,
+        ):
+            raise ValueError(
+                f"state_overrides_schema={v!r} is not a valid dotted "
+                f"path (expected `module.path:ClassName` or "
+                f"`module.path.ClassName`)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_terminal_tool_registry(self) -> "OrchestratorConfig":
+        """Cross-field invariants for the terminal-tool registry.
+
+        * If ``statuses`` is non-empty, ``default_terminal_status``
+          must be set and reference an existing status name.
+        * The status referenced by ``default_terminal_status`` must
+          be ``terminal=True`` (a non-terminal default makes no
+          sense).
+        * Every ``terminal_tools[i].status`` must reference an
+          existing status name.
+
+        Empty ``statuses`` (the framework's bare default) skips
+        these checks so ``OrchestratorConfig()`` still constructs.
+        Apps with ``statuses`` populated cross-validate at boot per
+        D-06-03 / D-06-06.
+        """
+        if not self.statuses:
+            # Bare framework default: nothing to cross-validate. If
+            # ``default_terminal_status`` is set without ``statuses``
+            # the app made a config mistake — flag it.
+            if self.default_terminal_status is not None:
+                raise ValueError(
+                    "default_terminal_status is set but statuses is "
+                    "empty; declare the status vocabulary first"
+                )
+            if self.terminal_tools:
+                raise ValueError(
+                    "terminal_tools is non-empty but statuses is "
+                    "empty; declare the status vocabulary first"
+                )
+            return self
+
+        if self.default_terminal_status is None:
+            raise ValueError(
+                "default_terminal_status is required when statuses "
+                "is non-empty"
+            )
+        if self.default_terminal_status not in self.statuses:
+            valid = sorted(self.statuses.keys())
+            raise ValueError(
+                f"default_terminal_status={self.default_terminal_status!r} "
+                f"is not a declared status; valid statuses: {valid}"
+            )
+        default_def = self.statuses[self.default_terminal_status]
+        if not default_def.terminal:
+            raise ValueError(
+                f"default_terminal_status={self.default_terminal_status!r} "
+                f"references a non-terminal status (terminal=False); "
+                f"the default must be terminal"
+            )
+        for idx, rule in enumerate(self.terminal_tools):
+            if rule.status not in self.statuses:
+                valid = sorted(self.statuses.keys())
+                raise ValueError(
+                    f"terminal_tools[{idx}].status={rule.status!r} "
+                    f"(tool_name={rule.tool_name!r}) is not a "
+                    f"declared status; valid statuses: {valid}"
+                )
+        return self
 
 
 RiskLevel = Literal["low", "medium", "high"]
@@ -310,11 +495,28 @@ class FrameworkAppConfig(BaseModel):
     # Intake runner knobs: forwarded into IntakeContext at graph-build time.
     intake_top_k: int = 3
     intake_similarity_threshold: float = 0.7
+    # Per-app session-id prefix. Threaded through ``SessionStore`` to
+    # ``Session.id_format`` so each app picks its own id namespace
+    # (``INC`` for incident management, ``REVIEW`` for code review,
+    # ``HR`` for HR cases, ...). Default ``"SES"`` keeps unconfigured
+    # apps generic. Validated as 1-16 chars of alphanumerics and
+    # hyphens so the resulting id stays scannable.
+    session_id_prefix: str = "SES"
     # UI rendering knobs surfaced to the generic runtime UI. Mirrors
     # AppConfig.ui — the FrameworkAppConfig provider can either copy
     # AppConfig.ui or supply its own. Defaults to empty so apps that
     # don't render with the generic UI pay nothing.
     ui: UIConfig = Field(default_factory=UIConfig)
+
+    @field_validator("session_id_prefix")
+    @classmethod
+    def _validate_session_id_prefix(cls, v: str) -> str:
+        if not _SESSION_ID_PREFIX_RE.match(v):
+            raise ValueError(
+                f"session_id_prefix={v!r} must be 1-16 chars of "
+                "alphanumerics and hyphens (no whitespace, no symbols)"
+            )
+        return v
 
 
 def resolve_framework_app_config(

@@ -10,8 +10,76 @@
 store_path: incidents
 similarity_method: keyword
 
+# Generic terminal-tool registry. Apps declare which tool calls
+# transition the session to which status, plus optional per-rule
+# extra-field extraction. Replaces the v1.0 hardcoded
+# ``_TERMINAL_TOOL_RULES`` table in ``orchestrator.py`` (Phase 6 /
+# DECOUPLE-02 / DECOUPLE-03 / D-06-01..06).
+orchestrator:
+  entry_agent: intake
+  default_terminal_status: needs_review
+  statuses:
+    open:
+      name: open
+      terminal: false
+      kind: pending
+    escalated:
+      name: escalated
+      terminal: true
+      kind: escalation
+    resolved:
+      name: resolved
+      terminal: true
+      kind: success
+    needs_review:
+      name: needs_review
+      terminal: true
+      kind: needs_review
+  terminal_tools:
+    - tool_name: mark_resolved
+      status: resolved
+    - tool_name: mark_escalated
+      status: escalated
+      extract_fields:
+        team:
+          - args.team
+          - result.team
+    - tool_name: notify_oncall
+      status: escalated
+      extract_fields:
+        team:
+          - args.team
+  # Tools whose ``args.patch`` blob the harvester folds into agent
+  # confidence/signal/rationale (DECOUPLE-02 generalization).
+  patch_tools:
+    - update_incident
+  # Tools the harvester treats as typed-terminal for confidence
+  # capture but the orchestrator's finalize path does NOT transition
+  # status on (the deep_investigator's hypothesis tool is a stage-
+  # complete signal, not a session-end signal).
+  harvest_terminal_tools:
+    - submit_hypothesis
+  # App-MCP-server discovery (Phase 7 / DECOUPLE-04 / D-07-02). Each
+  # entry is a dotted module path imported at orchestrator boot; each
+  # module exposes ``register(mcp_app, cfg)``. Replaces the v1.0
+  # hardcoded framework-internal MCP-server imports + setter calls.
+  mcp_servers:
+    - examples.incident_management.mcp_servers.observability
+    - examples.incident_management.mcp_servers.remediation
+    - examples.incident_management.mcp_servers.user_context
+  # Parameterized escalate path (Resolution A — Option B).
+  escalate_action_tool_name: notify_oncall
+  escalate_action_default_team: platform-oncall
+  # DECOUPLE-05 / D-08-01: app-declared pydantic schema for
+  # state_overrides; orchestrator validates the start_session
+  # kwarg against this class.
+  state_overrides_schema: examples.incident_management.state.IncidentStateOverrides
+
 # Cross-cutting framework knobs the runtime consumes directly.
 framework:
+  # Per-app session-id prefix. Threaded through SessionStore into
+  # Session.id_format so this app's rows look like INC-YYYYMMDD-NNN.
+  session_id_prefix: INC
   confidence_threshold: 0.75
   similarity_threshold: 0.2
   escalation_teams:

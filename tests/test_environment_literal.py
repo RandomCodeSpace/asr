@@ -1,7 +1,7 @@
 import pytest
 from pydantic import TypeAdapter
 
-from runtime.mcp_servers.observability import build_environment_validator
+from examples.incident_management.mcp_servers.observability import build_environment_validator
 
 
 def test_environment_validator_accepts_configured():

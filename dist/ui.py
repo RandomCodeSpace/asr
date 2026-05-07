@@ -135,6 +135,16 @@ def _make_repository(cfg: AppConfig) -> SessionStore:
     embedder = build_embedder(cfg.llm.embedding, cfg.llm.providers)
     vector_store = build_vector_store(cfg.storage.vector, embedder, engine)
     state_cls = resolve_state_class(cfg.runtime.state_class)
+    # Resolve framework knobs the same way the orchestrator does:
+    # dotted-path provider wins for back-compat, otherwise the YAML
+    # ``framework:`` block. Only ``session_id_prefix`` is read here so
+    # the UI's transient SessionStore mints ids in the same namespace.
+    if cfg.runtime.framework_app_config_path is not None:
+        framework_cfg = resolve_framework_app_config(
+            cfg.runtime.framework_app_config_path,
+        )
+    else:
+        framework_cfg = cfg.framework
     return SessionStore(
         engine=engine,
         state_cls=state_cls,
@@ -144,6 +154,7 @@ def _make_repository(cfg: AppConfig) -> SessionStore:
                      if cfg.storage.vector.backend == "faiss" else None),
         vector_index_name=cfg.storage.vector.collection_name,
         distance_strategy=cfg.storage.vector.distance_strategy,
+        id_prefix=framework_cfg.session_id_prefix,
     )
 
 

@@ -1,20 +1,66 @@
 from sqlalchemy import create_engine
 
+from runtime.config import (
+    AppConfig,
+    LLMConfig,
+    MCPConfig,
+    OrchestratorConfig,
+)
 from runtime.orchestrator import Orchestrator
 from runtime.state import ToolCall
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore, StaleVersionError
+from runtime.terminal_tools import StatusDef, TerminalToolRule
+
+
+# Registry-driven equivalent of the v1.0 hardcoded ``_TERMINAL_TOOL_RULES``
+# table that lived in orchestrator.py. The framework now reads this from
+# ``self.cfg.orchestrator.terminal_tools`` (Phase 6 / DECOUPLE-02).
+_INCIDENT_STATUSES = {
+    "open":         StatusDef(name="open",         terminal=False, kind="pending"),
+    "escalated":    StatusDef(name="escalated",    terminal=True,  kind="escalation"),
+    "resolved":     StatusDef(name="resolved",     terminal=True,  kind="success"),
+    "needs_review": StatusDef(name="needs_review", terminal=True,  kind="needs_review"),
+}
+_INCIDENT_RULES = [
+    TerminalToolRule(tool_name="mark_resolved", status="resolved"),
+    TerminalToolRule(
+        tool_name="mark_escalated", status="escalated",
+        extract_fields={"team": ["args.team", "result.team"]},
+    ),
+    TerminalToolRule(
+        tool_name="notify_oncall", status="escalated",
+        extract_fields={"team": ["args.team"]},
+    ),
+]
+
+
+def _incident_app_cfg() -> AppConfig:
+    return AppConfig(
+        llm=LLMConfig(),
+        mcp=MCPConfig(),
+        orchestrator=OrchestratorConfig(
+            statuses=_INCIDENT_STATUSES,
+            terminal_tools=_INCIDENT_RULES,
+            default_terminal_status="needs_review",
+        ),
+    )
 
 
 def _make_orch_with_store(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path/'t.db'}")
     Base.metadata.create_all(engine)
     store = SessionStore(engine=engine)
+    cfg = _incident_app_cfg()
     class _O:
-        def __init__(self, s): self.store = s
+        def __init__(self, s, c):
+            self.store = s
+            self.cfg = c
         _finalize_session_status = Orchestrator._finalize_session_status
         _save_or_yield = Orchestrator._save_or_yield
-    return _O(store), store
+        _infer_terminal_decision = Orchestrator._infer_terminal_decision
+        _extract_field = Orchestrator._extract_field
+    return _O(store, cfg), store
 
 
 def test_finalize_with_mark_escalated_in_history_yields_escalated(tmp_path):
