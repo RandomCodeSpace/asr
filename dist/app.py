@@ -2957,6 +2957,20 @@ def get_embedding(
     timeout resolution as ``get_llm``. Embeddings traffic shares the
     request_timeout knob with chat (see CONTEXT.md "Deferred Ideas" --
     splitting embedding timeout from chat is a future refinement).
+
+    Note (Phase 13 review WR-01): unlike the chat builders -- which apply a
+    defence-in-depth ``asyncio.wait_for`` wrapper (``_wrap_chat_with_timeout``)
+    that guarantees a structured ``LLMTimeoutError`` with ``elapsed_ms`` even
+    on partial-byte stalls -- embeddings rely SOLELY on the underlying
+    httpx-layer timeout configured above (``client_kwargs={"timeout": ...}``
+    for Ollama, ``request_timeout=`` for Azure). This asymmetry is a
+    deliberate scope choice tied to Phase 13 CONTEXT.md "Deferred Ideas" #4
+    (splitting embeddings timeout from chat timeout). If embeddings need
+    stricter bounds than chat -- or if the httpx-layer timeout proves
+    insufficient against post-headers TCP read stalls on the embeddings
+    path the same way it can on chat -- a future phase can mirror
+    ``_wrap_chat_with_timeout`` for the embeddings public surface
+    (``aembed_query`` / ``aembed_documents``).
     """
     if cfg.embedding is None:
         raise ValueError("llm.embedding is not configured")
