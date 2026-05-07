@@ -113,6 +113,21 @@ class StubChatModel(BaseChatModel):
 def _build_ollama_chat(provider: ProviderConfig, model_id: str,
                        temperature: float) -> BaseChatModel:
     from langchain_ollama import ChatOllama
+
+    # Many Ollama models (gemma*, gpt-oss, ministral, etc.) don't support
+    # native function-calling, which is langchain-ollama's default method
+    # for ``with_structured_output``. Subclass to force
+    # ``method='json_schema'`` (uses Ollama's structured-output API) so
+    # Phase 10's ``response_format=AgentTurnOutput`` envelope actually
+    # round-trips instead of failing with ``OutputParserException``
+    # when the LLM emits prose. Callers that want a different method
+    # may still override by passing ``method=`` explicitly.
+    class _ChatOllamaJsonSchema(ChatOllama):  # type: ignore[misc, valid-type]
+        def with_structured_output(self, schema, *, method=None, **kw):
+            return super().with_structured_output(
+                schema, method=method or "json_schema", **kw,
+            )
+
     kwargs: dict[str, Any] = {
         "base_url": provider.base_url or "https://ollama.com",
         "model": model_id,
@@ -121,7 +136,7 @@ def _build_ollama_chat(provider: ProviderConfig, model_id: str,
     api_key = provider.api_key or os.environ.get("OLLAMA_API_KEY")
     if api_key:
         kwargs["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
-    return ChatOllama(**kwargs)
+    return _ChatOllamaJsonSchema(**kwargs)
 
 
 def _build_azure_chat(provider: ProviderConfig, model: ModelConfig) -> BaseChatModel:
@@ -185,7 +200,32 @@ def get_llm(cfg: LLMConfig, model_name: str | None = None, *,
         return _build_ollama_chat(provider, model.model, model.temperature)
     if provider.kind == "azure_openai":
         return _build_azure_chat(provider, model)
+    if provider.kind == "openai_compat":
+        return _build_openai_compat_chat(provider, model)
     raise ValueError(f"Unknown provider kind: {provider.kind!r}")
+
+
+def _build_openai_compat_chat(provider: ProviderConfig,
+                              model: ModelConfig) -> BaseChatModel:
+    """Build a ``ChatOpenAI`` pointed at an OpenAI-compatible endpoint
+    (OpenRouter, Together, vLLM, etc.). Reuses langchain-openai's
+    ``ChatOpenAI`` with ``base_url=`` override and the provider's
+    ``api_key`` (resolved from env via the YAML loader).
+    """
+    from langchain_openai import ChatOpenAI
+    if provider.base_url is None:
+        raise ValueError(
+            "openai_compat provider requires 'base_url' "
+            "(e.g. https://openrouter.ai/api/v1)"
+        )
+    if provider.api_key is None:
+        raise ValueError("openai_compat provider requires 'api_key'")
+    return ChatOpenAI(
+        base_url=provider.base_url,
+        api_key=provider.api_key,
+        model=model.model,
+        temperature=model.temperature,
+    )
 
 
 def get_embedding(cfg: LLMConfig) -> Embeddings:

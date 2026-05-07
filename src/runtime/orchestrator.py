@@ -1442,22 +1442,15 @@ class Orchestrator(Generic[StateT]):
         session = getattr(self, "_current_session_for_invoke", None)
         cfg_inject = self.cfg.orchestrator.injected_args
         if session is not None and cfg_inject:
-            from runtime.tools.arg_injection import inject_injected_args
-            # Compute the set of params the underlying tool actually
-            # accepts so injection skips keys not on its signature
-            # (e.g. ``session_id`` injected into ``update_incident``
-            # which only accepts ``incident_id``/``patch``).
-            schema = getattr(entry.tool, "args_schema", None)
-            if schema is not None and hasattr(schema, "model_fields"):
-                accepted = frozenset(schema.model_fields.keys())
-            else:
-                accepted = None
+            from runtime.tools.arg_injection import (
+                accepted_params_for_tool, inject_injected_args,
+            )
             args = inject_injected_args(
                 args,
                 session=session,
                 injected_args_cfg=cfg_inject,
                 tool_name=name,
-                accepted_params=accepted,
+                accepted_params=accepted_params_for_tool(entry.tool),
             )
         return await entry.tool.ainvoke(args)
 

@@ -60,7 +60,30 @@ def strip_injected_params(
     if not injected_keys:
         return tool
     schema = getattr(tool, "args_schema", None)
-    if schema is None or not hasattr(schema, "model_fields"):
+    if schema is None:
+        return tool
+
+    # --- dict path: FastMCP / JSON-Schema tools ---------------------------
+    # FastMCP exposes ``args_schema`` as a plain JSON-Schema dict rather
+    # than a Pydantic model. Strip injected keys directly from the dict.
+    if isinstance(schema, dict):
+        props = schema.get("properties", {})
+        overlap = injected_keys & set(props)
+        if not overlap:
+            return tool
+        new_props = {k: v for k, v in props.items() if k not in injected_keys}
+        required = [r for r in schema.get("required", []) if r not in injected_keys]
+        new_dict_schema: dict[str, Any] = {**schema, "properties": new_props, "required": required}
+        try:
+            return tool.model_copy(update={"args_schema": new_dict_schema})
+        except Exception:  # pragma: no cover — defensive fallback
+            import copy
+            stripped = copy.copy(tool)
+            stripped.args_schema = new_dict_schema  # type: ignore[attr-defined]
+            return stripped
+
+    # --- Pydantic path: BaseModel subclass tools --------------------------
+    if not hasattr(schema, "model_fields"):
         return tool
     overlap = injected_keys & set(schema.model_fields.keys())
     if not overlap:
@@ -193,8 +216,36 @@ def inject_injected_args(
     return out
 
 
+def accepted_params_for_tool(tool: Any) -> frozenset[str] | None:
+    """Return the set of parameter names a wrapped tool accepts.
+
+    Handles both shapes ``args_schema`` can take in this codebase:
+
+    * pydantic ``BaseModel`` subclass — read ``model_fields.keys()``
+      (used by mock tools and by tests).
+    * JSON-Schema ``dict`` — read ``schema["properties"].keys()``
+      (used by real FastMCP-derived tools, which expose the underlying
+      function's input schema as a JSON Schema rather than a pydantic
+      class).
+
+    Returns ``None`` when the tool has no introspectable schema (caller
+    should treat this as "skip filtering" — preserves prior behaviour).
+    """
+    schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return None
+    if hasattr(schema, "model_fields"):
+        return frozenset(schema.model_fields.keys())
+    if isinstance(schema, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            return frozenset(props.keys())
+    return None
+
+
 __all__ = [
     "strip_injected_params",
     "inject_injected_args",
+    "accepted_params_for_tool",
     "_LOG",
 ]

@@ -306,8 +306,12 @@ def test_orchestrator_injected_args_field_in_yaml():
     """Test 11 — load each app YAML and assert its declared
     ``injected_args`` map matches the documented config."""
     full = load_config("config/config.yaml")
+    # ``environment`` lives on ``IncidentState.extra_fields`` (the base
+    # ``Session`` class is domain-neutral), so the path goes through the
+    # dict branch of ``_resolve_dotted``. Mirrors how code_review
+    # declares ``pr_url`` / ``repo`` below.
     assert full.orchestrator.injected_args == {
-        "environment": "session.environment",
+        "environment": "session.extra_fields.environment",
         "incident_id": "session.id",
         "session_id": "session.id",
     }

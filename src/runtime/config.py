@@ -18,7 +18,7 @@ from runtime.terminal_tools import StatusDef, TerminalToolRule
 _SESSION_ID_PREFIX_RE = re.compile(r"^[A-Za-z0-9-]{1,16}$")
 
 
-ProviderKind = Literal["ollama", "azure_openai", "stub"]
+ProviderKind = Literal["ollama", "azure_openai", "openai_compat", "stub"]
 
 
 class ProviderConfig(BaseModel):

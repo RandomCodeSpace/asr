@@ -65,7 +65,16 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                Session). Net +4 ``incident`` tokens, all reuses of the
 #                existing local on structurally required code paths -- no new
 #                domain concept introduced.
-BASELINE_TOTAL = 153
+#   153 -> 154   Phase 12 (FOC-05/06): framework-owned retry policy + E2E
+#                genericity test. ``Orchestrator._retry_session_locked``
+#                consults ``should_retry`` and yields ``retry_rejected`` events
+#                that include the reason; the new accessor / preview helpers
+#                reuse the existing ``incident`` local in orchestrator.py on
+#                the policy-gate code path. Net +1 ``incident`` token reuse,
+#                no new domain concept introduced (was missed in the Phase 12
+#                atomic commit; counted retroactively in the v1.2 follow-up
+#                that consolidates injection-path bug fixes).
+BASELINE_TOTAL = 154
 
 
 def test_runtime_leaks_at_or_below_baseline():

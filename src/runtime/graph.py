@@ -206,7 +206,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            return await executor.ainvoke(input_)
+            return await executor.ainvoke(input_, config={"recursion_limit": 25})
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): never retry a HITL pause.
             # GraphInterrupt is a checkpointed pending_approval signal,
@@ -594,12 +594,20 @@ def make_agent_node(
         # the original tools pass through untouched and
         # ``create_react_agent`` sees the same surface as before.
         if gateway_cfg is not None:
+            # Pass ORIGINAL tools (pre-strip) to wrap_tool — the gateway
+            # wrapper strips internally for the LLM-visible schema while
+            # keeping ``inner.args_schema`` intact so
+            # ``accepted_params_for_tool`` correctly recognises injected
+            # keys (e.g. ``environment``) as accepted by the underlying
+            # tool. Stripping twice (here AND in wrap_tool) hides those
+            # keys from ``accepted_params``, the inject step skips them,
+            # and FastMCP rejects the call as missing required arg.
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
                           injected_args=injected_args or {},
                           gate_policy=gate_policy)
-                for t in visible_tools
+                for t in tools
             ]
         elif injected_keys:
             # No gateway, but injected_args is configured — wrap each

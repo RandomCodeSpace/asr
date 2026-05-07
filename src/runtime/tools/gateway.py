@@ -266,12 +266,10 @@ def wrap_tool(
     # entry like ``session_id: session.id`` is unconditionally written
     # to every tool's kwargs — tools that don't accept ``session_id``
     # then raise pydantic ``unexpected_keyword`` errors at the FastMCP
-    # validation boundary.
-    _full_schema = inner.args_schema
-    if _full_schema is not None and hasattr(_full_schema, "model_fields"):
-        _accepted_params: frozenset[str] = frozenset(_full_schema.model_fields.keys())
-    else:
-        _accepted_params = frozenset()
+    # validation boundary. ``accepted_params_for_tool`` handles both
+    # pydantic-model and JSON-Schema-dict ``args_schema`` shapes.
+    from runtime.tools.arg_injection import accepted_params_for_tool
+    _accepted_params: frozenset[str] | None = accepted_params_for_tool(inner)
 
     def _sync_invoke_inner(payload: Any) -> Any:
         """Sync-invoke the inner tool, translating BaseTool's
@@ -288,8 +286,20 @@ def wrap_tool(
                 f"for this tool instead of the sync invoke path."
             ) from exc
 
+    # Tool-naming regex differs across LLM providers — Ollama allows
+    # ``[a-zA-Z0-9_.\-]{1,256}``, OpenAI is stricter at
+    # ``^[a-zA-Z0-9_-]+$`` (no dots). The framework's internal naming
+    # uses ``<server>:<tool>`` for PVC-08 prefixed-form policy lookups,
+    # but the LLM only sees the *wrapper*'s ``.name``. Use ``__``
+    # (double underscore) as the LLM-visible separator: it satisfies
+    # both providers' regexes and is unambiguous (no real tool name
+    # contains a double underscore). ``inner.name`` keeps the colon
+    # form so ``effective_action`` / ``should_gate`` policy lookups
+    # stay PVC-08-compliant.
+    _llm_visible_name = inner.name.replace(":", "__")
+
     class _GatedTool(_GatedToolMarker):
-        name: str = inner.name
+        name: str = _llm_visible_name
         description: str = inner.description
         # The wrapper does its own arg coercion via the inner tool's schema,
         # so no need to copy it here. Keep ``args_schema`` aligned with the
