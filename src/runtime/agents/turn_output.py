@@ -114,7 +114,15 @@ def parse_envelope_from_result(
         try:
             return AgentTurnOutput.model_validate(sr)
         except Exception:  # noqa: BLE001
-            pass
+            # Path 1 produced a dict that doesn't match the envelope
+            # schema. Fall through to Path 2 (parse last AIMessage), but
+            # log so providers shipping malformed structured_response are
+            # observable instead of silently degraded.
+            _LOG.debug(
+                "envelope path 1 (structured_response dict) failed validation; "
+                "falling through to AIMessage JSON parse",
+                exc_info=True,
+            )
 
     # Path 2: JSON-parse last AIMessage content
     messages = result.get("messages") or []

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -48,6 +49,8 @@ from typing import Any, Awaitable, TypeVar
 
 from runtime.config import AppConfig
 from runtime.mcp_loader import build_fastmcp_client
+
+_log = logging.getLogger("runtime.service")
 
 T = TypeVar("T")
 
@@ -547,8 +550,13 @@ class OrchestratorService:
                     pass
                 except Exception:  # noqa: BLE001
                     # The graph itself may have raised; we still want to
-                    # mark the row stopped below. Swallow here.
-                    pass
+                    # mark the row stopped below. Swallow here, but log
+                    # so post-mortem reveals the underlying failure.
+                    _log.warning(
+                        "stop_session: graph raised during cancel-await for %s",
+                        session_id,
+                        exc_info=True,
+                    )
             # Persist the stopped status. The orchestrator may not have
             # been built yet (caller passed an unknown id before any
             # session ran) — in that case there's nothing to persist.
@@ -557,7 +565,13 @@ class OrchestratorService:
                 try:
                     inc = orch.store.load(session_id)
                 except Exception:  # noqa: BLE001
-                    # Unknown id: nothing to persist; treat as no-op.
+                    # Unknown id: nothing to persist; treat as no-op. A
+                    # genuine store failure is still observable via the log.
+                    _log.debug(
+                        "stop_session: store.load(%s) failed; treating as unknown id",
+                        session_id,
+                        exc_info=True,
+                    )
                     inc = None
                 if inc is not None:
                     inc.status = "stopped"
@@ -626,7 +640,13 @@ class OrchestratorService:
                 )
                 fut.result(timeout=timeout)
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: shutdown must continue even if the watchdog
+                # refuses to stop cleanly. Surface the cause so it doesn't
+                # silently rot.
+                _log.warning(
+                    "shutdown: approval watchdog stop failed",
+                    exc_info=True,
+                )
             self._approval_watchdog = None
         # Cancel in-flight session tasks first so they observe a
         # CancelledError before the orchestrator's underlying
@@ -637,8 +657,13 @@ class OrchestratorService:
                     self._cancel_all_sessions(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: a stuck task that ignores cancellation must
+                # not block the loop teardown below. Surface for diagnosis.
+                _log.warning(
+                    "shutdown: cancel_all_sessions failed",
+                    exc_info=True,
+                )
         # Close the shared orchestrator on the loop, releasing its
         # checkpointer connection / MCP exit-stack.
         if loop.is_running() and self._orch is not None:
@@ -647,8 +672,13 @@ class OrchestratorService:
                     self._close_orchestrator(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: a misbehaving aclose() must not block
+                # the loop / thread join below. Surface for diagnosis.
+                _log.warning(
+                    "shutdown: orchestrator close failed",
+                    exc_info=True,
+                )
         # Close MCP clients on the loop *before* stopping it.
         if loop.is_running() and self._mcp_stack is not None:
             try:
@@ -656,9 +686,13 @@ class OrchestratorService:
                     self._close_mcp_pool(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                # Best-effort: don't block shutdown on a misbehaving client.
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: don't block shutdown on a misbehaving
+                # client. Log so diagnostics survive the silent cleanup.
+                _log.warning(
+                    "shutdown: MCP pool close failed",
+                    exc_info=True,
+                )
         if loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
@@ -699,7 +733,13 @@ class OrchestratorService:
         try:
             await orch.aclose()
         except Exception:  # noqa: BLE001
-            pass
+            # Best-effort cleanup: a checkpointer / MCP exit-stack that
+            # blew up on close still leaves the process to exit cleanly.
+            # Surface so the failure is observable post-mortem.
+            _log.warning(
+                "_close_orchestrator: orch.aclose() failed",
+                exc_info=True,
+            )
 
     async def _close_mcp_pool(self) -> None:
         if self._mcp_stack is None:

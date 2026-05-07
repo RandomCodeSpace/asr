@@ -441,6 +441,7 @@ state across cases.
 
 
 import concurrent.futures
+import logging
 import threading
 from typing import Any, Awaitable, TypeVar
 
@@ -468,7 +469,6 @@ graph is acyclic.
 """
 
 
-import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -1341,7 +1341,6 @@ from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
-
 
 
 # ----- imports for runtime/api_dedup.py -----
@@ -5019,6 +5018,8 @@ async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
 
 # ====== module: runtime/service.py ======
 
+_log = logging.getLogger("runtime.service")
+
 T = TypeVar("T")
 
 
@@ -5514,8 +5515,13 @@ class OrchestratorService:
                     pass
                 except Exception:  # noqa: BLE001
                     # The graph itself may have raised; we still want to
-                    # mark the row stopped below. Swallow here.
-                    pass
+                    # mark the row stopped below. Swallow here, but log
+                    # so post-mortem reveals the underlying failure.
+                    _log.warning(
+                        "stop_session: graph raised during cancel-await for %s",
+                        session_id,
+                        exc_info=True,
+                    )
             # Persist the stopped status. The orchestrator may not have
             # been built yet (caller passed an unknown id before any
             # session ran) — in that case there's nothing to persist.
@@ -5524,7 +5530,13 @@ class OrchestratorService:
                 try:
                     inc = orch.store.load(session_id)
                 except Exception:  # noqa: BLE001
-                    # Unknown id: nothing to persist; treat as no-op.
+                    # Unknown id: nothing to persist; treat as no-op. A
+                    # genuine store failure is still observable via the log.
+                    _log.debug(
+                        "stop_session: store.load(%s) failed; treating as unknown id",
+                        session_id,
+                        exc_info=True,
+                    )
                     inc = None
                 if inc is not None:
                     inc.status = "stopped"
@@ -5593,7 +5605,13 @@ class OrchestratorService:
                 )
                 fut.result(timeout=timeout)
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: shutdown must continue even if the watchdog
+                # refuses to stop cleanly. Surface the cause so it doesn't
+                # silently rot.
+                _log.warning(
+                    "shutdown: approval watchdog stop failed",
+                    exc_info=True,
+                )
             self._approval_watchdog = None
         # Cancel in-flight session tasks first so they observe a
         # CancelledError before the orchestrator's underlying
@@ -5604,8 +5622,13 @@ class OrchestratorService:
                     self._cancel_all_sessions(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: a stuck task that ignores cancellation must
+                # not block the loop teardown below. Surface for diagnosis.
+                _log.warning(
+                    "shutdown: cancel_all_sessions failed",
+                    exc_info=True,
+                )
         # Close the shared orchestrator on the loop, releasing its
         # checkpointer connection / MCP exit-stack.
         if loop.is_running() and self._orch is not None:
@@ -5614,8 +5637,13 @@ class OrchestratorService:
                     self._close_orchestrator(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: a misbehaving aclose() must not block
+                # the loop / thread join below. Surface for diagnosis.
+                _log.warning(
+                    "shutdown: orchestrator close failed",
+                    exc_info=True,
+                )
         # Close MCP clients on the loop *before* stopping it.
         if loop.is_running() and self._mcp_stack is not None:
             try:
@@ -5623,9 +5651,13 @@ class OrchestratorService:
                     self._close_mcp_pool(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                # Best-effort: don't block shutdown on a misbehaving client.
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: don't block shutdown on a misbehaving
+                # client. Log so diagnostics survive the silent cleanup.
+                _log.warning(
+                    "shutdown: MCP pool close failed",
+                    exc_info=True,
+                )
         if loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
@@ -5666,7 +5698,13 @@ class OrchestratorService:
         try:
             await orch.aclose()
         except Exception:  # noqa: BLE001
-            pass
+            # Best-effort cleanup: a checkpointer / MCP exit-stack that
+            # blew up on close still leaves the process to exit cleanly.
+            # Surface so the failure is observable post-mortem.
+            _log.warning(
+                "_close_orchestrator: orch.aclose() failed",
+                exc_info=True,
+            )
 
     async def _close_mcp_pool(self) -> None:
         if self._mcp_stack is None:
@@ -5779,7 +5817,15 @@ def parse_envelope_from_result(
         try:
             return AgentTurnOutput.model_validate(sr)
         except Exception:  # noqa: BLE001
-            pass
+            # Path 1 produced a dict that doesn't match the envelope
+            # schema. Fall through to Path 2 (parse last AIMessage), but
+            # log so providers shipping malformed structured_response are
+            # observable instead of silently degraded.
+            _LOG.debug(
+                "envelope path 1 (structured_response dict) failed validation; "
+                "falling through to AIMessage JSON parse",
+                exc_info=True,
+            )
 
     # Path 2: JSON-parse last AIMessage content
     messages = result.get("messages") or []
@@ -12337,7 +12383,13 @@ class Orchestrator(Generic[StateT]):
             try:
                 await checkpointer_close()  # pyright: ignore[reportPossiblyUnboundVariable]
             except Exception:  # noqa: BLE001
-                pass
+                # The original BaseException is what the caller cares
+                # about; this cleanup failure must not mask it. Log so
+                # the FD-leak path stays observable.
+                _log.warning(
+                    "build: checkpointer_close failed during error rollback",
+                    exc_info=True,
+                )
             await stack.aclose()
             raise
 
@@ -12349,7 +12401,13 @@ class Orchestrator(Generic[StateT]):
             try:
                 await self._checkpointer_close()
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: the rest of aclose() (exit_stack drain)
+                # must still run so MCP transports don't leak. Log so
+                # checkpointer-close failures stay observable.
+                _log.warning(
+                    "aclose: checkpointer close failed",
+                    exc_info=True,
+                )
             self._checkpointer_close = None
         await self._exit_stack.aclose()
 
@@ -13263,6 +13321,9 @@ def _event_ts() -> str:
 
 # ====== module: runtime/api.py ======
 
+_log = logging.getLogger("runtime.api")
+
+
 def _resolve_environments(dotted: str | None) -> list[str]:
     """Resolve ``RuntimeConfig.environments_provider_path`` to a list.
 
@@ -13456,7 +13517,12 @@ def _make_lifespan(cfg: AppConfig):
             try:
                 await registry.stop_all()
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: a misbehaving trigger transport must not
+                # block ``svc.shutdown()`` below. Surface for observability.
+                _log.warning(
+                    "trigger registry stop_all failed during lifespan teardown",
+                    exc_info=True,
+                )
             # ``shutdown()`` cancels in-flight session tasks, closes the
             # underlying Orchestrator + MCP pool, joins the loop thread,
             # and resets the process-singleton.

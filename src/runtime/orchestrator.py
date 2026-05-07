@@ -546,7 +546,13 @@ class Orchestrator(Generic[StateT]):
             try:
                 await checkpointer_close()  # pyright: ignore[reportPossiblyUnboundVariable]
             except Exception:  # noqa: BLE001
-                pass
+                # The original BaseException is what the caller cares
+                # about; this cleanup failure must not mask it. Log so
+                # the FD-leak path stays observable.
+                _log.warning(
+                    "build: checkpointer_close failed during error rollback",
+                    exc_info=True,
+                )
             await stack.aclose()
             raise
 
@@ -558,7 +564,13 @@ class Orchestrator(Generic[StateT]):
             try:
                 await self._checkpointer_close()
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: the rest of aclose() (exit_stack drain)
+                # must still run so MCP transports don't leak. Log so
+                # checkpointer-close failures stay observable.
+                _log.warning(
+                    "aclose: checkpointer close failed",
+                    exc_info=True,
+                )
             self._checkpointer_close = None
         await self._exit_stack.aclose()
 

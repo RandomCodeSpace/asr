@@ -22,6 +22,7 @@ The module-level ``get_app()`` is a no-arg factory suitable for
 """
 from __future__ import annotations
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +33,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from runtime.config import AppConfig, load_config
+
+_log = logging.getLogger("runtime.api")
 
 
 def _resolve_environments(dotted: str | None) -> list[str]:
@@ -227,7 +230,12 @@ def _make_lifespan(cfg: AppConfig):
             try:
                 await registry.stop_all()
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: a misbehaving trigger transport must not
+                # block ``svc.shutdown()`` below. Surface for observability.
+                _log.warning(
+                    "trigger registry stop_all failed during lifespan teardown",
+                    exc_info=True,
+                )
             # ``shutdown()`` cancels in-flight session tasks, closes the
             # underlying Orchestrator + MCP pool, joins the loop thread,
             # and resets the process-singleton.
