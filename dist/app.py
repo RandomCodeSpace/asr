@@ -9,6 +9,22 @@ Importable as ``from runtime.errors import LLMTimeoutError, LLMConfigError``.
 
 
 
+# ----- imports for runtime/terminal_tools.py -----
+"""Generic terminal-tool registry types.
+
+Apps register their terminal-tool rules and status vocabulary via
+``OrchestratorConfig.terminal_tools`` / ``OrchestratorConfig.statuses``;
+the framework reads these models without knowing app-specific tool
+or status names. Cf. .planning/phases/06-generic-terminal-tool-registry/
+06-CONTEXT.md (D-06-01, D-06-02, D-06-05).
+"""
+
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
 # ----- imports for runtime/config.py -----
 """Config schemas for the orchestrator."""
 
@@ -45,7 +61,6 @@ app's ``state.py``.
 
 
 
-from pydantic import BaseModel, Field
 
 # ----- imports for runtime/state_resolver.py -----
 """Resolve ``RuntimeConfig.state_class`` (a dotted path) to a class object.
@@ -297,6 +312,65 @@ from sqlalchemy.orm import Session as SqlSession
 # hook existed. New rows are validated by ``_SESSION_ID_RE`` which
 # accepts any ``PREFIX-YYYYMMDD-NNN`` shape the app's ``id_format`` may
 # emit (e.g. ``CR-...`` for code-review).
+# ----- imports for runtime/storage/event_log.py -----
+"""Append-only session event log.
+
+Events drive the status finalizer's inference (e.g. a registered
+``<terminal_tool>`` event appearing in the log -> session reached
+the corresponding terminal status). They are never mutated or
+deleted.
+"""
+
+
+from dataclasses import dataclass
+from typing import Iterator
+
+
+
+
+# ----- imports for runtime/storage/migrations.py -----
+"""Idempotent migrations for the JSON-shaped row payloads.
+
+Fills the per-call audit fields on :class:`runtime.state.ToolCall` for
+legacy rows. The risk-rated tool gateway uses five optional audit fields:
+
+  * ``risk``          — ``"low" | "medium" | "high" | None``
+  * ``status``        — ``ToolStatus`` literal (default ``"executed"``)
+  * ``approver``      — operator id, set when status in {approved, rejected}
+  * ``approved_at``   — ISO-8601 timestamp of the decision
+  * ``approval_rationale`` — free-text justification
+
+Older rows in the ``incidents.tool_calls`` JSON column lack these
+fields. Pydantic hydrates the missing keys with their defaults at read
+time so reading is already back-compat — but the on-disk JSON still
+shows the legacy shape until something rewrites the row.
+
+This migration walks every session, normalises the JSON-shaped
+``tool_calls`` list to the current audit schema, and saves the row back
+when (and only when) at least one entry changed. Idempotent — running
+twice is safe (the second pass is a no-op because every row already
+has the fields).
+
+The function operates on the row's JSON list directly (not via the
+``ToolCall`` Pydantic model) so we don't accidentally widen the
+migration's contract — for example, dropping unknown extra keys via
+Pydantic's ``extra='ignore'`` would silently delete forward-compat
+fields in a downgrade scenario. JSON-walk is conservative: only fill
+what's missing; leave everything else alone.
+"""
+
+
+from typing import Any, Iterable
+
+from sqlalchemy import inspect, text
+
+
+# Columns added after the initial schema. Each entry is
+# ``(column_name, sql_type, default_clause_or_None)``. SQLite ``ADD
+# COLUMN`` cannot add a non-nullable column without a constant default,
+# so every entry here is nullable — Pydantic hydrates the missing keys
+# at read time. Append-only: never reorder, never delete. Removing a
+# column needs a separate destructive migration with explicit sign-off.
 # ----- imports for runtime/mcp_loader.py -----
 """Load MCP servers (in_process / stdio / http / sse) and build a tool registry.
 
@@ -325,6 +399,53 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 
 
+# ----- imports for runtime/service.py -----
+"""Long-lived orchestrator service.
+
+Owns a background asyncio event loop and a shared FastMCP client pool.
+All session execution will run as asyncio tasks on this loop. Sync callers
+(Streamlit, FastAPI request handlers, CLI) submit coroutines via
+``submit(coro) -> concurrent.futures.Future``.
+
+Lifecycle::
+
+    svc = OrchestratorService.get_or_create(cfg)
+    svc.start()    # spins up background thread + loop
+    fut = svc.submit(some_coro)
+    result = fut.result(timeout=30)
+    svc.shutdown() # cancels in-flight tasks, closes MCP clients, joins thread
+
+Capabilities:
+  - Skeleton + singleton + start/shutdown lifecycle.
+  - ``submit()`` / ``submit_and_wait()`` thread-safe bridge.
+  - Shared ``MCPClientPool`` with per-server ``asyncio.Lock``.
+  - ``start_session()`` schedules a per-session asyncio task on the
+    service's loop and returns the session id immediately (the agent run
+    continues in the background). Active tasks are tracked in an
+    in-memory registry that evicts on completion / cancellation.
+  - ``list_active_sessions()`` returns a thread-safe snapshot of
+    the in-flight registry; the snapshot coroutine runs on the loop so
+    readers from any thread see a point-in-time consistent view.
+  - ``stop_session(sid)`` cancels the in-flight task, waits up
+    to 5 s for graceful exit, and persists ``status="stopped"`` on the
+    row (clearing ``pending_intervention``). Idempotent — a no-op for
+    unknown ids or already-completed sessions.
+  - Hard cap on concurrent sessions. ``start_session`` raises
+    ``SessionCapExceeded`` once ``len(self._registry) >=
+    self.max_concurrent_sessions``. Fail fast; queueing is not supported.
+
+The singleton is process-scoped and reset on ``shutdown()`` so that test
+suites can build, tear down, and rebuild the service without leaking
+state across cases.
+"""
+
+
+import concurrent.futures
+import threading
+from typing import Any, Awaitable, TypeVar
+
+
+
 # ----- imports for runtime/agents/turn_output.py -----
 """Phase 10 (FOC-03) — AgentTurnOutput envelope + reconciliation helpers.
 
@@ -348,6 +469,91 @@ graph is acyclic.
 import logging
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# ----- imports for runtime/tools/gateway.py -----
+"""Risk-rated tool gateway: pure resolver + ``BaseTool`` HITL wrapper.
+
+The gateway sits between the ReAct agent and each tool the orchestrator
+configures. It enforces the *hybrid* HITL policy resolved by
+``effective_action``:
+
+  ``auto``    -> call the underlying tool directly (no plumbing)
+  ``notify``  -> call the tool, then persist a soft-notify audit entry
+  ``approve`` -> raise ``langgraph.types.interrupt(...)`` BEFORE calling
+                 the tool; on resume re-invoke
+
+The resolver is a plain function with no I/O so it can be unit-tested
+exhaustively without spinning up Pydantic Sessions, MCP servers, or a
+LangGraph runtime. The wrapper is a closure factory deliberately built
+inside ``make_agent_node`` so the closure captures the live ``Session``
+per agent invocation (mitigation R2 in the Phase-4 plan).
+"""
+
+
+from fnmatch import fnmatchcase
+from typing import TYPE_CHECKING, Any, Literal
+
+
+
+
+# ----- imports for runtime/tools/arg_injection.py -----
+"""Session-derived tool-arg injection (Phase 9 / FOC-01 / FOC-02).
+
+Two responsibilities, one module:
+
+1. :func:`strip_injected_params` — clones a ``BaseTool``'s args_schema with
+   one or more parameters removed. The LLM only sees the stripped sig and
+   therefore cannot hallucinate values for those params (D-09-01). The
+   original tool is left untouched so direct downstream callers (tests,
+   scripts, in-process MCP fixtures) keep working.
+
+2. :func:`inject_injected_args` — at tool-invocation time, re-adds the
+   real values resolved from the live :class:`runtime.state.Session` via
+   the configured dotted paths. When the LLM still supplied a value for
+   an injected arg, the framework's session-derived value wins and an
+   INFO log captures the override (D-09-03).
+
+The framework stays generic — apps declare which args to inject and from
+where via :attr:`runtime.config.OrchestratorConfig.injected_args` (D-09-02).
+"""
+
+
+
+from pydantic import BaseModel, create_model
+
+
+
+# Module-private logger. Tests assert against logger name
+# ``"runtime.orchestrator"`` so the override-log line shows up alongside
+# the rest of the orchestrator-side observability without requiring a
+# separate caplog target.
+# ----- imports for runtime/tools/approval_watchdog.py -----
+"""Pending-approval timeout watchdog.
+
+A high-risk tool call enters ``langgraph.types.interrupt()`` and the
+session sits in ``awaiting_input`` indefinitely. Without a watchdog
+the slot leaks against ``OrchestratorService.max_concurrent_sessions``
+forever — the cap eventually starves out new traffic.
+
+The :class:`ApprovalWatchdog` is an asyncio task that runs on the
+service's background loop. Every ``poll_interval_seconds`` it:
+
+  1. Snapshots the in-flight session registry.
+  2. For each session whose row has ``status="awaiting_input"``,
+     scans ``tool_calls`` for entries with ``status="pending_approval"``
+     whose ``ts`` is older than ``approval_timeout_seconds``.
+  3. Resumes each such session via ``Command(resume={"decision":
+     "timeout", "approver": "system", "rationale": "approval window
+     expired"})``. The wrapped tool's resume path updates the audit
+     row to ``status="timeout"``.
+
+Failures during polling (DB hiccup, malformed row) are logged and
+swallowed so a single bad session cannot kill the watchdog.
+"""
+
+
+from typing import TYPE_CHECKING, Any
+
 
 # ----- imports for runtime/policy.py -----
 """Pure HITL gating policy (Phase 11 / FOC-04).
@@ -387,7 +593,6 @@ production code path.
 """
 
 
-from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -396,13 +601,105 @@ from pydantic import BaseModel, ConfigDict
 # signature only; kept inside ``TYPE_CHECKING`` so the bundle's
 # intra-import stripper does not remove a load-bearing import. The
 # ``pass`` keeps the block syntactically valid after stripping.
+# ----- imports for runtime/agents/responsive.py -----
+"""Responsive agent kind — the today-default LLM agent.
+
+A responsive skill is a LangGraph node that:
+
+1. Builds a ReAct executor over the skill's ``tools`` and ``model``.
+2. Invokes the executor with the live ``Session`` payload as a human
+   message preamble.
+3. Records ``ToolCall`` and ``AgentRun`` rows on the session, harvests
+   the agent's confidence / signal / rationale, and decides the next
+   route from ``skill.routes``.
+
+This module owns only the node-factory entrypoint
+(``make_agent_node``); the implementation reuses helpers in
+:mod:`runtime.graph` so existing call sites and the gate node continue
+to work unchanged. Supervisor and monitor factories live alongside it
+under :mod:`runtime.agents` rather than piling more kinds into
+``graph.py``.
+"""
+
+
+from typing import Callable
+
+from langchain_core.messages import HumanMessage
+from langgraph.prebuilt import create_react_agent
+
+from langgraph.errors import GraphInterrupt
+
+
+
+
+
+
+
+# ----- imports for runtime/agents/supervisor.py -----
+"""Supervisor agent kind — no-LLM router.
+
+A supervisor skill is a LangGraph node that:
+
+1. Reads the live ``Session`` plus the current dispatch depth.
+2. Picks one or more subordinate agents per ``dispatch_strategy``:
+   ``rule`` (deterministic, evaluated via the same safe-eval AST that
+   gates monitor expressions) or ``llm`` (one short LLM call against
+   ``dispatch_prompt``).
+3. Emits a structured ``supervisor_dispatch`` log entry (no
+   ``AgentRun`` row — supervisors are bookkeeping, not token-burning
+   agents).
+4. Returns ``next_route`` set to the chosen subordinate (or to
+   ``__end__`` when the depth limit is hit).
+
+The recursion depth is tracked in :class:`runtime.graph.GraphState`'s
+``dispatch_depth`` field; if a supervisor would exceed
+``skill.max_dispatch_depth`` the node aborts with a clean error
+instead of recursing forever.
+
+This is **not** a fan-out implementation; we always pick a single
+target. Multi-target ``Send()`` is intentionally not supported.
+"""
+
+
+from typing import Any, Callable
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+
+
+# ----- imports for runtime/agents/monitor.py -----
+"""Monitor agent kind — out-of-band scheduled observer.
+
+A monitor skill runs **outside** any session graph. The orchestrator
+owns one :class:`MonitorRunner` (a singleton) which schedules registered
+monitor skills on a small bounded
+:class:`concurrent.futures.ThreadPoolExecutor`.
+Each tick:
+
+1. Calls every tool name in ``observe`` via the supplied callable
+   (``observe_fn``); aggregates results into one dict keyed by tool.
+2. Evaluates ``emit_signal_when`` against the observation using the
+   stdlib safe-eval evaluator (R7).
+3. If true, looks up ``trigger_target`` in the supplied trigger
+   registry / fire callback and fires it with the observation as the
+   payload.
+
+APScheduler is intentionally *not* a dependency: the air-gapped target
+env doesn't ship it (see ``rules/build.md``). We get away with a tiny
+single-threaded scheduler thread because monitor schedules are coarse
+(minute-resolution cron) and tool calls are dispatched into the
+executor; the scheduler thread itself never blocks on tool I/O.
+"""
+
+
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+
 # ----- imports for runtime/graph.py -----
 """LangGraph state, routing helpers, and node runner."""
 
 from typing import Any, TypedDict, Callable, Awaitable
 
-from langchain_core.messages import HumanMessage
-from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, END
 
 
@@ -415,7 +712,6 @@ from langgraph.graph import StateGraph, END
 # pending-approval pause signal. It is NOT an error and must NOT route
 # through _handle_agent_failure -- the orchestrator's interrupt-aware
 # bridge handles the resume protocol via the checkpointer.
-from langgraph.errors import GraphInterrupt
 
 
 # ----- imports for runtime/checkpointer_postgres.py -----
@@ -484,7 +780,6 @@ purely for traceability; the orchestrator does not branch on it.
 
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 # ----- imports for runtime/triggers/config.py -----
@@ -549,7 +844,6 @@ required, matching the existing P3 pattern):
 """
 
 
-import threading
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 
@@ -572,7 +866,6 @@ config-derived secret in the runtime.
 
 
 import hmac
-from typing import Callable
 
 from fastapi import Header, HTTPException, status
 
@@ -784,7 +1077,6 @@ via :func:`compose_runners`.
 """
 
 
-from typing import Any, Callable
 
 
 # ----- imports for runtime/memory/session_state.py -----
@@ -978,6 +1270,37 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 
+# ----- imports for runtime/skill_validator.py -----
+"""Load-time validation of skill YAML against the live MCP registry.
+
+Catches:
+  * tools.local entries that reference a non-existent (server, tool)
+    pair (typically typos that would silently make the tool invisible).
+  * routes that omit ``when: default`` (would cause graph hangs at
+    __end__ when no signal matches).
+"""
+
+
+
+# ----- imports for runtime/storage/checkpoint_gc.py -----
+"""Garbage-collect orphaned LangGraph checkpoints.
+
+When ``Orchestrator.retry_session`` rebinds a session to a new
+``thread_id`` (e.g. ``INC-1:retry-1``), the original ``INC-1`` thread's
+checkpoint becomes orphaned — no code path will ever resume it. Over
+time these accumulate. ``gc_orphaned_checkpoints`` removes any
+checkpoint whose ``thread_id`` does not reference an active session
+(or a known retry suffix).
+
+This is intentionally conservative: only checkpoints whose thread_id
+prefix matches no live session row at all are removed.
+"""
+
+
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+
+
 # ----- imports for runtime/orchestrator.py -----
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 
@@ -1088,6 +1411,71 @@ class LLMConfigError(ValueError):
 
 
 __all__ = ["LLMTimeoutError", "LLMConfigError"]
+
+# ====== module: runtime/terminal_tools.py ======
+
+class TerminalToolRule(BaseModel):
+    """Maps a terminal tool name to the session status it produces.
+
+    ``tool_name`` matches both bare (``set_recommendation``) and prefixed
+    (``<server>:set_recommendation``) MCP tool-call names — the framework
+    does the suffix check.
+
+    ``status`` must reference a name declared in the same
+    ``OrchestratorConfig.statuses`` map; ``OrchestratorConfig``'s
+    cross-field validator enforces this at config-load.
+
+    ``extract_fields`` declares per-rule extra-metadata pulls. Each
+    key is the destination field name on the session
+    (``Session.extra_fields[<key>]``); each value is an ordered list
+    of ``args.X`` / ``result.X`` lookup hints. The framework picks
+    the first non-falsy match. Empty dict (default) means "no extra
+    metadata to capture". Generalises the v1.0
+    ``_extract_team(tc, team_keys)`` path; the same lookup syntax is
+    preserved (D-06-02).
+
+    ``match_args`` is an optional argument-value discriminator. When
+    non-empty, the rule matches a tool call only if EVERY ``(key,
+    value)`` pair in ``match_args`` matches ``tool_call.args[key]``
+    exactly. Lets one tool name route to multiple statuses based on
+    a discriminator argument (e.g. ``set_recommendation`` with
+    ``recommendation=approve`` vs ``recommendation=request_changes``).
+    Empty default = no arg dispatch; preserves the v1.0 single-rule
+    shape (DECOUPLE-07 / D-08-03).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    tool_name: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    extract_fields: dict[str, list[str]] = Field(default_factory=dict)
+    match_args: dict[str, str] = Field(default_factory=dict)
+
+
+StatusKind = Literal[
+    "success",       # e.g. set_recommendation(approve) -> approved
+    "failure",       # e.g. set_recommendation(request_changes) -> changes_requested
+    "escalation",    # app-defined escalation terminal (e.g. <terminal_tool>)
+    "needs_review",  # finalize fired with no rule match
+    "pending",       # session in flight
+]
+
+
+class StatusDef(BaseModel):
+    """Pydantic record of one app status.
+
+    Framework reads ``terminal`` to decide finalize-vs-pending and
+    ``kind`` to dispatch the needs_review fallback path / let UIs
+    group statuses without owning their own taxonomy. ``color`` and
+    other presentation fields stay in ``UIConfig.badges`` (D-06-05
+    rejected alternative — presentation leak).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(min_length=1)
+    terminal: bool
+    kind: StatusKind
 
 # ====== module: runtime/config.py ======
 
@@ -4160,6 +4548,204 @@ class SessionStore(Generic[StateT]):
             "version": getattr(inc, "version", 1),
         }
 
+# ====== module: runtime/storage/event_log.py ======
+
+@dataclass(frozen=True)
+class SessionEvent:
+    """Immutable view of one row in the event log."""
+    seq: int
+    session_id: str
+    kind: str
+    payload: dict
+    ts: str
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class EventLog:
+    """Append-only log of session events.
+
+    Events drive the status finalizer's inference (e.g. a registered
+    ``<terminal_tool>`` event appearing in the log -> session reached
+    the corresponding terminal status). They are never mutated or
+    deleted.
+    """
+
+    def __init__(self, *, engine: Engine) -> None:
+        self.engine = engine
+
+    def append(self, session_id: str, kind: str, payload: dict) -> None:
+        """Append a new event row. Never mutates existing rows."""
+        with Session(self.engine) as s:
+            with s.begin():
+                s.add(SessionEventRow(
+                    session_id=session_id,
+                    kind=kind,
+                    payload=dict(payload),
+                    ts=_now(),
+                ))
+
+    def iter_for(self, session_id: str) -> Iterator[SessionEvent]:
+        """Yield events for ``session_id`` in monotonic insertion order."""
+        with Session(self.engine) as s:
+            stmt = (
+                select(SessionEventRow)
+                .where(SessionEventRow.session_id == session_id)
+                .order_by(SessionEventRow.seq)
+            )
+            for row in s.execute(stmt).scalars():
+                yield SessionEvent(
+                    seq=row.seq,
+                    session_id=row.session_id,
+                    kind=row.kind,
+                    payload=row.payload,
+                    ts=row.ts,
+                )
+
+# ====== module: runtime/storage/migrations.py ======
+
+_FORWARD_COLUMNS: list[tuple[str, str]] = [
+    ("parent_session_id", "VARCHAR"),  # dedup linkage
+    ("dedup_rationale", "TEXT"),       # LLM rationale
+    ("extra_fields", "JSON"),          # generic round-trip tunnel
+]
+_FORWARD_INDEXES: list[tuple[str, str, str]] = [
+    # (index_name, table, column) — mirrors models.IncidentRow.__table_args__.
+    ("ix_incidents_parent_session_id", "incidents", "parent_session_id"),
+]
+
+# Default audit fields. Mirrors the Pydantic defaults on
+# :class:`runtime.state.ToolCall`. Keep these in sync — a divergence
+# means rows hydrated post-migration would carry different defaults
+# than rows hydrated via the Pydantic constructor, which would surface
+# as subtle test flakes long after the migration ran.
+_AUDIT_DEFAULTS: dict[str, Any] = {
+    "status": "executed",
+    "risk": None,
+    "approver": None,
+    "approved_at": None,
+    "approval_rationale": None,
+}
+
+
+def _fill_audit_fields(tc: dict[str, Any]) -> bool:
+    """Mutate ``tc`` in place, filling any missing audit field with its
+    default. Returns ``True`` when at least one key was added.
+
+    Existing values (including explicit ``None`` already on the row)
+    are left untouched — this is the idempotency guarantee.
+    """
+    changed = False
+    for key, default in _AUDIT_DEFAULTS.items():
+        if key not in tc:
+            tc[key] = default
+            changed = True
+    return changed
+
+
+def _normalise_tool_calls_list(
+    tool_calls: Iterable[Any] | None,
+) -> tuple[list[Any], bool]:
+    """Walk a session's tool_calls JSON list, fill missing audit fields.
+
+    Returns ``(new_list, changed)``. Non-dict entries (corrupt rows)
+    are passed through unchanged — the migration is not a validator.
+    """
+    if not tool_calls:
+        return [], False
+    new: list[Any] = []
+    changed = False
+    for tc in tool_calls:
+        if isinstance(tc, dict):
+            # Copy so we don't mutate caller-owned data accidentally.
+            tc_copy = dict(tc)
+            if _fill_audit_fields(tc_copy):
+                changed = True
+            new.append(tc_copy)
+        else:
+            new.append(tc)
+    return new, changed
+
+
+def migrate_tool_calls_audit(engine: Engine) -> dict[str, int]:
+    """Walk every session's ``tool_calls`` and fill missing audit fields.
+
+    Idempotent — running on a freshly-migrated DB is a no-op.
+
+    Returns a small stats dict::
+
+        {"sessions_scanned": N, "sessions_updated": M, "rows_filled": K}
+
+    where ``rows_filled`` is the count of individual ToolCall entries
+    that received at least one default. Useful for ops dashboards and
+    post-migration verification.
+    """
+    scanned = 0
+    updated = 0
+    filled = 0
+    with SqlSession(engine) as session:
+        rows = session.query(IncidentRow).all()
+        for row in rows:
+            scanned += 1
+            new_list, changed = _normalise_tool_calls_list(row.tool_calls)
+            if changed:
+                # Count individual entries that gained at least one
+                # field. Cheap re-walk — rows.tool_calls is already in
+                # memory.
+                for old, new in zip(row.tool_calls or [], new_list):
+                    if isinstance(old, dict) and isinstance(new, dict):
+                        if any(k not in old for k in _AUDIT_DEFAULTS):
+                            filled += 1
+                row.tool_calls = new_list
+                updated += 1
+        if updated:
+            session.commit()
+    return {
+        "sessions_scanned": scanned,
+        "sessions_updated": updated,
+        "rows_filled": filled,
+    }
+
+
+def migrate_add_session_columns(engine: Engine) -> dict[str, int]:
+    """Add post-initial columns to ``incidents`` if missing. Idempotent.
+
+    Older on-disk databases may lack ``extra_fields``,
+    ``parent_session_id``, or ``dedup_rationale``; SQLAlchemy's read-side
+    query then errors with ``no such column``. This walker uses
+    ``PRAGMA table_info`` (via SQLAlchemy's ``inspect``) to detect
+    missing columns and adds each one nullable. Running on a freshly-
+    migrated DB is a no-op.
+
+    Returns ``{"columns_added": N, "indexes_added": M}``.
+    """
+    inspector = inspect(engine)
+    if "incidents" not in inspector.get_table_names():
+        # Fresh DB; ``Base.metadata.create_all`` already produced the
+        # full schema. Nothing to backfill.
+        return {"columns_added": 0, "indexes_added": 0}
+    existing_cols = {c["name"] for c in inspector.get_columns("incidents")}
+    existing_idx = {i["name"] for i in inspector.get_indexes("incidents")}
+    added_cols = 0
+    added_idx = 0
+    with engine.begin() as conn:
+        for col, sql_type in _FORWARD_COLUMNS:
+            if col not in existing_cols:
+                conn.execute(text(f"ALTER TABLE incidents ADD COLUMN {col} {sql_type}"))
+                added_cols += 1
+        for idx_name, table, col in _FORWARD_INDEXES:
+            if idx_name in existing_idx:
+                continue
+            # If the column itself was just added (or already present)
+            # the index is safe to create now.
+            cols_after = {c["name"] for c in inspect(conn).get_columns(table)}
+            if col in cols_after:
+                conn.execute(text(f"CREATE INDEX {idx_name} ON {table} ({col})"))
+                added_idx += 1
+    return {"columns_added": added_cols, "indexes_added": added_idx}
+
 # ====== module: runtime/mcp_loader.py ======
 
 @dataclass
@@ -4360,6 +4946,657 @@ async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
             ))
     return registry
 
+# ====== module: runtime/service.py ======
+
+T = TypeVar("T")
+
+
+@dataclass
+class _ActiveSession:
+    """In-memory metadata for an in-flight session.
+
+    Lives in ``OrchestratorService._registry``; mutated only on the
+    loop thread so the dict itself needs no thread lock. Snapshots are
+    produced via :meth:`OrchestratorService.list_active_sessions`,
+    which submits a coroutine to the loop and returns a list of plain
+    dicts to the calling thread.
+    """
+
+    session_id: str
+    started_at: str
+    status: str = "running"
+    current_agent: str | None = None
+    task: asyncio.Task | None = None
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+_lock = threading.Lock()
+_instance: "OrchestratorService | None" = None
+
+
+class SessionCapExceeded(RuntimeError):
+    """Raised by ``start_session`` when the service is already running
+    ``max_concurrent_sessions`` sessions.
+
+    Fail fast, do not queue. Callers (Streamlit, FastAPI handlers)
+    catch this and surface a clear error — Streamlit shows a toast;
+    the HTTP layer translates it to a 429 with ``Retry-After``.
+    """
+
+    def __init__(self, cap: int) -> None:
+        super().__init__(
+            f"OrchestratorService at capacity ({cap} concurrent); "
+            f"reject incoming start_session"
+        )
+        self.cap = cap
+
+
+class OrchestratorService:
+    """Process-singleton orchestrator service.
+
+    Surface: construction, singleton accessor, ``start()`` /
+    ``shutdown()``, coroutine submission bridge, and the shared MCP
+    client pool.
+    """
+
+    def __init__(
+        self,
+        cfg: AppConfig,
+        max_concurrent_sessions: int | None = None,
+    ) -> None:
+        self.cfg = cfg
+        # Resource cap. Prefer the explicit constructor arg; fall back
+        # to ``cfg.runtime.max_concurrent_sessions``. Tests mutate this
+        # attribute directly to drive cap behaviour deterministically.
+        self.max_concurrent_sessions: int = (
+            max_concurrent_sessions
+            if max_concurrent_sessions is not None
+            else cfg.runtime.max_concurrent_sessions
+        )
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        # Shared MCP client pool — built lazily on first ``get_mcp_client``
+        # so processes that never touch MCP pay zero startup cost. All
+        # mutations of ``_mcp_clients`` / ``_mcp_locks`` happen on the
+        # background loop, so the dicts themselves don't need a thread
+        # lock.
+        self._mcp_stack: AsyncExitStack | None = None
+        self._mcp_clients: dict[str, Any] = {}
+        self._mcp_locks: dict[str, asyncio.Lock] = {}
+        # Per-server-name asyncio.Lock guarding lazy build. Created on the
+        # loop the first time the server is requested.
+        self._mcp_build_locks: dict[str, asyncio.Lock] = {}
+        # Shared Orchestrator (lazy-built on first session start) and
+        # the in-flight session registry. The registry dict itself is
+        # only mutated from the loop thread (writers go through
+        # ``submit_and_wait``); readers also hop through the loop so the
+        # snapshot is point-in-time consistent with concurrent mutators.
+        self._orch: Any | None = None
+        self._registry: dict[str, _ActiveSession] = {}
+        # Lazily-built lock for serialising orchestrator construction
+        # under concurrent ``start_session`` calls. Created on the loop.
+        self._orch_build_lock: asyncio.Lock | None = None
+        # Pending-approval timeout watchdog. Started in ``start()`` iff
+        # ``cfg.runtime.gateway`` is configured; otherwise None and the
+        # lifecycle hooks are no-ops.
+        self._approval_watchdog: Any | None = None
+
+    @classmethod
+    def get_or_create(cls, cfg: AppConfig) -> "OrchestratorService":
+        """Return the process-singleton service, building it on first call.
+
+        Subsequent calls ignore the supplied ``cfg`` and return the
+        existing instance — there is exactly one orchestrator service per
+        Python process. To rebuild with a new config, call
+        ``shutdown()`` first.
+        """
+        global _instance
+        with _lock:
+            if _instance is None:
+                _instance = cls(cfg)
+            return _instance
+
+    def start(self) -> None:
+        """Spin up the background thread + asyncio loop.
+
+        Idempotent: a no-op if the loop is already running. Blocks until
+        the background thread reports the loop is ready (5s timeout) so
+        callers can ``submit()`` immediately after ``start()`` returns.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._started.clear()
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="OrchestratorService",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._started.wait(timeout=5.0):
+            raise RuntimeError("OrchestratorService loop failed to start within 5s")
+        # Arm the pending-approval watchdog iff a gateway is configured.
+        # The watchdog is harmless when no high-risk tool calls ever
+        # fire (it scans the empty registry), but skipping the start
+        # when the gateway is off keeps process startup quiet for apps
+        # that have not opted into HITL.
+        gateway_cfg = getattr(self.cfg.runtime, "gateway", None)
+        if gateway_cfg is not None:
+
+
+            timeout_s = getattr(
+                gateway_cfg, "approval_timeout_seconds", 3600,
+            )
+            self._approval_watchdog = ApprovalWatchdog(
+                self,
+                approval_timeout_seconds=timeout_s,
+            )
+            self._approval_watchdog.start(self._loop)
+
+    def _run_loop(self) -> None:
+        assert self._loop is not None
+        asyncio.set_event_loop(self._loop)
+        self._started.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            # Drain any remaining tasks before closing so no coroutine is
+            # left dangling without a chance to clean up.
+            try:
+                pending = asyncio.all_tasks(loop=self._loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            finally:
+                self._loop.close()
+
+    def submit(
+        self, coro: Awaitable[T]
+    ) -> concurrent.futures.Future[T]:
+        """Submit a coroutine to the background loop from any thread.
+
+        Returns a ``concurrent.futures.Future`` whose ``.result()`` blocks
+        the calling thread until the coroutine resolves on the loop. Safe
+        to call concurrently from multiple threads.
+        """
+        if self._loop is None:
+            raise RuntimeError(
+                "OrchestratorService not started; call start() first"
+            )
+        if not self._loop.is_running():
+            raise RuntimeError("OrchestratorService loop is not running")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def submit_and_wait(
+        self, coro: Awaitable[T], timeout: float | None = None
+    ) -> T:
+        """Submit a coroutine and block the caller until it resolves.
+
+        Convenience wrapper for sync callers (Streamlit, FastAPI request
+        handlers, CLI). Raises ``concurrent.futures.TimeoutError`` if the
+        coroutine doesn't complete within ``timeout`` seconds.
+
+        WARNING: do not call from an async function whose event loop is
+        the same loop ``OrchestratorService`` is hosting (e.g. tests using
+        ``httpx.AsyncClient + ASGITransport`` against the FastAPI app
+        share the same loop the service runs on). The caller would block
+        the loop while waiting for work scheduled onto that same loop —
+        a deadlock. Use :meth:`submit_async` from async code.
+        """
+        return self.submit(coro).result(timeout=timeout)
+
+    async def submit_async(self, coro: Awaitable[T]) -> T:
+        """Bridge a coroutine onto the service's background loop, awaitable
+        from any caller's loop.
+
+        Async equivalent of :meth:`submit_and_wait`. ``asyncio.wrap_future``
+        exposes the cross-thread ``concurrent.futures.Future`` returned by
+        ``run_coroutine_threadsafe`` as awaitable on the calling loop, so
+        the caller yields control while the work runs on the service's
+        loop. Safe to call from a request handler whose event loop is the
+        same one the service is hosting (no deadlock).
+        """
+        if self._loop is None:
+            raise RuntimeError(
+                "OrchestratorService not started; call start() first"
+            )
+        if not self._loop.is_running():
+            raise RuntimeError("OrchestratorService loop is not running")
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return await asyncio.wrap_future(fut)
+
+    async def get_mcp_client(self, server_name: str) -> Any:
+        """Return the shared FastMCP client for ``server_name``, building
+        on first request.
+
+        Lookup is serialised via a per-server ``asyncio.Lock`` so two
+        concurrent sessions racing for the same server don't double-build
+        the client. The clients themselves are reused across all sessions
+        for the lifetime of the service; teardown happens in
+        :meth:`shutdown`.
+
+        Raises ``KeyError`` if ``server_name`` is not declared in
+        ``cfg.mcp.servers``.
+        """
+        # Build-lock dict mutation must happen on the loop; we *are* on
+        # the loop here (this is an async method).
+        if server_name not in self._mcp_build_locks:
+            self._mcp_build_locks[server_name] = asyncio.Lock()
+        async with self._mcp_build_locks[server_name]:
+            if server_name in self._mcp_clients:
+                return self._mcp_clients[server_name]
+            server_cfg = next(
+                (s for s in self.cfg.mcp.servers if s.name == server_name),
+                None,
+            )
+            if server_cfg is None:
+                raise KeyError(
+                    f"MCP server {server_name!r} not declared in cfg.mcp.servers"
+                )
+            if self._mcp_stack is None:
+                self._mcp_stack = AsyncExitStack()
+                await self._mcp_stack.__aenter__()
+            client = build_fastmcp_client(server_cfg)
+            await self._mcp_stack.enter_async_context(client)
+            self._mcp_clients[server_name] = client
+            self._mcp_locks[server_name] = asyncio.Lock()
+            return client
+
+    def lock_for(self, server_name: str) -> asyncio.Lock:
+        """Return the per-server ``asyncio.Lock`` that serialises tool
+        calls against a single FastMCP client.
+
+        Must be called after ``get_mcp_client(server_name)`` has built
+        the client, otherwise ``KeyError``.
+        """
+        return self._mcp_locks[server_name]
+
+    # ------------------------------------------------------------------
+    # Per-session task scheduling + in-flight registry
+    # ------------------------------------------------------------------
+
+    async def _ensure_orchestrator(self) -> Any:
+        """Lazily build the shared ``Orchestrator`` on the loop thread.
+
+        Concurrent ``start_session`` calls coordinate through
+        ``_orch_build_lock`` so we never build the orchestrator twice.
+        Returns the cached instance on subsequent calls.
+        """
+        # Build-lock construction must happen on the loop. We *are* on
+        # the loop here (this is an async method invoked via the bridge).
+        if self._orch_build_lock is None:
+            self._orch_build_lock = asyncio.Lock()
+        async with self._orch_build_lock:
+            if self._orch is None:
+                # Lazy import to avoid a circular dependency at module
+                # load time (orchestrator transitively imports a lot).
+
+                self._orch = await Orchestrator.create(self.cfg)
+            return self._orch
+
+    def start_session(
+        self,
+        *,
+        query: str = "",
+        state_overrides: dict | None = None,
+        environment: str | None = None,
+        submitter: dict | None = None,
+        reporter_id: str | None = None,
+        reporter_team: str | None = None,
+        trigger: Any | None = None,
+    ) -> str:
+        """Start a new agent session. Returns the session id immediately.
+
+        The session row is created (and the id minted) synchronously on
+        the loop so the caller has a stable handle before this method
+        returns. The actual graph run is launched as an ``asyncio.Task``
+        on the same loop and runs in the background — the caller does
+        **not** block on it. Listen via :meth:`list_active_sessions` and
+        per-session state lookups for progress.
+
+        ``state_overrides`` is a free-form dict of domain fields the app
+        stamps onto the new session row. The framework only projects
+        ``environment`` onto the storage column today; other keys ride
+        through to app-specific MCP tools.
+
+        ``submitter`` is a free-form dict the calling app interprets.
+        For incident-management it is ``{"id": "...", "team": "..."}``;
+        other apps can carry app-specific keys (e.g. code-review's
+        ``{"id": "<github-username>", "pr_url": "..."}``). The framework
+        only projects ``id``/``team`` onto the row's reporter columns.
+
+        Deprecated kwargs (coerced and warned):
+          * ``environment`` -> ``state_overrides={"environment": ...}``
+          * ``reporter_id`` / ``reporter_team`` -> ``submitter``
+
+        The registry entry is evicted by a ``Task.add_done_callback`` on
+        completion, cancellation, or failure — so a session that crashes
+        does not leak a stale entry.
+        """
+
+
+
+        # Resolve the generic ``submitter`` and ``state_overrides`` once
+        # on the caller's thread — the deprecation warnings fire here
+        # (in the user's frame), not deep inside the loop's ``_scheduler``.
+        resolved_overrides = _coerce_state_overrides(
+            state_overrides, environment,
+        )
+        resolved_submitter = _coerce_submitter(
+            submitter, reporter_id, reporter_team
+        )
+        sub_id = (resolved_submitter or {}).get("id", "user-mock")
+        sub_team = (resolved_submitter or {}).get("team", "platform")
+        env = (resolved_overrides or {}).get("environment", "")
+
+        async def _scheduler() -> str:
+            # Enforce the concurrency cap on the loop thread so the
+            # registry size check is race-free. Fail-fast with
+            # ``SessionCapExceeded``; the exception propagates through
+            # ``submit_and_wait`` -> ``Future.result()`` to the caller.
+            if len(self._registry) >= self.max_concurrent_sessions:
+                raise SessionCapExceeded(self.max_concurrent_sessions)
+            orch = await self._ensure_orchestrator()
+            # Allocate the row (and its id) synchronously on the loop
+            # so the caller gets a stable id back. The graph then runs
+            # in a separate task — registration happens here, before
+            # the task is created, so ``list_active_sessions`` sees the
+            # entry immediately.
+            inc = orch.store.create(
+                query=query,
+                environment=env,
+                reporter_id=sub_id,
+                reporter_team=sub_team,
+            )
+            session_id = inc.id
+            # Stamp trigger provenance onto the row before the graph
+            # runs so any crash mid-graph still leaves an audit trail.
+            # ``inc.findings`` is a JSON dict on the row.
+            if trigger is not None:
+                try:
+                    received_at = trigger.received_at.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                except Exception:  # noqa: BLE001
+                    received_at = _utc_iso_now()
+                inc.findings["trigger"] = {
+                    "name": getattr(trigger, "name", None),
+                    "transport": getattr(trigger, "transport", None),
+                    "target_app": getattr(trigger, "target_app", None),
+                    "received_at": received_at,
+                }
+                orch.store.save(inc)
+            entry = _ActiveSession(
+                session_id=session_id,
+                started_at=_utc_iso_now(),
+            )
+            self._registry[session_id] = entry
+
+            async def _run() -> None:
+                # Fail-fast on contention (D-03): if another task already
+                # holds the session lock, refuse the new turn immediately.
+                if orch._locks.is_locked(session_id):
+
+                    raise SessionBusy(session_id)
+                # Hold the per-session lock for the full graph turn,
+                # including any HITL interrupt() pause (D-01).
+                async with orch._locks.acquire(session_id):
+                    try:
+                        await orch.graph.ainvoke(
+                            GraphState(
+                                session=inc,
+                                next_route=None,
+                                last_agent=None,
+                                error=None,
+                            ),
+                            config=orch._thread_config(session_id),
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is a
+                        # pending-approval pause, not a failure. Don't stamp
+                        # status='error' on the registry entry -- let
+                        # LangGraph's checkpointer hold the paused state
+                        # and let the UI's Approve/Reject action drive
+                        # resume.
+                        try:
+                            from langgraph.errors import GraphInterrupt
+                            if isinstance(exc, GraphInterrupt):
+                                # Propagate so the underlying Task
+                                # observer (stop_session etc.) still
+                                # sees the exception, but skip the
+                                # status='error' write.
+                                raise
+                        except ImportError:  # pragma: no cover
+                            pass
+                        # Mark the registry entry so any concurrent snapshot
+                        # observes the failure before the done-callback
+                        # evicts it. The exception itself is preserved on
+                        # the task object for ``stop_session`` and any
+                        # other observer that holds a Task reference.
+                        e = self._registry.get(session_id)
+                        if e is not None:
+                            e.status = "error"
+                        raise
+
+            task = asyncio.create_task(_run(), name=f"session:{session_id}")
+            entry.task = task
+
+            # Eviction is loop-local: ``add_done_callback`` fires on the
+            # loop thread, so the dict mutation is single-threaded.
+            def _evict(_t: asyncio.Task) -> None:
+                self._registry.pop(session_id, None)
+
+            task.add_done_callback(_evict)
+            return session_id
+
+        return self.submit_and_wait(_scheduler(), timeout=30.0)
+
+    # ------------------------------------------------------------------
+    # stop_session — cancel in-flight task + persist stopped status
+    # ------------------------------------------------------------------
+
+    def stop_session(self, session_id: str) -> None:
+        """Cancel an in-flight session and mark its row ``status="stopped"``.
+
+        Idempotent: calling on an unknown id, an already-stopped session,
+        or a session that completed naturally is a no-op (does not raise).
+        Also clears ``pending_intervention`` so a session interrupted
+        mid-resume doesn't leave a stale prompt on the row.
+
+        Partial work (recorded ``tool_calls``, ``agents_run``) is
+        preserved — they are written as they happen, and stopping is
+        not a rollback.
+        """
+
+        async def _stop() -> None:
+            entry = self._registry.get(session_id)
+            task = entry.task if entry is not None else None
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception:  # noqa: BLE001
+                    # The graph itself may have raised; we still want to
+                    # mark the row stopped below. Swallow here.
+                    pass
+            # Persist the stopped status. The orchestrator may not have
+            # been built yet (caller passed an unknown id before any
+            # session ran) — in that case there's nothing to persist.
+            orch = self._orch
+            if orch is not None:
+                try:
+                    inc = orch.store.load(session_id)
+                except Exception:  # noqa: BLE001
+                    # Unknown id: nothing to persist; treat as no-op.
+                    inc = None
+                if inc is not None:
+                    inc.status = "stopped"
+                    inc.pending_intervention = None
+                    orch.store.save(inc)
+            # Drop the registry entry if the done-callback didn't already
+            # evict it (it always does, but be defensive).
+            self._registry.pop(session_id, None)
+
+        # If the loop isn't running (caller stopped the service), be a
+        # silent no-op rather than raising — keeps idempotency guarantees.
+        if self._loop is None or not self._loop.is_running():
+            return
+        self.submit_and_wait(_stop(), timeout=10.0)
+
+    # ------------------------------------------------------------------
+    # Active-session registry snapshot accessor
+    # ------------------------------------------------------------------
+
+    def list_active_sessions(self) -> list[dict[str, Any]]:
+        """Return a thread-safe snapshot of in-flight sessions.
+
+        The snapshot coroutine runs on the loop thread, so the view is
+        point-in-time consistent w.r.t. concurrent registry mutators
+        (which also run on the loop). Each entry is a plain ``dict``
+        with ``session_id``, ``status``, ``started_at``, and
+        ``current_agent`` keys — callers in any thread can pass it
+        around without holding any asyncio resources.
+
+        Returns an empty list when the service has never run a session
+        or when every previously-started run has completed.
+        """
+
+        async def _snapshot() -> list[dict[str, Any]]:
+            return [
+                {
+                    "session_id": e.session_id,
+                    "status": e.status,
+                    "started_at": e.started_at,
+                    "current_agent": e.current_agent,
+                }
+                for e in self._registry.values()
+            ]
+
+        return self.submit_and_wait(_snapshot(), timeout=5.0)
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        """Stop the loop, tear down MCP clients, join the thread,
+        reset the singleton.
+
+        Idempotent: safe to call multiple times, including after the
+        loop has already been torn down. Resets the module-level
+        singleton so ``get_or_create()`` will rebuild on the next call.
+        """
+        if self._loop is None:
+            self._reset_singleton()
+            return
+        loop = self._loop
+        thread = self._thread
+        # Stop the watchdog before draining sessions so its scan
+        # doesn't race against the registry teardown below.
+        if loop.is_running() and self._approval_watchdog is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._approval_watchdog.stop(), loop,
+                )
+                fut.result(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                pass
+            self._approval_watchdog = None
+        # Cancel in-flight session tasks first so they observe a
+        # CancelledError before the orchestrator's underlying
+        # resources (DB engine, FastMCP transports) are torn down.
+        if loop.is_running() and self._registry:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._cancel_all_sessions(), loop
+                )
+                fut.result(timeout=timeout)
+            except Exception:
+                pass
+        # Close the shared orchestrator on the loop, releasing its
+        # checkpointer connection / MCP exit-stack.
+        if loop.is_running() and self._orch is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._close_orchestrator(), loop
+                )
+                fut.result(timeout=timeout)
+            except Exception:
+                pass
+        # Close MCP clients on the loop *before* stopping it.
+        if loop.is_running() and self._mcp_stack is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._close_mcp_pool(), loop
+                )
+                fut.result(timeout=timeout)
+            except Exception:
+                # Best-effort: don't block shutdown on a misbehaving client.
+                pass
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=timeout)
+        self._loop = None
+        self._thread = None
+        self._started.clear()
+        self._mcp_stack = None
+        self._mcp_clients.clear()
+        self._mcp_locks.clear()
+        self._mcp_build_locks.clear()
+        self._orch = None
+        self._orch_build_lock = None
+        self._registry.clear()
+        self._approval_watchdog = None
+        self._reset_singleton()
+
+    async def _cancel_all_sessions(self) -> None:
+        """Cancel every in-flight session task and wait for them to exit.
+
+        Runs on the loop thread. Each task gets up to 5s to honour the
+        ``CancelledError``; misbehaving tasks that ignore cancellation
+        do not block shutdown beyond that — ``run_loop`` will sweep
+        them in its final ``gather`` pass.
+        """
+        tasks = [e.task for e in self._registry.values() if e.task is not None]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._registry.clear()
+
+    async def _close_orchestrator(self) -> None:
+        if self._orch is None:
+            return
+        orch = self._orch
+        self._orch = None
+        try:
+            await orch.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _close_mcp_pool(self) -> None:
+        if self._mcp_stack is None:
+            return
+        stack = self._mcp_stack
+        self._mcp_stack = None
+        await stack.__aexit__(None, None, None)
+        self._mcp_clients.clear()
+        self._mcp_locks.clear()
+        self._mcp_build_locks.clear()
+
+    @staticmethod
+    def _reset_singleton() -> None:
+        global _instance
+        with _lock:
+            _instance = None
+
 # ====== module: runtime/agents/turn_output.py ======
 
 _LOG = logging.getLogger("runtime.orchestrator")
@@ -4529,6 +5766,1039 @@ __all__ = [
     "parse_envelope_from_result",
     "reconcile_confidence",
 ]
+
+# ====== module: runtime/tools/gateway.py ======
+
+if TYPE_CHECKING:
+    pass
+GatewayAction = Literal["auto", "notify", "approve"]
+
+_RISK_TO_ACTION: dict[str, GatewayAction] = {
+    "low": "auto",
+    "medium": "notify",
+    "high": "approve",
+}
+
+_UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def effective_action(
+    tool_name: str,
+    *,
+    env: str | None,
+    gateway_cfg: GatewayConfig | None,
+) -> GatewayAction:
+    """Resolve the effective gateway action for a tool invocation.
+
+    Order of evaluation (the prod-override predicate runs FIRST so it can
+    only TIGHTEN the action — never relax it):
+
+      1. ``gateway_cfg is None`` -> ``"auto"`` (gateway disabled).
+      2. Prod override: if ``cfg.prod_overrides`` is configured AND
+         ``env`` is in ``prod_environments`` AND ``tool_name`` matches
+         one of the ``resolution_trigger_tools`` globs -> ``"approve"``.
+      3. Risk-tier lookup: ``cfg.policy.get(tool_name)`` mapped via
+         ``low->auto``, ``medium->notify``, ``high->approve``.
+      4. No policy entry -> ``"auto"`` (safe default).
+
+    Tool-name lookups try the fully-qualified name (``<server>:<tool>``,
+    as registered by ``runtime.mcp_loader``) FIRST, then the bare
+    suffix as a fallback. This lets app config use bare names without
+    knowing the server prefix while keeping prefixed-form policy keys
+    deterministically more specific. Globs in
+    ``resolution_trigger_tools`` are matched against both forms for
+    the same reason, prefixed first.
+
+    The function is pure: same inputs always yield the same output and
+    no argument is mutated.
+    """
+    if gateway_cfg is None:
+        return "auto"
+
+    bare = tool_name.split(":", 1)[1] if ":" in tool_name else None
+
+    overrides = gateway_cfg.prod_overrides
+    if overrides is not None and env and env in overrides.prod_environments:
+        for pattern in overrides.resolution_trigger_tools:
+            if fnmatchcase(tool_name, pattern):
+                return "approve"
+            if bare is not None and fnmatchcase(bare, pattern):
+                return "approve"
+
+    risk = gateway_cfg.policy.get(tool_name)
+    if risk is not None:
+        return _RISK_TO_ACTION[risk]
+    if bare is not None:
+        risk = gateway_cfg.policy.get(bare)
+        if risk is not None:
+            return _RISK_TO_ACTION[risk]
+    return "auto"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+
+def _find_pending_index(
+    tool_calls: list,
+    tool_name: str,
+    ts: str,
+) -> int | None:
+    """Locate the index of the ``pending_approval`` ToolCall row that
+    matches ``tool_name`` and ``ts``.
+
+    Used by the wrap_tool resume path to update the in-place audit row
+    rather than appending a duplicate. The watchdog may have replaced
+    the row with a ``timeout`` entry while the graph was paused — in
+    that case we return ``None`` and the resume path leaves the audit
+    list unchanged (the watchdog already wrote the canonical record).
+
+    Searches from the end of the list because the pending row is
+    almost always the most recent ToolCall.
+    """
+    for idx in range(len(tool_calls) - 1, -1, -1):
+        tc = tool_calls[idx]
+        if (getattr(tc, "tool", None) == tool_name
+                and getattr(tc, "ts", None) == ts
+                and getattr(tc, "status", None) == "pending_approval"):
+            return idx
+    return None
+
+
+def _find_existing_pending_index(
+    tool_calls: list,
+    tool_name: str,
+) -> int | None:
+    """Find the most recent ``pending_approval`` row for ``tool_name``.
+
+    LangGraph's interrupt/resume model re-runs the gated node from the
+    top after ``Command(resume=...)``; we re-use the existing pending
+    row rather than appending a duplicate every time the closure
+    re-enters the approve branch.
+    """
+    for idx in range(len(tool_calls) - 1, -1, -1):
+        tc = tool_calls[idx]
+        if (getattr(tc, "tool", None) == tool_name
+                and getattr(tc, "status", None) == "pending_approval"):
+            return idx
+    return None
+
+
+def _evaluate_gate(
+    *,
+    session: Session,
+    tool_name: str,
+    gate_policy: GatePolicy | None,
+    gateway_cfg: GatewayConfig | None,
+) -> "GateDecision":
+    """Phase 11 (FOC-04) bridge: invoke ``should_gate`` from the wrap.
+
+    Constructs a minimal ``ToolCall`` shape for the pure-function
+    boundary, and a temporary ``OrchestratorConfig`` shim with the
+    in-flight ``gate_policy`` + ``gateway`` so the pure function sees
+    a single config object (its declared signature).
+
+    When ``gate_policy`` is ``None`` -- the legacy callers that have
+    not yet been threaded -- a default ``GatePolicy()`` is used so
+    Phase-11 behaviour applies uniformly. The default mirrors v1.0
+    HITL behaviour (``gated_risk_actions={"approve"}``), so existing
+    pre-Phase-11 tests keep passing.
+    """
+    # Local imports (avoid cycle on policy.py importing gateway).
+
+
+
+    effective_policy = gate_policy if gate_policy is not None else GatePolicy()
+    # OrchestratorConfig has model_config={"extra": "forbid"} so we
+    # cannot stash gateway as a top-level field. We thread gateway via
+    # the cfg.gateway lookup that should_gate already performs via
+    # ``getattr(cfg, "gateway", None)``. Building a transient cfg with
+    # gate_policy and a stashed gateway attr is the smallest-diff
+    # pathway -- avoids changing should_gate's signature.
+    cfg = OrchestratorConfig(gate_policy=effective_policy)
+    object.__setattr__(cfg, "gateway", gateway_cfg)
+
+    minimal_tc = ToolCall(
+        agent="",
+        tool=tool_name,
+        args={},
+        result=None,
+        ts=_now_iso(),
+        risk="low",
+        status="executed",
+    )
+    confidence = getattr(session, "turn_confidence_hint", None)
+    decision: GateDecision = should_gate(
+        session=session, tool_call=minimal_tc, confidence=confidence, cfg=cfg,
+    )
+    return decision
+
+
+class _GatedToolMarker(BaseTool):
+    """Marker base class so ``isinstance(t, _GatedToolMarker)`` identifies
+    a tool that has already been wrapped by :func:`wrap_tool`. Used to
+    short-circuit ``wrap_tool(wrap_tool(t))`` and avoid wrapper recursion.
+
+    Not instantiated directly — every ``_GatedTool`` defined inside
+    :func:`wrap_tool` inherits from this.
+    """
+
+    name: str = "_gated_marker"
+    description: str = "internal — never invoked"
+
+    def _run(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError("marker base — _GatedTool overrides this")
+
+
+def wrap_tool(
+    base_tool: BaseTool,
+    *,
+    session: Session,
+    gateway_cfg: GatewayConfig | None,
+    agent_name: str = "",
+    store: "SessionStore | None" = None,
+    injected_args: dict[str, str] | None = None,
+    gate_policy: GatePolicy | None = None,
+) -> BaseTool:
+    """Wrap ``base_tool`` so every invocation passes through the gateway.
+
+    The factory closes over ``session`` and ``gateway_cfg`` so the live
+    audit log (``session.tool_calls``) is the same instance the rest of
+    the orchestrator reads — no detour through a separate audit table.
+
+    Returned object is a ``BaseTool`` subclass instance whose ``name``
+    and ``description`` mirror the underlying tool, so LangGraph's ReAct
+    prompt builder still sees the right tool surface.
+
+    Idempotent: wrapping an already-gated tool returns it unchanged so a
+    second ``wrap_tool(wrap_tool(t))`` does not nest wrappers (which would
+    cause unbounded recursion when ``_run`` calls ``inner.invoke`` and
+    that dispatches back into another ``_GatedTool._run``).
+
+    Phase 9 (D-09-01 / D-09-03): when ``injected_args`` is supplied, the
+    gateway expands ``kwargs`` with session-derived values BEFORE
+    ``effective_action`` is consulted — so the gateway's risk-rating
+    sees the canonical ``environment`` (avoiding T-09-05: gateway
+    misclassifies prod as auto because env was missing from the LLM
+    args).
+    """
+    if isinstance(base_tool, _GatedToolMarker):
+        return base_tool
+
+    env = getattr(session, "environment", None)
+    inner = base_tool
+    inject_cfg = injected_args or {}
+
+    # Phase 9 (D-09-01): the LLM-visible args_schema on the wrapper must
+    # exclude every injected key — otherwise BaseTool's input validator
+    # rejects the call when the LLM omits a "required" arg the framework
+    # is about to supply. The inner tool keeps its full schema so the
+    # downstream invoke still sees every kwarg.
+    if inject_cfg:
+
+        _llm_visible_schema = strip_injected_params(
+            inner, frozenset(inject_cfg.keys()),
+        ).args_schema
+    else:
+        _llm_visible_schema = inner.args_schema
+
+    # Phase 9 follow-up: compute the set of param names the inner tool
+    # actually accepts so injection skips keys the target tool doesn't
+    # declare. Without this filter, a config-wide ``injected_args``
+    # entry like ``session_id: session.id`` is unconditionally written
+    # to every tool's kwargs — tools that don't accept ``session_id``
+    # then raise pydantic ``unexpected_keyword`` errors at the FastMCP
+    # validation boundary. ``accepted_params_for_tool`` handles both
+    # pydantic-model and JSON-Schema-dict ``args_schema`` shapes.
+
+    _accepted_params: frozenset[str] | None = accepted_params_for_tool(inner)
+
+    def _sync_invoke_inner(payload: Any) -> Any:
+        """Sync-invoke the inner tool, translating BaseTool's
+        default-``_run`` ``NotImplementedError`` into a clearer message
+        for native-async-only tools. Without this, callers see a vague
+        ``NotImplementedError`` from langchain core with no hint that
+        the right path is ``ainvoke``."""
+        try:
+            return inner.invoke(payload)
+        except NotImplementedError as exc:
+            raise NotImplementedError(
+                f"Tool {inner.name!r} appears to be async-only "
+                f"(``_run`` not implemented). Use ``ainvoke`` / ``_arun`` "
+                f"for this tool instead of the sync invoke path."
+            ) from exc
+
+    # Tool-naming regex differs across LLM providers — Ollama allows
+    # ``[a-zA-Z0-9_.\-]{1,256}``, OpenAI is stricter at
+    # ``^[a-zA-Z0-9_-]+$`` (no dots). The framework's internal naming
+    # uses ``<server>:<tool>`` for PVC-08 prefixed-form policy lookups,
+    # but the LLM only sees the *wrapper*'s ``.name``. Use ``__``
+    # (double underscore) as the LLM-visible separator: it satisfies
+    # both providers' regexes and is unambiguous (no real tool name
+    # contains a double underscore). ``inner.name`` keeps the colon
+    # form so ``effective_action`` / ``should_gate`` policy lookups
+    # stay PVC-08-compliant.
+    _llm_visible_name = inner.name.replace(":", "__")
+
+    class _GatedTool(_GatedToolMarker):
+        name: str = _llm_visible_name
+        description: str = inner.description
+        # The wrapper does its own arg coercion via the inner tool's schema,
+        # so no need to copy it here. Keep ``args_schema`` aligned with the
+        # LLM-visible (post-strip) schema so BaseTool's input validator
+        # accepts the post-strip kwargs the LLM emits. Phase 9 strips
+        # injected keys here; pre-Phase-9 callers see the full schema.
+        args_schema: Any = _llm_visible_schema  # type: ignore[assignment]
+
+        def _run(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # Phase 9 (D-09-01 / T-09-05): inject session-derived args
+            # BEFORE the gateway risk lookup so risk-rating sees the
+            # post-injection environment value. Pure no-op when
+            # ``injected_args`` is empty.
+            if inject_cfg:
+
+                kwargs = inject_injected_args(
+                    kwargs,
+                    session=session,
+                    injected_args_cfg=inject_cfg,
+                    tool_name=inner.name,
+                    accepted_params=_accepted_params or None,
+                )
+            # Phase 11 (FOC-04): pure-policy gating boundary. Call
+            # should_gate to decide whether to pause for HITL approval;
+            # also call effective_action so the notify-audit branch
+            # below still fires for medium-risk tools that should NOT
+            # gate but should record an audit row.
+            action = effective_action(
+                inner.name, env=env, gateway_cfg=gateway_cfg,
+            )
+            decision = _evaluate_gate(
+                session=session,
+                tool_name=inner.name,
+                gate_policy=gate_policy,
+                gateway_cfg=gateway_cfg,
+            )
+            if decision.gate:
+                from langgraph.types import interrupt
+
+                # Persist a ``pending_approval`` ToolCall row BEFORE
+                # raising GraphInterrupt so the approval-timeout watchdog
+                # has a record to scan. ``ts`` is the moment the human
+                # approval window opened. Stored args mirror the post-
+                # decision rows so the audit history reads consistently.
+                #
+                # On resume, LangGraph re-enters this node and runs us
+                # again from the top — so we must re-use the existing
+                # pending row instead of appending a duplicate. The most
+                # recent ``pending_approval`` row for this tool wins.
+                pending_args = dict(kwargs) if kwargs else {"args": list(args)}
+                existing_idx = _find_existing_pending_index(
+                    session.tool_calls, inner.name,
+                )
+                if existing_idx is not None:
+                    pending_ts = session.tool_calls[existing_idx].ts
+                else:
+                    pending_ts = _now_iso()
+                    session.tool_calls.append(
+                        ToolCall(
+                            agent=agent_name,
+                            tool=inner.name,
+                            args=pending_args,
+                            result=None,
+                            ts=pending_ts,
+                            risk="high",
+                            status="pending_approval",
+                        )
+                    )
+                    # CRITICAL: persist the pending_approval row BEFORE
+                    # raising interrupt() so the approval-timeout
+                    # watchdog (which reads from the DB) and the
+                    # /approvals UI can see the pending state. Without
+                    # this save the in-memory mutation is invisible to
+                    # any out-of-process observer.
+                    if store is not None:
+                        store.save(session)
+                payload = {
+                    "kind": "tool_approval",
+                    "tool": inner.name,
+                    "args": kwargs or args,
+                    "tool_call_id": kwargs.get("tool_call_id"),
+                }
+                # First execution: raises GraphInterrupt, checkpointer pauses.
+                # Resume: returns whatever Command(resume=...) supplied.
+                decision = interrupt(payload)
+                # Decision payload may be a string ("approve" / "reject" /
+                # "timeout") or a dict {decision, approver, rationale}.
+                if isinstance(decision, dict):
+                    verdict = decision.get("decision", "approve")
+                    approver = decision.get("approver")
+                    rationale = decision.get("rationale")
+                else:
+                    verdict = decision or "approve"
+                    approver = None
+                    rationale = None
+                # Update the pending_approval row in place rather than
+                # appending a second audit entry. The watchdog and the
+                # /approvals UI both reason about a single audit row per
+                # high-risk call.
+                pending_idx = _find_pending_index(
+                    session.tool_calls, inner.name, pending_ts,
+                )
+                verdict_str = str(verdict).lower()
+                if verdict_str == "reject":
+                    if pending_idx is not None:
+                        session.tool_calls[pending_idx] = ToolCall(
+                            agent=agent_name,
+                            tool=inner.name,
+                            args=pending_args,
+                            result={"rejected": True, "rationale": rationale},
+                            ts=pending_ts,
+                            risk="high",
+                            status="rejected",
+                            approver=approver,
+                            approved_at=_now_iso(),
+                            approval_rationale=rationale,
+                        )
+                    return {"rejected": True, "rationale": rationale}
+                if verdict_str == "timeout":
+                    # The approval window expired. Do NOT run the tool;
+                    # mark the audit row ``status="timeout"`` so
+                    # downstream consumers (UI, retraining) can
+                    # distinguish operator-initiated rejections from
+                    # automatic timeouts.
+                    if pending_idx is not None:
+                        session.tool_calls[pending_idx] = ToolCall(
+                            agent=agent_name,
+                            tool=inner.name,
+                            args=pending_args,
+                            result={"timeout": True, "rationale": rationale},
+                            ts=pending_ts,
+                            risk="high",
+                            status="timeout",
+                            approver=approver,
+                            approved_at=_now_iso(),
+                            approval_rationale=rationale,
+                        )
+                    return {"timeout": True, "rationale": rationale}
+                # Approved -> run the tool, then update the audit row.
+                result = _sync_invoke_inner(kwargs if kwargs else args[0] if args else {})
+                if pending_idx is not None:
+                    session.tool_calls[pending_idx] = ToolCall(
+                        agent=agent_name,
+                        tool=inner.name,
+                        args=pending_args,
+                        result=result,
+                        ts=pending_ts,
+                        risk="high",
+                        status="approved",
+                        approver=approver,
+                        approved_at=_now_iso(),
+                        approval_rationale=rationale,
+                    )
+                return result
+
+            # auto / notify both run the tool now.
+            result = _sync_invoke_inner(kwargs if kwargs else args[0] if args else {})
+
+            if action == "notify":
+                session.tool_calls.append(
+                    ToolCall(
+                        agent=agent_name,
+                        tool=inner.name,
+                        args=dict(kwargs) if kwargs else {"args": list(args)},
+                        result=result,
+                        ts=_now_iso(),
+                        risk="medium",
+                        status="executed_with_notify",
+                    )
+                )
+            return result
+
+        async def _arun(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # Phase 9 (D-09-01 / T-09-05): inject session-derived args
+            # BEFORE the gateway risk lookup. Mirror of the sync ``_run``.
+            if inject_cfg:
+
+                kwargs = inject_injected_args(
+                    kwargs,
+                    session=session,
+                    injected_args_cfg=inject_cfg,
+                    tool_name=inner.name,
+                    accepted_params=_accepted_params or None,
+                )
+            # Phase 11 (FOC-04): pure-policy gating boundary. Mirror of
+            # the sync ``_run`` -- consult should_gate via
+            # ``_evaluate_gate``; still call ``effective_action`` to
+            # keep the notify-audit branch for medium-risk tools.
+            action = effective_action(
+                inner.name, env=env, gateway_cfg=gateway_cfg,
+            )
+            decision = _evaluate_gate(
+                session=session,
+                tool_name=inner.name,
+                gate_policy=gate_policy,
+                gateway_cfg=gateway_cfg,
+            )
+            if decision.gate:
+                from langgraph.types import interrupt
+
+                # Persist a ``pending_approval`` audit row BEFORE the
+                # GraphInterrupt fires so the watchdog can spot stale
+                # approvals. See the sync ``_run`` mirror for details.
+                pending_args = dict(kwargs) if kwargs else {"args": list(args)}
+                existing_idx = _find_existing_pending_index(
+                    session.tool_calls, inner.name,
+                )
+                if existing_idx is not None:
+                    pending_ts = session.tool_calls[existing_idx].ts
+                else:
+                    pending_ts = _now_iso()
+                    session.tool_calls.append(
+                        ToolCall(
+                            agent=agent_name,
+                            tool=inner.name,
+                            args=pending_args,
+                            result=None,
+                            ts=pending_ts,
+                            risk="high",
+                            status="pending_approval",
+                        )
+                    )
+                    # CRITICAL: persist the pending_approval row BEFORE
+                    # raising interrupt() so the approval-timeout
+                    # watchdog (which reads from the DB) and the
+                    # /approvals UI can see the pending state.
+                    if store is not None:
+                        store.save(session)
+                payload = {
+                    "kind": "tool_approval",
+                    "tool": inner.name,
+                    "args": kwargs or args,
+                    "tool_call_id": kwargs.get("tool_call_id"),
+                }
+                decision = interrupt(payload)
+                if isinstance(decision, dict):
+                    verdict = decision.get("decision", "approve")
+                    approver = decision.get("approver")
+                    rationale = decision.get("rationale")
+                else:
+                    verdict = decision or "approve"
+                    approver = None
+                    rationale = None
+                pending_idx = _find_pending_index(
+                    session.tool_calls, inner.name, pending_ts,
+                )
+                verdict_str = str(verdict).lower()
+                if verdict_str == "reject":
+                    if pending_idx is not None:
+                        session.tool_calls[pending_idx] = ToolCall(
+                            agent=agent_name,
+                            tool=inner.name,
+                            args=pending_args,
+                            result={"rejected": True, "rationale": rationale},
+                            ts=pending_ts,
+                            risk="high",
+                            status="rejected",
+                            approver=approver,
+                            approved_at=_now_iso(),
+                            approval_rationale=rationale,
+                        )
+                    return {"rejected": True, "rationale": rationale}
+                if verdict_str == "timeout":
+                    if pending_idx is not None:
+                        session.tool_calls[pending_idx] = ToolCall(
+                            agent=agent_name,
+                            tool=inner.name,
+                            args=pending_args,
+                            result={"timeout": True, "rationale": rationale},
+                            ts=pending_ts,
+                            risk="high",
+                            status="timeout",
+                            approver=approver,
+                            approved_at=_now_iso(),
+                            approval_rationale=rationale,
+                        )
+                    return {"timeout": True, "rationale": rationale}
+                result = await inner.ainvoke(kwargs if kwargs else args[0] if args else {})
+                if pending_idx is not None:
+                    session.tool_calls[pending_idx] = ToolCall(
+                        agent=agent_name,
+                        tool=inner.name,
+                        args=pending_args,
+                        result=result,
+                        ts=pending_ts,
+                        risk="high",
+                        status="approved",
+                        approver=approver,
+                        approved_at=_now_iso(),
+                        approval_rationale=rationale,
+                    )
+                return result
+
+            result = await inner.ainvoke(kwargs if kwargs else args[0] if args else {})
+
+            if action == "notify":
+                session.tool_calls.append(
+                    ToolCall(
+                        agent=agent_name,
+                        tool=inner.name,
+                        args=dict(kwargs) if kwargs else {"args": list(args)},
+                        result=result,
+                        ts=_now_iso(),
+                        risk="medium",
+                        status="executed_with_notify",
+                    )
+                )
+            return result
+
+    return _GatedTool()
+
+# ====== module: runtime/tools/arg_injection.py ======
+
+_LOG = logging.getLogger("runtime.orchestrator")
+
+
+def strip_injected_params(
+    tool: BaseTool,
+    injected_keys: frozenset[str],
+) -> BaseTool:
+    """Return a ``BaseTool`` whose ``args_schema`` hides every param named
+    in ``injected_keys``.
+
+    The LLM only sees the stripped sig; the framework re-adds the real
+    values at invocation time via :func:`inject_injected_args` (D-09-01).
+
+    Properties:
+
+    * **Pure.** The original tool is left unchanged — its ``args_schema``
+      is not mutated, so tests and in-process callers that hold a direct
+      reference keep their full schema.
+    * **Idempotent.** Calling twice with the same keys is equivalent to
+      calling once. The cloned schema is structurally identical.
+    * **Identity short-circuit.** Empty ``injected_keys`` (or no overlap
+      between ``injected_keys`` and the tool's params) returns the tool
+      unchanged so unconfigured apps and tools without any injectable
+      params pay nothing.
+    """
+    if not injected_keys:
+        return tool
+    schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return tool
+
+    # --- dict path: FastMCP / JSON-Schema tools ---------------------------
+    # FastMCP exposes ``args_schema`` as a plain JSON-Schema dict rather
+    # than a Pydantic model. Strip injected keys directly from the dict.
+    if isinstance(schema, dict):
+        props = schema.get("properties", {})
+        overlap = injected_keys & set(props)
+        if not overlap:
+            return tool
+        new_props = {k: v for k, v in props.items() if k not in injected_keys}
+        required = [r for r in schema.get("required", []) if r not in injected_keys]
+        new_dict_schema: dict[str, Any] = {**schema, "properties": new_props, "required": required}
+        try:
+            return tool.model_copy(update={"args_schema": new_dict_schema})
+        except Exception:  # pragma: no cover — defensive fallback
+            import copy
+            stripped = copy.copy(tool)
+            stripped.args_schema = new_dict_schema  # type: ignore[attr-defined]
+            return stripped
+
+    # --- Pydantic path: BaseModel subclass tools --------------------------
+    if not hasattr(schema, "model_fields"):
+        return tool
+    overlap = injected_keys & set(schema.model_fields.keys())
+    if not overlap:
+        # No params to strip — preserve identity (no clone).
+        return tool
+
+    # Build the kwargs for ``create_model`` from the surviving fields.
+    # Pydantic v2's ``create_model`` accepts ``(annotation, FieldInfo)``
+    # tuples; FieldInfo carries default + description + alias so the
+    # cloned schema is functionally equivalent to the original minus
+    # the stripped fields.
+    keep: dict[str, tuple[Any, Any]] = {
+        name: (f.annotation, f)
+        for name, f in schema.model_fields.items()
+        if name not in injected_keys
+    }
+    new_schema = create_model(
+        f"{schema.__name__}__StrippedForLLM",
+        __base__=BaseModel,
+        **keep,  # type: ignore[arg-type]
+    )
+
+    # ``BaseTool`` is itself a pydantic BaseModel — ``model_copy`` clones
+    # it cheaply and lets us swap ``args_schema`` without touching the
+    # original. Tools that are not pydantic models (extremely rare; only
+    # custom subclasses) fall back to a regular shallow copy.
+    try:
+        stripped = tool.model_copy(update={"args_schema": new_schema})
+    except Exception:  # pragma: no cover — defensive fallback
+        import copy
+        stripped = copy.copy(tool)
+        stripped.args_schema = new_schema  # type: ignore[attr-defined]
+    return stripped
+
+
+def _resolve_dotted(root: Session, path: str) -> Any | None:
+    """Walk ``path`` ('session.foo.bar') against ``root`` and return the
+    terminal value or ``None`` if any segment is missing / None.
+
+    ``path`` must start with ``session.``. The leading ``session`` token
+    pins the resolution root to the live Session — config-declared paths
+    cannot reach into arbitrary modules. Subsequent segments walk
+    attributes (``getattr``) — for fields stored under ``extra_fields``
+    apps use ``session.extra_fields.foo`` which goes through the dict
+    branch below.
+    """
+    parts = path.split(".")
+    if not parts or parts[0] != "session":
+        raise ValueError(
+            f"injected_args path {path!r} must start with 'session.'"
+        )
+    cur: Any = root
+    for seg in parts[1:]:
+        if cur is None:
+            return None
+        # Support dict-valued attrs (notably ``Session.extra_fields``)
+        # transparently — ``session.extra_fields.pr_url`` resolves
+        # whether ``extra_fields`` is a real attribute or a dict on
+        # the model. Plain attribute walks work for typed Session
+        # subclasses (``IncidentState.environment``).
+        if isinstance(cur, dict):
+            cur = cur.get(seg)
+        else:
+            cur = getattr(cur, seg, None)
+    return cur
+
+
+def inject_injected_args(
+    tool_args: dict[str, Any],
+    *,
+    session: Session,
+    injected_args_cfg: dict[str, str],
+    tool_name: str,
+    accepted_params: set[str] | frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Return a NEW dict with each injected arg resolved from ``session``.
+
+    Behaviour (D-09-03):
+
+    * Mutation-free: ``tool_args`` is never modified. Callers that need
+      to keep the LLM's original call shape can compare ``tool_args`` to
+      the return value.
+    * Framework wins on conflict. When the LLM already supplied a value
+      and the resolved framework value differs, the framework value is
+      written and a single INFO record is emitted on the
+      ``runtime.orchestrator`` logger with the documented payload tokens
+      (``tool``, ``arg``, ``llm_value``, ``framework_value``,
+      ``session_id``).
+    * Missing/None resolutions are skipped. The arg is left absent so
+      the tool's own default-handling (or the MCP server's required-arg
+      validator) decides what to do — never silently ``None``.
+    * When ``accepted_params`` is provided, injected keys not present in
+      that set are skipped. Prevents writing kwargs the target tool
+      doesn't accept (which would raise pydantic ``unexpected_keyword``
+      validation errors at the FastMCP boundary).
+    """
+    out = dict(tool_args)
+    for arg_name, path in injected_args_cfg.items():
+        if accepted_params is not None and arg_name not in accepted_params:
+            # The tool doesn't declare this injectable param. Strip any
+            # LLM-supplied value too — the LLM shouldn't be emitting it
+            # (Phase 9 strips injectable keys from the LLM-visible sig)
+            # and forwarding it to the tool would raise pydantic
+            # ``unexpected_keyword`` at the FastMCP boundary.
+            if arg_name in out:
+                _LOG.info(
+                    "tool_call.injected_arg_dropped tool=%s arg=%s "
+                    "llm_value=%r reason=not_accepted_by_tool session_id=%s",
+                    tool_name,
+                    arg_name,
+                    out[arg_name],
+                    getattr(session, "id", "?"),
+                )
+                del out[arg_name]
+            continue
+        framework_value = _resolve_dotted(session, path)
+        if framework_value is None:
+            continue
+        if arg_name in out and out[arg_name] != framework_value:
+            _LOG.info(
+                "tool_call.injected_arg_overridden tool=%s arg=%s "
+                "llm_value=%r framework_value=%r session_id=%s",
+                tool_name,
+                arg_name,
+                out[arg_name],
+                framework_value,
+                getattr(session, "id", "?"),
+            )
+        out[arg_name] = framework_value
+    return out
+
+
+def accepted_params_for_tool(tool: Any) -> frozenset[str] | None:
+    """Return the set of parameter names a wrapped tool accepts.
+
+    Handles both shapes ``args_schema`` can take in this codebase:
+
+    * pydantic ``BaseModel`` subclass — read ``model_fields.keys()``
+      (used by mock tools and by tests).
+    * JSON-Schema ``dict`` — read ``schema["properties"].keys()``
+      (used by real FastMCP-derived tools, which expose the underlying
+      function's input schema as a JSON Schema rather than a pydantic
+      class).
+
+    Returns ``None`` when the tool has no introspectable schema (caller
+    should treat this as "skip filtering" — preserves prior behaviour).
+    """
+    schema = getattr(tool, "args_schema", None)
+    if schema is None:
+        return None
+    if hasattr(schema, "model_fields"):
+        return frozenset(schema.model_fields.keys())
+    if isinstance(schema, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            return frozenset(props.keys())
+    return None
+
+
+__all__ = [
+    "strip_injected_params",
+    "inject_injected_args",
+    "accepted_params_for_tool",
+    "_LOG",
+]
+
+# ====== module: runtime/tools/approval_watchdog.py ======
+
+if TYPE_CHECKING:
+    pass
+logger = logging.getLogger(__name__)
+
+_UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+# Sessions whose status is in this set are *not* candidates for the
+# watchdog — either they never paused for approval, or they have already
+# moved past it. ``awaiting_input`` is the only status produced by
+# ``langgraph.types.interrupt()`` while a high-risk gate is open.
+_TERMINAL_STATUSES = frozenset({
+    "resolved", "stopped", "escalated", "duplicate", "deleted", "error",
+})
+
+
+def _parse_iso(ts: str | None) -> datetime | None:
+    """Parse an ISO-8601 ``YYYY-MM-DDTHH:MM:SSZ`` ts back into UTC.
+
+    Returns ``None`` for malformed values; callers treat that as
+    "skip this row" so the watchdog never crashes on a bad audit
+    record.
+    """
+    if not ts:
+        return None
+    try:
+        # Replace trailing 'Z' so ``fromisoformat`` accepts it on
+        # Python <3.11. The format is fixed by ``_UTC_TS_FMT`` so this
+        # round-trips cleanly.
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+class ApprovalWatchdog:
+    """Background asyncio task that resumes stale pending-approval sessions.
+
+    Owned by :class:`runtime.service.OrchestratorService`; started in
+    ``OrchestratorService.start()`` and stopped in ``shutdown()``. The
+    task runs on the service's background loop so it shares the same
+    checkpointer / SQLite engine / FastMCP transports the live
+    sessions are using.
+    """
+
+    def __init__(
+        self,
+        service: "OrchestratorService",
+        *,
+        approval_timeout_seconds: int,
+        poll_interval_seconds: float = 60.0,
+    ) -> None:
+        self._service = service
+        self._approval_timeout_seconds = approval_timeout_seconds
+        self._poll_interval_seconds = poll_interval_seconds
+        self._task: asyncio.Task | None = None
+        self._stop_event: asyncio.Event | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Schedule the watchdog onto ``loop``. Idempotent.
+
+        Must be called from a thread that is not the loop's own thread —
+        the typical caller is :meth:`OrchestratorService.start`. Returns
+        immediately; the polling coroutine runs in the background.
+        """
+        if self._task is not None and not self._task.done():
+            return
+
+        async def _arm() -> None:
+            self._stop_event = asyncio.Event()
+            self._task = asyncio.create_task(
+                self._run(), name="approval_watchdog",
+            )
+
+        fut = asyncio.run_coroutine_threadsafe(_arm(), loop)
+        fut.result(timeout=5.0)
+
+    async def stop(self) -> None:
+        """Signal the polling loop to exit and await termination.
+
+        Runs on the loop thread (called from ``OrchestratorService._close_*``
+        helpers). Idempotent — a no-op when the watchdog never started.
+        """
+        if self._stop_event is not None:
+            self._stop_event.set()
+        task = self._task  # LOCAL variable — guards against concurrent stop() calls
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                try:
+                    await task  # drain LOCAL task ref; suppresses CancelledError
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._stop_event = None
+
+    async def _run(self) -> None:
+        """Polling loop. Runs until ``_stop_event`` is set."""
+        assert self._stop_event is not None
+        while not self._stop_event.is_set():
+            try:
+                await self._tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("approval watchdog tick failed")
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self._poll_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                # Expected — wakes the loop every ``poll_interval_seconds``.
+                continue
+
+    async def _tick(self) -> None:
+        """One scan + resume pass. Visible for tests via ``run_once``."""
+        await self.run_once()
+
+    async def run_once(self) -> int:
+        """Single scan pass. Returns the number of sessions resumed.
+
+        Exposed publicly so tests can drive the watchdog
+        deterministically without waiting on the polling cadence.
+        """
+        orch = getattr(self._service, "_orch", None)
+        if orch is None:
+            return 0
+        registry = dict(self._service._registry)
+        if not registry:
+            return 0
+        now = datetime.now(timezone.utc)
+        resumed = 0
+        for session_id in list(registry.keys()):
+            try:
+                inc = orch.store.load(session_id)
+            except Exception:  # noqa: BLE001
+                continue
+            status = getattr(inc, "status", None)
+            if status in _TERMINAL_STATUSES:
+                continue
+            if status != "awaiting_input":
+                # Only sessions paused on a high-risk gate are watchdog
+                # candidates. ``in_progress`` / ``new`` are still
+                # actively running on the loop.
+                continue
+            stale = self._find_stale_pending(inc, now)
+            if not stale:
+                continue
+            # No is_locked() peek here — try_acquire (inside
+            # _resume_with_timeout) is the single contention check, so
+            # there is no TOCTOU window between check and acquire. The
+            # SessionBusy handler below fires on real contention.
+            try:
+                await self._resume_with_timeout(orch, session_id)
+                resumed += 1
+            except SessionBusy:
+                logger.debug(
+                    "approval watchdog: session %s SessionBusy at resume, skipping",
+                    session_id,
+                )
+                continue
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "approval watchdog: resume failed for session %s",
+                    session_id,
+                )
+        return resumed
+
+    def _find_stale_pending(self, inc: Any, now: datetime) -> list[int]:
+        """Return indices of ``pending_approval`` ToolCalls older than the
+        configured timeout."""
+        out: list[int] = []
+        tool_calls = getattr(inc, "tool_calls", []) or []
+        threshold = self._approval_timeout_seconds
+        for idx, tc in enumerate(tool_calls):
+            if getattr(tc, "status", None) != "pending_approval":
+                continue
+            ts = _parse_iso(getattr(tc, "ts", None))
+            if ts is None:
+                continue
+            age = (now - ts).total_seconds()
+            if age >= threshold:
+                out.append(idx)
+        return out
+
+    async def _resume_with_timeout(
+        self, orch: Any, session_id: str,
+    ) -> None:
+        """Resume the paused graph with a synthetic timeout decision.
+
+        Uses ``Command(resume=...)`` against the same ``thread_id`` the
+        approval API would use — the wrap_tool resume path updates the
+        audit row to ``status="timeout"`` automatically.
+
+        Per D-18: the ``ainvoke`` call is wrapped in
+        ``orch._locks.try_acquire(session_id)`` so a concurrent user-
+        driven turn cannot interleave checkpoint writes for the same
+        ``thread_id``. If the lock is already held, ``try_acquire``
+        raises ``SessionBusy`` immediately (no waiting); the caller
+        (``run_once``) catches that and skips the tick — this is how
+        the watchdog tolerates a busy session without piling up.
+        """
+        from langgraph.types import Command  # local: heavy import
+
+        decision_payload = {
+            "decision": "timeout",
+            "approver": "system",
+            "rationale": "approval window expired",
+        }
+        async with orch._locks.try_acquire(session_id):
+            await orch.graph.ainvoke(
+                Command(resume=decision_payload),
+                config=orch._thread_config(session_id),
+            )
 
 # ====== module: runtime/policy.py ======
 
@@ -4752,6 +7022,840 @@ __all__ = [
     "GateDecision", "GateReason", "should_gate",
     # Phase 12
     "RetryDecision", "RetryReason", "should_retry",
+]
+
+# ====== module: runtime/agents/responsive.py ======
+
+logger = logging.getLogger(__name__)
+
+
+def make_agent_node(
+    *,
+    skill: Skill,
+    llm: BaseChatModel,
+    tools: list[BaseTool],
+    decide_route: Callable[[Session], str],
+    store: SessionStore,
+    valid_signals: frozenset[str] | None = None,
+    gateway_cfg: GatewayConfig | None = None,
+    terminal_tool_names: frozenset[str] = frozenset(),
+    patch_tool_names: frozenset[str] = frozenset(),
+    gate_policy: "GatePolicy | None" = None,
+):
+    """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
+
+    ``valid_signals`` is the orchestrator-wide accepted signal vocabulary
+    (``cfg.orchestrator.signals``). When omitted, the legacy
+    ``{success, failed, needs_input}`` default is used so older callers and
+    tests keep working.
+
+    ``gateway_cfg`` is the optional risk-rated tool gateway config.
+    When supplied, every ``BaseTool`` in ``tools`` is wrapped via
+    :func:`runtime.tools.gateway.wrap_tool` *inside the node body* so the
+    closure captures the live ``Session`` per agent invocation. When
+    ``None``, tools are passed through untouched.
+    """
+    # Imported lazily to avoid an import cycle: ``runtime.graph`` depends
+    # on this module via ``_build_agent_nodes``, but the helpers used
+    # inside the node body live in ``graph`` so we keep a single
+    # implementation for the responsive path. The cycle is benign at
+    # call time — both modules are fully imported before ``node()`` runs.
+
+
+    async def node(state: GraphState) -> dict:
+        incident: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        inc_id = incident.id
+        started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # Wrap tools per-invocation so each wrap closes over the
+        # live ``Session`` for this run.
+        if gateway_cfg is not None:
+            run_tools = [
+                wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
+                          agent_name=skill.name, store=store,
+                          gate_policy=gate_policy)
+                for t in tools
+            ]
+        else:
+            run_tools = tools
+        # Phase 10 (FOC-03 / D-10-02): every responsive agent invocation
+        # is wrapped in an AgentTurnOutput envelope. LangGraph internally
+        # calls llm.with_structured_output(AgentTurnOutput) on a final pass
+        # after the tool loop, populating result["structured_response"].
+        agent_executor = create_react_agent(
+            llm, run_tools, prompt=skill.system_prompt,
+            response_format=AgentTurnOutput,
+        )
+
+        # Phase 11 (FOC-04): reset per-turn confidence hint at the
+        # start of each agent step so the gateway treats the first
+        # tool call of the turn as "no signal yet".
+        try:
+            incident.turn_confidence_hint = None
+        except (AttributeError, ValueError):
+            pass
+
+        try:
+            result = await _ainvoke_with_retry(
+                agent_executor,
+                {"messages": [HumanMessage(content=_format_agent_input(incident))]},
+            )
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): HITL pause -- propagate up.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return _handle_agent_failure(
+                skill_name=skill.name, started_at=started_at, exc=exc,
+                inc_id=inc_id, store=store, fallback=incident,
+            )
+
+        # Tools (e.g. registered patch tools) write straight to disk.
+        # Reload so the node's own append of agent_run + tool_calls
+        # happens against the tool-mutated state.
+        incident = store.load(inc_id)
+
+        messages = result.get("messages", [])
+        ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
+            messages, skill.name, incident, ts, valid_signals,
+            terminal_tool_names=terminal_tool_names,
+            patch_tool_names=patch_tool_names,
+        )
+        # Phase 11 (FOC-04): update hint so any subsequent in-turn
+        # tool call sees the harvested confidence.
+        if agent_confidence is not None:
+            try:
+                incident.turn_confidence_hint = agent_confidence
+            except (AttributeError, ValueError):
+                pass
+        _pair_tool_responses(messages, incident)
+
+        # Phase 10 (FOC-03 / D-10-03): parse envelope; reconcile against
+        # any typed-terminal-tool-arg confidence. Envelope failure is a
+        # structured agent_run error.
+        try:
+            envelope = parse_envelope_from_result(result, agent=skill.name)
+        except EnvelopeMissingError as exc:
+            return _handle_agent_failure(
+                skill_name=skill.name, started_at=started_at, exc=exc,
+                inc_id=inc_id, store=store, fallback=incident,
+            )
+
+        terminal_tool_for_log = _first_terminal_tool_called_this_turn(
+            messages, terminal_tool_names,
+        )
+        final_confidence = reconcile_confidence(
+            envelope.confidence,
+            agent_confidence,
+            agent=skill.name,
+            session_id=inc_id,
+            tool_name=terminal_tool_for_log,
+        )
+        final_rationale = agent_rationale or envelope.confidence_rationale
+        final_signal = agent_signal if agent_signal is not None else envelope.signal
+
+        final_text = envelope.content or _extract_final_text(messages)
+        usage = _sum_token_usage(messages)
+
+        _record_success_run(
+            incident=incident, skill_name=skill.name, started_at=started_at,
+            final_text=final_text, usage=usage,
+            confidence=final_confidence, rationale=final_rationale,
+            signal=final_signal,
+            store=store,
+        )
+        next_route_signal = decide_route(incident)
+        next_node = route_from_skill(skill, next_route_signal)
+        return {"session": incident, "next_route": next_node,
+                "last_agent": skill.name, "error": None}
+
+    return node
+
+
+__all__ = ["make_agent_node"]
+
+# ====== module: runtime/agents/supervisor.py ======
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_eval(expr: str, ctx: dict[str, Any]) -> Any:
+    """Evaluate a pre-validated safe-eval expression against ``ctx``.
+
+    The expression must already have passed
+    :func:`runtime.skill._validate_safe_expr` — that's enforced at
+    skill-load time. We re-parse here (cheap) and walk the tree
+    against the same allowlist; any non-whitelisted node is treated
+    as evaluating to ``False`` so a malformed runtime expression can
+    never escalate to arbitrary code execution.
+    """
+
+    _validate_safe_expr(expr, source="supervisor.dispatch_rule")
+    # ``compile`` + ``eval`` over a built-in-stripped namespace is the
+    # cheapest correct evaluator once the AST is whitelisted. The
+    # ``__builtins__`` removal blocks ``__import__`` etc. should the
+    # AST checker miss something.
+    code = compile(expr, "<safe-eval>", "eval")
+    return eval(code, {"__builtins__": {}}, ctx)  # noqa: S307 — AST-whitelisted
+
+
+def _ctx_for_session(incident: Session) -> dict[str, Any]:
+    """Build the variable namespace dispatch-rule expressions see.
+
+    Exposes the live session payload as ``session`` plus a few
+    ergonomic top-level aliases for fields operators reach for most
+    often. Adding new top-level names is a one-liner; the safe-eval
+    AST checker already restricts the language so we don't need to
+    sandbox the namespace any further.
+    """
+    payload = incident.model_dump()
+    return {
+        "session": payload,
+        "status": payload.get("status"),
+        "agents_run": payload.get("agents_run") or [],
+        "tool_calls": payload.get("tool_calls") or [],
+    }
+
+
+def log_supervisor_dispatch(
+    *,
+    session: Session,
+    supervisor: str,
+    strategy: str,
+    depth: int,
+    targets: list[str],
+    rule_matched: str | None,
+    payload_size: int,
+) -> None:
+    """Emit one structured ``supervisor_dispatch`` log entry.
+
+    Operators wanting an end-to-end audit join ``agent_runs`` and the
+    log stream by ``incident_id``. The audit trail is deliberately a
+    different stream from ``agent_runs`` because supervisors don't burn
+    tokens — bloating ``agents_run`` with router rows is a known trap
+    we explicitly avoid.
+    """
+    record = {
+        "event": "supervisor_dispatch",
+        "ts": datetime.now(timezone.utc).strftime(_UTC_TS_FMT),
+        "incident_id": session.id,
+        "session_id": session.id,
+        "supervisor": supervisor,
+        "strategy": strategy,
+        "depth": depth,
+        "targets": targets,
+        "rule_matched": rule_matched,
+        "dispatch_payload_size": payload_size,
+    }
+    logger.info("supervisor_dispatch %s", json.dumps(record))
+
+
+def _llm_pick_target(
+    *,
+    skill: Skill,
+    llm: BaseChatModel,
+    incident: Session,
+) -> str:
+    """One-shot LLM dispatch: ask the model to choose a subordinate.
+
+    The model is asked to reply with **only** the name of one
+    subordinate. We accept the first matching name in the response
+    (case-insensitive substring match) and fall back to the first
+    subordinate when the response is unparseable — keeping the graph
+    moving rather than failing outright.
+    """
+    prompt = (
+        f"{skill.dispatch_prompt}\n\n"
+        f"Choose ONE of: {', '.join(skill.subordinates)}.\n"
+        f"Reply with only the agent name."
+    )
+    payload = json.dumps(incident.model_dump(), default=str)
+    msgs = [
+        SystemMessage(content=prompt),
+        HumanMessage(content=payload),
+    ]
+    try:
+        result = llm.invoke(msgs)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "supervisor %s: LLM dispatch failed (%s); falling back to %s",
+            skill.name, exc, skill.subordinates[0],
+        )
+        return skill.subordinates[0]
+    text = (getattr(result, "content", "") or "").strip().lower()
+    for name in skill.subordinates:
+        if name.lower() in text:
+            return name
+    logger.warning(
+        "supervisor %s: LLM reply %r did not name a subordinate; "
+        "falling back to %s", skill.name, text, skill.subordinates[0],
+    )
+    return skill.subordinates[0]
+
+
+def _rule_pick_target(
+    *,
+    skill: Skill,
+    incident: Session,
+) -> tuple[str, str | None]:
+    """Walk dispatch_rules in order; return (target, matched_when).
+
+    Falls back to the first subordinate when no rule matches; the
+    fallback case carries ``matched_when=None`` so the audit log can
+    distinguish "default" from "rule X matched".
+    """
+    ctx = _ctx_for_session(incident)
+    for rule in skill.dispatch_rules:
+        try:
+            if bool(_safe_eval(rule.when, ctx)):
+                return rule.target, rule.when
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "supervisor %s: dispatch_rule %r raised %s; skipping",
+                skill.name, rule.when, exc,
+            )
+    return skill.subordinates[0], None
+
+
+def _normalize_runner_route(value: Any) -> str:
+    """Map runner-supplied route aliases to the canonical graph end token.
+
+    Apps writing runners reach for ``"END"`` / ``"end"`` / ``"__end__"``
+    interchangeably; LangGraph's conditional edges only recognise
+    ``"__end__"``. Normalising here keeps the runner contract permissive
+    without spreading the alias check across the graph layer.
+    """
+    if isinstance(value, str) and value.strip().lower() in {"end", "__end__"}:
+        return "__end__"
+    return value
+
+
+def make_supervisor_node(
+    *,
+    skill: Skill,
+    llm: BaseChatModel | None = None,
+    framework_cfg: Any | None = None,
+):
+    """Build the supervisor LangGraph node.
+
+    Pure routing: no ``AgentRun`` row, no tool execution, no token
+    accounting beyond what the optional LLM call itself reports. The
+    node sets ``state["next_route"]`` to a subordinate name and returns;
+    LangGraph's conditional edges fan out to that node from there.
+
+    The optional ``llm`` is only used when ``skill.dispatch_strategy``
+    is ``"llm"``. Callers using ``"rule"`` may pass ``None``.
+
+    When ``skill.runner`` is set, the dotted-path callable is resolved
+    at build time and invoked at the start of each node call BEFORE the
+    routing dispatch. The runner gets the live ``GraphState`` and the
+    optional ``framework_cfg`` and may return ``None`` (continue with
+    the routing table) or a dict patch that gets merged into state. A
+    patch carrying ``"next_route"`` short-circuits the routing table
+    entirely (use ``"__end__"`` to terminate the graph).
+    """
+    # Local import to avoid the circular runtime.graph -> runtime.agents
+    # cycle at module-load time.
+
+
+    if skill.kind != "supervisor":
+        raise ValueError(
+            f"make_supervisor_node called with non-supervisor skill "
+            f"{skill.name!r} (kind={skill.kind!r})"
+        )
+
+    runner: Callable[..., Any] | None = None
+    if skill.runner is not None:
+        if callable(skill.runner):
+            # Test stubs and composed runners may supply a live callable
+            # directly rather than a dotted-path string. Access via the
+            # class __dict__ to avoid Python binding it as an instance
+            # method when the skill is a plain object (not a Pydantic model).
+            raw = vars(type(skill)).get("runner", skill.runner)
+            runner = raw if callable(raw) else skill.runner
+        else:
+            # Resolved a second time here so a runner that fails to import
+            # at graph-build time still surfaces a clear error. The skill
+            # validator catches most issues at YAML load; this is belt-and-
+            # braces and also gives us the live callable to invoke.
+            runner = _resolve_dotted_callable(
+                skill.runner, source=f"supervisor {skill.name!r} runner"
+            )
+
+    async def node(state: GraphState) -> dict:
+        sess: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        # ``dispatch_depth`` is an extension field on GraphState; start
+        # at 0 and increment per supervisor entry.
+        depth = int(state.get("dispatch_depth") or 0) + 1
+        if depth > skill.max_dispatch_depth:
+            logger.warning(
+                "supervisor %s: dispatch depth %d exceeds limit %d; aborting",
+                skill.name, depth, skill.max_dispatch_depth,
+            )
+            return {
+                "session": sess,
+                "next_route": "__end__",
+                "last_agent": skill.name,
+                "dispatch_depth": depth,
+                "error": (
+                    f"supervisor {skill.name!r}: max_dispatch_depth "
+                    f"{skill.max_dispatch_depth} exceeded"
+                ),
+            }
+
+        # ----- App-supplied runner hook -------------------------------
+        runner_patch: dict[str, Any] = {}
+        if runner is not None:
+            # Build a thin proxy so the runner can reach intake_context
+            # (and any other framework_cfg attributes) without needing
+            # framework_cfg to be mutable. The proxy exposes intake_context
+            # directly and falls back to framework_cfg for all other attrs.
+            _app_cfg_proxy = type("_RunnerAppCfg", (), {
+                "intake_context": getattr(framework_cfg, "intake_context", None),
+                "__getattr__": lambda self, name: getattr(framework_cfg, name),
+            })()
+            try:
+                result = runner(state, app_cfg=_app_cfg_proxy)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "supervisor %s: runner %s raised; aborting to __end__",
+                    skill.name, skill.runner,
+                )
+                return {
+                    "session": sess,
+                    "next_route": "__end__",
+                    "last_agent": skill.name,
+                    "dispatch_depth": depth,
+                    "error": (
+                        f"supervisor {skill.name!r}: runner failed: {exc}"
+                    ),
+                }
+            if isinstance(result, dict):
+                runner_patch = dict(result)
+            elif result is not None:
+                logger.warning(
+                    "supervisor %s: runner returned %s (expected dict|None); "
+                    "ignoring", skill.name, type(result).__name__,
+                )
+            override = runner_patch.pop("next_route", None)
+            if override is not None:
+                # Short-circuit: skip the routing table entirely. Audit
+                # log still fires so operators can trace the decision.
+                target = _normalize_runner_route(override)
+                # Pick up any fresh reference the runner returned.
+                sess = runner_patch.get("session", sess)
+                try:
+                    payload_size = len(
+                        json.dumps(sess.model_dump(), default=str)
+                    )
+                except Exception:  # noqa: BLE001 — defensive
+                    payload_size = 0
+                log_supervisor_dispatch(
+                    session=sess,
+                    supervisor=skill.name,
+                    strategy=f"runner:{skill.runner}",
+                    depth=depth,
+                    targets=[target],
+                    rule_matched=None,
+                    payload_size=payload_size,
+                )
+                out: dict[str, Any] = {
+                    "session": sess,
+                    "next_route": target,
+                    "last_agent": skill.name,
+                    "dispatch_depth": depth,
+                    "error": None,
+                }
+                # Merge any non-route keys the runner returned (e.g.
+                # extra GraphState fields apps want to carry forward).
+                for k, v in runner_patch.items():
+                    if k not in out:
+                        out[k] = v
+                return out
+            # No override: fold any payload mutation back so the
+            # routing table sees the up-to-date object.
+            if "session" in runner_patch:
+                sess = runner_patch["session"]
+
+        rule_matched: str | None = None
+        if skill.dispatch_strategy == "rule":
+            target, rule_matched = _rule_pick_target(skill=skill, incident=sess)
+        else:  # "llm"
+            if llm is None:
+                logger.warning(
+                    "supervisor %s: strategy=llm but no llm provided; "
+                    "falling back to first subordinate", skill.name,
+                )
+                target = skill.subordinates[0]
+            else:
+                target = _llm_pick_target(skill=skill, llm=llm, incident=sess)
+
+        # Audit: one structured log entry per dispatch.
+        try:
+            payload_size = len(json.dumps(sess.model_dump(), default=str))
+        except Exception:  # noqa: BLE001 — defensive; size is a hint
+            payload_size = 0
+        log_supervisor_dispatch(
+            session=sess,
+            supervisor=skill.name,
+            strategy=skill.dispatch_strategy,
+            depth=depth,
+            targets=[target],
+            rule_matched=rule_matched,
+            payload_size=payload_size,
+        )
+
+        out: dict[str, Any] = {
+            "session": sess,
+            "next_route": target,
+            "last_agent": skill.name,
+            "dispatch_depth": depth,
+            "error": None,
+        }
+        # Carry through any extra keys the runner emitted that the
+        # framework didn't consume itself (e.g. memory snapshots).
+        for k, v in runner_patch.items():
+            if k not in out:
+                out[k] = v
+        return out
+
+    return node
+
+
+__all__ = ["make_supervisor_node", "log_supervisor_dispatch"]
+
+# ====== module: runtime/agents/monitor.py ======
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Safe-eval evaluator
+# ---------------------------------------------------------------------------
+
+
+class SafeEvalError(Exception):
+    """Raised when a supposedly-validated expression fails to evaluate."""
+
+
+def safe_eval(expr: str, ctx: dict[str, Any]) -> Any:
+    """Evaluate ``expr`` against ``ctx`` after a fresh AST whitelist check.
+
+    The skill loader validates ``emit_signal_when`` at parse time; we
+    re-validate here on every call to keep the threat model defensive
+    against any future code path that might construct a Skill bypassing
+    the loader's validators.
+    """
+    _validate_safe_expr(expr, source="monitor.emit_signal_when")
+    code = compile(expr, "<safe-eval>", "eval")
+    try:
+        return eval(code, {"__builtins__": {}}, ctx)  # noqa: S307 — AST-whitelisted
+    except Exception as exc:  # noqa: BLE001
+        raise SafeEvalError(f"emit_signal_when {expr!r} raised: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Cron parsing (minute-resolution; matches Skill._validate_cron grammar)
+# ---------------------------------------------------------------------------
+
+
+def _expand_cron_field(field: str, lo: int, hi: int) -> set[int]:
+    """Expand a single cron field into the set of int values it matches.
+
+    Supports ``*``, ``*/n``, ``a``, ``a-b``, ``a-b/n``, and
+    comma-separated combinations of those — the grammar accepted by
+    :func:`runtime.skill._validate_cron`.
+    """
+    out: set[int] = set()
+    for part in field.split(","):
+        step = 1
+        if "/" in part:
+            base, _, step_s = part.partition("/")
+            step = int(step_s)
+        else:
+            base = part
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            a, _, b = base.partition("-")
+            start, end = int(a), int(b)
+        else:
+            v = int(base)
+            start, end = v, v
+        out.update(range(start, end + 1, step))
+    return {v for v in out if lo <= v <= hi}
+
+
+def _cron_matches(expr: str, when: datetime) -> bool:
+    """Return True if the given datetime satisfies the 5-field cron expression.
+
+    Fields: minute, hour, day-of-month, month, day-of-week (0=Mon..6=Sun
+    — Python's ``datetime.weekday()`` convention; cron itself uses
+    0=Sun, but for our minute-resolution scheduler the convention only
+    needs to be internally consistent and documented).
+    """
+    minute, hour, dom, month, dow = expr.split()
+    return (
+        when.minute in _expand_cron_field(minute, 0, 59)
+        and when.hour in _expand_cron_field(hour, 0, 23)
+        and when.day in _expand_cron_field(dom, 1, 31)
+        and when.month in _expand_cron_field(month, 1, 12)
+        and when.weekday() in _expand_cron_field(dow, 0, 6)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Monitor callable factory
+# ---------------------------------------------------------------------------
+
+
+def make_monitor_callable(
+    *,
+    skill: Skill,
+    observe_fn: Callable[[str], Any],
+    fire_trigger: Callable[[str, dict[str, Any]], None],
+) -> Callable[[], None]:
+    """Build the callable a :class:`MonitorRunner` runs per tick.
+
+    ``observe_fn(tool_name)`` is the seam through which the runner
+    invokes a tool. Production wires this to the orchestrator's MCP
+    tool registry; tests wire it to deterministic stubs.
+
+    ``fire_trigger(name, payload)`` is the seam through which the
+    runner fires a trigger. Production wires this to the trigger
+    registry; tests wire it to a recorder.
+
+    The returned callable is intentionally synchronous and exception-
+    safe: a failed ``observe_fn`` or ``fire_trigger`` is logged and
+    swallowed so one bad monitor cannot stall the runner.
+    """
+    if skill.kind != "monitor":
+        raise ValueError(
+            f"make_monitor_callable called with non-monitor skill "
+            f"{skill.name!r} (kind={skill.kind!r})"
+        )
+
+    def tick() -> None:
+        observation: dict[str, Any] = {}
+        for tool_name in skill.observe:
+            try:
+                observation[tool_name] = observe_fn(tool_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "monitor %s: observe tool %r raised %s; skipping",
+                    skill.name, tool_name, exc,
+                )
+                observation[tool_name] = None
+        ctx = {
+            "observation": observation,
+            "obs": observation,
+        }
+        try:
+            should_emit = bool(safe_eval(skill.emit_signal_when or "False", ctx))
+        except SafeEvalError as exc:
+            logger.warning("monitor %s: %s", skill.name, exc)
+            return
+        if not should_emit:
+            return
+        try:
+            fire_trigger(skill.trigger_target or "", {
+                "monitor": skill.name,
+                "observation": observation,
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "monitor %s: fire_trigger(%s) raised %s",
+                skill.name, skill.trigger_target, exc,
+            )
+
+    return tick
+
+
+# ---------------------------------------------------------------------------
+# MonitorRunner — orchestrator-level singleton
+# ---------------------------------------------------------------------------
+
+
+class _RegisteredMonitor:
+    __slots__ = ("skill", "callable_", "next_run_ts")
+
+    def __init__(self, skill: Skill, callable_: Callable[[], None]) -> None:
+        self.skill = skill
+        self.callable_ = callable_
+        # Track the last *scheduled* minute we fired so we never fire
+        # twice for the same wall-clock minute even if the scheduler
+        # thread oversleeps.
+        self.next_run_ts: datetime | None = None
+
+
+class MonitorRunner:
+    """Owns a bounded thread pool and a scheduler thread that ticks
+    registered monitor skills on their cron schedules.
+
+    Exactly one ``MonitorRunner`` exists per ``OrchestratorService``
+    instance; the runner is built at service startup and shut down at
+    service teardown.
+
+    Concurrency: each tick is dispatched to the
+    :class:`~concurrent.futures.ThreadPoolExecutor` so the scheduler
+    thread itself never blocks on a slow ``observe`` tool. The pool
+    size defaults to ``4`` (R6); each tick has a per-monitor timeout
+    sourced from the skill's ``tick_timeout_seconds``.
+    """
+
+    def __init__(
+        self,
+        *,
+        observe_fn: Callable[[str], Any],
+        fire_trigger: Callable[[str, dict[str, Any]], None],
+        max_workers: int = 4,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._observe_fn = observe_fn
+        self._fire_trigger = fire_trigger
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="monitor",
+        )
+        self._monitors: dict[str, _RegisteredMonitor] = {}
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        # Injection seam for tests; default uses real wall-clock UTC.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    # ----- registration -----
+
+    def register(self, skill: Skill) -> None:
+        if skill.kind != "monitor":
+            raise ValueError(
+                f"MonitorRunner.register: skill {skill.name!r} kind="
+                f"{skill.kind!r} (expected 'monitor')"
+            )
+        callable_ = make_monitor_callable(
+            skill=skill,
+            observe_fn=self._observe_fn,
+            fire_trigger=self._fire_trigger,
+        )
+        with self._lock:
+            if skill.name in self._monitors:
+                raise ValueError(f"monitor {skill.name!r} already registered")
+            self._monitors[skill.name] = _RegisteredMonitor(skill, callable_)
+
+    def unregister(self, name: str) -> None:
+        with self._lock:
+            self._monitors.pop(name, None)
+
+    def registered(self) -> list[str]:
+        with self._lock:
+            return sorted(self._monitors.keys())
+
+    # ----- lifecycle -----
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="MonitorRunner",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, *, wait: bool = True, timeout: float = 5.0) -> None:
+        """Halt the scheduler thread and shut down the executor.
+
+        ``wait=True`` (default) blocks up to ``timeout`` seconds for
+        in-flight ticks to drain. Daemon threads are still joined so
+        pytest fixture teardown is deterministic.
+        """
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and wait:
+            thread.join(timeout=timeout)
+        self._executor.shutdown(wait=wait)
+        self._thread = None
+
+    # ----- test hook -----
+
+    def tick_once(self, when: datetime | None = None) -> None:
+        """Fire any monitors whose cron expression matches ``when``.
+
+        Useful in tests where freezing wall-clock time is awkward; the
+        production scheduler loop calls this internally too.
+        """
+        when = when or self._clock()
+        # Truncate to the minute so identical seconds within a minute
+        # don't fire the same monitor twice.
+        minute = when.replace(second=0, microsecond=0)
+        with self._lock:
+            entries = list(self._monitors.values())
+        for entry in entries:
+            try:
+                if not _cron_matches(entry.skill.schedule or "* * * * *", minute):
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "monitor %s: cron parse failed (%s); skipping tick",
+                    entry.skill.name, exc,
+                )
+                continue
+            if entry.next_run_ts == minute:
+                # Already fired this minute; idempotent on oversleep.
+                continue
+            entry.next_run_ts = minute
+            self._dispatch(entry)
+
+    def _dispatch(self, entry: _RegisteredMonitor) -> None:
+        timeout = float(entry.skill.tick_timeout_seconds or 30.0)
+        future = self._executor.submit(entry.callable_)
+
+        def _wait_and_log() -> None:
+            try:
+                future.result(timeout=timeout)
+            except FuturesTimeout:
+                logger.warning(
+                    "monitor %s: tick exceeded %.1fs timeout",
+                    entry.skill.name, timeout,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "monitor %s: tick raised %s", entry.skill.name, exc,
+                )
+
+        # Watcher runs on a side thread so the scheduler loop never
+        # blocks waiting for a slow tick — the executor handles
+        # parallelism, the watcher handles per-tick timeout reporting.
+        threading.Thread(
+            target=_wait_and_log,
+            name=f"monitor-watch:{entry.skill.name}",
+            daemon=True,
+        ).start()
+
+    # ----- scheduler loop -----
+
+    def _run(self) -> None:
+        """Single-threaded scheduler. Wakes once per second, fires
+        any monitor whose cron expression matches the current minute,
+        marks each fired monitor for the minute so we never fire
+        twice if we oversleep.
+        """
+        while not self._stop.is_set():
+            try:
+                self.tick_once()
+            except Exception as exc:  # noqa: BLE001 — never crash the loop
+                logger.warning("MonitorRunner loop error: %s", exc)
+            # Sleep with frequent wakeups so stop() returns promptly.
+            self._stop.wait(timeout=1.0)
+
+
+__all__ = [
+    "MonitorRunner",
+    "SafeEvalError",
+    "make_monitor_callable",
+    "safe_eval",
 ]
 
 # ====== module: runtime/graph.py ======
@@ -8415,6 +11519,112 @@ class SessionLockRegistry:
             if slot.depth == 0:
                 slot.owner = None
                 slot.lock.release()
+
+# ====== module: runtime/skill_validator.py ======
+
+class SkillValidationError(RuntimeError):
+    """Raised when skill YAML references a tool or route that does not
+    exist or is malformed. Refuses to start the orchestrator."""
+
+
+def _build_bare_to_full_map(registered_tools: set[str]) -> dict[str, list[str]]:
+    """Map bare tool name → list of fully-qualified ``<server>:<tool>``."""
+    bare_to_full: dict[str, list[str]] = {}
+    for full in registered_tools:
+        bare = full.split(":", 1)[1] if ":" in full else full
+        bare_to_full.setdefault(bare, []).append(full)
+    return bare_to_full
+
+
+def _check_tool_ref(
+    skill_name: str,
+    tool_ref: str,
+    registered_tools: set[str],
+    bare_to_full: dict[str, list[str]],
+) -> None:
+    """Raise SkillValidationError if ``tool_ref`` doesn't resolve to a
+    registered tool, or resolves ambiguously across multiple servers."""
+    if tool_ref in registered_tools:
+        return
+    resolutions = bare_to_full.get(tool_ref)
+    if resolutions is None:
+        raise SkillValidationError(
+            f"skill {skill_name!r} references tool {tool_ref!r} which "
+            f"is not registered. Known tools: {sorted(registered_tools)[:10]}..."
+        )
+    if len(resolutions) > 1:
+        raise SkillValidationError(
+            f"skill {skill_name!r} uses bare tool ref {tool_ref!r} but "
+            f"it is exposed by multiple servers: {sorted(resolutions)}. "
+            f"Use the prefixed form to disambiguate."
+        )
+
+
+def validate_skill_tool_references(
+    skills: dict, registered_tools: set[str],
+) -> None:
+    """Assert every ``tools.local`` entry in every skill resolves to a
+    registered MCP tool.
+
+    ``registered_tools`` is the set of fully-qualified ``<server>:<tool>``
+    names from the MCP loader. We accept either bare or prefixed forms
+    in skill YAML (the LLM-facing call uses prefixed; YAML can use
+    either for ergonomics).
+    """
+    bare_to_full = _build_bare_to_full_map(registered_tools)
+    for skill_name, skill in skills.items():
+        local = (skill.get("tools") or {}).get("local") or []
+        for tool_ref in local:
+            _check_tool_ref(skill_name, tool_ref, registered_tools, bare_to_full)
+
+
+def validate_skill_routes(skills: dict) -> None:
+    """Assert every skill has a ``when: default`` route entry.
+
+    Skipped for ``kind: supervisor`` skills — supervisors dispatch via
+    ``dispatch_rules`` to subordinates and do not use the ``routes``
+    table at all.
+    """
+    for skill_name, skill in skills.items():
+        if skill.get("kind") == "supervisor":
+            continue
+        routes = skill.get("routes") or []
+        if not any((r.get("when") == "default") for r in routes):
+            raise SkillValidationError(
+                f"skill {skill_name!r} has no ``when: default`` route — "
+                f"agents whose signal doesn't match a rule will hang."
+            )
+
+# ====== module: runtime/storage/checkpoint_gc.py ======
+
+def gc_orphaned_checkpoints(engine: Engine) -> int:
+    """Remove orphaned checkpoint rows; return count removed.
+
+    Returns 0 if the ``checkpoints`` table doesn't exist (fresh DB,
+    LangGraph checkpointer has not yet bootstrapped its schema).
+    """
+    with engine.begin() as conn:
+        live_ids = {row[0] for row in conn.execute(
+            text("SELECT id FROM incidents")
+        )}
+        try:
+            rows = conn.execute(text(
+                "SELECT DISTINCT thread_id FROM checkpoints"
+            )).all()
+        except OperationalError:
+            return 0
+        # thread_id may be ``INC-1`` or ``INC-1:retry-N`` — strip suffix.
+        orphans = []
+        for (tid,) in rows:
+            base = tid.split(":")[0] if tid else tid
+            if base not in live_ids:
+                orphans.append(tid)
+        for tid in orphans:
+            conn.execute(
+                text("DELETE FROM checkpoints WHERE thread_id = :tid"),
+                {"tid": tid},
+            )
+        return len(orphans)
 
 # ====== module: runtime/orchestrator.py ======
 

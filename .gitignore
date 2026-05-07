@@ -50,10 +50,13 @@ Thumbs.db
 # --- Claude tooling artifacts ----------------------------------------
 AGENTS.md
 ASR.md
-# docs/AIRGAP_INSTALL.md is the shipped air-gap install doc (Phase 14, HARD-02).
-# Everything else under docs/ is Claude scratch.
+# Tracked docs are explicitly listed below; everything else under docs/
+# is Claude scratch (plans, brainstorm output, etc) and stays gitignored.
+#   - AIRGAP_INSTALL.md: Phase 14 (HARD-02) air-gap install path.
+#   - DEVELOPMENT.md:    Phase 16 (BUNDLER-01) contributor workflow.
 docs/*
 !docs/AIRGAP_INSTALL.md
+!docs/DEVELOPMENT.md
 REVIEW_*.md
 review_*.md
 .planning/
