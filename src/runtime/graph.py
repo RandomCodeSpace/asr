@@ -16,6 +16,7 @@ from runtime.skill import Skill
 from runtime.config import (
     AppConfig,
     FrameworkAppConfig,
+    GatePolicy,
     GatewayConfig,
     resolve_framework_app_config,
 )
@@ -23,6 +24,11 @@ from runtime.llm import get_llm
 from runtime.mcp_loader import ToolRegistry
 from runtime.storage.session_store import SessionStore
 from runtime.tools.gateway import wrap_tool
+# Phase 11 (FOC-04 / D-11-04): GraphInterrupt is the LangGraph
+# pending-approval pause signal. It is NOT an error and must NOT route
+# through _handle_agent_failure -- the orchestrator's interrupt-aware
+# bridge handles the resume protocol via the checkpointer.
+from langgraph.errors import GraphInterrupt
 from runtime.agents.turn_output import (
     AgentTurnOutput,
     EnvelopeMissingError,
@@ -200,6 +206,11 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     for attempt in range(max_attempts):
         try:
             return await executor.ainvoke(input_)
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): never retry a HITL pause.
+            # GraphInterrupt is a checkpointed pending_approval signal,
+            # not a transient error.
+            raise
         except Exception as exc:  # noqa: BLE001
             msg = str(exc).lower()
             transient = any(m in msg for m in _TRANSIENT_MARKERS)
@@ -480,6 +491,7 @@ def make_agent_node(
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
     injected_args: dict[str, str] | None = None,
+    gate_policy: "GatePolicy | None" = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -540,7 +552,8 @@ def make_agent_node(
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
-                          injected_args=injected_args or {})
+                          injected_args=injected_args or {},
+                          gate_policy=gate_policy)
                 for t in visible_tools
             ]
         elif injected_keys:
@@ -596,11 +609,26 @@ def make_agent_node(
             response_format=AgentTurnOutput,
         )
 
+        # Phase 11 (FOC-04): reset per-turn confidence hint. The hint
+        # is updated below after _harvest_tool_calls_and_patches; on
+        # re-entry from a HITL pause the hint resets cleanly so a new
+        # turn starts from "no signal yet" (None).
+        try:
+            incident.turn_confidence_hint = None
+        except (AttributeError, ValueError):
+            pass
+
         try:
             result = await _ainvoke_with_retry(
                 agent_executor,
                 {"messages": [HumanMessage(content=_format_agent_input(incident))]},
             )
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): HITL pause is NOT an error.
+            # Re-raise so LangGraph's checkpointer captures the paused
+            # state. Session.status is left to the orchestrator's
+            # interrupt-aware bridge, NOT _handle_agent_failure.
+            raise
         except Exception as exc:  # noqa: BLE001
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
@@ -623,6 +651,13 @@ def make_agent_node(
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
+        # Phase 11 (FOC-04): update hint so any subsequent in-turn
+        # tool call sees the harvested confidence at the gateway.
+        if agent_confidence is not None:
+            try:
+                incident.turn_confidence_hint = agent_confidence
+            except (AttributeError, ValueError):
+                pass
 
         # Pair tool responses with their tool calls.
         _pair_tool_responses(messages, incident)
@@ -874,6 +909,10 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     valid_signals = frozenset(cfg.orchestrator.signals)
     gateway_cfg = getattr(cfg.runtime, "gateway", None)
+    # Phase 11 (FOC-04): thread the orchestrator's gate_policy down to
+    # wrap_tool so should_gate can apply the configured per-app
+    # confidence threshold + gated environments / risk actions.
+    gate_policy = getattr(cfg.orchestrator, "gate_policy", None)
     # Build the harvester's tool-name sets once per graph-build. The
     # union of ``terminal_tools`` (status-transitioning) and
     # ``harvest_terminal_tools`` (harvest-only) gives the full
@@ -922,6 +961,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
             injected_args=cfg.orchestrator.injected_args,
+            gate_policy=gate_policy,
         )
     return nodes
 

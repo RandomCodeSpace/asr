@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import yaml
 
 
@@ -109,6 +109,7 @@ instead of at runtime. Three kinds are supported:
 
 import ast
 from typing import Any, Callable, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ----- imports for runtime/llm.py -----
@@ -299,6 +300,53 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 
 
+# ----- imports for runtime/policy.py -----
+"""Pure HITL gating policy (Phase 11 / FOC-04).
+
+The :func:`should_gate` function is the SOLE place the framework decides
+whether a tool call requires human-in-the-loop approval. It composes
+three orthogonal inputs:
+
+  1. ``effective_action(tool_call.tool, env=session.environment,
+     gateway_cfg=cfg.gateway)`` -- preserves the v1.0 PVC-08
+     prefixed-form lookup invariant.
+  2. ``session.environment`` -- gated when in
+     ``cfg.gate_policy.gated_environments``.
+  3. ``confidence`` -- gated when below
+     ``cfg.gate_policy.confidence_threshold``.
+
+Pure: same inputs always yield identical :class:`GateDecision`; no I/O,
+no skill-prompt input, no mutation.
+
+Precedence (descending):
+
+  1. ``effective_action`` returns a value in
+     ``cfg.gate_policy.gated_risk_actions``
+     -> ``GateDecision(gate=True, reason="high_risk_tool")``
+  2. ``session.environment`` in ``cfg.gate_policy.gated_environments``
+     AND ``effective_action != "auto"``
+     -> ``GateDecision(gate=True, reason="gated_env")``
+  3. ``confidence`` is not None AND
+     ``confidence < cfg.gate_policy.confidence_threshold``
+     AND ``effective_action != "auto"``
+     -> ``GateDecision(gate=True, reason="low_confidence")``
+  4. otherwise -> ``GateDecision(gate=False, reason="auto")``
+
+The literal ``"blocked"`` is reserved on :class:`GateDecision.reason`
+for future hard-stop semantics; Phase 11 itself never returns it from a
+production code path.
+"""
+
+
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import BaseModel, ConfigDict
+
+
+# Phase 11 (FOC-04): forward-reference imports for the should_gate
+# signature only; kept inside ``TYPE_CHECKING`` so the bundle's
+# intra-import stripper does not remove a load-bearing import. The
+# ``pass`` keeps the block syntactically valid after stripping.
 # ----- imports for runtime/graph.py -----
 """LangGraph state, routing helpers, and node runner."""
 
@@ -316,6 +364,11 @@ from langgraph.graph import StateGraph, END
 
 
 
+# Phase 11 (FOC-04 / D-11-04): GraphInterrupt is the LangGraph
+# pending-approval pause signal. It is NOT an error and must NOT route
+# through _handle_agent_failure -- the orchestrator's interrupt-aware
+# bridge handles the resume protocol via the checkpointer.
+from langgraph.errors import GraphInterrupt
 
 
 # ----- imports for runtime/checkpointer_postgres.py -----
@@ -1132,6 +1185,43 @@ class Paths(BaseModel):
     incidents_dir: str = "incidents"
 
 
+class GatePolicy(BaseModel):
+    """Phase 11 (FOC-04): declarative HITL gating policy.
+
+    Drives the framework's pure ``should_gate`` boundary. The LLM never
+    sees this config -- flow control is a framework decision, not a
+    skill-prompt incantation.
+
+    ``confidence_threshold`` is the strict-less-than predicate the gate
+    applies to the active turn confidence; tool calls below the
+    threshold fire a low_confidence pause for any non-auto-rated tool.
+
+    ``gated_environments`` enumerates Session.environment values that
+    automatically gate every non-auto-rated tool call regardless of
+    confidence -- lifecycle defence against blast radius in production.
+
+    ``gated_risk_actions`` enumerates GatewayAction Literal values
+    (``auto``/``notify``/``approve``) that ALWAYS trigger a gate
+    regardless of env or confidence. Default ``{"approve"}`` mirrors
+    v1.0 HITL behaviour.
+
+    Phase 11 chooses ``"approve"`` (the actual GatewayAction literal)
+    over CONTEXT.md's sketched ``"hitl"`` -- see
+    src/runtime/tools/gateway.py:32 for the canonical 3-valued
+    GatewayAction Literal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    gated_environments: set[str] = Field(
+        default_factory=lambda: {"production"},
+    )
+    gated_risk_actions: set[str] = Field(
+        default_factory=lambda: {"approve"},
+    )
+
+
 class OrchestratorConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -1231,6 +1321,12 @@ class OrchestratorConfig(BaseModel):
     # behaviour). Validated at config-load: keys are non-empty
     # identifiers, values are dotted paths starting with "session.".
     injected_args: dict[str, str] = Field(default_factory=dict)
+
+    # Phase 11 (FOC-04): declarative HITL gating policy. Apps tune
+    # thresholds in YAML; the framework's should_gate boundary reads
+    # this struct and the LLM never sees it. Default keeps v1.1
+    # behaviour (production gates "approve"-risk tools, threshold 0.7).
+    gate_policy: "GatePolicy" = Field(default_factory=lambda: GatePolicy())
 
     @field_validator("state_overrides_schema")
     @classmethod
@@ -1792,6 +1888,17 @@ class Session(BaseModel):
     # with a stale version raise ``StaleVersionError`` so the caller can
     # reload + retry.
     version: int = 1
+    # Phase 11 (FOC-04): transient per-turn confidence hint set by the
+    # agent runner (graph.py / responsive.py) AFTER each
+    # _harvest_tool_calls_and_patches call so the gateway's should_gate
+    # boundary can apply low_confidence gating using whatever
+    # confidence the agent has emitted so far. Reset to ``None`` at
+    # turn start; never persisted (``Field(exclude=True)``). The
+    # framework treats ``None`` as "no signal yet" and does NOT fire a
+    # low_confidence gate -- this avoids a false-positive gate on the
+    # very first tool call of a turn before any envelope/tool-arg
+    # carrying confidence has surfaced.
+    turn_confidence_hint: float | None = Field(default=None, exclude=True)
 
     # ------------------------------------------------------------------
     # App-overridable agent-input formatter hook.
@@ -3954,6 +4061,88 @@ async def load_tools(cfg: MCPConfig, stack: AsyncExitStack) -> ToolRegistry:
             ))
     return registry
 
+# ====== module: runtime/policy.py ======
+
+if TYPE_CHECKING:  # pragma: no cover -- type checking only
+
+
+    pass  # noqa: PIE790 -- bundle survives even if imports are stripped
+
+
+GateReason = Literal[
+    "auto",
+    "high_risk_tool",
+    "gated_env",
+    "low_confidence",
+    "blocked",
+]
+
+
+class GateDecision(BaseModel):
+    """Outcome of a single gating evaluation."""
+
+    model_config = ConfigDict(extra="forbid")
+    gate: bool
+    reason: GateReason
+
+
+def should_gate(
+    session: Any,
+    tool_call: "ToolCall",
+    confidence: float | None,
+    cfg: "OrchestratorConfig",
+) -> GateDecision:
+    """Decide whether ``tool_call`` should pause for HITL approval.
+
+    Pure -- delegates the per-tool risk lookup to
+    :func:`runtime.tools.gateway.effective_action` (so the v1.0 PVC-08
+    prefixed-form lookup invariant is preserved) and combines the
+    result with ``session.environment`` and ``confidence`` per the
+    precedence rules in the module docstring.
+
+    ``session`` is typed as ``Any`` because the framework's base
+    :class:`runtime.state.Session` does not own the ``environment``
+    field (apps subclass and add it). The function reads
+    ``session.environment`` and tolerates a missing attribute by
+    treating it as ``None``.
+
+    ``confidence=None`` means "no signal yet" -- treated internally as
+    1.0 to avoid a false-positive low_confidence gate before any
+    envelope/tool-arg has surfaced for the active turn.
+    """
+    # Read gateway config off the OrchestratorConfig. The runtime threads
+    # it via cfg.gateway today (sibling of cfg.gate_policy in the
+    # OrchestratorConfig namespace) -- gracefully tolerate the legacy
+    # path where gateway is configured on RuntimeConfig instead.
+    gateway_cfg = getattr(cfg, "gateway", None)
+    env = getattr(session, "environment", None)
+
+    risk_action = effective_action(
+        tool_call.tool,
+        env=env,
+        gateway_cfg=gateway_cfg,
+    )
+
+    # 1. high-risk tool gates first.
+    if risk_action in cfg.gate_policy.gated_risk_actions:
+        return GateDecision(gate=True, reason="high_risk_tool")
+
+    # 2. gated env: any non-"auto" risk in a gated environment.
+    if (env in cfg.gate_policy.gated_environments
+            and risk_action != "auto"):
+        return GateDecision(gate=True, reason="gated_env")
+
+    # 3. low confidence: only an actionable tool. None == "no signal yet".
+    effective_conf = 1.0 if confidence is None else confidence
+    if (effective_conf < cfg.gate_policy.confidence_threshold
+            and risk_action != "auto"):
+        return GateDecision(gate=True, reason="low_confidence")
+
+    return GateDecision(gate=False, reason="auto")
+
+
+__all__ = ["GateDecision", "GateReason", "should_gate"]
+
 # ====== module: runtime/graph.py ======
 
 logger = logging.getLogger(__name__)
@@ -4126,6 +4315,11 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     for attempt in range(max_attempts):
         try:
             return await executor.ainvoke(input_)
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): never retry a HITL pause.
+            # GraphInterrupt is a checkpointed pending_approval signal,
+            # not a transient error.
+            raise
         except Exception as exc:  # noqa: BLE001
             msg = str(exc).lower()
             transient = any(m in msg for m in _TRANSIENT_MARKERS)
@@ -4406,6 +4600,7 @@ def make_agent_node(
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
     injected_args: dict[str, str] | None = None,
+    gate_policy: "GatePolicy | None" = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -4463,7 +4658,8 @@ def make_agent_node(
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
-                          injected_args=injected_args or {})
+                          injected_args=injected_args or {},
+                          gate_policy=gate_policy)
                 for t in visible_tools
             ]
         elif injected_keys:
@@ -4519,11 +4715,26 @@ def make_agent_node(
             response_format=AgentTurnOutput,
         )
 
+        # Phase 11 (FOC-04): reset per-turn confidence hint. The hint
+        # is updated below after _harvest_tool_calls_and_patches; on
+        # re-entry from a HITL pause the hint resets cleanly so a new
+        # turn starts from "no signal yet" (None).
+        try:
+            incident.turn_confidence_hint = None
+        except (AttributeError, ValueError):
+            pass
+
         try:
             result = await _ainvoke_with_retry(
                 agent_executor,
                 {"messages": [HumanMessage(content=_format_agent_input(incident))]},
             )
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): HITL pause is NOT an error.
+            # Re-raise so LangGraph's checkpointer captures the paused
+            # state. Session.status is left to the orchestrator's
+            # interrupt-aware bridge, NOT _handle_agent_failure.
+            raise
         except Exception as exc:  # noqa: BLE001
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
@@ -4546,6 +4757,13 @@ def make_agent_node(
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
+        # Phase 11 (FOC-04): update hint so any subsequent in-turn
+        # tool call sees the harvested confidence at the gateway.
+        if agent_confidence is not None:
+            try:
+                incident.turn_confidence_hint = agent_confidence
+            except (AttributeError, ValueError):
+                pass
 
         # Pair tool responses with their tool calls.
         _pair_tool_responses(messages, incident)
@@ -4797,6 +5015,10 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     valid_signals = frozenset(cfg.orchestrator.signals)
     gateway_cfg = getattr(cfg.runtime, "gateway", None)
+    # Phase 11 (FOC-04): thread the orchestrator's gate_policy down to
+    # wrap_tool so should_gate can apply the configured per-app
+    # confidence threshold + gated environments / risk actions.
+    gate_policy = getattr(cfg.orchestrator, "gate_policy", None)
     # Build the harvester's tool-name sets once per graph-build. The
     # union of ``terminal_tools`` (status-transitioning) and
     # ``harvest_terminal_tools`` (harvest-only) gives the full
@@ -4845,6 +5067,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
             injected_args=cfg.orchestrator.injected_args,
+            gate_policy=gate_policy,
         )
     return nodes
 
@@ -7502,6 +7725,7 @@ if TYPE_CHECKING:
 
 
 
+from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
 
@@ -8214,6 +8438,17 @@ class Orchestrator(Generic[StateT]):
         except StaleVersionError:
             return None
 
+    @staticmethod
+    def _is_graph_interrupt(exc: BaseException) -> bool:
+        """Phase 11 (FOC-04 / D-11-04): identify a LangGraph HITL pause.
+
+        ``GraphInterrupt`` is NOT an error -- it signals a checkpointed
+        ``pending_approval`` state. Real exceptions still flow through
+        the normal failure path. Helper kept on the orchestrator so
+        callers don't each re-import langgraph internals.
+        """
+        return isinstance(exc, GraphInterrupt)
+
     async def _finalize_session_status_async(
         self, session_id: str,
     ) -> str | None:
@@ -8721,6 +8956,14 @@ class Orchestrator(Generic[StateT]):
                 config=self._thread_config(incident_id),
             ):
                 yield self._to_ui_event(ev, incident_id)
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): a resume that re-paused via
+            # a fresh HITL gate. Don't restore the prior pending_intervention
+            # block (the new pending_approval ToolCall row is the
+            # canonical pause record now). Propagate so LangGraph's
+            # checkpointer captures the new pause; the UI's
+            # _render_pending_approvals_block surfaces the resume target.
+            raise
         except Exception as exc:  # noqa: BLE001 — restore on any failure
             # Reload from disk to absorb any partial writes from tools
             # that ran before the failure, then restore intervention

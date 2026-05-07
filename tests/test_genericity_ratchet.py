@@ -58,7 +58,14 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                (the runner's domain Session) on the new envelope-error
 #                branch — no new domain concept, just two new uses of the
 #                existing variable on a structurally required code path.
-BASELINE_TOTAL = 149
+#   149 -> 153   Phase 11 (FOC-04): pure-policy HITL gating + GraphInterrupt-vs-error
+#                fix. The runner's per-turn confidence-hint reset / update lines
+#                in graph.py and responsive.py reuse the same ``incident`` local
+#                variable name introduced in Phase 10 (the runner's domain
+#                Session). Net +4 ``incident`` tokens, all reuses of the
+#                existing local on structurally required code paths -- no new
+#                domain concept introduced.
+BASELINE_TOTAL = 153
 
 
 def test_runtime_leaks_at_or_below_baseline():

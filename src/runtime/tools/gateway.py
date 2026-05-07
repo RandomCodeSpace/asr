@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from langchain_core.tools import BaseTool
 
-from runtime.config import GatewayConfig
+from runtime.config import GatePolicy, GatewayConfig
 from runtime.state import Session, ToolCall
 
 if TYPE_CHECKING:
@@ -142,6 +142,56 @@ def _find_existing_pending_index(
     return None
 
 
+def _evaluate_gate(
+    *,
+    session: Session,
+    tool_name: str,
+    gate_policy: GatePolicy | None,
+    gateway_cfg: GatewayConfig | None,
+) -> "GateDecision":
+    """Phase 11 (FOC-04) bridge: invoke ``should_gate`` from the wrap.
+
+    Constructs a minimal ``ToolCall`` shape for the pure-function
+    boundary, and a temporary ``OrchestratorConfig`` shim with the
+    in-flight ``gate_policy`` + ``gateway`` so the pure function sees
+    a single config object (its declared signature).
+
+    When ``gate_policy`` is ``None`` -- the legacy callers that have
+    not yet been threaded -- a default ``GatePolicy()`` is used so
+    Phase-11 behaviour applies uniformly. The default mirrors v1.0
+    HITL behaviour (``gated_risk_actions={"approve"}``), so existing
+    pre-Phase-11 tests keep passing.
+    """
+    # Local imports (avoid cycle on policy.py importing gateway).
+    from runtime.policy import GateDecision, should_gate
+    from runtime.config import OrchestratorConfig
+
+    effective_policy = gate_policy if gate_policy is not None else GatePolicy()
+    # OrchestratorConfig has model_config={"extra": "forbid"} so we
+    # cannot stash gateway as a top-level field. We thread gateway via
+    # the cfg.gateway lookup that should_gate already performs via
+    # ``getattr(cfg, "gateway", None)``. Building a transient cfg with
+    # gate_policy and a stashed gateway attr is the smallest-diff
+    # pathway -- avoids changing should_gate's signature.
+    cfg = OrchestratorConfig(gate_policy=effective_policy)
+    object.__setattr__(cfg, "gateway", gateway_cfg)
+
+    minimal_tc = ToolCall(
+        agent="",
+        tool=tool_name,
+        args={},
+        result=None,
+        ts=_now_iso(),
+        risk="low",
+        status="executed",
+    )
+    confidence = getattr(session, "turn_confidence_hint", None)
+    decision: GateDecision = should_gate(
+        session=session, tool_call=minimal_tc, confidence=confidence, cfg=cfg,
+    )
+    return decision
+
+
 class _GatedToolMarker(BaseTool):
     """Marker base class so ``isinstance(t, _GatedToolMarker)`` identifies
     a tool that has already been wrapped by :func:`wrap_tool`. Used to
@@ -166,6 +216,7 @@ def wrap_tool(
     agent_name: str = "",
     store: "SessionStore | None" = None,
     injected_args: dict[str, str] | None = None,
+    gate_policy: GatePolicy | None = None,
 ) -> BaseTool:
     """Wrap ``base_tool`` so every invocation passes through the gateway.
 
@@ -247,8 +298,21 @@ def wrap_tool(
                     injected_args_cfg=inject_cfg,
                     tool_name=inner.name,
                 )
-            action = effective_action(inner.name, env=env, gateway_cfg=gateway_cfg)
-            if action == "approve":
+            # Phase 11 (FOC-04): pure-policy gating boundary. Call
+            # should_gate to decide whether to pause for HITL approval;
+            # also call effective_action so the notify-audit branch
+            # below still fires for medium-risk tools that should NOT
+            # gate but should record an audit row.
+            action = effective_action(
+                inner.name, env=env, gateway_cfg=gateway_cfg,
+            )
+            decision = _evaluate_gate(
+                session=session,
+                tool_name=inner.name,
+                gate_policy=gate_policy,
+                gateway_cfg=gateway_cfg,
+            )
+            if decision.gate:
                 from langgraph.types import interrupt
 
                 # Persist a ``pending_approval`` ToolCall row BEFORE
@@ -395,8 +459,20 @@ def wrap_tool(
                     injected_args_cfg=inject_cfg,
                     tool_name=inner.name,
                 )
-            action = effective_action(inner.name, env=env, gateway_cfg=gateway_cfg)
-            if action == "approve":
+            # Phase 11 (FOC-04): pure-policy gating boundary. Mirror of
+            # the sync ``_run`` -- consult should_gate via
+            # ``_evaluate_gate``; still call ``effective_action`` to
+            # keep the notify-audit branch for medium-risk tools.
+            action = effective_action(
+                inner.name, env=env, gateway_cfg=gateway_cfg,
+            )
+            decision = _evaluate_gate(
+                session=session,
+                tool_name=inner.name,
+                gate_policy=gate_policy,
+                gateway_cfg=gateway_cfg,
+            )
+            if decision.gate:
                 from langgraph.types import interrupt
 
                 # Persist a ``pending_approval`` audit row BEFORE the

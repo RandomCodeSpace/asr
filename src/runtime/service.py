@@ -463,7 +463,23 @@ class OrchestratorService:
                         )
                     except asyncio.CancelledError:
                         raise
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is a
+                        # pending-approval pause, not a failure. Don't stamp
+                        # status='error' on the registry entry -- let
+                        # LangGraph's checkpointer hold the paused state
+                        # and let the UI's Approve/Reject action drive
+                        # resume.
+                        try:
+                            from langgraph.errors import GraphInterrupt
+                            if isinstance(exc, GraphInterrupt):
+                                # Propagate so the underlying Task
+                                # observer (stop_session etc.) still
+                                # sees the exception, but skip the
+                                # status='error' write.
+                                raise
+                        except ImportError:  # pragma: no cover
+                            pass
                         # Mark the registry entry so any concurrent snapshot
                         # observes the failure before the done-callback
                         # evicts it. The exception itself is preserved on

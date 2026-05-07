@@ -41,6 +41,14 @@ paths:
 # When no rule fires the session falls through to ``unreviewed``
 # (the v1.0 framework-default failure mode).
 orchestrator:
+  # Phase 11 (FOC-04): declarative HITL gating policy. Framework
+  # default threshold (0.7) -- code review is less prod-blast-radius
+  # than incident remediation so the stricter incident threshold
+  # (0.8) is unwarranted here.
+  gate_policy:
+    confidence_threshold: 0.7
+    gated_environments: [production]
+    gated_risk_actions: [approve]
   entry_agent: intake
   default_terminal_status: unreviewed
   statuses:

@@ -30,6 +30,7 @@ from runtime.intake import IntakeContext
 from runtime.llm import get_llm
 from runtime.skill import load_all_skills, Skill
 from runtime.mcp_loader import load_tools, ToolRegistry
+from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
 from runtime.graph import build_graph, GraphState
@@ -746,6 +747,17 @@ class Orchestrator(Generic[StateT]):
         except StaleVersionError:
             return None
 
+    @staticmethod
+    def _is_graph_interrupt(exc: BaseException) -> bool:
+        """Phase 11 (FOC-04 / D-11-04): identify a LangGraph HITL pause.
+
+        ``GraphInterrupt`` is NOT an error -- it signals a checkpointed
+        ``pending_approval`` state. Real exceptions still flow through
+        the normal failure path. Helper kept on the orchestrator so
+        callers don't each re-import langgraph internals.
+        """
+        return isinstance(exc, GraphInterrupt)
+
     async def _finalize_session_status_async(
         self, session_id: str,
     ) -> str | None:
@@ -1253,6 +1265,14 @@ class Orchestrator(Generic[StateT]):
                 config=self._thread_config(incident_id),
             ):
                 yield self._to_ui_event(ev, incident_id)
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): a resume that re-paused via
+            # a fresh HITL gate. Don't restore the prior pending_intervention
+            # block (the new pending_approval ToolCall row is the
+            # canonical pause record now). Propagate so LangGraph's
+            # checkpointer captures the new pause; the UI's
+            # _render_pending_approvals_block surfaces the resume target.
+            raise
         except Exception as exc:  # noqa: BLE001 — restore on any failure
             # Reload from disk to absorb any partial writes from tools
             # that ran before the failure, then restore intervention

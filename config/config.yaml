@@ -135,6 +135,13 @@ dedup:
 # ``incident_management.yaml`` since this is the bundled deployment
 # config for the example app.
 orchestrator:
+  # Phase 11 (FOC-04): declarative HITL gating policy. Framework
+  # default (threshold 0.7) -- mirrors incident_management v1.1
+  # behaviour with the production-class environment gate.
+  gate_policy:
+    confidence_threshold: 0.7
+    gated_environments: [production]
+    gated_risk_actions: [approve]
   entry_agent: intake
   default_terminal_status: needs_review
   statuses:

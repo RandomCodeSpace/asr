@@ -4,7 +4,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import yaml
 
 from runtime.terminal_tools import StatusDef, TerminalToolRule
@@ -138,6 +138,43 @@ class Paths(BaseModel):
     incidents_dir: str = "incidents"
 
 
+class GatePolicy(BaseModel):
+    """Phase 11 (FOC-04): declarative HITL gating policy.
+
+    Drives the framework's pure ``should_gate`` boundary. The LLM never
+    sees this config -- flow control is a framework decision, not a
+    skill-prompt incantation.
+
+    ``confidence_threshold`` is the strict-less-than predicate the gate
+    applies to the active turn confidence; tool calls below the
+    threshold fire a low_confidence pause for any non-auto-rated tool.
+
+    ``gated_environments`` enumerates Session.environment values that
+    automatically gate every non-auto-rated tool call regardless of
+    confidence -- lifecycle defence against blast radius in production.
+
+    ``gated_risk_actions`` enumerates GatewayAction Literal values
+    (``auto``/``notify``/``approve``) that ALWAYS trigger a gate
+    regardless of env or confidence. Default ``{"approve"}`` mirrors
+    v1.0 HITL behaviour.
+
+    Phase 11 chooses ``"approve"`` (the actual GatewayAction literal)
+    over CONTEXT.md's sketched ``"hitl"`` -- see
+    src/runtime/tools/gateway.py:32 for the canonical 3-valued
+    GatewayAction Literal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    gated_environments: set[str] = Field(
+        default_factory=lambda: {"production"},
+    )
+    gated_risk_actions: set[str] = Field(
+        default_factory=lambda: {"approve"},
+    )
+
+
 class OrchestratorConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -237,6 +274,12 @@ class OrchestratorConfig(BaseModel):
     # behaviour). Validated at config-load: keys are non-empty
     # identifiers, values are dotted paths starting with "session.".
     injected_args: dict[str, str] = Field(default_factory=dict)
+
+    # Phase 11 (FOC-04): declarative HITL gating policy. Apps tune
+    # thresholds in YAML; the framework's should_gate boundary reads
+    # this struct and the LLM never sees it. Default keeps v1.1
+    # behaviour (production gates "approve"-risk tools, threshold 0.7).
+    gate_policy: "GatePolicy" = Field(default_factory=lambda: GatePolicy())
 
     @field_validator("state_overrides_schema")
     @classmethod

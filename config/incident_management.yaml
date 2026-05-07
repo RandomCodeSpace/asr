@@ -16,6 +16,14 @@ similarity_method: keyword
 # ``_TERMINAL_TOOL_RULES`` table in ``orchestrator.py`` (Phase 6 /
 # DECOUPLE-02 / DECOUPLE-03 / D-06-01..06).
 orchestrator:
+  # Phase 11 (FOC-04): declarative HITL gating policy. Tighter
+  # threshold than the framework default -- incident remediation
+  # pauses on production-class medium-risk tools and on any tool
+  # call below 80% turn confidence.
+  gate_policy:
+    confidence_threshold: 0.8
+    gated_environments: [production]
+    gated_risk_actions: [approve]
   entry_agent: intake
   default_terminal_status: needs_review
   statuses:

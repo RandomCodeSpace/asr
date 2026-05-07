@@ -27,7 +27,9 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 from langgraph.prebuilt import create_react_agent
 
-from runtime.config import GatewayConfig
+from langgraph.errors import GraphInterrupt
+
+from runtime.config import GatePolicy, GatewayConfig
 from runtime.skill import Skill
 from runtime.state import Session, _UTC_TS_FMT
 from runtime.storage.session_store import SessionStore
@@ -53,6 +55,7 @@ def make_agent_node(
     gateway_cfg: GatewayConfig | None = None,
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
+    gate_policy: "GatePolicy | None" = None,
 ):
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -96,7 +99,8 @@ def make_agent_node(
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name, store=store)
+                          agent_name=skill.name, store=store,
+                          gate_policy=gate_policy)
                 for t in tools
             ]
         else:
@@ -110,11 +114,22 @@ def make_agent_node(
             response_format=AgentTurnOutput,
         )
 
+        # Phase 11 (FOC-04): reset per-turn confidence hint at the
+        # start of each agent step so the gateway treats the first
+        # tool call of the turn as "no signal yet".
+        try:
+            incident.turn_confidence_hint = None
+        except (AttributeError, ValueError):
+            pass
+
         try:
             result = await _ainvoke_with_retry(
                 agent_executor,
                 {"messages": [HumanMessage(content=_format_agent_input(incident))]},
             )
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): HITL pause -- propagate up.
+            raise
         except Exception as exc:  # noqa: BLE001
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
@@ -134,6 +149,13 @@ def make_agent_node(
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
+        # Phase 11 (FOC-04): update hint so any subsequent in-turn
+        # tool call sees the harvested confidence.
+        if agent_confidence is not None:
+            try:
+                incident.turn_confidence_hint = agent_confidence
+            except (AttributeError, ValueError):
+                pass
         _pair_tool_responses(messages, incident)
 
         # Phase 10 (FOC-03 / D-10-03): parse envelope; reconcile against

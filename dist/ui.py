@@ -1051,15 +1051,42 @@ def _render_hypothesis_trail_block(sess: dict) -> None:
                         st.caption(rationale)
 
 
+def _should_render_retry_block(sess: dict) -> bool:
+    """Phase 11 (FOC-04 / D-11-04) predicate.
+
+    The retry block exists for terminally failed sessions only. A
+    session in ``status='error'`` that ALSO has a ``pending_approval``
+    ToolCall row is genuinely paused on a HITL gate -- the
+    pending-approvals block (rendered separately) carries the
+    Approve/Reject action; the retry block would be wrong-mode here.
+    Returning ``False`` keeps the two blocks mutually exclusive.
+
+    Tolerates both pydantic ``ToolCall`` objects and dict
+    representations (Streamlit's ``model_dump`` on the loaded session
+    yields dicts, but defensive reads from the live ``Session.tool_calls``
+    return pydantic objects).
+    """
+    if sess.get("status") != "error":
+        return False
+    for tc in (sess.get("tool_calls") or []):
+        status = (
+            tc.get("status") if isinstance(tc, dict)
+            else getattr(tc, "status", None)
+        )
+        if status == "pending_approval":
+            return False
+    return True
+
+
 def _render_pending_approvals_block(sess: dict, session_id: str) -> None:
-    """Render the ### Pending Approvals section for high-risk tool calls
-    paused on the gateway's HITL approval handshake.
+    """Render the ### Pending Approvals section for tool calls the
+    framework's pure-policy gate has paused for human approval.
 
     Iterates ``tool_calls`` looking for entries with
     ``status="pending_approval"``. Each pending row gets a small card
     with the tool name + args, a free-text rationale input, and two
-    buttons (Approve / Reject) that resolve the pending interrupt via
-    the OrchestratorService bridge.
+    buttons (Approve / Reject) that resolve the pending pause via the
+    OrchestratorService bridge.
     """
     tool_calls = sess.get("tool_calls", [])
     pending = [
@@ -1135,9 +1162,10 @@ def render_session_detail(store: SessionStore,
         _render_summary_meta(sess, app_cfg)
         if sess.get("status") == "awaiting_input" and sess.get("pending_intervention"):
             _render_intervention_block(sess, session_id, app_cfg, agent_names)
-        if sess.get("status") == "error":
+        if _should_render_retry_block(sess):
             _render_retry_block(sess, session_id, agent_names)
-        # Pending tool-approval cards (risk-rated gateway HITL).
+        # Pending tool-approval cards (paused via the framework's
+        # pure-policy gate; see ``runtime.policy.should_gate``).
         # Rendered above the agents/tool-calls blocks so a paused
         # approval is the first action surface the operator sees.
         _render_pending_approvals_block(sess, session_id)

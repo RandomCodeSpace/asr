@@ -73,6 +73,10 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # consequently boots without any incident-vocabulary MCP servers
     # (its ``orchestrator.mcp_servers`` list is empty).
     (RUNTIME_ROOT, "mcp_loader.py"),
+    # Phase 11 (FOC-04): pure-policy HITL gating boundary. Imported by
+    # tools.gateway, which graph.py uses -- so policy.py must precede
+    # graph.py in the bundle.
+    (RUNTIME_ROOT, "policy.py"),
     (RUNTIME_ROOT, "graph.py"),
     (RUNTIME_ROOT, "checkpointer_postgres.py"),
     (RUNTIME_ROOT, "checkpointer.py"),
