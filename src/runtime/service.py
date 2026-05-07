@@ -45,7 +45,7 @@ import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Coroutine, TypeVar, cast
 
 from runtime.config import AppConfig
 from runtime.mcp_loader import build_fastmcp_client
@@ -251,7 +251,14 @@ class OrchestratorService:
             )
         if not self._loop.is_running():
             raise RuntimeError("OrchestratorService loop is not running")
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # Public signature accepts ``Awaitable[T]`` for caller flexibility;
+        # ``run_coroutine_threadsafe`` requires a ``Coroutine``. Every
+        # in-tree caller passes ``async def fn()`` — a Coroutine — so the
+        # cast is sound. Outside callers passing a non-coroutine
+        # Awaitable would already fail at runtime.
+        return asyncio.run_coroutine_threadsafe(
+            cast(Coroutine[Any, Any, T], coro), self._loop,
+        )
 
     def submit_and_wait(
         self, coro: Awaitable[T], timeout: float | None = None
@@ -288,7 +295,10 @@ class OrchestratorService:
             )
         if not self._loop.is_running():
             raise RuntimeError("OrchestratorService loop is not running")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # See ``submit`` above for the Awaitable-vs-Coroutine cast.
+        fut = asyncio.run_coroutine_threadsafe(
+            cast(Coroutine[Any, Any, T], coro), self._loop,
+        )
         return await asyncio.wrap_future(fut)
 
     async def get_mcp_client(self, server_name: str) -> Any:

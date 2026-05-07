@@ -70,7 +70,9 @@ class IdempotencyStore:
         self._engine = engine
         # Ensure the table exists even if the orchestrator hasn't run
         # ``Base.metadata.create_all`` yet (early lifespan path).
-        Base.metadata.create_all(engine, tables=[IdempotencyRow.__table__])
+        # ``IdempotencyRow.__table__`` is a ``Table`` at runtime; the
+        # SQLAlchemy stub types it as the wider ``FromClause``.
+        Base.metadata.create_all(engine, tables=[IdempotencyRow.__table__])  # pyright: ignore[reportArgumentType]
         self._lru: dict[str, OrderedDict[str, str]] = {}
         self._lock = threading.Lock()
 
@@ -190,7 +192,10 @@ class IdempotencyStore:
                 )
             )
             s.commit()
-            return result.rowcount or 0
+            # ``rowcount`` is exposed on ``CursorResult`` (the concrete
+            # return of DML execute); the abstract ``Result`` stub does
+            # not declare it.
+            return result.rowcount or 0  # pyright: ignore[reportAttributeAccessIssue]
 
     # ------------------------------------------------------------------
     # Internals

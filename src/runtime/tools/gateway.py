@@ -26,7 +26,12 @@ from langchain_core.tools import BaseTool
 from runtime.config import GatePolicy, GatewayConfig
 from runtime.state import Session, ToolCall
 
+# ``GateDecision`` is imported lazily inside ``_evaluate_gate`` (function
+# body) to avoid a runtime cycle (policy.py imports gateway types). The
+# type-only import below lets pyright resolve the string-literal return
+# annotation on ``_evaluate_gate`` without forming a real cycle.
 if TYPE_CHECKING:
+    from runtime.policy import GateDecision  # noqa: F401
     from runtime.storage.session_store import SessionStore
 
 GatewayAction = Literal["auto", "notify", "approve"]
@@ -163,7 +168,9 @@ def _evaluate_gate(
     pre-Phase-11 tests keep passing.
     """
     # Local imports (avoid cycle on policy.py importing gateway).
-    from runtime.policy import GateDecision, should_gate
+    # ``GateDecision`` is type-only here -- the lazy import sits in the
+    # TYPE_CHECKING block at module top.
+    from runtime.policy import should_gate
     from runtime.config import OrchestratorConfig
 
     effective_policy = gate_policy if gate_policy is not None else GatePolicy()

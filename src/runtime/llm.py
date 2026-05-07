@@ -137,7 +137,12 @@ class StubChatModel(BaseChatModel):
                 break
         return self
 
-    def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
+    # ``BaseChatModel.with_structured_output`` returns ``Runnable[..., dict | BaseModel]``
+    # in the langchain stub; this stub override returns a deterministic
+    # ``_StructuredRunnable`` so tests can drive structured outputs
+    # without a live provider. Functionally a Runnable (it implements
+    # ``invoke`` + ``ainvoke``); the stub mismatch is cosmetic.
+    def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
         """Phase 10 (FOC-03): honour the structured-output pass.
 
         Historically (pre-Phase-15) the deprecated
@@ -325,13 +330,17 @@ def _build_azure_chat(
             f"azure_openai model {model.model!r} requires 'deployment'"
         )
     _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
+    # ``request_timeout`` is a runtime alias for ``timeout`` on
+    # AzureChatOpenAI (langchain-openai > 0.3 declares it via Pydantic
+    # ``Field(alias="timeout")``); the langchain stubs only expose
+    # ``timeout``, hence the stub gap.
     base = AzureChatOpenAI(
         azure_endpoint=provider.endpoint,
         api_version=provider.api_version or "2024-08-01-preview",
         azure_deployment=model.deployment,
         api_key=SecretStr(_ak) if _ak else None,
         temperature=model.temperature,
-        request_timeout=request_timeout,  # Phase 13 (HARD-01) -- native AzureChatOpenAI field
+        request_timeout=request_timeout,  # pyright: ignore[reportCallIssue]  -- Phase 13 (HARD-01) -- alias for ``timeout`` not in stub
     )
     return _wrap_chat_with_timeout(
         base, "azure_openai", model.model, request_timeout,
@@ -423,12 +432,14 @@ def _build_openai_compat_chat(
         )
     if provider.api_key is None:
         raise ValueError("openai_compat provider requires 'api_key'")
+    # See AzureChatOpenAI block above: ``request_timeout`` is a runtime
+    # alias for ``timeout`` not in the langchain stubs.
     base = ChatOpenAI(
         base_url=provider.base_url,
         api_key=provider.api_key,
         model=model.model,
         temperature=model.temperature,
-        request_timeout=request_timeout,  # Phase 13 (HARD-01) -- native ChatOpenAI field
+        request_timeout=request_timeout,  # pyright: ignore[reportCallIssue]  -- Phase 13 (HARD-01) -- alias for ``timeout`` not in stub
     )
     return _wrap_chat_with_timeout(
         base, "openai_compat", model.model, request_timeout,
@@ -486,12 +497,14 @@ def get_embedding(
             raise ValueError("azure_openai provider requires 'endpoint'")
         deployment = cfg.embedding.deployment or cfg.embedding.model
         _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
+        # See chat builders above: ``request_timeout`` is a runtime
+        # alias for ``timeout`` not surfaced in the langchain-openai stub.
         return AzureOpenAIEmbeddings(
             azure_endpoint=provider.endpoint,
             api_version=provider.api_version or "2024-08-01-preview",
             azure_deployment=deployment,
             api_key=SecretStr(_ak) if _ak else None,
-            request_timeout=effective,  # Phase 13 (HARD-01) -- native AzureOpenAIEmbeddings field
+            request_timeout=effective,  # pyright: ignore[reportCallIssue]  -- Phase 13 (HARD-01) -- alias for ``timeout`` not in stub
         )
     raise ValueError(
         f"Embedding not supported for provider kind {provider.kind!r}"

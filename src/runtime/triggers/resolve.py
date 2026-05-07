@@ -8,7 +8,7 @@ fails at startup, not at first webhook delivery.
 from __future__ import annotations
 
 import importlib
-from typing import Any, Callable, Type
+from typing import Any, Callable, Type, cast
 
 from pydantic import BaseModel
 
@@ -65,4 +65,7 @@ def resolve_transform(path: str) -> Callable[..., dict]:
         raise TypeError(
             f"transform {path!r} did not resolve to a callable; got {obj!r}"
         )
-    return obj
+    # Apps own the strict signature -- the framework only enforces
+    # ``callable``. The cast satisfies the declared return type without
+    # adding a runtime wrapper.
+    return cast(Callable[..., dict], obj)

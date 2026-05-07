@@ -1171,6 +1171,10 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
             )
         else:
             framework_cfg = getattr(cfg, "framework", None) or resolve_framework_app_config(None)
+    # ``resolve_framework_app_config(None)`` always returns a bare
+    # ``FrameworkAppConfig`` (never None), so the chain above is
+    # exhaustive — assert for pyright's flow narrowing.
+    assert framework_cfg is not None
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)

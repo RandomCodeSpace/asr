@@ -54,13 +54,15 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check src/ tests/
 
-      - name: Type check (pyright)
-        # Pyright was previously pointed at src/orchestrator (a shim layer
-        # of star-imports) so its real coverage of the framework was nil.
-        # After deleting src/orchestrator, the target moved to src/runtime
-        # and surfaces ~41 pre-existing generic/typed-dict issues. Don't
-        # block the build on those; track via the follow-up cleanup plan.
-        continue-on-error: true
+      - name: Type check (pyright) (HARD-03)
+        # Phase 19 -- the gate is now fail-on-error against ``src/runtime``.
+        # The earlier 54-error backlog was resolved via type-annotation
+        # tightening + per-line ``# pyright: ignore[<rule>] -- <rationale>``
+        # comments for legitimate stub gaps. ``pyproject.toml`` carries
+        # the ``[tool.pyright]`` block (``include = ["src"]``,
+        # ``extraPaths = ["src"]``, ``typeCheckingMode = "basic"``).
+        # Test files and ``dist/`` bundles are out of scope for this
+        # phase; future phases may extend coverage outward.
         run: uv run pyright src/runtime
 
       - name: Test with coverage

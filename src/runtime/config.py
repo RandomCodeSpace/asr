@@ -758,7 +758,11 @@ class AppConfig(BaseModel):
         if isinstance(self.dedup, DedupConfig):
             return self
         if isinstance(self.dedup, dict):
-            self.__dict__["dedup"] = DedupConfig(**self.dedup)
+            # ``BaseModel.__dict__`` is typed as ``MappingProxyType`` in
+            # the pydantic stub; the documented post-validator mutation
+            # path is direct ``__dict__`` assignment, which works at
+            # runtime (pydantic stores fields in a plain dict).
+            self.__dict__["dedup"] = DedupConfig(**self.dedup)  # pyright: ignore[reportIndexIssue]
             return self
         raise ValueError(
             f"app.dedup must be a DedupConfig or dict; got "
@@ -804,8 +808,9 @@ class AppConfig(BaseModel):
                 )
             coerced.append(cls(**raw))
         # Pydantic v2 stores fields in ``__dict__``; assigning here is
-        # the documented way to mutate after validation.
-        self.__dict__["triggers"] = coerced
+        # the documented way to mutate after validation. (Stub types
+        # ``__dict__`` as MappingProxyType; runtime is a plain dict.)
+        self.__dict__["triggers"] = coerced  # pyright: ignore[reportIndexIssue]
         return self
 
 

@@ -37,10 +37,13 @@ def _faiss_distance_strategy(name: str):
 
 def _pgvector_distance_strategy(name: str):
     from langchain_postgres.vectorstores import DistanceStrategy
+    # ``langchain_postgres.DistanceStrategy.INNER_PRODUCT`` exists at
+    # runtime (verified via the live module) but the langchain-postgres
+    # stubs only expose ``COSINE`` / ``EUCLIDEAN``.
     return {
         "cosine": DistanceStrategy.COSINE,
         "euclidean": DistanceStrategy.EUCLIDEAN,
-        "inner_product": DistanceStrategy.INNER_PRODUCT,
+        "inner_product": DistanceStrategy.INNER_PRODUCT,  # pyright: ignore[reportAttributeAccessIssue]
     }[name]
 
 

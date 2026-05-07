@@ -523,14 +523,22 @@ class Orchestrator(Generic[StateT]):
             # Backfill dedup_pipeline into the IntakeContext now that it is built.
             # The IntakeContext was constructed with dedup_pipeline=None above
             # because the pipeline is built after graph construction.
+            # ``intake_context`` was attached via ``object.__setattr__`` ~140
+            # lines up; pyright doesn't see dynamic Pydantic attrs, so go
+            # via getattr for the type-checker.
             if dedup_pipeline is not None:
-                framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
+                getattr(framework_cfg, "intake_context").dedup_pipeline = dedup_pipeline
             # No bespoke resume graph — resume runs through the main
             # graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrating paused state.
+            # ``repo_state_cls: Type[BaseModel]`` matches the loose
+            # bound on ``Orchestrator.StateT`` (also ``BaseModel``) at
+            # the call site, but pyright sees the un-narrowed
+            # ``StateT`` placeholder. Concrete narrowing happens via
+            # the runtime resolver enforced earlier in this method.
             instance = cls(cfg, store, skills, registry, graph,
                            stack, framework_cfg=framework_cfg,
-                           state_cls=repo_state_cls,
+                           state_cls=repo_state_cls,  # pyright: ignore[reportArgumentType]
                            history=history,
                            checkpointer=checkpointer,
                            checkpointer_close=checkpointer_close,

@@ -172,7 +172,12 @@ class TriggerRegistry:
                     f"but no transport with that kind is registered "
                     f"(known: {sorted(plugin_kinds)})"
                 )
-            transports.append(kind_cls(pcfg))
+            # Plugin transports inherit from the abstract
+            # ``TriggerTransport`` (no positional args declared on the
+            # ABC) but every concrete subclass loaded via the entry-
+            # point registry must accept the plugin's config object.
+            # The ABC mismatch is a stub limitation, not a runtime bug.
+            transports.append(kind_cls(pcfg))  # pyright: ignore[reportCallIssue]
 
         return cls(specs, transports, start_session_fn, idempotency)
 

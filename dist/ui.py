@@ -240,7 +240,11 @@ def _badge(label: str, color: str) -> None:
     the rest of the UI can call ``_status_badge(...)`` etc. without
     touching the palette dicts directly.
     """
-    st.badge(label, color=color)
+    # ``st.badge`` declares ``color`` as a fixed Literal; at runtime any
+    # string in the Streamlit palette works (and we control the palette
+    # dicts above). Keeping the parameter as ``str`` lets callers pass
+    # values resolved from the dict lookups without per-site casts.
+    st.badge(label, color=color)  # pyright: ignore[reportArgumentType]
 
 
 def _status_badge(status: str | None) -> None:

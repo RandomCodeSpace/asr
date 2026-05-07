@@ -31,7 +31,11 @@ async def make_postgres_checkpointer(
     enclosing transaction would otherwise hold the row lock until
     explicit commit.
     """
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    # ``langgraph-checkpoint-postgres`` is an optional extra (declared
+    # under [project.optional-dependencies].postgres in pyproject) so
+    # the wheel is not present in CI's SQLite-only install. The module
+    # is only imported on the Postgres URL branch in production.
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # pyright: ignore[reportMissingImports]
     from psycopg_pool import AsyncConnectionPool
 
     # Translate SQLAlchemy URL -> libpq connection string. SQLAlchemy

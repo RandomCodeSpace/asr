@@ -63,3 +63,16 @@ pythonpath = ["src", "."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pyright]
+# Phase 19 (HARD-03): the CI gate runs ``pyright src/runtime`` and now
+# fails on any error. ``extraPaths = ["src"]`` lets pyright resolve the
+# bare ``runtime.X`` imports the code uses (mirrors pytest's ``pythonpath``
+# in [tool.pytest.ini_options]). Mode is ``basic`` because the project's
+# typing surface is BaseModel-heavy with langchain/langgraph stubs that
+# are partial; we treat genuine bugs as errors and tag stub gaps with
+# per-line ``# pyright: ignore[<rule>] -- <rationale>`` comments.
+include = ["src"]
+extraPaths = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"

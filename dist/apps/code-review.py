@@ -224,6 +224,7 @@ without external services.
 
 import hashlib
 import numpy as np
+from pydantic import SecretStr
 
 
 
@@ -271,16 +272,19 @@ anything else, build their filter on the fly.
 
 from typing import Any, Generic, Mapping, Optional, Type, TypeVar
 
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session as SqlaSession
 
 
-# Mirrors the bound on ``SessionStore.StateT`` — kept permissive at
-# ``BaseModel`` so framework code does not need to import the
-# example-app subclass. The resolver in :mod:`runtime.state_resolver`
-# enforces a ``runtime.state.Session`` subclass at config time.
+
+# Mirrors the bound on ``SessionStore.StateT`` — tightened from
+# ``BaseModel`` to ``runtime.state.Session`` in Phase 19 (HARD-03) so
+# pyright sees the typed fields (``id``, ``status``, ``deleted_at`` …)
+# this store reads. The resolver in :mod:`runtime.state_resolver`
+# already enforces a ``Session`` subclass at config time, and every
+# in-tree caller passes either bare ``Session`` or a ``Session``
+# subclass.
 # ----- imports for runtime/storage/session_store.py -----
 """Active session lifecycle store.
 
@@ -302,6 +306,7 @@ import json
 from datetime import datetime, timezone
 from typing import Generic, Optional, Type, TypeVar
 
+from pydantic import BaseModel
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session as SqlSession
 
@@ -325,6 +330,7 @@ deleted.
 from dataclasses import dataclass
 from typing import Iterator
 
+from sqlalchemy.orm import Session
 
 
 
@@ -443,7 +449,7 @@ state across cases.
 import concurrent.futures
 import logging
 import threading
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Coroutine, TypeVar, cast
 
 
 
@@ -498,6 +504,10 @@ from typing import TYPE_CHECKING, Any, Literal
 
 
 
+# ``GateDecision`` is imported lazily inside ``_evaluate_gate`` (function
+# body) to avoid a runtime cycle (policy.py imports gateway types). The
+# type-only import below lets pyright resolve the string-literal return
+# annotation on ``_evaluate_gate`` without forming a real cycle.
 # ----- imports for runtime/tools/arg_injection.py -----
 """Session-derived tool-arg injection (Phase 9 / FOC-01 / FOC-02).
 
@@ -816,7 +826,7 @@ fails at startup, not at first webhook delivery.
 """
 
 
-from typing import Any, Callable, Type
+from typing import Any, Callable, Type, cast
 
 
 
@@ -2275,7 +2285,11 @@ class AppConfig(BaseModel):
         if isinstance(self.dedup, DedupConfig):
             return self
         if isinstance(self.dedup, dict):
-            self.__dict__["dedup"] = DedupConfig(**self.dedup)
+            # ``BaseModel.__dict__`` is typed as ``MappingProxyType`` in
+            # the pydantic stub; the documented post-validator mutation
+            # path is direct ``__dict__`` assignment, which works at
+            # runtime (pydantic stores fields in a plain dict).
+            self.__dict__["dedup"] = DedupConfig(**self.dedup)  # pyright: ignore[reportIndexIssue]
             return self
         raise ValueError(
             f"app.dedup must be a DedupConfig or dict; got "
@@ -2316,8 +2330,9 @@ class AppConfig(BaseModel):
                 )
             coerced.append(cls(**raw))
         # Pydantic v2 stores fields in ``__dict__``; assigning here is
-        # the documented way to mutate after validation.
-        self.__dict__["triggers"] = coerced
+        # the documented way to mutate after validation. (Stub types
+        # ``__dict__`` as MappingProxyType; runtime is a plain dict.)
+        self.__dict__["triggers"] = coerced  # pyright: ignore[reportIndexIssue]
         return self
 
 
@@ -3161,7 +3176,12 @@ class StubChatModel(BaseChatModel):
                 break
         return self
 
-    def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
+    # ``BaseChatModel.with_structured_output`` returns ``Runnable[..., dict | BaseModel]``
+    # in the langchain stub; this stub override returns a deterministic
+    # ``_StructuredRunnable`` so tests can drive structured outputs
+    # without a live provider. Functionally a Runnable (it implements
+    # ``invoke`` + ``ainvoke``); the stub mismatch is cosmetic.
+    def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
         """Phase 10 (FOC-03): honour the structured-output pass.
 
         Historically (pre-Phase-15) the deprecated
@@ -3349,13 +3369,17 @@ def _build_azure_chat(
             f"azure_openai model {model.model!r} requires 'deployment'"
         )
     _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
+    # ``request_timeout`` is a runtime alias for ``timeout`` on
+    # AzureChatOpenAI (langchain-openai > 0.3 declares it via Pydantic
+    # ``Field(alias="timeout")``); the langchain stubs only expose
+    # ``timeout``, hence the stub gap.
     base = AzureChatOpenAI(
         azure_endpoint=provider.endpoint,
         api_version=provider.api_version or "2024-08-01-preview",
         azure_deployment=model.deployment,
         api_key=SecretStr(_ak) if _ak else None,
         temperature=model.temperature,
-        request_timeout=request_timeout,  # Phase 13 (HARD-01) -- native AzureChatOpenAI field
+        request_timeout=request_timeout,  # pyright: ignore[reportCallIssue]  -- Phase 13 (HARD-01) -- alias for ``timeout`` not in stub
     )
     return _wrap_chat_with_timeout(
         base, "azure_openai", model.model, request_timeout,
@@ -3447,12 +3471,14 @@ def _build_openai_compat_chat(
         )
     if provider.api_key is None:
         raise ValueError("openai_compat provider requires 'api_key'")
+    # See AzureChatOpenAI block above: ``request_timeout`` is a runtime
+    # alias for ``timeout`` not in the langchain stubs.
     base = ChatOpenAI(
         base_url=provider.base_url,
         api_key=provider.api_key,
         model=model.model,
         temperature=model.temperature,
-        request_timeout=request_timeout,  # Phase 13 (HARD-01) -- native ChatOpenAI field
+        request_timeout=request_timeout,  # pyright: ignore[reportCallIssue]  -- Phase 13 (HARD-01) -- alias for ``timeout`` not in stub
     )
     return _wrap_chat_with_timeout(
         base, "openai_compat", model.model, request_timeout,
@@ -3510,12 +3536,14 @@ def get_embedding(
             raise ValueError("azure_openai provider requires 'endpoint'")
         deployment = cfg.embedding.deployment or cfg.embedding.model
         _ak = provider.api_key or os.environ.get("AZURE_OPENAI_KEY")
+        # See chat builders above: ``request_timeout`` is a runtime
+        # alias for ``timeout`` not surfaced in the langchain-openai stub.
         return AzureOpenAIEmbeddings(
             azure_endpoint=provider.endpoint,
             api_version=provider.api_version or "2024-08-01-preview",
             azure_deployment=deployment,
             api_key=SecretStr(_ak) if _ak else None,
-            request_timeout=effective,  # Phase 13 (HARD-01) -- native AzureOpenAIEmbeddings field
+            request_timeout=effective,  # pyright: ignore[reportCallIssue]  -- Phase 13 (HARD-01) -- alias for ``timeout`` not in stub
         )
     raise ValueError(
         f"Embedding not supported for provider kind {provider.kind!r}"
@@ -3732,12 +3760,14 @@ def build_embedder(
         )
     if p.kind == "azure_openai":
         from langchain_openai import AzureOpenAIEmbeddings
+        # AzureOpenAIEmbeddings.api_key is typed as ``SecretStr | None``
+        # (pydantic v2). Wrap the env-sourced str so the type matches.
         return AzureOpenAIEmbeddings(
             azure_deployment=cfg.deployment,
             model=cfg.model,
             azure_endpoint=p.endpoint,
             api_version=p.api_version,
-            api_key=p.api_key,
+            api_key=SecretStr(p.api_key) if p.api_key else None,
         )
     if p.kind == "stub":
         return _StubEmbeddings(dim=cfg.dim)
@@ -3759,10 +3789,13 @@ def _faiss_distance_strategy(name: str):
 
 def _pgvector_distance_strategy(name: str):
     from langchain_postgres.vectorstores import DistanceStrategy
+    # ``langchain_postgres.DistanceStrategy.INNER_PRODUCT`` exists at
+    # runtime (verified via the live module) but the langchain-postgres
+    # stubs only expose ``COSINE`` / ``EUCLIDEAN``.
     return {
         "cosine": DistanceStrategy.COSINE,
         "euclidean": DistanceStrategy.EUCLIDEAN,
-        "inner_product": DistanceStrategy.INNER_PRODUCT,
+        "inner_product": DistanceStrategy.INNER_PRODUCT,  # pyright: ignore[reportAttributeAccessIssue]
     }[name]
 
 
@@ -3838,7 +3871,7 @@ def distance_to_similarity(distance: float, strategy: str) -> float:
 
 # ====== module: runtime/storage/history_store.py ======
 
-StateT = TypeVar("StateT", bound=BaseModel)
+StateT = TypeVar("StateT", bound=Session)
 
 # Allowed ``filter_kwargs`` keys = IncidentRow column names.
 # Computed at module load so we can produce a precise error for typos.
@@ -3890,7 +3923,7 @@ class HistoryStore(Generic[StateT]):
         return self._converter._row_to_incident(row)
 
     def _load(self, incident_id: str) -> StateT:
-        with Session(self.engine) as session:
+        with SqlaSession(self.engine) as session:
             row = session.get(IncidentRow, incident_id)
             if row is None:
                 raise FileNotFoundError(incident_id)
@@ -3901,7 +3934,7 @@ class HistoryStore(Generic[StateT]):
 
         Pure SQL prefilter — used by both vector and keyword paths.
         """
-        with Session(self.engine) as session:
+        with SqlaSession(self.engine) as session:
             stmt = select(IncidentRow).where(IncidentRow.deleted_at.is_(None))
             for col, val in filter_kwargs.items():
                 stmt = stmt.where(getattr(IncidentRow, col) == val)
@@ -3958,7 +3991,12 @@ class HistoryStore(Generic[StateT]):
         threshold = self.similarity_threshold if threshold is None else threshold
 
         vec = self.embedder.embed_query(query)
-        raw = self.vector_store.similarity_search_with_score_by_vector(vec, k=limit * 4)
+        # ``similarity_search_with_score_by_vector`` is provided by the
+        # concrete FAISS / pgvector / langchain-postgres backends (and
+        # validated by ``runtime.storage.vector.build_vector_store``)
+        # but the abstract ``langchain_core.vectorstores.VectorStore``
+        # base class does not declare it.
+        raw = self.vector_store.similarity_search_with_score_by_vector(vec, k=limit * 4)  # pyright: ignore[reportAttributeAccessIssue]
         out: list[tuple[StateT, float]] = []
         for doc, distance in raw:
             score = distance_to_similarity(float(distance), self.distance_strategy)
@@ -3995,7 +4033,7 @@ class HistoryStore(Generic[StateT]):
             if getattr(i, "status", None) == status_filter
             and getattr(i, "deleted_at", None) is None
         ]
-        def _ef(i, key, default=""):
+        def _ef(i, key, default: Any = ""):
             """Read a field from typed attribute first, then extra_fields."""
             val = getattr(i, key, None)
             if val:
@@ -4027,12 +4065,16 @@ class HistoryStore(Generic[StateT]):
 _INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
 _SESSION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-\d{8}-\d{3}$")
 
-# StateT is bound to ``BaseModel`` so callers can pass either bare
-# ``Session`` or any pydantic subclass. The resolver in
-# :mod:`runtime.state_resolver` enforces a ``runtime.state.Session``
-# subclass at config time; the looser bound here keeps the storage
-# layer usable by ad-hoc tests that build a ``BaseModel`` directly.
-StateT = TypeVar("StateT", bound=BaseModel)
+# StateT is bound to ``Session`` (not bare ``BaseModel``) because the
+# store body reads typed fields (``id``, ``status``, ``version``,
+# ``updated_at`` …) that are declared on ``runtime.state.Session`` and
+# not on ``pydantic.BaseModel``. The resolver in
+# :mod:`runtime.state_resolver` already enforces a ``Session`` subclass
+# at config time, and every existing caller (production + tests) passes
+# either bare ``Session`` or a ``Session`` subclass — see
+# Phase 19 / HARD-03 for the rationale (was: ``bound=BaseModel`` which
+# made pyright flag every typed-field access).
+StateT = TypeVar("StateT", bound=Session)
 
 
 def _embed_source(inc: BaseModel) -> str:
@@ -4230,7 +4272,12 @@ class SessionStore(Generic[StateT]):
             raise ValueError(
                 f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
-        incident.updated_at = _iso(_now())
+        # ``_iso(_now())`` returns ``str`` here -- the input datetime is
+        # never None -- but the helper's signature is the broader
+        # ``Optional[str]``. ``or ""`` keeps pyright + the typed
+        # ``Session.updated_at: str`` field consistent without changing
+        # behaviour (real value is always present).
+        incident.updated_at = _iso(_now()) or ""
         sess = incident  # local alias — avoids repeating the domain token in new code
         expected_version = getattr(sess, "version", 1)
         # Bump in-memory BEFORE building the row dict so the persisted
@@ -4375,12 +4422,16 @@ class SessionStore(Generic[StateT]):
         from pathlib import Path
         folder = Path(self.vector_path)
         folder.mkdir(parents=True, exist_ok=True)
-        self.vector_store.save_local(
+        # ``save_local`` is FAISS-specific; the runtime ``hasattr`` guard
+        # at the top of this method already ensured this codepath only
+        # runs against FAISS (other VectorStores omit the method).
+        # ``langchain_core.vectorstores.VectorStore`` doesn't declare it.
+        self.vector_store.save_local(  # pyright: ignore[reportAttributeAccessIssue]
             folder_path=str(folder),
             index_name=self.vector_index_name,
         )
 
-    def _add_vector(self, inc: BaseModel) -> None:
+    def _add_vector(self, inc: Session) -> None:
         if self.vector_store is None or self.embedder is None:
             return
         text = _embed_source(inc)
@@ -4393,7 +4444,7 @@ class SessionStore(Generic[StateT]):
         )
         self._persist_vector()
 
-    def _refresh_vector(self, inc: BaseModel, *, prior_text: str) -> None:
+    def _refresh_vector(self, inc: Session, *, prior_text: str) -> None:
         if self.vector_store is None or self.embedder is None:
             return
         text = _embed_source(inc)
@@ -4568,7 +4619,13 @@ class SessionStore(Generic[StateT]):
                 merged_extras[k] = v
             kwargs["extra_fields"] = merged_extras
 
-        return self._state_cls(**kwargs)
+        # ``kwargs`` is built up from heterogeneous sources (typed row
+        # columns + ``extra_fields`` blob) so pyright infers each value
+        # as ``object``. At runtime each entry matches the concrete
+        # ``state_cls`` field type by construction (the row schema is
+        # the source of truth); pydantic's own validation rejects bad
+        # shapes at the constructor.
+        return self._state_cls(**kwargs)  # pyright: ignore[reportArgumentType]
 
     def _incident_to_row_dict(self, inc: StateT) -> dict:
         """Serialize a state instance into a row-shaped dict.
@@ -5272,7 +5329,14 @@ class OrchestratorService:
             )
         if not self._loop.is_running():
             raise RuntimeError("OrchestratorService loop is not running")
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # Public signature accepts ``Awaitable[T]`` for caller flexibility;
+        # ``run_coroutine_threadsafe`` requires a ``Coroutine``. Every
+        # in-tree caller passes ``async def fn()`` — a Coroutine — so the
+        # cast is sound. Outside callers passing a non-coroutine
+        # Awaitable would already fail at runtime.
+        return asyncio.run_coroutine_threadsafe(
+            cast(Coroutine[Any, Any, T], coro), self._loop,
+        )
 
     def submit_and_wait(
         self, coro: Awaitable[T], timeout: float | None = None
@@ -5309,7 +5373,10 @@ class OrchestratorService:
             )
         if not self._loop.is_running():
             raise RuntimeError("OrchestratorService loop is not running")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # See ``submit`` above for the Awaitable-vs-Coroutine cast.
+        fut = asyncio.run_coroutine_threadsafe(
+            cast(Coroutine[Any, Any, T], coro), self._loop,
+        )
         return await asyncio.wrap_future(fut)
 
     async def get_mcp_client(self, server_name: str) -> Any:
@@ -6094,6 +6161,8 @@ def _evaluate_gate(
     pre-Phase-11 tests keep passing.
     """
     # Local imports (avoid cycle on policy.py importing gateway).
+    # ``GateDecision`` is type-only here -- the lazy import sits in the
+    # TYPE_CHECKING block at module top.
 
 
 
@@ -9257,6 +9326,10 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
             )
         else:
             framework_cfg = getattr(cfg, "framework", None) or resolve_framework_app_config(None)
+    # ``resolve_framework_app_config(None)`` always returns a bare
+    # ``FrameworkAppConfig`` (never None), so the chain above is
+    # exhaustive — assert for pyright's flow narrowing.
+    assert framework_cfg is not None
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)
@@ -9323,7 +9396,11 @@ async def make_postgres_checkpointer(
     enclosing transaction would otherwise hold the row lock until
     explicit commit.
     """
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    # ``langgraph-checkpoint-postgres`` is an optional extra (declared
+    # under [project.optional-dependencies].postgres in pyproject) so
+    # the wheel is not present in CI's SQLite-only install. The module
+    # is only imported on the Postgres URL branch in production.
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # pyright: ignore[reportMissingImports]
     from psycopg_pool import AsyncConnectionPool
 
     # Translate SQLAlchemy URL -> libpq connection string. SQLAlchemy
@@ -9691,7 +9768,10 @@ def resolve_transform(path: str) -> Callable[..., dict]:
         raise TypeError(
             f"transform {path!r} did not resolve to a callable; got {obj!r}"
         )
-    return obj
+    # Apps own the strict signature -- the framework only enforces
+    # ``callable``. The cast satisfies the declared return type without
+    # adding a runtime wrapper.
+    return cast(Callable[..., dict], obj)
 
 # ====== module: runtime/triggers/idempotency.py ======
 
@@ -9731,7 +9811,9 @@ class IdempotencyStore:
         self._engine = engine
         # Ensure the table exists even if the orchestrator hasn't run
         # ``Base.metadata.create_all`` yet (early lifespan path).
-        Base.metadata.create_all(engine, tables=[IdempotencyRow.__table__])
+        # ``IdempotencyRow.__table__`` is a ``Table`` at runtime; the
+        # SQLAlchemy stub types it as the wider ``FromClause``.
+        Base.metadata.create_all(engine, tables=[IdempotencyRow.__table__])  # pyright: ignore[reportArgumentType]
         self._lru: dict[str, OrderedDict[str, str]] = {}
         self._lock = threading.Lock()
 
@@ -9851,7 +9933,10 @@ class IdempotencyStore:
                 )
             )
             s.commit()
-            return result.rowcount or 0
+            # ``rowcount`` is exposed on ``CursorResult`` (the concrete
+            # return of DML execute); the abstract ``Result`` stub does
+            # not declare it.
+            return result.rowcount or 0  # pyright: ignore[reportAttributeAccessIssue]
 
     # ------------------------------------------------------------------
     # Internals
@@ -10225,7 +10310,12 @@ class TriggerRegistry:
                     f"but no transport with that kind is registered "
                     f"(known: {sorted(plugin_kinds)})"
                 )
-            transports.append(kind_cls(pcfg))
+            # Plugin transports inherit from the abstract
+            # ``TriggerTransport`` (no positional args declared on the
+            # ABC) but every concrete subclass loaded via the entry-
+            # point registry must accept the plugin's config object.
+            # The ABC mismatch is a stub limitation, not a runtime bug.
+            transports.append(kind_cls(pcfg))  # pyright: ignore[reportCallIssue]
 
         return cls(specs, transports, start_session_fn, idempotency)
 
@@ -12413,14 +12503,22 @@ class Orchestrator(Generic[StateT]):
             # Backfill dedup_pipeline into the IntakeContext now that it is built.
             # The IntakeContext was constructed with dedup_pipeline=None above
             # because the pipeline is built after graph construction.
+            # ``intake_context`` was attached via ``object.__setattr__`` ~140
+            # lines up; pyright doesn't see dynamic Pydantic attrs, so go
+            # via getattr for the type-checker.
             if dedup_pipeline is not None:
-                framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
+                getattr(framework_cfg, "intake_context").dedup_pipeline = dedup_pipeline
             # No bespoke resume graph — resume runs through the main
             # graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrating paused state.
+            # ``repo_state_cls: Type[BaseModel]`` matches the loose
+            # bound on ``Orchestrator.StateT`` (also ``BaseModel``) at
+            # the call site, but pyright sees the un-narrowed
+            # ``StateT`` placeholder. Concrete narrowing happens via
+            # the runtime resolver enforced earlier in this method.
             instance = cls(cfg, store, skills, registry, graph,
                            stack, framework_cfg=framework_cfg,
-                           state_cls=repo_state_cls,
+                           state_cls=repo_state_cls,  # pyright: ignore[reportArgumentType]
                            history=history,
                            checkpointer=checkpointer,
                            checkpointer_close=checkpointer_close,
