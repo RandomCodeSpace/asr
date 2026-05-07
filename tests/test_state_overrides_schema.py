@@ -358,7 +358,11 @@ def test_incident_yaml_loads_with_schema():
             == "examples.incident_management.state.IncidentStateOverrides")
 
 
-def test_default_yaml_loads_with_schema():
+def test_default_yaml_loads_with_schema(monkeypatch):
+    # config.yaml carries `${OLLAMA_API_KEY}`; tests should not depend on
+    # real secrets. Set a placeholder so `_interpolate` succeeds; the test
+    # only needs the YAML to parse, not to actually call Ollama.
+    monkeypatch.setenv("OLLAMA_API_KEY", "test-placeholder")
     cfg = _load_app_config_from_yaml("config/config.yaml")
     assert (cfg.orchestrator.state_overrides_schema
             == "examples.incident_management.state.IncidentStateOverrides")
