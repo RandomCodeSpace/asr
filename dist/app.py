@@ -450,10 +450,12 @@ from typing import Any, Awaitable, TypeVar
 """Phase 10 (FOC-03) — AgentTurnOutput envelope + reconciliation helpers.
 
 The envelope is the structural contract every responsive agent invocation
-must satisfy: content + confidence ∈ [0,1] + confidence_rationale + optional signal.
-LangGraph's `create_react_agent(..., response_format=AgentTurnOutput)` enforces
-the schema at the LLM boundary; the framework reads the resulting
-``result["structured_response"]`` and persists it onto the ``AgentRun`` row.
+must satisfy: content + confidence in [0,1] + confidence_rationale + optional
+signal. The framework wires it as ``response_format=AgentTurnOutput`` into
+``langchain.agents.create_agent`` (see Phase 15 / LLM-COMPAT-01); the
+agent loop terminates on the same turn the LLM emits the envelope-shaped
+tool call, populating ``result["structured_response"]``, which the
+framework reads and persists onto the ``AgentRun`` row.
 
 D-10-02 — pydantic envelope wrapped via ``response_format``.
 D-10-03 — when a typed-terminal-tool was called this turn, the framework
@@ -625,7 +627,7 @@ under :mod:`runtime.agents` rather than piling more kinds into
 from typing import Callable
 
 from langchain_core.messages import HumanMessage
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 from langgraph.errors import GraphInterrupt
 
@@ -3014,6 +3016,18 @@ class StubChatModel(BaseChatModel):
     that need a specific envelope shape can override
     ``stub_envelope_confidence`` / ``stub_envelope_rationale`` /
     ``stub_envelope_signal``.
+
+    Phase 15 (LLM-COMPAT-01): ``langchain.agents.create_agent`` with
+    ``response_format=AgentTurnOutput`` (via ``AutoStrategy`` ->
+    ``ToolStrategy`` for non-native-structured-output models, including
+    this stub) injects ``AgentTurnOutput`` as a CALLABLE TOOL. The
+    agent loop only terminates when the LLM emits a tool call NAMED
+    ``AgentTurnOutput``. ``bind_tools`` records that envelope-tool name
+    so ``_generate`` can auto-emit a closing tool call after any
+    user-configured ``tool_call_plan`` is exhausted -- preserving the
+    pre-Phase-15 stub semantics (canned text + optional pre-scripted
+    tool calls) while satisfying the new tool-loop termination
+    contract.
     """
     role: str = "default"
     canned_responses: dict[str, str] = Field(default_factory=dict)
@@ -3022,6 +3036,12 @@ class StubChatModel(BaseChatModel):
     stub_envelope_rationale: str = "stub envelope rationale"
     stub_envelope_signal: str | None = None
     _called_once: bool = False
+    # Phase 15 (LLM-COMPAT-01): set by ``bind_tools`` when
+    # ``langchain.agents.create_agent`` injects a structured-output tool
+    # for ``AgentTurnOutput``. Holds the bare tool name (e.g.
+    # ``"AgentTurnOutput"``) so ``_generate`` can emit a final
+    # envelope-shaped tool call to close the agent loop.
+    _envelope_tool_name: str | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -3035,6 +3055,26 @@ class StubChatModel(BaseChatModel):
             for tc in self.tool_call_plan:
                 tool_calls.append({"name": tc["name"], "args": tc.get("args", {}), "id": str(uuid4())})
             self._called_once = True
+        elif self._envelope_tool_name is not None:
+            # Phase 15 (LLM-COMPAT-01): the tool_call_plan is exhausted
+            # (or wasn't configured) AND ``langchain.agents.create_agent``
+            # has bound the AgentTurnOutput envelope as a tool. Emit a
+            # closing tool call so the loop terminates with a populated
+            # ``structured_response``. The args mirror the
+            # ``with_structured_output`` path's envelope construction so
+            # tests see the same confidence / rationale / signal regardless
+            # of whether the new tool-strategy or the legacy structured-
+            # output path is in play.
+            tool_calls.append({
+                "name": self._envelope_tool_name,
+                "args": {
+                    "content": text or ".",
+                    "confidence": self.stub_envelope_confidence,
+                    "confidence_rationale": self.stub_envelope_rationale,
+                    "signal": self.stub_envelope_signal,
+                },
+                "id": str(uuid4()),
+            })
         msg = AIMessage(content=text, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
@@ -3043,17 +3083,48 @@ class StubChatModel(BaseChatModel):
         return self._generate(messages, stop, run_manager, **kwargs)
 
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
-        """No-op binder: stub emits tool calls only via `tool_call_plan`, not via real binding."""
+        """Record the AgentTurnOutput envelope-tool name when present.
+
+        Phase 15 (LLM-COMPAT-01): ``langchain.agents.create_agent`` with
+        ``response_format=AgentTurnOutput`` calls ``bind_tools(...)``
+        with the user's tools PLUS the envelope-as-a-tool. We scan the
+        list for the AgentTurnOutput-shaped tool (matched by ``__name__``
+        on Pydantic schemas, ``name`` on ``BaseTool`` instances, or the
+        ``"name"`` key on dict-shaped tool specs) and remember it on the
+        instance so ``_generate`` can close the agent loop with a
+        synthetic envelope tool call after any pre-scripted
+        ``tool_call_plan`` is exhausted. Tools bound by the framework
+        itself (real BaseTools the agent should call) flow through
+        unchanged -- the stub still emits them only via
+        ``tool_call_plan``.
+        """
+        for t in tools or []:
+            name = (
+                getattr(t, "__name__", None)
+                or getattr(t, "name", None)
+                or (isinstance(t, dict) and t.get("name"))
+            )
+            if isinstance(name, str) and name == "AgentTurnOutput":
+                self._envelope_tool_name = name
+                break
         return self
 
     def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
-        """Phase 10 (FOC-03): honour LangGraph's structured-output pass.
+        """Phase 10 (FOC-03): honour the structured-output pass.
 
-        ``create_react_agent(..., response_format=schema)`` calls this after
-        the tool loop completes. We return a Runnable-like that yields a
-        valid ``schema`` instance derived from the stub's canned text and
-        the per-instance envelope configuration. Tests can tune
-        ``stub_envelope_confidence`` etc. to drive gate / reconcile paths.
+        Historically (pre-Phase-15) the deprecated
+        ``langgraph.prebuilt.create_react_agent`` factory called this
+        after its tool loop completed. The current
+        ``langchain.agents.create_agent`` path uses a tool-strategy
+        binding instead (see ``bind_tools`` above), but providers and
+        test code that call ``with_structured_output`` directly still
+        get a deterministic schema instance.
+
+        We return a Runnable-like that yields a valid ``schema``
+        instance derived from the stub's canned text and the
+        per-instance envelope configuration. Tests can tune
+        ``stub_envelope_confidence`` etc. to drive gate / reconcile
+        paths.
         """
         text = self.canned_responses.get(self.role, f"[stub:{self.role}] no canned response")
         confidence = self.stub_envelope_confidence
@@ -5613,7 +5684,7 @@ class AgentTurnOutput(BaseModel):
     """Structural envelope every agent invocation MUST emit.
 
     The framework wires this as ``response_format=AgentTurnOutput`` on both
-    ``create_react_agent`` call sites (``runtime.graph`` and
+    ``create_agent`` call sites (``runtime.graph`` and
     ``runtime.agents.responsive``). Pydantic's ``extra="forbid"`` keeps the
     contract narrow — adding fields is a deliberate schema migration, not a
     free-for-all.
@@ -7078,12 +7149,23 @@ def make_agent_node(
             ]
         else:
             run_tools = tools
-        # Phase 10 (FOC-03 / D-10-02): every responsive agent invocation
-        # is wrapped in an AgentTurnOutput envelope. LangGraph internally
-        # calls llm.with_structured_output(AgentTurnOutput) on a final pass
-        # after the tool loop, populating result["structured_response"].
-        agent_executor = create_react_agent(
-            llm, run_tools, prompt=skill.system_prompt,
+        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
+        # responsive agent invocation is wrapped in an AgentTurnOutput
+        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
+        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
+        # bare schema as ``response_format`` and, by default, wraps it in
+        # ``AutoStrategy`` — ProviderStrategy for models with native
+        # structured-output (OpenAI-class), falling back to ToolStrategy
+        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
+        # callable tool: when the LLM ``calls`` it, the loop terminates on
+        # the same turn with ``result["structured_response"]`` populated.
+        # Eliminates the old two-call structure (loop + separate
+        # ``with_structured_output`` pass) that hit recursion_limit=25 on
+        # Ollama models without true function-calling.
+        agent_executor = create_agent(
+            model=llm,
+            tools=run_tools,
+            system_prompt=skill.system_prompt,
             response_format=AgentTurnOutput,
         )
 
@@ -8029,7 +8111,16 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            return await executor.ainvoke(input_, config={"recursion_limit": 25})
+            # Phase 15 (LLM-COMPAT-01): the recursion_limit=25 workaround
+            # introduced in 3ba099f as a safety net is gone — the
+            # ``langchain.agents.create_agent`` migration replaces the
+            # old two-call structure (loop + separate
+            # ``with_structured_output`` pass) with a single tool-loop
+            # whose terminal signal is the AgentTurnOutput tool call
+            # itself (AutoStrategy → ToolStrategy fallback for non-
+            # function-calling Ollama models). The default langgraph
+            # recursion bound is now a true upper bound, not a workaround.
+            return await executor.ainvoke(input_)
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): never retry a HITL pause.
             # GraphInterrupt is a checkpointed pending_approval signal,
@@ -8473,12 +8564,23 @@ def make_agent_node(
             ]
         else:
             run_tools = visible_tools
-        # Phase 10 (FOC-03 / D-10-02): every responsive agent invocation is
-        # wrapped in an AgentTurnOutput envelope. LangGraph internally calls
-        # llm.with_structured_output(AgentTurnOutput) on a final pass after
-        # the tool loop completes, populating result["structured_response"].
-        agent_executor = create_react_agent(
-            llm, run_tools, prompt=skill.system_prompt,
+        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
+        # responsive agent invocation is wrapped in an AgentTurnOutput
+        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
+        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
+        # bare schema as ``response_format`` and, by default, wraps it in
+        # ``AutoStrategy`` — ProviderStrategy for models with native
+        # structured-output (OpenAI-class), falling back to ToolStrategy
+        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
+        # callable tool: when the LLM ``calls`` it, the loop terminates on
+        # the same turn with ``result["structured_response"]`` populated.
+        # Eliminates the old two-call structure (loop + separate
+        # ``with_structured_output`` pass) that hit recursion_limit=25 on
+        # Ollama models without true function-calling.
+        agent_executor = create_agent(
+            model=llm,
+            tools=run_tools,
+            system_prompt=skill.system_prompt,
             response_format=AgentTurnOutput,
         )
 

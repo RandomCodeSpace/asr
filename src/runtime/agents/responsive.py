@@ -25,7 +25,7 @@ from typing import Callable
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 from langgraph.errors import GraphInterrupt
 
@@ -105,12 +105,23 @@ def make_agent_node(
             ]
         else:
             run_tools = tools
-        # Phase 10 (FOC-03 / D-10-02): every responsive agent invocation
-        # is wrapped in an AgentTurnOutput envelope. LangGraph internally
-        # calls llm.with_structured_output(AgentTurnOutput) on a final pass
-        # after the tool loop, populating result["structured_response"].
-        agent_executor = create_react_agent(
-            llm, run_tools, prompt=skill.system_prompt,
+        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
+        # responsive agent invocation is wrapped in an AgentTurnOutput
+        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
+        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
+        # bare schema as ``response_format`` and, by default, wraps it in
+        # ``AutoStrategy`` — ProviderStrategy for models with native
+        # structured-output (OpenAI-class), falling back to ToolStrategy
+        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
+        # callable tool: when the LLM ``calls`` it, the loop terminates on
+        # the same turn with ``result["structured_response"]`` populated.
+        # Eliminates the old two-call structure (loop + separate
+        # ``with_structured_output`` pass) that hit recursion_limit=25 on
+        # Ollama models without true function-calling.
+        agent_executor = create_agent(
+            model=llm,
+            tools=run_tools,
+            system_prompt=skill.system_prompt,
             response_format=AgentTurnOutput,
         )
 

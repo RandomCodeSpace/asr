@@ -1,10 +1,12 @@
 """Phase 10 (FOC-03) — AgentTurnOutput envelope + reconciliation helpers.
 
 The envelope is the structural contract every responsive agent invocation
-must satisfy: content + confidence ∈ [0,1] + confidence_rationale + optional signal.
-LangGraph's `create_react_agent(..., response_format=AgentTurnOutput)` enforces
-the schema at the LLM boundary; the framework reads the resulting
-``result["structured_response"]`` and persists it onto the ``AgentRun`` row.
+must satisfy: content + confidence in [0,1] + confidence_rationale + optional
+signal. The framework wires it as ``response_format=AgentTurnOutput`` into
+``langchain.agents.create_agent`` (see Phase 15 / LLM-COMPAT-01); the
+agent loop terminates on the same turn the LLM emits the envelope-shaped
+tool call, populating ``result["structured_response"]``, which the
+framework reads and persists onto the ``AgentRun`` row.
 
 D-10-02 — pydantic envelope wrapped via ``response_format``.
 D-10-03 — when a typed-terminal-tool was called this turn, the framework
@@ -36,7 +38,7 @@ class AgentTurnOutput(BaseModel):
     """Structural envelope every agent invocation MUST emit.
 
     The framework wires this as ``response_format=AgentTurnOutput`` on both
-    ``create_react_agent`` call sites (``runtime.graph`` and
+    ``create_agent`` call sites (``runtime.graph`` and
     ``runtime.agents.responsive``). Pydantic's ``extra="forbid"`` keeps the
     contract narrow — adding fields is a deliberate schema migration, not a
     free-for-all.

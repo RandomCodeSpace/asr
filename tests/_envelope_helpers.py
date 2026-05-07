@@ -62,6 +62,12 @@ class EnvelopeStubChatModel(BaseChatModel):
     canned_responses: dict[str, str] = Field(default_factory=dict)
     tool_call_plan: list[dict] | None = None
     _called_once: bool = False
+    # Phase 15 (LLM-COMPAT-01): same contract as ``StubChatModel`` --
+    # ``langchain.agents.create_agent``'s ToolStrategy injects
+    # ``AgentTurnOutput`` as a tool; ``bind_tools`` records the name
+    # so ``_generate`` can emit a closing envelope tool call once any
+    # pre-scripted ``tool_call_plan`` is exhausted.
+    _envelope_tool_name: str | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -82,6 +88,19 @@ class EnvelopeStubChatModel(BaseChatModel):
                     {"name": tc["name"], "args": tc.get("args", {}), "id": str(uuid4())}
                 )
             self._called_once = True
+        elif self._envelope_tool_name is not None:
+            # Phase 15 (LLM-COMPAT-01): close the agent loop by emitting
+            # the envelope-shaped tool call ToolStrategy is waiting for.
+            tool_calls.append({
+                "name": self._envelope_tool_name,
+                "args": {
+                    "content": self.envelope_content,
+                    "confidence": self.envelope_confidence,
+                    "confidence_rationale": self.envelope_rationale,
+                    "signal": self.envelope_signal,
+                },
+                "id": str(uuid4()),
+            })
         msg = AIMessage(content=text, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
@@ -95,6 +114,18 @@ class EnvelopeStubChatModel(BaseChatModel):
         return self._generate(messages, stop, run_manager, **kwargs)
 
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        # Phase 15 (LLM-COMPAT-01): record the AgentTurnOutput tool
+        # name so ``_generate`` can emit a closing tool call. See
+        # ``StubChatModel.bind_tools`` for the matching heuristic.
+        for t in tools or []:
+            name = (
+                getattr(t, "__name__", None)
+                or getattr(t, "name", None)
+                or (isinstance(t, dict) and t.get("name"))
+            )
+            if isinstance(name, str) and name == "AgentTurnOutput":
+                self._envelope_tool_name = name
+                break
         return self
 
     def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):
