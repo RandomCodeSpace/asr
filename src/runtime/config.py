@@ -228,6 +228,16 @@ class OrchestratorConfig(BaseModel):
     # bad path raises at boot with a useful message (DECOUPLE-05 / D-08-01).
     state_overrides_schema: str | None = None
 
+    # Phase 9 (D-09-02 / FOC-01): map of LLM-visible-arg -> dotted-path
+    # on the live Session. Tools whose param name matches a key in this
+    # dict get the param stripped from the LLM-visible signature, and
+    # the framework supplies the resolved value at _invoke_tool /
+    # _GatedTool._run / _arun time. Apps declare what to inject; the
+    # framework stays generic. Empty default = no injection (legacy
+    # behaviour). Validated at config-load: keys are non-empty
+    # identifiers, values are dotted paths starting with "session.".
+    injected_args: dict[str, str] = Field(default_factory=dict)
+
     @field_validator("state_overrides_schema")
     @classmethod
     def _validate_state_overrides_schema_format(
@@ -260,6 +270,38 @@ class OrchestratorConfig(BaseModel):
                 f"path (expected `module.path:ClassName` or "
                 f"`module.path.ClassName`)"
             )
+        return v
+
+    @field_validator("injected_args")
+    @classmethod
+    def _validate_injected_args(
+        cls, v: dict[str, str],
+    ) -> dict[str, str]:
+        """Phase 9 (D-09-02): config-load validation for injected_args.
+
+        Each entry is ``arg_name -> dotted_path`` where ``arg_name`` must
+        be a valid Python identifier (it is the keyword name on a tool
+        signature) and ``dotted_path`` must be a non-empty string with at
+        least one dot (e.g. ``session.environment``). Real attribute
+        resolution happens at injection time in
+        :func:`runtime.tools.arg_injection.inject_injected_args` so
+        config-load doesn't drag the live ``Session`` into every consumer.
+        """
+        for key, path in v.items():
+            if not key or not key.isidentifier():
+                raise ValueError(
+                    f"injected_args key {key!r} must be a non-empty "
+                    f"Python identifier"
+                )
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(
+                    f"injected_args[{key!r}] must be a non-empty dotted path"
+                )
+            if "." not in path:
+                raise ValueError(
+                    f"injected_args[{key!r}]={path!r} must be a dotted path "
+                    f"(e.g. 'session.environment')"
+                )
         return v
 
     @model_validator(mode="after")

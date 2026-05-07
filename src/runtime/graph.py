@@ -2,7 +2,7 @@
 from __future__ import annotations
 import asyncio
 import logging
-from typing import TypedDict, Callable, Awaitable
+from typing import Any, TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage
@@ -449,6 +449,7 @@ def make_agent_node(
     gateway_cfg: GatewayConfig | None = None,
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
+    injected_args: dict[str, str] | None = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -469,12 +470,37 @@ def make_agent_node(
     union ``OrchestratorConfig.harvest_terminal_tools`` /
     ``OrchestratorConfig.patch_tools``). Empty defaults preserve the
     "no harvester recognition" behavior for legacy callers.
+
+    ``injected_args`` (Phase 9 / D-09-01) is the orchestrator-wide
+    map of ``arg_name -> dotted_path`` declared in
+    :attr:`OrchestratorConfig.injected_args`. Every entry is stripped
+    from each tool's LLM-visible signature (so the LLM cannot emit a
+    value for it) and re-supplied at invocation time from session
+    state. When ``None`` or empty, tools pass through to the LLM
+    unchanged — preserves legacy callers and the framework default.
     """
 
     async def node(state: GraphState) -> dict:
         incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # Phase 9 (D-09-01): strip injected-arg keys from every tool's
+        # LLM-visible signature BEFORE create_react_agent serialises the
+        # tool surface — so the LLM literally cannot emit values for
+        # those params. The framework re-supplies them at invocation
+        # time inside the gateway (or an inject-only wrapper) below.
+        from runtime.tools.arg_injection import (
+            inject_injected_args as _inject_args,
+            strip_injected_params,
+        )
+        injected_keys = frozenset((injected_args or {}).keys())
+        if injected_keys:
+            visible_tools = [
+                strip_injected_params(t, injected_keys) for t in tools
+            ]
+        else:
+            visible_tools = tools
 
         # Wrap tools per-invocation so each wrap closes over the live
         # ``Session`` for this run. When the gateway is unconfigured,
@@ -483,11 +509,54 @@ def make_agent_node(
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name, store=store)
-                for t in tools
+                          agent_name=skill.name, store=store,
+                          injected_args=injected_args or {})
+                for t in visible_tools
+            ]
+        elif injected_keys:
+            # No gateway, but injected_args is configured — wrap each
+            # tool in an inject-only ``StructuredTool`` so the LLM-visible
+            # sig matches ``visible_tools`` while the underlying call
+            # still receives the framework-supplied values.
+            from langchain_core.tools import StructuredTool
+
+            _inject_cfg = injected_args or {}
+
+            def _make_inject_only_wrapper(
+                base: BaseTool, llm_visible: BaseTool, sess: Session,
+            ) -> BaseTool:
+                async def _arun(**kwargs: Any) -> Any:
+                    new_kwargs = _inject_args(
+                        kwargs,
+                        session=sess,
+                        injected_args_cfg=_inject_cfg,
+                        tool_name=base.name,
+                    )
+                    return await base.ainvoke(new_kwargs)
+
+                def _run(**kwargs: Any) -> Any:
+                    new_kwargs = _inject_args(
+                        kwargs,
+                        session=sess,
+                        injected_args_cfg=_inject_cfg,
+                        tool_name=base.name,
+                    )
+                    return base.invoke(new_kwargs)
+
+                return StructuredTool.from_function(
+                    func=_run,
+                    coroutine=_arun,
+                    name=base.name,
+                    description=base.description,
+                    args_schema=llm_visible.args_schema,
+                )
+
+            run_tools = [
+                _make_inject_only_wrapper(orig, vis, incident)
+                for orig, vis in zip(tools, visible_tools)
             ]
         else:
-            run_tools = tools
+            run_tools = visible_tools
         agent_executor = create_react_agent(
             llm, run_tools, prompt=skill.system_prompt,
         )
@@ -777,6 +846,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             gateway_cfg=gateway_cfg,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
+            injected_args=cfg.orchestrator.injected_args,
         )
     return nodes
 

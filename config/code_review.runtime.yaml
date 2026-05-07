@@ -85,6 +85,16 @@ orchestrator:
   # state_overrides; orchestrator validates start_session's
   # state_overrides kwarg against this class.
   state_overrides_schema: examples.code_review.state.CodeReviewStateOverrides
+  # Phase 9 (D-09-02 / FOC-01 / FOC-02): session-derived tool-arg
+  # injection map. code_review's pr_url / repo live under
+  # ``Session.extra_fields`` (the framework-default Session has no
+  # typed fields for them) so the dotted paths reach into the dict.
+  # The framework's ``_resolve_dotted`` walks dict-valued attrs
+  # transparently.
+  injected_args:
+    session_id: session.id
+    pr_url: session.extra_fields.pr_url
+    repo: session.extra_fields.repo
 # Cross-cutting framework knobs read directly off AppConfig.framework.
 framework:
   # Per-app session-id prefix. Threaded through SessionStore into

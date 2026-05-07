@@ -165,6 +165,7 @@ def wrap_tool(
     gateway_cfg: GatewayConfig | None,
     agent_name: str = "",
     store: "SessionStore | None" = None,
+    injected_args: dict[str, str] | None = None,
 ) -> BaseTool:
     """Wrap ``base_tool`` so every invocation passes through the gateway.
 
@@ -180,12 +181,33 @@ def wrap_tool(
     second ``wrap_tool(wrap_tool(t))`` does not nest wrappers (which would
     cause unbounded recursion when ``_run`` calls ``inner.invoke`` and
     that dispatches back into another ``_GatedTool._run``).
+
+    Phase 9 (D-09-01 / D-09-03): when ``injected_args`` is supplied, the
+    gateway expands ``kwargs`` with session-derived values BEFORE
+    ``effective_action`` is consulted — so the gateway's risk-rating
+    sees the canonical ``environment`` (avoiding T-09-05: gateway
+    misclassifies prod as auto because env was missing from the LLM
+    args).
     """
     if isinstance(base_tool, _GatedToolMarker):
         return base_tool
 
     env = getattr(session, "environment", None)
     inner = base_tool
+    inject_cfg = injected_args or {}
+
+    # Phase 9 (D-09-01): the LLM-visible args_schema on the wrapper must
+    # exclude every injected key — otherwise BaseTool's input validator
+    # rejects the call when the LLM omits a "required" arg the framework
+    # is about to supply. The inner tool keeps its full schema so the
+    # downstream invoke still sees every kwarg.
+    if inject_cfg:
+        from runtime.tools.arg_injection import strip_injected_params
+        _llm_visible_schema = strip_injected_params(
+            inner, frozenset(inject_cfg.keys()),
+        ).args_schema
+    else:
+        _llm_visible_schema = inner.args_schema
 
     def _sync_invoke_inner(payload: Any) -> Any:
         """Sync-invoke the inner tool, translating BaseTool's
@@ -206,10 +228,25 @@ def wrap_tool(
         name: str = inner.name
         description: str = inner.description
         # The wrapper does its own arg coercion via the inner tool's schema,
-        # so no need to copy it here. Keep ``args_schema`` aligned.
-        args_schema: Any = inner.args_schema  # type: ignore[assignment]
+        # so no need to copy it here. Keep ``args_schema`` aligned with the
+        # LLM-visible (post-strip) schema so BaseTool's input validator
+        # accepts the post-strip kwargs the LLM emits. Phase 9 strips
+        # injected keys here; pre-Phase-9 callers see the full schema.
+        args_schema: Any = _llm_visible_schema  # type: ignore[assignment]
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # Phase 9 (D-09-01 / T-09-05): inject session-derived args
+            # BEFORE the gateway risk lookup so risk-rating sees the
+            # post-injection environment value. Pure no-op when
+            # ``injected_args`` is empty.
+            if inject_cfg:
+                from runtime.tools.arg_injection import inject_injected_args
+                kwargs = inject_injected_args(
+                    kwargs,
+                    session=session,
+                    injected_args_cfg=inject_cfg,
+                    tool_name=inner.name,
+                )
             action = effective_action(inner.name, env=env, gateway_cfg=gateway_cfg)
             if action == "approve":
                 from langgraph.types import interrupt
@@ -348,6 +385,16 @@ def wrap_tool(
             return result
 
         async def _arun(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # Phase 9 (D-09-01 / T-09-05): inject session-derived args
+            # BEFORE the gateway risk lookup. Mirror of the sync ``_run``.
+            if inject_cfg:
+                from runtime.tools.arg_injection import inject_injected_args
+                kwargs = inject_injected_args(
+                    kwargs,
+                    session=session,
+                    injected_args_cfg=inject_cfg,
+                    tool_name=inner.name,
+                )
             action = effective_action(inner.name, env=env, gateway_cfg=gateway_cfg)
             if action == "approve":
                 from langgraph.types import interrupt

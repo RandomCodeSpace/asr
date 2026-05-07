@@ -74,6 +74,15 @@ orchestrator:
   # state_overrides; orchestrator validates the start_session
   # kwarg against this class.
   state_overrides_schema: examples.incident_management.state.IncidentStateOverrides
+  # Phase 9 (D-09-02 / FOC-01 / FOC-02): session-derived tool-arg
+  # injection map. Each entry strips the named arg from every tool's
+  # LLM-visible signature and re-supplies the value from the live
+  # Session at invocation time. The LLM cannot hallucinate values
+  # for args it cannot see.
+  injected_args:
+    environment: session.environment
+    incident_id: session.id
+    session_id: session.id
 
 # Cross-cutting framework knobs the runtime consumes directly.
 framework:

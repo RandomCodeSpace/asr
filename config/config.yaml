@@ -186,6 +186,15 @@ orchestrator:
   # state_overrides; orchestrator validates the start_session
   # kwarg against this class.
   state_overrides_schema: examples.incident_management.state.IncidentStateOverrides
+  # Phase 9 (D-09-02 / FOC-01 / FOC-02): session-derived tool-arg
+  # injection map. Strips the named args from each tool's LLM-visible
+  # signature and re-supplies them from the live Session at invocation
+  # time. Mirrors incident_management.yaml since this file is the
+  # bundled deployment config for the example app.
+  injected_args:
+    environment: session.environment
+    incident_id: session.id
+    session_id: session.id
 runtime:
   # Wires the orchestrator and storage layer to the incident-management
   # domain state class (see examples/incident_management/state.py).

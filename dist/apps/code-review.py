@@ -304,7 +304,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 import asyncio
 import logging
-from typing import TypedDict, Callable, Awaitable
+from typing import Any, TypedDict, Callable, Awaitable
 
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
@@ -1215,6 +1215,16 @@ class OrchestratorConfig(BaseModel):
     # bad path raises at boot with a useful message (DECOUPLE-05 / D-08-01).
     state_overrides_schema: str | None = None
 
+    # Phase 9 (D-09-02 / FOC-01): map of LLM-visible-arg -> dotted-path
+    # on the live Session. Tools whose param name matches a key in this
+    # dict get the param stripped from the LLM-visible signature, and
+    # the framework supplies the resolved value at _invoke_tool /
+    # _GatedTool._run / _arun time. Apps declare what to inject; the
+    # framework stays generic. Empty default = no injection (legacy
+    # behaviour). Validated at config-load: keys are non-empty
+    # identifiers, values are dotted paths starting with "session.".
+    injected_args: dict[str, str] = Field(default_factory=dict)
+
     @field_validator("state_overrides_schema")
     @classmethod
     def _validate_state_overrides_schema_format(
@@ -1247,6 +1257,38 @@ class OrchestratorConfig(BaseModel):
                 f"path (expected `module.path:ClassName` or "
                 f"`module.path.ClassName`)"
             )
+        return v
+
+    @field_validator("injected_args")
+    @classmethod
+    def _validate_injected_args(
+        cls, v: dict[str, str],
+    ) -> dict[str, str]:
+        """Phase 9 (D-09-02): config-load validation for injected_args.
+
+        Each entry is ``arg_name -> dotted_path`` where ``arg_name`` must
+        be a valid Python identifier (it is the keyword name on a tool
+        signature) and ``dotted_path`` must be a non-empty string with at
+        least one dot (e.g. ``session.environment``). Real attribute
+        resolution happens at injection time in
+        :func:`runtime.tools.arg_injection.inject_injected_args` so
+        config-load doesn't drag the live ``Session`` into every consumer.
+        """
+        for key, path in v.items():
+            if not key or not key.isidentifier():
+                raise ValueError(
+                    f"injected_args key {key!r} must be a non-empty "
+                    f"Python identifier"
+                )
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(
+                    f"injected_args[{key!r}] must be a non-empty dotted path"
+                )
+            if "." not in path:
+                raise ValueError(
+                    f"injected_args[{key!r}]={path!r} must be a dotted path "
+                    f"(e.g. 'session.environment')"
+                )
         return v
 
     @model_validator(mode="after")
@@ -4260,6 +4302,7 @@ def make_agent_node(
     gateway_cfg: GatewayConfig | None = None,
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
+    injected_args: dict[str, str] | None = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -4280,12 +4323,34 @@ def make_agent_node(
     union ``OrchestratorConfig.harvest_terminal_tools`` /
     ``OrchestratorConfig.patch_tools``). Empty defaults preserve the
     "no harvester recognition" behavior for legacy callers.
+
+    ``injected_args`` (Phase 9 / D-09-01) is the orchestrator-wide
+    map of ``arg_name -> dotted_path`` declared in
+    :attr:`OrchestratorConfig.injected_args`. Every entry is stripped
+    from each tool's LLM-visible signature (so the LLM cannot emit a
+    value for it) and re-supplied at invocation time from session
+    state. When ``None`` or empty, tools pass through to the LLM
+    unchanged — preserves legacy callers and the framework default.
     """
 
     async def node(state: GraphState) -> dict:
         incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # Phase 9 (D-09-01): strip injected-arg keys from every tool's
+        # LLM-visible signature BEFORE create_react_agent serialises the
+        # tool surface — so the LLM literally cannot emit values for
+        # those params. The framework re-supplies them at invocation
+        # time inside the gateway (or an inject-only wrapper) below.
+
+        injected_keys = frozenset((injected_args or {}).keys())
+        if injected_keys:
+            visible_tools = [
+                strip_injected_params(t, injected_keys) for t in tools
+            ]
+        else:
+            visible_tools = tools
 
         # Wrap tools per-invocation so each wrap closes over the live
         # ``Session`` for this run. When the gateway is unconfigured,
@@ -4294,11 +4359,54 @@ def make_agent_node(
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name, store=store)
-                for t in tools
+                          agent_name=skill.name, store=store,
+                          injected_args=injected_args or {})
+                for t in visible_tools
+            ]
+        elif injected_keys:
+            # No gateway, but injected_args is configured — wrap each
+            # tool in an inject-only ``StructuredTool`` so the LLM-visible
+            # sig matches ``visible_tools`` while the underlying call
+            # still receives the framework-supplied values.
+            from langchain_core.tools import StructuredTool
+
+            _inject_cfg = injected_args or {}
+
+            def _make_inject_only_wrapper(
+                base: BaseTool, llm_visible: BaseTool, sess: Session,
+            ) -> BaseTool:
+                async def _arun(**kwargs: Any) -> Any:
+                    new_kwargs = _inject_args(
+                        kwargs,
+                        session=sess,
+                        injected_args_cfg=_inject_cfg,
+                        tool_name=base.name,
+                    )
+                    return await base.ainvoke(new_kwargs)
+
+                def _run(**kwargs: Any) -> Any:
+                    new_kwargs = _inject_args(
+                        kwargs,
+                        session=sess,
+                        injected_args_cfg=_inject_cfg,
+                        tool_name=base.name,
+                    )
+                    return base.invoke(new_kwargs)
+
+                return StructuredTool.from_function(
+                    func=_run,
+                    coroutine=_arun,
+                    name=base.name,
+                    description=base.description,
+                    args_schema=llm_visible.args_schema,
+                )
+
+            run_tools = [
+                _make_inject_only_wrapper(orig, vis, incident)
+                for orig, vis in zip(tools, visible_tools)
             ]
         else:
-            run_tools = tools
+            run_tools = visible_tools
         agent_executor = create_react_agent(
             llm, run_tools, prompt=skill.system_prompt,
         )
@@ -4588,6 +4696,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             gateway_cfg=gateway_cfg,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
+            injected_args=cfg.orchestrator.injected_args,
         )
     return nodes
 
@@ -8254,7 +8363,15 @@ class Orchestrator(Generic[StateT]):
                 tool_args: dict = {"incident_id": incident_id, "message": message}
                 if team is not None:
                     tool_args["team"] = team
-                tool_result = await self._invoke_tool(tool_name, tool_args)
+                # Phase 9 (D-09-01): expose the live session to
+                # _invoke_tool's injection branch via the implicit slot.
+                # try/finally so a failed tool call doesn't leak the
+                # reference into the next orchestrator-driven call.
+                self._current_session_for_invoke = inc_loaded
+                try:
+                    tool_result = await self._invoke_tool(tool_name, tool_args)
+                finally:
+                    self._current_session_for_invoke = None
                 inc_loaded.tool_calls.append(ToolCall(
                     agent="orchestrator",
                     tool=tool_name,
@@ -8456,6 +8573,14 @@ class Orchestrator(Generic[StateT]):
         Used for orchestrator-driven tool calls (e.g. an app-registered
         escalation tool invoked from the awaiting_input gate) that aren't
         initiated by an LLM.
+
+        Phase 9 (D-09-01): orchestrator-driven calls also flow through
+        injection so the tool gets the canonical session-derived arg set
+        even when the orchestrator only passed intent-args. The current
+        session is read off ``self._current_session_for_invoke`` (set
+        by callers via try/finally) so the public signature stays
+        unchanged. When no session is reachable the injection step is
+        a no-op — the existing escalation path keeps working unchanged.
         """
         entry = next(
             (e for e in self.registry.entries.values() if e.name == name),
@@ -8463,6 +8588,16 @@ class Orchestrator(Generic[StateT]):
         )
         if entry is None:
             raise KeyError(f"tool '{name}' not registered")
+        session = getattr(self, "_current_session_for_invoke", None)
+        cfg_inject = self.cfg.orchestrator.injected_args
+        if session is not None and cfg_inject:
+
+            args = inject_injected_args(
+                args,
+                session=session,
+                injected_args_cfg=cfg_inject,
+                tool_name=name,
+            )
         return await entry.tool.ainvoke(args)
 
     @staticmethod

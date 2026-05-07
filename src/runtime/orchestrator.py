@@ -1043,7 +1043,15 @@ class Orchestrator(Generic[StateT]):
                 tool_args: dict = {"incident_id": incident_id, "message": message}
                 if team is not None:
                     tool_args["team"] = team
-                tool_result = await self._invoke_tool(tool_name, tool_args)
+                # Phase 9 (D-09-01): expose the live session to
+                # _invoke_tool's injection branch via the implicit slot.
+                # try/finally so a failed tool call doesn't leak the
+                # reference into the next orchestrator-driven call.
+                self._current_session_for_invoke = inc_loaded
+                try:
+                    tool_result = await self._invoke_tool(tool_name, tool_args)
+                finally:
+                    self._current_session_for_invoke = None
                 inc_loaded.tool_calls.append(ToolCall(
                     agent="orchestrator",
                     tool=tool_name,
@@ -1245,6 +1253,14 @@ class Orchestrator(Generic[StateT]):
         Used for orchestrator-driven tool calls (e.g. an app-registered
         escalation tool invoked from the awaiting_input gate) that aren't
         initiated by an LLM.
+
+        Phase 9 (D-09-01): orchestrator-driven calls also flow through
+        injection so the tool gets the canonical session-derived arg set
+        even when the orchestrator only passed intent-args. The current
+        session is read off ``self._current_session_for_invoke`` (set
+        by callers via try/finally) so the public signature stays
+        unchanged. When no session is reachable the injection step is
+        a no-op — the existing escalation path keeps working unchanged.
         """
         entry = next(
             (e for e in self.registry.entries.values() if e.name == name),
@@ -1252,6 +1268,16 @@ class Orchestrator(Generic[StateT]):
         )
         if entry is None:
             raise KeyError(f"tool '{name}' not registered")
+        session = getattr(self, "_current_session_for_invoke", None)
+        cfg_inject = self.cfg.orchestrator.injected_args
+        if session is not None and cfg_inject:
+            from runtime.tools.arg_injection import inject_injected_args
+            args = inject_injected_args(
+                args,
+                session=session,
+                injected_args_cfg=cfg_inject,
+                tool_name=name,
+            )
         return await entry.tool.ainvoke(args)
 
     @staticmethod
