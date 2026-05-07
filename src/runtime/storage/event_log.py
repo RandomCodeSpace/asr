@@ -1,8 +1,9 @@
 """Append-only session event log.
 
-Events drive the status finalizer's inference (e.g. ``mark_escalated``
-appearing in the log -> session was escalated). They are never
-mutated or deleted.
+Events drive the status finalizer's inference (e.g. a registered
+``<terminal_tool>`` event appearing in the log -> session reached
+the corresponding terminal status). They are never mutated or
+deleted.
 """
 from __future__ import annotations
 
@@ -34,9 +35,10 @@ def _now() -> str:
 class EventLog:
     """Append-only log of session events.
 
-    Events drive the status finalizer's inference (e.g. ``mark_escalated``
-    appearing in the log -> session was escalated). They are never
-    mutated or deleted.
+    Events drive the status finalizer's inference (e.g. a registered
+    ``<terminal_tool>`` event appearing in the log -> session reached
+    the corresponding terminal status). They are never mutated or
+    deleted.
     """
 
     def __init__(self, *, engine: Engine) -> None:

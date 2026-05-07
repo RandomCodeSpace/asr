@@ -945,6 +945,18 @@ status flip via :meth:`SessionStore.un_duplicate`.
 from fastapi import FastAPI, HTTPException
 
 
+# ----- imports for examples/incident_management/state.py -----
+"""Incident-management state-overrides schema (DECOUPLE-05 / D-08-01).
+
+Registered via ``OrchestratorConfig.state_overrides_schema`` in
+``config/incident_management.yaml``. Validated by ``Orchestrator.start_session``
+against the dict passed under the ``state_overrides=`` kwarg before any
+row is written to the session store.
+"""
+
+
+
+
 # ----- imports for examples/incident_management/mcp_servers/observability.py -----
 """FastMCP server: observability mock tools."""
 
@@ -1198,6 +1210,50 @@ class OrchestratorConfig(BaseModel):
     # is set. Apps own this default (``incident_management`` defaults
     # to ``platform-oncall``).
     escalate_action_default_team: str | None = None
+
+    # Dotted path to a pydantic BaseModel subclass that validates the
+    # ``state_overrides=`` dict passed to ``Orchestrator.start_session``.
+    # Format: ``module.path:ClassName`` OR ``module.path.ClassName`` (both
+    # accepted; ``:`` is the canonical entry-point form). ``None`` (default)
+    # = no validation; ``start_session(state_overrides=...)`` passes the
+    # dict through unchanged (D-08-02 backward-compat). Resolved at
+    # ``Orchestrator.create()`` via ``importlib.import_module`` + ``getattr``;
+    # bad path raises at boot with a useful message (DECOUPLE-05 / D-08-01).
+    state_overrides_schema: str | None = None
+
+    @field_validator("state_overrides_schema")
+    @classmethod
+    def _validate_state_overrides_schema_format(
+        cls, v: str | None,
+    ) -> str | None:
+        """String-format sanity check for the dotted-path schema reference.
+
+        Real importlib resolution happens at ``Orchestrator.create()``
+        time so config-load doesn't drag the schema module into every
+        consumer. This validator only catches obviously-malformed
+        strings (whitespace, hyphens, missing class component) so the
+        actual ImportError/AttributeError is the only reason boot
+        ever fails (DECOUPLE-05 / D-08-01).
+        """
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError(
+                "state_overrides_schema must be non-empty when set"
+            )
+        # Accept either ``mod.path:ClassName`` or ``mod.path.ClassName``.
+        # Each component must be a Python identifier; the trailing
+        # element MUST be a class name (no further dots after the
+        # separator).
+        if not re.fullmatch(
+            r"[A-Za-z_][\w.]*[:.][A-Za-z_]\w*", v,
+        ):
+            raise ValueError(
+                f"state_overrides_schema={v!r} is not a valid dotted "
+                f"path (expected `module.path:ClassName` or "
+                f"`module.path.ClassName`)"
+            )
+        return v
 
     @model_validator(mode="after")
     def _validate_terminal_tool_registry(self) -> "OrchestratorConfig":
@@ -7421,6 +7477,13 @@ class Orchestrator(Generic[StateT]):
         # on the same session id. The set is mutated under self._locks
         # so the in-flight check + add is atomic per session.
         self._retries_in_flight: set[str] = set()
+        # Resolved app-declared pydantic schema for the
+        # ``state_overrides=`` kwarg of ``start_session``. ``None``
+        # (default) means no validation — start_session passes the
+        # dict through unchanged (DECOUPLE-05 / D-08-02 backward-
+        # compat). Set by ``Orchestrator.create()`` after importlib
+        # resolution of ``cfg.orchestrator.state_overrides_schema``.
+        self._state_overrides_cls: type[BaseModel] | None = None
 
     @classmethod
     async def create(cls, cfg: AppConfig) -> "Orchestrator":
@@ -7440,6 +7503,41 @@ class Orchestrator(Generic[StateT]):
                 )
             else:
                 framework_cfg = cfg.framework
+            # DECOUPLE-05 / D-08-01: resolve the app-declared
+            # state-overrides pydantic schema once at boot. ``None``
+            # means no validation (D-08-02 backward-compat). The
+            # config-load layer already format-validated the dotted
+            # path; importlib failures here surface as a clear boot
+            # error naming the path AND the underlying cause.
+            state_overrides_cls: type[BaseModel] | None = None
+            schema_path = cfg.orchestrator.state_overrides_schema
+            if schema_path is not None:
+                if ":" in schema_path:
+                    module_path, _, class_name = schema_path.rpartition(":")
+                else:
+                    module_path, _, class_name = schema_path.rpartition(".")
+                try:
+                    schema_module = importlib.import_module(module_path)
+                except ImportError as exc:
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"failed to import module {module_path!r}: {exc}"
+                    ) from exc
+                try:
+                    state_overrides_cls = getattr(schema_module, class_name)
+                except AttributeError as exc:
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"module {module_path!r} has no attribute "
+                        f"{class_name!r}"
+                    ) from exc
+                if not (isinstance(state_overrides_cls, type)
+                        and issubclass(state_overrides_cls, BaseModel)):
+                    raise RuntimeError(
+                        f"state_overrides_schema={schema_path!r}: "
+                        f"{class_name!r} is not a pydantic BaseModel "
+                        f"subclass"
+                    )
             # Resolve the app state class once. ``None`` (default) keeps the
             # framework-default ``Session`` shape; apps point this at e.g.
             # ``examples.incident_management.state.IncidentState`` via YAML.
@@ -7622,13 +7720,18 @@ class Orchestrator(Generic[StateT]):
             # No bespoke resume graph — resume runs through the main
             # graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrating paused state.
-            return cls(cfg, store, skills, registry, graph,
-                       stack, framework_cfg=framework_cfg,
-                       state_cls=repo_state_cls,
-                       history=history,
-                       checkpointer=checkpointer,
-                       checkpointer_close=checkpointer_close,
-                       dedup_pipeline=dedup_pipeline)
+            instance = cls(cfg, store, skills, registry, graph,
+                           stack, framework_cfg=framework_cfg,
+                           state_cls=repo_state_cls,
+                           history=history,
+                           checkpointer=checkpointer,
+                           checkpointer_close=checkpointer_close,
+                           dedup_pipeline=dedup_pipeline)
+            # DECOUPLE-05 / D-08-01: stash the resolved schema class
+            # so ``start_session`` can run ``model_validate`` on the
+            # ``state_overrides=`` kwarg.
+            instance._state_overrides_cls = state_overrides_cls
+            return instance
         except BaseException:
             # Best-effort: close the checkpointer connection if it was
             # built before we hit the failure, so we don't leak FDs.
@@ -7783,14 +7886,27 @@ class Orchestrator(Generic[StateT]):
             tool_name = tc.tool or ""
             for rule in rules:
                 bare = rule.tool_name
-                if tool_name == bare or tool_name.endswith(f":{bare}"):
-                    extracted = {
-                        dest: self._extract_field(tc, lookup_keys)
-                        for dest, lookup_keys in rule.extract_fields.items()
-                    }
-                    return rule.status, {
-                        k: v for k, v in extracted.items() if v
-                    }
+                if not (tool_name == bare or tool_name.endswith(f":{bare}")):
+                    continue
+                # DECOUPLE-07 / D-08-03: optional argument-value
+                # discriminator. When ``match_args`` is non-empty
+                # the rule applies only if EVERY (key, value) pair
+                # matches ``tc.args[key]`` exactly. Empty default
+                # matches any args (v1.0 single-rule shape).
+                if rule.match_args:
+                    args = tc.args if isinstance(tc.args, dict) else {}
+                    if not all(
+                        args.get(k) == v
+                        for k, v in rule.match_args.items()
+                    ):
+                        continue
+                extracted = {
+                    dest: self._extract_field(tc, lookup_keys)
+                    for dest, lookup_keys in rule.extract_fields.items()
+                }
+                return rule.status, {
+                    k: v for k, v in extracted.items() if v
+                }
         return None
 
     def _extract_field(
@@ -7962,6 +8078,15 @@ class Orchestrator(Generic[StateT]):
         agent graph is skipped entirely.
         """
         state_overrides = _coerce_state_overrides(state_overrides, environment)
+        # DECOUPLE-05 / D-08-01: validate against the app-registered
+        # pydantic schema if configured. ``None`` (D-08-02) skips
+        # validation entirely so the legacy v1.0 free-form dict
+        # surface still works for unconfigured apps. ``getattr`` with
+        # a default keeps tests that build the orchestrator via
+        # ``__new__`` (bypassing ``__init__``) working.
+        state_overrides_cls = getattr(self, "_state_overrides_cls", None)
+        if state_overrides_cls is not None and state_overrides is not None:
+            state_overrides_cls.model_validate(state_overrides)
         submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
         sub_id = (submitter or {}).get("id", "user-mock")
         sub_team = (submitter or {}).get("team", "platform")
@@ -8972,6 +9097,23 @@ def register_dedup_routes(
             retracted_by=payload.retracted_by,
             note=payload.note,
         )
+
+# ====== module: examples/incident_management/state.py ======
+
+class IncidentStateOverrides(BaseModel):
+    """Per-session overrides for incident_management.
+
+    All fields are Optional so v1.0 callers passing only ``environment``
+    (e.g. ``tests/test_start_session_state_overrides.py``,
+    ``tests/test_start_session_submitter.py``, ``src/runtime/api.py``)
+    continue to validate. ``extra='forbid'`` catches typos at session-start
+    rather than at gateway-eval time (PVC-06 / D-08-01).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    environment: str | None = None
+    severity: str | None = None
 
 # ====== module: examples/incident_management/mcp_servers/observability.py ======
 

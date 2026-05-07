@@ -57,18 +57,14 @@ PATTERN = re.compile(
 # Removing an allowlist entry without first removing the leak is
 # always a regression and will fail this ratchet.
 # ---------------------------------------------------------------------------
-RATCHET_ALLOWLIST: dict[tuple[str, str], str] = {
-    # Phase 8 (DECOUPLE-07) will scrub the remaining incident-vocabulary
-    # docstring examples from ``terminal_tools.py`` (the framework's
-    # registry types) and ``storage/event_log.py`` after the code_review
-    # e2e test ships and we have a non-incident vocabulary to use as
-    # the canonical doc-string example.
-    ("src/runtime/terminal_tools.py", "mark_escalated"): "Phase 8",
-    ("src/runtime/terminal_tools.py", "mark_resolved"): "Phase 8",
-    ("src/runtime/terminal_tools.py", "apply_fix"): "Phase 8",
-    ("src/runtime/terminal_tools.py", "notify_oncall"): "Phase 8",
-    ("src/runtime/storage/event_log.py", "mark_escalated"): "Phase 8",
-}
+# Phase 8 (DECOUPLE-07) closed the milestone — every Phase 8
+# docstring leak was scrubbed to use neutral placeholders
+# (``<terminal_tool>``, ``set_recommendation``). The ratchet is
+# now a binary assertion: ANY match under ``src/runtime/`` is a
+# regression. To intentionally land code that matches a forbidden
+# token, you must first remove the leak; the allowlist is no
+# longer a release valve.
+RATCHET_ALLOWLIST: dict[tuple[str, str], str] = {}
 
 
 def _iter_runtime_py_files() -> list[Path]:

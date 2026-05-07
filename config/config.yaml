@@ -182,6 +182,10 @@ orchestrator:
     - examples.incident_management.mcp_servers.user_context
   escalate_action_tool_name: notify_oncall
   escalate_action_default_team: platform-oncall
+  # DECOUPLE-05 / D-08-01: app-declared pydantic schema for
+  # state_overrides; orchestrator validates the start_session
+  # kwarg against this class.
+  state_overrides_schema: examples.incident_management.state.IncidentStateOverrides
 runtime:
   # Wires the orchestrator and storage layer to the incident-management
   # domain state class (see examples/incident_management/state.py).

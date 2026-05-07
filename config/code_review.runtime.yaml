@@ -34,11 +34,12 @@ mcp:
 paths:
   skills_dir: examples/code_review/skills
   incidents_dir: code_reviews
-# Phase 6 placeholder: code_review's full terminal-tool registration
-# ships in Phase 8 (DECOUPLE-07 + DECOUPLE-05) alongside the e2e
-# test. For now the framework knows the app's status vocabulary
-# but has no rules to fire on — every code_review session finalizes
-# to ``unreviewed`` (the app's app-owned default per D-06-06).
+# Phase 8 (DECOUPLE-05 + DECOUPLE-07): full terminal-tool registry +
+# state-overrides schema for code_review. Three rules dispatch
+# ``set_recommendation`` by ``args.recommendation`` (approve ->
+# approved; request_changes -> changes_requested; comment -> commented).
+# When no rule fires the session falls through to ``unreviewed``
+# (the v1.0 framework-default failure mode).
 orchestrator:
   entry_agent: intake
   default_terminal_status: unreviewed
@@ -47,17 +48,43 @@ orchestrator:
       name: in_review
       terminal: false
       kind: pending
+    approved:
+      name: approved
+      terminal: true
+      kind: success
+    changes_requested:
+      name: changes_requested
+      terminal: true
+      kind: failure
+    commented:
+      name: commented
+      terminal: true
+      kind: needs_review
     unreviewed:
       name: unreviewed
       terminal: true
       kind: needs_review
-  terminal_tools: []
+  terminal_tools:
+    - tool_name: set_recommendation
+      status: approved
+      match_args:
+        recommendation: approve
+    - tool_name: set_recommendation
+      status: changes_requested
+      match_args:
+        recommendation: request_changes
+    - tool_name: set_recommendation
+      status: commented
+      match_args:
+        recommendation: comment
   # App-MCP-server discovery (Phase 7 / DECOUPLE-04 / D-07-02). Empty
   # list = code-review boots without app-owned MCP servers; framework
-  # treats the empty branch gracefully (the orchestrator's discovery
-  # loop simply iterates zero times). Phase 8 may populate this for
-  # code-review-specific tools.
+  # treats the empty branch gracefully.
   mcp_servers: []
+  # DECOUPLE-05 / D-08-01: app-declared pydantic schema for
+  # state_overrides; orchestrator validates start_session's
+  # state_overrides kwarg against this class.
+  state_overrides_schema: examples.code_review.state.CodeReviewStateOverrides
 # Cross-cutting framework knobs read directly off AppConfig.framework.
 framework:
   # Per-app session-id prefix. Threaded through SessionStore into

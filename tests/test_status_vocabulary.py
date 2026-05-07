@@ -33,6 +33,10 @@ def test_terminal_tool_rule_with_extract_fields_round_trip():
         "tool_name": "mark_escalated",
         "status": "escalated",
         "extract_fields": {"team": ["args.team", "result.team"]},
+        # Phase 8 (DECOUPLE-07 / D-08-03) added the optional
+        # ``match_args`` discriminator. Empty default preserves the
+        # v1.0 single-rule shape.
+        "match_args": {},
     }
 
 

@@ -218,6 +218,50 @@ class OrchestratorConfig(BaseModel):
     # to ``platform-oncall``).
     escalate_action_default_team: str | None = None
 
+    # Dotted path to a pydantic BaseModel subclass that validates the
+    # ``state_overrides=`` dict passed to ``Orchestrator.start_session``.
+    # Format: ``module.path:ClassName`` OR ``module.path.ClassName`` (both
+    # accepted; ``:`` is the canonical entry-point form). ``None`` (default)
+    # = no validation; ``start_session(state_overrides=...)`` passes the
+    # dict through unchanged (D-08-02 backward-compat). Resolved at
+    # ``Orchestrator.create()`` via ``importlib.import_module`` + ``getattr``;
+    # bad path raises at boot with a useful message (DECOUPLE-05 / D-08-01).
+    state_overrides_schema: str | None = None
+
+    @field_validator("state_overrides_schema")
+    @classmethod
+    def _validate_state_overrides_schema_format(
+        cls, v: str | None,
+    ) -> str | None:
+        """String-format sanity check for the dotted-path schema reference.
+
+        Real importlib resolution happens at ``Orchestrator.create()``
+        time so config-load doesn't drag the schema module into every
+        consumer. This validator only catches obviously-malformed
+        strings (whitespace, hyphens, missing class component) so the
+        actual ImportError/AttributeError is the only reason boot
+        ever fails (DECOUPLE-05 / D-08-01).
+        """
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError(
+                "state_overrides_schema must be non-empty when set"
+            )
+        # Accept either ``mod.path:ClassName`` or ``mod.path.ClassName``.
+        # Each component must be a Python identifier; the trailing
+        # element MUST be a class name (no further dots after the
+        # separator).
+        if not re.fullmatch(
+            r"[A-Za-z_][\w.]*[:.][A-Za-z_]\w*", v,
+        ):
+            raise ValueError(
+                f"state_overrides_schema={v!r} is not a valid dotted "
+                f"path (expected `module.path:ClassName` or "
+                f"`module.path.ClassName`)"
+            )
+        return v
+
     @model_validator(mode="after")
     def _validate_terminal_tool_registry(self) -> "OrchestratorConfig":
         """Cross-field invariants for the terminal-tool registry.

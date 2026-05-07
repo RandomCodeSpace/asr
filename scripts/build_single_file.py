@@ -129,6 +129,11 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
 # the framework helpers to incident_management's stores + active-session
 # lookup now lives inside ``mcp_server.py``.
 INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
+    # state.py — pydantic ``IncidentStateOverrides`` schema
+    # (DECOUPLE-05 / D-08-01). Bundled FIRST so any later module's
+    # ``from examples.incident_management.state import …`` resolves
+    # against the in-bundle definition (Phase 8).
+    (EXAMPLES_ROOT, "incident_management/state.py"),
     # Per-tool MCP servers — relocated under
     # ``examples/incident_management/`` in Phase 7 (DECOUPLE-04 /
     # D-07-01). Bundled before mcp_server.py so the dotted-path
@@ -147,6 +152,11 @@ INCIDENT_APP_MODULE_ORDER: list[tuple[Path, str]] = [
 # files were removed in the framework/dedup/environments YAML
 # migration; cross-cutting knobs now live on AppConfig directly.
 CODE_REVIEW_APP_MODULE_ORDER: list[tuple[Path, str]] = [
+    # state.py — pydantic ``CodeReviewStateOverrides`` schema
+    # (DECOUPLE-05 / D-08-01). Bundled FIRST so any later module's
+    # ``from examples.code_review.state import …`` resolves against
+    # the in-bundle definition (Phase 8).
+    (EXAMPLES_ROOT, "code_review/state.py"),
     (EXAMPLES_ROOT, "code_review/mcp_server.py"),
 ]
 
