@@ -44,6 +44,7 @@ class IntakeContext:
 
     history_store: Any = None       # Optional[HistoryStore[StateT]]
     dedup_pipeline: Any = None      # Optional[DedupPipeline[StateT]]
+    event_log: Any = None           # Optional[EventLog] — M1 telemetry sink
     top_k: int = 3
     similarity_threshold: float = 0.7
 

@@ -50,6 +50,9 @@ Thumbs.db
 # --- Claude tooling artifacts ----------------------------------------
 AGENTS.md
 ASR.md
+.claude/ralph-loop.local.md
+.claude/worktrees/
+.plan/
 # Tracked docs are explicitly listed below; everything else under docs/
 # is Claude scratch (plans, brainstorm output, etc) and stays gitignored.
 #   - AIRGAP_INSTALL.md: Phase 14 (HARD-02) air-gap install path.

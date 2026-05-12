@@ -10890,6 +10890,7 @@ class IntakeContext:
 
     history_store: Any = None       # Optional[HistoryStore[StateT]]
     dedup_pipeline: Any = None      # Optional[DedupPipeline[StateT]]
+    event_log: Any = None           # Optional[EventLog] — M1 telemetry sink
     top_k: int = 3
     similarity_threshold: float = 0.7
 
@@ -12028,6 +12029,7 @@ from langgraph.types import Command
 
 
 
+
 _log = logging.getLogger("runtime.orchestrator")
 
 
@@ -12217,6 +12219,7 @@ class Orchestrator(Generic[StateT]):
                  framework_cfg: FrameworkAppConfig | None = None,
                  state_cls: Type[StateT] = Session,  # type: ignore[assignment]
                  history: HistoryStore | None = None,
+                 event_log: EventLog | None = None,
                  checkpointer=None,
                  checkpointer_close=None,
                  dedup_pipeline: "DedupPipeline | None" = None):
@@ -12231,6 +12234,10 @@ class Orchestrator(Generic[StateT]):
         # vector store; ``history`` is optional for callers that don't
         # need similarity lookups.
         self.history = history
+        # M1 (per-step telemetry): append-only event sink. Single instance
+        # shared with framework_cfg.intake_context.event_log so module-level
+        # supervisor runners can emit via the same handle.
+        self.event_log = event_log
         self.skills = skills
         self.registry = registry
         # A single compiled graph drives both fresh runs and resume-
@@ -12365,6 +12372,11 @@ class Orchestrator(Generic[StateT]):
                 similarity_threshold=framework_cfg.similarity_threshold,
                 distance_strategy=cfg.storage.vector.distance_strategy,
             )
+            # M1 (per-step telemetry): append-only event sink writing into
+            # session_events; shared by AgentRunRecorder, gateway, and the
+            # status-finalize hook (M3/M4). One row per agent boundary or
+            # tool call — never mutated.
+            event_log = EventLog(engine=engine)
             # Attach intake_context onto framework_cfg so supervisor nodes can
             # reach the live stores via app_cfg.intake_context. FrameworkAppConfig
             # is a Pydantic model; use object.__setattr__ to set a runtime
@@ -12375,6 +12387,7 @@ class Orchestrator(Generic[StateT]):
                 IntakeContext(
                     history_store=history,
                     dedup_pipeline=None,  # dedup_pipeline built below; patched after
+                    event_log=event_log,
                     top_k=framework_cfg.intake_top_k,
                     similarity_threshold=framework_cfg.intake_similarity_threshold,
                 ),
@@ -12520,6 +12533,7 @@ class Orchestrator(Generic[StateT]):
                            stack, framework_cfg=framework_cfg,
                            state_cls=repo_state_cls,  # pyright: ignore[reportArgumentType]
                            history=history,
+                           event_log=event_log,
                            checkpointer=checkpointer,
                            checkpointer_close=checkpointer_close,
                            dedup_pipeline=dedup_pipeline)
