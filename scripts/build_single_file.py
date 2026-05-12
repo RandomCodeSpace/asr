@@ -87,6 +87,9 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # orchestrator.py so it can instantiate the store at boot.
     (RUNTIME_ROOT, "storage/lesson_store.py"),
     (RUNTIME_ROOT, "learning/extractor.py"),
+    # M7: nightly lesson refresher (APScheduler cron). Depends on
+    # extractor + lesson_store (both above).
+    (RUNTIME_ROOT, "learning/scheduler.py"),
     # NOTE: the per-tool mcp_server modules
     # (observability/remediation/user_context) were relocated under
     # ``examples/incident_management/mcp_servers/`` in Phase 7

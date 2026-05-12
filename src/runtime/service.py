@@ -158,6 +158,10 @@ class OrchestratorService:
         # ``cfg.runtime.gateway`` is configured; otherwise None and the
         # lifecycle hooks are no-ops.
         self._approval_watchdog: Any | None = None
+        # M7 nightly lesson refresher. Started in ``start()`` iff the
+        # orchestrator has a lesson_store; otherwise None (the lifecycle
+        # hooks short-circuit).
+        self._lesson_refresher: Any | None = None
 
     @classmethod
     def get_or_create(cls, cfg: AppConfig) -> "OrchestratorService":
@@ -215,6 +219,7 @@ class OrchestratorService:
                 approval_timeout_seconds=timeout_s,
             )
             self._approval_watchdog.start(self._loop)
+
 
     def _run_loop(self) -> None:
         assert self._loop is not None
@@ -368,7 +373,50 @@ class OrchestratorService:
                 # load time (orchestrator transitively imports a lot).
                 from runtime.orchestrator import Orchestrator
                 self._orch = await Orchestrator.create(self.cfg)
+                # M7: nightly lesson refresher. Wired on first
+                # orchestrator build so the engine + lesson_store +
+                # event_log handles are already populated.
+                self._maybe_start_lesson_refresher(self._orch)
             return self._orch
+
+    def _maybe_start_lesson_refresher(self, orch: Any) -> None:
+        """Arm the M7 nightly refresher on first orchestrator build.
+        No-op when the orchestrator has no lesson_store / event_log
+        (test fixtures, apps that disable the corpus) or when the
+        refresher is already armed."""
+        if self._lesson_refresher is not None:
+            return
+        lesson_store = getattr(orch, "lesson_store", None)
+        event_log = getattr(orch, "event_log", None)
+        if lesson_store is None or event_log is None:
+            return
+        from runtime.learning.scheduler import LessonRefresher
+
+        framework_cfg = getattr(orch, "framework_cfg", None)
+        cron = getattr(framework_cfg, "lesson_refresh_cron", "0 3 * * *")
+        window_days = getattr(framework_cfg, "lesson_refresh_window_days", 7)
+        terminal_statuses = frozenset(
+            name for name, sdef in self.cfg.orchestrator.statuses.items()
+            if getattr(sdef, "terminal", False)
+        )
+        if not terminal_statuses or self._loop is None:
+            return
+        self._lesson_refresher = LessonRefresher(
+            engine=orch.store.engine,
+            lesson_store=lesson_store,
+            event_log=event_log,
+            terminal_statuses=terminal_statuses,
+            cron=cron,
+            window_days=window_days,
+        )
+        try:
+            self._lesson_refresher.start(self._loop)
+        except Exception:  # noqa: BLE001 — don't break orch build on cron failure
+            _log.warning(
+                "LessonRefresher start failed; corpus refresh disabled",
+                exc_info=True,
+            )
+            self._lesson_refresher = None
 
     def start_session(
         self,
@@ -658,6 +706,19 @@ class OrchestratorService:
                     exc_info=True,
                 )
             self._approval_watchdog = None
+        # M7: stop the nightly lesson refresher symmetrically with the
+        # watchdog. Same best-effort discipline.
+        if loop.is_running() and self._lesson_refresher is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._lesson_refresher.stop(), loop,
+                )
+                fut.result(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "shutdown: lesson refresher stop failed", exc_info=True,
+                )
+            self._lesson_refresher = None
         # Cancel in-flight session tasks first so they observe a
         # CancelledError before the orchestrator's underlying
         # resources (DB engine, FastMCP transports) are torn down.

@@ -656,6 +656,12 @@ class FrameworkAppConfig(BaseModel):
     # Intake runner knobs: forwarded into IntakeContext at graph-build time.
     intake_top_k: int = 3
     intake_similarity_threshold: float = 0.7
+    # M7: lesson refresher knobs. ``lesson_refresh_cron`` is a 5-field
+    # cron expression evaluated in UTC; default ``0 3 * * *`` runs daily
+    # at 03:00 UTC. ``lesson_refresh_window_days`` bounds how far back
+    # the refresher walks for terminal-status sessions on each tick.
+    lesson_refresh_cron: str = "0 3 * * *"
+    lesson_refresh_window_days: int = 7
     # Per-app session-id prefix. Threaded through ``SessionStore`` to
     # ``Session.id_format`` so each app picks its own id namespace
     # (``INC`` for incident management, ``REVIEW`` for code review,
