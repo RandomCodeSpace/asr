@@ -45,6 +45,7 @@ class IntakeContext:
     history_store: Any = None       # Optional[HistoryStore[StateT]]
     dedup_pipeline: Any = None      # Optional[DedupPipeline[StateT]]
     event_log: Any = None           # Optional[EventLog] — M1 telemetry sink
+    lesson_store: Any = None        # Optional[LessonStore] — M6 lesson corpus
     top_k: int = 3
     similarity_threshold: float = 0.7
 
@@ -92,6 +93,37 @@ def default_intake_runner(
         )
         # hits is list[tuple[Session, float]]
         session.findings["prior_similar"] = [_project_prior(h) for h, _ in hits]
+        patch["session"] = session
+
+    # M6: stamp findings["lessons"] from the auto-learning corpus. The
+    # intake runner surfaces "incidents like this one were resolved by
+    # running tools X, Y, Z" as a hypothesis surface for downstream
+    # agents — not a verdict. Best-effort: lesson_store failures are
+    # logged and skipped so a misconfigured embedding backend never
+    # blocks intake.
+    if ctx.lesson_store is not None and text:
+        try:
+            lesson_hits = ctx.lesson_store.find_similar(
+                query=text,
+                limit=ctx.top_k,
+                threshold=ctx.similarity_threshold,
+            )
+        except Exception:  # noqa: BLE001 — never block intake on a corpus query
+            _log.warning(
+                "default_intake_runner: lesson_store.find_similar failed; "
+                "skipping for session %s", session.id, exc_info=True,
+            )
+            lesson_hits = []
+        session.findings["lessons"] = [
+            {
+                "id": lesson.id,
+                "summary": lesson.outcome_summary,
+                "tools": [
+                    t.get("tool") for t in lesson.tool_sequence if t.get("tool")
+                ],
+            }
+            for lesson, _score in lesson_hits
+        ]
         patch["session"] = session
 
     if ctx.dedup_pipeline is not None:

@@ -1363,7 +1363,7 @@ from sqlalchemy.exc import OperationalError
 """Public Orchestrator class — the API consumed by the UI and (future) FastAPI."""
 
 import warnings
-from typing import AsyncIterator, Generic, Type, TypeVar
+from typing import Any, AsyncIterator, Generic, Type, TypeVar
 
 
 
@@ -11552,6 +11552,7 @@ class IntakeContext:
     history_store: Any = None       # Optional[HistoryStore[StateT]]
     dedup_pipeline: Any = None      # Optional[DedupPipeline[StateT]]
     event_log: Any = None           # Optional[EventLog] — M1 telemetry sink
+    lesson_store: Any = None        # Optional[LessonStore] — M6 lesson corpus
     top_k: int = 3
     similarity_threshold: float = 0.7
 
@@ -11599,6 +11600,37 @@ def default_intake_runner(
         )
         # hits is list[tuple[Session, float]]
         session.findings["prior_similar"] = [_project_prior(h) for h, _ in hits]
+        patch["session"] = session
+
+    # M6: stamp findings["lessons"] from the auto-learning corpus. The
+    # intake runner surfaces "incidents like this one were resolved by
+    # running tools X, Y, Z" as a hypothesis surface for downstream
+    # agents — not a verdict. Best-effort: lesson_store failures are
+    # logged and skipped so a misconfigured embedding backend never
+    # blocks intake.
+    if ctx.lesson_store is not None and text:
+        try:
+            lesson_hits = ctx.lesson_store.find_similar(
+                query=text,
+                limit=ctx.top_k,
+                threshold=ctx.similarity_threshold,
+            )
+        except Exception:  # noqa: BLE001 — never block intake on a corpus query
+            _log.warning(
+                "default_intake_runner: lesson_store.find_similar failed; "
+                "skipping for session %s", session.id, exc_info=True,
+            )
+            lesson_hits = []
+        session.findings["lessons"] = [
+            {
+                "id": lesson.id,
+                "summary": lesson.outcome_summary,
+                "tools": [
+                    t.get("tool") for t in lesson.tool_sequence if t.get("tool")
+                ],
+            }
+            for lesson, _score in lesson_hits
+        ]
         patch["session"] = session
 
     if ctx.dedup_pipeline is not None:
@@ -12928,13 +12960,30 @@ def _emit_status_changed_event(
 
 
 def _extract_lesson_on_terminal(*, orch, inc) -> None:
-    """M4 placeholder; M5 wires this to LessonExtractor.extract.
+    """M6: run the LessonExtractor against the finalized session and
+    persist the row through the LessonStore. No-op when either the
+    event log or the lesson store is unavailable (shim test classes,
+    apps that disable the corpus, etc).
 
-    Kept as a module-level function so M5's edit is a single-function
-    swap with no need to re-thread arguments through the finalize path.
+    Failures here are logged and dropped — terminal-status routing
+    must never fail because the corpus write hiccupped.
     """
-    # No-op until M5 wires up LessonStore + LessonExtractor.
-    _ = (orch, inc)
+    event_log = getattr(orch, "event_log", None)
+    lesson_store = getattr(orch, "lesson_store", None)
+    if event_log is None or lesson_store is None:
+        return None
+    try:
+
+
+        row = LessonExtractor.extract(session=inc, event_log=event_log)
+        if row is None:
+            return None
+        lesson_store.add(row)
+    except Exception:  # noqa: BLE001 — finalize must never break on corpus write
+        _log.warning(
+            "lesson extraction failed for session %s; finalize continues",
+            inc.id, exc_info=True,
+        )
     return None
 
 
@@ -12957,6 +13006,7 @@ class Orchestrator(Generic[StateT]):
                  state_cls: Type[StateT] = Session,  # type: ignore[assignment]
                  history: HistoryStore | None = None,
                  event_log: EventLog | None = None,
+                 lesson_store: "Any | None" = None,
                  checkpointer=None,
                  checkpointer_close=None,
                  dedup_pipeline: "DedupPipeline | None" = None):
@@ -12975,6 +13025,10 @@ class Orchestrator(Generic[StateT]):
         # shared with framework_cfg.intake_context.event_log so module-level
         # supervisor runners can emit via the same handle.
         self.event_log = event_log
+        # M5/M6: lesson corpus store. Shared with
+        # framework_cfg.intake_context.lesson_store so the default intake
+        # runner reads from the same handle the finalize hook writes to.
+        self.lesson_store = lesson_store
         self.skills = skills
         self.registry = registry
         # A single compiled graph drives both fresh runs and resume-
@@ -13114,6 +13168,30 @@ class Orchestrator(Generic[StateT]):
             # status-finalize hook (M3/M4). One row per agent boundary or
             # tool call — never mutated.
             event_log = EventLog(engine=engine)
+            # M5 + M6: lesson corpus + vector index. Reuses the same
+            # backend/distance strategy as the main session vector store;
+            # collection_name="lessons" produces a sibling FAISS file
+            # under the same path (or a separate pgvector row family
+            # under collection "lessons").
+
+
+
+            migrate_add_lesson_table(engine)
+            _lesson_vector_cfg = _VectorConfig(
+                backend=cfg.storage.vector.backend,
+                path=cfg.storage.vector.path,
+                collection_name="lessons",
+                distance_strategy=cfg.storage.vector.distance_strategy,
+            )
+            lesson_vector_store = build_vector_store(
+                _lesson_vector_cfg, embedder, engine,
+            )
+            lesson_store = _LessonStore(
+                engine=engine,
+                vector_store=lesson_vector_store,
+                distance_strategy=cfg.storage.vector.distance_strategy,
+                similarity_threshold=framework_cfg.intake_similarity_threshold,
+            )
             # Attach intake_context onto framework_cfg so supervisor nodes can
             # reach the live stores via app_cfg.intake_context. FrameworkAppConfig
             # is a Pydantic model; use object.__setattr__ to set a runtime
@@ -13125,6 +13203,7 @@ class Orchestrator(Generic[StateT]):
                     history_store=history,
                     dedup_pipeline=None,  # dedup_pipeline built below; patched after
                     event_log=event_log,
+                    lesson_store=lesson_store,
                     top_k=framework_cfg.intake_top_k,
                     similarity_threshold=framework_cfg.intake_similarity_threshold,
                 ),
@@ -13272,6 +13351,7 @@ class Orchestrator(Generic[StateT]):
                            state_cls=repo_state_cls,  # pyright: ignore[reportArgumentType]
                            history=history,
                            event_log=event_log,
+                           lesson_store=lesson_store,
                            checkpointer=checkpointer,
                            checkpointer_close=checkpointer_close,
                            dedup_pipeline=dedup_pipeline)
