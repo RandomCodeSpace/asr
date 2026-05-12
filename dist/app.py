@@ -642,7 +642,7 @@ under :mod:`runtime.agents` rather than piling more kinds into
 """
 
 
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
@@ -718,7 +718,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 # ----- imports for runtime/graph.py -----
 """LangGraph state, routing helpers, and node runner."""
 
-from typing import Any, TypedDict, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, TypedDict, Callable, Awaitable
 
 from langgraph.graph import StateGraph, END
 
@@ -727,11 +727,6 @@ from langgraph.graph import StateGraph, END
 
 
 
-
-# Phase 11 (FOC-04 / D-11-04): GraphInterrupt is the LangGraph
-# pending-approval pause signal. It is NOT an error and must NOT route
-# through _handle_agent_failure -- the orchestrator's interrupt-aware
-# bridge handles the resume protocol via the checkpointer.
 
 
 # ----- imports for runtime/checkpointer_postgres.py -----
@@ -886,6 +881,7 @@ config-derived secret in the runtime.
 
 
 import hmac
+from typing import Callable
 
 from fastapi import Header, HTTPException, status
 
@@ -6017,6 +6013,8 @@ __all__ = [
 
 if TYPE_CHECKING:
     pass
+_log = logging.getLogger("runtime.tools.gateway")
+
 GatewayAction = Literal["auto", "notify", "approve"]
 
 _RISK_TO_ACTION: dict[str, GatewayAction] = {
@@ -6207,6 +6205,7 @@ def wrap_tool(
     store: "SessionStore | None" = None,
     injected_args: dict[str, str] | None = None,
     gate_policy: GatePolicy | None = None,
+    event_log: "EventLog | None" = None,
 ) -> BaseTool:
     """Wrap ``base_tool`` so every invocation passes through the gateway.
 
@@ -6288,6 +6287,64 @@ def wrap_tool(
     # stay PVC-08-compliant.
     _llm_visible_name = inner.name.replace(":", "__")
 
+    # M3 (per-step telemetry): emit `tool_invoked` and `gate_fired` events
+    # through the optional EventLog. Telemetry failures never break a
+    # tool call — they are logged at DEBUG and dropped.
+
+    def _cap_args(args_dict: Any) -> Any:
+        """Cap args payload at 4 KB of JSON; oversized payloads become
+        a small ``{"_truncated": True, "preview": ...}`` marker."""
+        try:
+            blob = json.dumps(args_dict, default=str)
+        except (TypeError, ValueError):
+            return {"_unencodable": True}
+        if len(blob) <= 4096:
+            return args_dict
+        return {"_truncated": True, "preview": blob[:4096]}
+
+    def _emit_invoked(
+        *,
+        status: str,
+        risk: str,
+        args_dict: Any,
+        result: Any,
+        latency_ms: float,
+    ) -> None:
+        if event_log is None:
+            return
+        try:
+            event_log.record(
+                session.id,
+                "tool_invoked",
+                tool=inner.name,
+                agent=agent_name,
+                args=_cap_args(args_dict),
+                result_kind=type(result).__name__,
+                latency_ms=round(latency_ms, 3),
+                risk=risk,
+                status=status,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break a tool call
+            _log.debug(
+                "event_log.record(tool_invoked) failed", exc_info=True,
+            )
+
+    def _emit_gate(*, reason: str) -> None:
+        if event_log is None:
+            return
+        try:
+            event_log.record(
+                session.id,
+                "gate_fired",
+                tool=inner.name,
+                agent=agent_name,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "event_log.record(gate_fired) failed", exc_info=True,
+            )
+
     class _GatedTool(_GatedToolMarker):
         name: str = _llm_visible_name
         description: str = inner.description
@@ -6299,6 +6356,9 @@ def wrap_tool(
         args_schema: Any = _llm_visible_schema  # type: ignore[assignment]
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # M3 (per-step telemetry): start the latency clock for every
+            # tool invocation. _emit_invoked computes ``(now - t0) * 1000``.
+            t0 = time.monotonic()
             # Phase 9 (D-09-01 / T-09-05): inject session-derived args
             # BEFORE the gateway risk lookup so risk-rating sees the
             # post-injection environment value. Pure no-op when
@@ -6328,6 +6388,11 @@ def wrap_tool(
             )
             if decision.gate:
                 from langgraph.types import interrupt
+
+                # M3: emit gate_fired BEFORE the interrupt fires so the
+                # event ordering in the log matches the runtime causality
+                # (gate decision precedes tool execution / pause).
+                _emit_gate(reason=decision.reason)
 
                 # Persist a ``pending_approval`` ToolCall row BEFORE
                 # raising GraphInterrupt so the approval-timeout watchdog
@@ -6407,7 +6472,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"rejected": True, "rationale": rationale}
+                    rejected_result = {"rejected": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="rejected", risk="high",
+                        args_dict=pending_args, result=rejected_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return rejected_result
                 if verdict_str == "timeout":
                     # The approval window expired. Do NOT run the tool;
                     # mark the audit row ``status="timeout"`` so
@@ -6427,7 +6498,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"timeout": True, "rationale": rationale}
+                    timeout_result = {"timeout": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="timeout", risk="high",
+                        args_dict=pending_args, result=timeout_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return timeout_result
                 # Approved -> run the tool, then update the audit row.
                 result = _sync_invoke_inner(kwargs if kwargs else args[0] if args else {})
                 if pending_idx is not None:
@@ -6443,26 +6520,45 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                _emit_invoked(
+                    status="approved", risk="high",
+                    args_dict=pending_args, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
                 return result
 
             # auto / notify both run the tool now.
             result = _sync_invoke_inner(kwargs if kwargs else args[0] if args else {})
 
+            _args_dict = dict(kwargs) if kwargs else {"args": list(args)}
             if action == "notify":
                 session.tool_calls.append(
                     ToolCall(
                         agent=agent_name,
                         tool=inner.name,
-                        args=dict(kwargs) if kwargs else {"args": list(args)},
+                        args=_args_dict,
                         result=result,
                         ts=_now_iso(),
                         risk="medium",
                         status="executed_with_notify",
                     )
                 )
+                _emit_invoked(
+                    status="executed_with_notify", risk="medium",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
+            else:
+                _emit_invoked(
+                    status="executed", risk="low",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
             return result
 
         async def _arun(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # M3: start latency clock; mirror of sync ``_run``.
+            t0 = time.monotonic()
             # Phase 9 (D-09-01 / T-09-05): inject session-derived args
             # BEFORE the gateway risk lookup. Mirror of the sync ``_run``.
             if inject_cfg:
@@ -6489,6 +6585,9 @@ def wrap_tool(
             )
             if decision.gate:
                 from langgraph.types import interrupt
+
+                # M3: emit gate_fired BEFORE interrupt.
+                _emit_gate(reason=decision.reason)
 
                 # Persist a ``pending_approval`` audit row BEFORE the
                 # GraphInterrupt fires so the watchdog can spot stale
@@ -6551,7 +6650,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"rejected": True, "rationale": rationale}
+                    rejected_result = {"rejected": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="rejected", risk="high",
+                        args_dict=pending_args, result=rejected_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return rejected_result
                 if verdict_str == "timeout":
                     if pending_idx is not None:
                         session.tool_calls[pending_idx] = ToolCall(
@@ -6566,7 +6671,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"timeout": True, "rationale": rationale}
+                    timeout_result = {"timeout": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="timeout", risk="high",
+                        args_dict=pending_args, result=timeout_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return timeout_result
                 result = await inner.ainvoke(kwargs if kwargs else args[0] if args else {})
                 if pending_idx is not None:
                     session.tool_calls[pending_idx] = ToolCall(
@@ -6581,21 +6692,38 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                _emit_invoked(
+                    status="approved", risk="high",
+                    args_dict=pending_args, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
                 return result
 
             result = await inner.ainvoke(kwargs if kwargs else args[0] if args else {})
 
+            _args_dict = dict(kwargs) if kwargs else {"args": list(args)}
             if action == "notify":
                 session.tool_calls.append(
                     ToolCall(
                         agent=agent_name,
                         tool=inner.name,
-                        args=dict(kwargs) if kwargs else {"args": list(args)},
+                        args=_args_dict,
                         result=result,
                         ts=_now_iso(),
                         risk="medium",
                         status="executed_with_notify",
                     )
+                )
+                _emit_invoked(
+                    status="executed_with_notify", risk="medium",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
+            else:
+                _emit_invoked(
+                    status="executed", risk="low",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
                 )
             return result
 
@@ -7335,6 +7463,8 @@ __all__ = [
 
 # ====== module: runtime/agents/responsive.py ======
 
+if TYPE_CHECKING:
+    pass
 logger = logging.getLogger(__name__)
 
 
@@ -7350,6 +7480,7 @@ def make_agent_node(
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
     gate_policy: "GatePolicy | None" = None,
+    event_log: "EventLog | None" = None,
 ):
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -7376,13 +7507,26 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
+        # M3: emit agent_started telemetry before any work happens.
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "agent_started",
+                    agent=skill.name, started_at=started_at,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not break the agent
+                logger.debug(
+                    "event_log.record(agent_started) failed", exc_info=True,
+                )
+
         # Wrap tools per-invocation so each wrap closes over the
         # live ``Session`` for this run.
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
-                          gate_policy=gate_policy)
+                          gate_policy=gate_policy,
+                          event_log=event_log)
                 for t in tools
             ]
         else:
@@ -7478,6 +7622,22 @@ def make_agent_node(
         final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
+        # M3: emit confidence_emitted after reconcile_confidence + signal
+        # harvest land, before _record_success_run persists the agent_run.
+        if event_log is not None and final_confidence is not None:
+            try:
+                event_log.record(
+                    inc_id, "confidence_emitted",
+                    agent=skill.name,
+                    value=float(final_confidence),
+                    rationale=final_rationale or "",
+                    signal=final_signal,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(confidence_emitted) failed", exc_info=True,
+                )
+
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
@@ -7487,6 +7647,35 @@ def make_agent_node(
         )
         next_route_signal = decide_route(incident)
         next_node = route_from_skill(skill, next_route_signal)
+
+        # M3: emit route_decided + agent_finished. agent_finished carries
+        # the token_usage harvested by _sum_token_usage above so the
+        # session-level telemetry has per-step counts.
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "route_decided",
+                    agent=skill.name,
+                    signal=next_route_signal,
+                    next_node=next_node,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(route_decided) failed", exc_info=True,
+                )
+            try:
+                event_log.record(
+                    inc_id, "agent_finished",
+                    agent=skill.name,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    total_tokens=usage.total_tokens,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(agent_finished) failed", exc_info=True,
+                )
+
         return {"session": incident, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
@@ -8180,6 +8369,15 @@ __all__ = [
 
 # ====== module: runtime/graph.py ======
 
+if TYPE_CHECKING:
+    pass
+# Phase 11 (FOC-04 / D-11-04): GraphInterrupt is the LangGraph
+# pending-approval pause signal. It is NOT an error and must NOT route
+# through _handle_agent_failure -- the orchestrator's interrupt-aware
+# bridge handles the resume protocol via the checkpointer.
+from langgraph.errors import GraphInterrupt
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -8689,6 +8887,7 @@ def make_agent_node(
     patch_tool_names: frozenset[str] = frozenset(),
     injected_args: dict[str, str] | None = None,
     gate_policy: "GatePolicy | None" = None,
+    event_log: "EventLog | None" = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -8724,6 +8923,18 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
+        # M3 (per-step telemetry): emit agent_started.
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "agent_started",
+                    agent=skill.name, started_at=started_at,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not break the agent
+                logger.debug(
+                    "event_log.record(agent_started) failed", exc_info=True,
+                )
+
         # Phase 9 (D-09-01): strip injected-arg keys from every tool's
         # LLM-visible signature BEFORE create_react_agent serialises the
         # tool surface — so the LLM literally cannot emit values for
@@ -8755,7 +8966,8 @@ def make_agent_node(
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
                           injected_args=injected_args or {},
-                          gate_policy=gate_policy)
+                          gate_policy=gate_policy,
+                          event_log=event_log)
                 for t in tools
             ]
         elif injected_keys:
@@ -8941,6 +9153,21 @@ def make_agent_node(
         final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
+        # M3: emit confidence_emitted after reconcile lands.
+        if event_log is not None and final_confidence is not None:
+            try:
+                event_log.record(
+                    inc_id, "confidence_emitted",
+                    agent=skill.name,
+                    value=float(final_confidence),
+                    rationale=final_rationale or "",
+                    signal=final_signal,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(confidence_emitted) failed", exc_info=True,
+                )
+
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
@@ -8949,6 +9176,33 @@ def make_agent_node(
         )
         next_route_signal = decide_route(incident)
         next_node = route_from_skill(skill, next_route_signal)
+
+        # M3: emit route_decided + agent_finished (carrying token_usage).
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "route_decided",
+                    agent=skill.name,
+                    signal=next_route_signal,
+                    next_node=next_node,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(route_decided) failed", exc_info=True,
+                )
+            try:
+                event_log.record(
+                    inc_id, "agent_finished",
+                    agent=skill.name,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    total_tokens=usage.total_tokens,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(agent_finished) failed", exc_info=True,
+                )
+
         return {"session": incident, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
@@ -9138,7 +9392,8 @@ def make_gate_node(
 
 
 def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
-                       registry: ToolRegistry) -> dict:
+                       registry: ToolRegistry,
+                       event_log: "EventLog | None" = None) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
 
     Dispatches on ``skill.kind``:
@@ -9215,6 +9470,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             patch_tool_names=patch_tool_names,
             injected_args=cfg.orchestrator.injected_args,
             gate_policy=gate_policy,
+            event_log=event_log,
         )
     return nodes
 
@@ -9271,7 +9527,8 @@ def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
 async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
                       registry: ToolRegistry,
                       checkpointer=None,
-                      framework_cfg: FrameworkAppConfig | None = None):
+                      framework_cfg: FrameworkAppConfig | None = None,
+                      event_log: "EventLog | None" = None):
     """Compile the main LangGraph from configured skills and routes.
 
     The entry agent is read from ``cfg.orchestrator.entry_agent``. Gate
@@ -9318,7 +9575,8 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)
-    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
+    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store,
+                                registry=registry, event_log=event_log)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
     sg.add_node("gate", make_gate_node(
@@ -12457,7 +12715,8 @@ class Orchestrator(Generic[StateT]):
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry,
                                       checkpointer=checkpointer,
-                                      framework_cfg=framework_cfg)
+                                      framework_cfg=framework_cfg,
+                                      event_log=event_log)
             # Build the dedup pipeline iff the app has opted in AND the
             # configured stage 2 model resolves in the LLM registry.
             # When the registry doesn't include the configured model

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
@@ -41,6 +41,9 @@ from runtime.agents.turn_output import (
     reconcile_confidence,
 )
 
+if TYPE_CHECKING:
+    from runtime.storage.event_log import EventLog
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +59,7 @@ def make_agent_node(
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
     gate_policy: "GatePolicy | None" = None,
+    event_log: "EventLog | None" = None,
 ):
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -94,13 +98,26 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
+        # M3: emit agent_started telemetry before any work happens.
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "agent_started",
+                    agent=skill.name, started_at=started_at,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not break the agent
+                logger.debug(
+                    "event_log.record(agent_started) failed", exc_info=True,
+                )
+
         # Wrap tools per-invocation so each wrap closes over the
         # live ``Session`` for this run.
         if gateway_cfg is not None:
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
-                          gate_policy=gate_policy)
+                          gate_policy=gate_policy,
+                          event_log=event_log)
                 for t in tools
             ]
         else:
@@ -196,6 +213,22 @@ def make_agent_node(
         final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
+        # M3: emit confidence_emitted after reconcile_confidence + signal
+        # harvest land, before _record_success_run persists the agent_run.
+        if event_log is not None and final_confidence is not None:
+            try:
+                event_log.record(
+                    inc_id, "confidence_emitted",
+                    agent=skill.name,
+                    value=float(final_confidence),
+                    rationale=final_rationale or "",
+                    signal=final_signal,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(confidence_emitted) failed", exc_info=True,
+                )
+
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
@@ -205,6 +238,35 @@ def make_agent_node(
         )
         next_route_signal = decide_route(incident)
         next_node = route_from_skill(skill, next_route_signal)
+
+        # M3: emit route_decided + agent_finished. agent_finished carries
+        # the token_usage harvested by _sum_token_usage above so the
+        # session-level telemetry has per-step counts.
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "route_decided",
+                    agent=skill.name,
+                    signal=next_route_signal,
+                    next_node=next_node,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(route_decided) failed", exc_info=True,
+                )
+            try:
+                event_log.record(
+                    inc_id, "agent_finished",
+                    agent=skill.name,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    total_tokens=usage.total_tokens,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(agent_finished) failed", exc_info=True,
+                )
+
         return {"session": incident, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 

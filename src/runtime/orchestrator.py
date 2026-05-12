@@ -491,7 +491,8 @@ class Orchestrator(Generic[StateT]):
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry,
                                       checkpointer=checkpointer,
-                                      framework_cfg=framework_cfg)
+                                      framework_cfg=framework_cfg,
+                                      event_log=event_log)
             # Build the dedup pipeline iff the app has opted in AND the
             # configured stage 2 model resolves in the LLM registry.
             # When the registry doesn't include the configured model

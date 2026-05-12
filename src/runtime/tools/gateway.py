@@ -17,6 +17,9 @@ per agent invocation (mitigation R2 in the Phase-4 plan).
 """
 from __future__ import annotations
 
+import json
+import logging
+import time
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any, Literal
@@ -32,7 +35,10 @@ from runtime.state import Session, ToolCall
 # annotation on ``_evaluate_gate`` without forming a real cycle.
 if TYPE_CHECKING:
     from runtime.policy import GateDecision  # noqa: F401
+    from runtime.storage.event_log import EventLog
     from runtime.storage.session_store import SessionStore
+
+_log = logging.getLogger("runtime.tools.gateway")
 
 GatewayAction = Literal["auto", "notify", "approve"]
 
@@ -224,6 +230,7 @@ def wrap_tool(
     store: "SessionStore | None" = None,
     injected_args: dict[str, str] | None = None,
     gate_policy: GatePolicy | None = None,
+    event_log: "EventLog | None" = None,
 ) -> BaseTool:
     """Wrap ``base_tool`` so every invocation passes through the gateway.
 
@@ -305,6 +312,64 @@ def wrap_tool(
     # stay PVC-08-compliant.
     _llm_visible_name = inner.name.replace(":", "__")
 
+    # M3 (per-step telemetry): emit `tool_invoked` and `gate_fired` events
+    # through the optional EventLog. Telemetry failures never break a
+    # tool call — they are logged at DEBUG and dropped.
+
+    def _cap_args(args_dict: Any) -> Any:
+        """Cap args payload at 4 KB of JSON; oversized payloads become
+        a small ``{"_truncated": True, "preview": ...}`` marker."""
+        try:
+            blob = json.dumps(args_dict, default=str)
+        except (TypeError, ValueError):
+            return {"_unencodable": True}
+        if len(blob) <= 4096:
+            return args_dict
+        return {"_truncated": True, "preview": blob[:4096]}
+
+    def _emit_invoked(
+        *,
+        status: str,
+        risk: str,
+        args_dict: Any,
+        result: Any,
+        latency_ms: float,
+    ) -> None:
+        if event_log is None:
+            return
+        try:
+            event_log.record(
+                session.id,
+                "tool_invoked",
+                tool=inner.name,
+                agent=agent_name,
+                args=_cap_args(args_dict),
+                result_kind=type(result).__name__,
+                latency_ms=round(latency_ms, 3),
+                risk=risk,
+                status=status,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break a tool call
+            _log.debug(
+                "event_log.record(tool_invoked) failed", exc_info=True,
+            )
+
+    def _emit_gate(*, reason: str) -> None:
+        if event_log is None:
+            return
+        try:
+            event_log.record(
+                session.id,
+                "gate_fired",
+                tool=inner.name,
+                agent=agent_name,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "event_log.record(gate_fired) failed", exc_info=True,
+            )
+
     class _GatedTool(_GatedToolMarker):
         name: str = _llm_visible_name
         description: str = inner.description
@@ -316,6 +381,9 @@ def wrap_tool(
         args_schema: Any = _llm_visible_schema  # type: ignore[assignment]
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # M3 (per-step telemetry): start the latency clock for every
+            # tool invocation. _emit_invoked computes ``(now - t0) * 1000``.
+            t0 = time.monotonic()
             # Phase 9 (D-09-01 / T-09-05): inject session-derived args
             # BEFORE the gateway risk lookup so risk-rating sees the
             # post-injection environment value. Pure no-op when
@@ -345,6 +413,11 @@ def wrap_tool(
             )
             if decision.gate:
                 from langgraph.types import interrupt
+
+                # M3: emit gate_fired BEFORE the interrupt fires so the
+                # event ordering in the log matches the runtime causality
+                # (gate decision precedes tool execution / pause).
+                _emit_gate(reason=decision.reason)
 
                 # Persist a ``pending_approval`` ToolCall row BEFORE
                 # raising GraphInterrupt so the approval-timeout watchdog
@@ -424,7 +497,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"rejected": True, "rationale": rationale}
+                    rejected_result = {"rejected": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="rejected", risk="high",
+                        args_dict=pending_args, result=rejected_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return rejected_result
                 if verdict_str == "timeout":
                     # The approval window expired. Do NOT run the tool;
                     # mark the audit row ``status="timeout"`` so
@@ -444,7 +523,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"timeout": True, "rationale": rationale}
+                    timeout_result = {"timeout": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="timeout", risk="high",
+                        args_dict=pending_args, result=timeout_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return timeout_result
                 # Approved -> run the tool, then update the audit row.
                 result = _sync_invoke_inner(kwargs if kwargs else args[0] if args else {})
                 if pending_idx is not None:
@@ -460,26 +545,45 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                _emit_invoked(
+                    status="approved", risk="high",
+                    args_dict=pending_args, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
                 return result
 
             # auto / notify both run the tool now.
             result = _sync_invoke_inner(kwargs if kwargs else args[0] if args else {})
 
+            _args_dict = dict(kwargs) if kwargs else {"args": list(args)}
             if action == "notify":
                 session.tool_calls.append(
                     ToolCall(
                         agent=agent_name,
                         tool=inner.name,
-                        args=dict(kwargs) if kwargs else {"args": list(args)},
+                        args=_args_dict,
                         result=result,
                         ts=_now_iso(),
                         risk="medium",
                         status="executed_with_notify",
                     )
                 )
+                _emit_invoked(
+                    status="executed_with_notify", risk="medium",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
+            else:
+                _emit_invoked(
+                    status="executed", risk="low",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
             return result
 
         async def _arun(self, *args: Any, **kwargs: Any) -> Any:  # noqa: D401
+            # M3: start latency clock; mirror of sync ``_run``.
+            t0 = time.monotonic()
             # Phase 9 (D-09-01 / T-09-05): inject session-derived args
             # BEFORE the gateway risk lookup. Mirror of the sync ``_run``.
             if inject_cfg:
@@ -506,6 +610,9 @@ def wrap_tool(
             )
             if decision.gate:
                 from langgraph.types import interrupt
+
+                # M3: emit gate_fired BEFORE interrupt.
+                _emit_gate(reason=decision.reason)
 
                 # Persist a ``pending_approval`` audit row BEFORE the
                 # GraphInterrupt fires so the watchdog can spot stale
@@ -568,7 +675,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"rejected": True, "rationale": rationale}
+                    rejected_result = {"rejected": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="rejected", risk="high",
+                        args_dict=pending_args, result=rejected_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return rejected_result
                 if verdict_str == "timeout":
                     if pending_idx is not None:
                         session.tool_calls[pending_idx] = ToolCall(
@@ -583,7 +696,13 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
-                    return {"timeout": True, "rationale": rationale}
+                    timeout_result = {"timeout": True, "rationale": rationale}
+                    _emit_invoked(
+                        status="timeout", risk="high",
+                        args_dict=pending_args, result=timeout_result,
+                        latency_ms=(time.monotonic() - t0) * 1000,
+                    )
+                    return timeout_result
                 result = await inner.ainvoke(kwargs if kwargs else args[0] if args else {})
                 if pending_idx is not None:
                     session.tool_calls[pending_idx] = ToolCall(
@@ -598,21 +717,38 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                _emit_invoked(
+                    status="approved", risk="high",
+                    args_dict=pending_args, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
                 return result
 
             result = await inner.ainvoke(kwargs if kwargs else args[0] if args else {})
 
+            _args_dict = dict(kwargs) if kwargs else {"args": list(args)}
             if action == "notify":
                 session.tool_calls.append(
                     ToolCall(
                         agent=agent_name,
                         tool=inner.name,
-                        args=dict(kwargs) if kwargs else {"args": list(args)},
+                        args=_args_dict,
                         result=result,
                         ts=_now_iso(),
                         risk="medium",
                         status="executed_with_notify",
                     )
+                )
+                _emit_invoked(
+                    status="executed_with_notify", risk="medium",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                )
+            else:
+                _emit_invoked(
+                    status="executed", risk="low",
+                    args_dict=_args_dict, result=result,
+                    latency_ms=(time.monotonic() - t0) * 1000,
                 )
             return result
 

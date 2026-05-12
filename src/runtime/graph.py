@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, TypedDict, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage
@@ -25,6 +25,9 @@ from runtime.llm import get_llm
 from runtime.mcp_loader import ToolRegistry
 from runtime.storage.session_store import SessionStore
 from runtime.tools.gateway import wrap_tool
+
+if TYPE_CHECKING:
+    from runtime.storage.event_log import EventLog
 # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is the LangGraph
 # pending-approval pause signal. It is NOT an error and must NOT route
 # through _handle_agent_failure -- the orchestrator's interrupt-aware
@@ -546,6 +549,7 @@ def make_agent_node(
     patch_tool_names: frozenset[str] = frozenset(),
     injected_args: dict[str, str] | None = None,
     gate_policy: "GatePolicy | None" = None,
+    event_log: "EventLog | None" = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -581,6 +585,18 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
+        # M3 (per-step telemetry): emit agent_started.
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "agent_started",
+                    agent=skill.name, started_at=started_at,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not break the agent
+                logger.debug(
+                    "event_log.record(agent_started) failed", exc_info=True,
+                )
+
         # Phase 9 (D-09-01): strip injected-arg keys from every tool's
         # LLM-visible signature BEFORE create_react_agent serialises the
         # tool surface — so the LLM literally cannot emit values for
@@ -615,7 +631,8 @@ def make_agent_node(
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
                           injected_args=injected_args or {},
-                          gate_policy=gate_policy)
+                          gate_policy=gate_policy,
+                          event_log=event_log)
                 for t in tools
             ]
         elif injected_keys:
@@ -801,6 +818,21 @@ def make_agent_node(
         final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
 
+        # M3: emit confidence_emitted after reconcile lands.
+        if event_log is not None and final_confidence is not None:
+            try:
+                event_log.record(
+                    inc_id, "confidence_emitted",
+                    agent=skill.name,
+                    value=float(final_confidence),
+                    rationale=final_rationale or "",
+                    signal=final_signal,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(confidence_emitted) failed", exc_info=True,
+                )
+
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
@@ -809,6 +841,33 @@ def make_agent_node(
         )
         next_route_signal = decide_route(incident)
         next_node = route_from_skill(skill, next_route_signal)
+
+        # M3: emit route_decided + agent_finished (carrying token_usage).
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "route_decided",
+                    agent=skill.name,
+                    signal=next_route_signal,
+                    next_node=next_node,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(route_decided) failed", exc_info=True,
+                )
+            try:
+                event_log.record(
+                    inc_id, "agent_finished",
+                    agent=skill.name,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    total_tokens=usage.total_tokens,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(agent_finished) failed", exc_info=True,
+                )
+
         return {"session": incident, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
@@ -998,7 +1057,8 @@ def make_gate_node(
 
 
 def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
-                       registry: ToolRegistry) -> dict:
+                       registry: ToolRegistry,
+                       event_log: "EventLog | None" = None) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
 
     Dispatches on ``skill.kind``:
@@ -1075,6 +1135,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             patch_tool_names=patch_tool_names,
             injected_args=cfg.orchestrator.injected_args,
             gate_policy=gate_policy,
+            event_log=event_log,
         )
     return nodes
 
@@ -1131,7 +1192,8 @@ def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
 async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
                       registry: ToolRegistry,
                       checkpointer=None,
-                      framework_cfg: FrameworkAppConfig | None = None):
+                      framework_cfg: FrameworkAppConfig | None = None,
+                      event_log: "EventLog | None" = None):
     """Compile the main LangGraph from configured skills and routes.
 
     The entry agent is read from ``cfg.orchestrator.entry_agent``. Gate
@@ -1178,7 +1240,8 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)
-    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
+    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store,
+                                registry=registry, event_log=event_log)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
     sg.add_node("gate", make_gate_node(
