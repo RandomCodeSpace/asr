@@ -41,6 +41,12 @@ from pydantic import BaseModel, ConfigDict
 
 from runtime.tools.gateway import effective_action
 
+# Phase 12 (FOC-05) imports for should_retry policy (defined below).
+import asyncio as _asyncio
+import pydantic as _pydantic
+
+from runtime.agents.turn_output import EnvelopeMissingError
+
 # Phase 11 (FOC-04): forward-reference imports for the should_gate
 # signature only; kept inside ``TYPE_CHECKING`` so the bundle's
 # intra-import stripper does not remove a load-bearing import. The
@@ -126,12 +132,6 @@ def should_gate(
 # ---------------------------------------------------------------
 # Phase 12 (FOC-05): pure should_retry policy.
 # ---------------------------------------------------------------
-
-import asyncio as _asyncio
-
-import pydantic as _pydantic
-
-from runtime.agents.turn_output import EnvelopeMissingError
 
 RetryReason = Literal[
     "auto_retry",

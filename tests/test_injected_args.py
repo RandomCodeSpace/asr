@@ -14,8 +14,8 @@ import logging
 from typing import Any
 
 import pytest
-from langchain_core.tools import StructuredTool, tool
-from pydantic import BaseModel, Field, ValidationError
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, ValidationError
 
 from runtime.config import OrchestratorConfig, load_config
 from runtime.state import Session
@@ -336,7 +336,6 @@ def test_e2e_gateway_injects_before_effective_action():
     from runtime.tools.gateway import wrap_tool
 
     sess = _make_session(environment="production", sid="INC-10")
-    inner = _make_get_logs_tool()
     captured: dict = {}
 
     def _capture(service: str, environment: str, minutes: int = 15) -> dict:
@@ -416,7 +415,7 @@ def test_e2e_inject_only_wrapper_override_emits_info_log(caplog):
     stripped_schema = strip_injected_params(
         inner, frozenset(cfg_inject.keys()),
     ).args_schema
-    wrapper = StructuredTool.from_function(
+    StructuredTool.from_function(
         func=_run,
         name=inner.name,
         description=inner.description,
@@ -445,8 +444,6 @@ def test_e2e_make_agent_node_strips_sig_no_gateway():
     when gateway_cfg is None, and the inject-only wrapper supplies the
     framework value at call time. Mirrors the no-gateway path used by
     apps that don't configure the risk-rated gateway."""
-    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-    from langchain_core.messages import AIMessage, ToolMessage
 
     # We don't actually invoke the agent end-to-end here — we just
     # construct the node and verify the inject-only wrapper path

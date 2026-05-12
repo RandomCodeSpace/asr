@@ -17,7 +17,6 @@ This module pins:
 """
 from __future__ import annotations
 
-import pytest
 from unittest.mock import patch
 
 from runtime.policy import GateDecision, should_gate
