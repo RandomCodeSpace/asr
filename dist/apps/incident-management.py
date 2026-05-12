@@ -12509,6 +12509,82 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
+# ---------------------------------------------------------------------
+# M4 (per-step telemetry): status_changed emission helpers. Kept at
+# module scope so test shims that build a partial _O class with only
+# specific Orchestrator methods attached still drive the finalize
+# path without needing every new helper in their attribute list.
+# ---------------------------------------------------------------------
+
+def _latest_terminal_tool_for_status(
+    rules,
+    tool_calls,
+    new_status: str,
+) -> str | None:
+    """Return the bare name of the most recent executed terminal-tool
+    that maps to ``new_status``, for use as the ``cause`` field on the
+    ``status_changed`` event. Returns ``None`` if no rule matches.
+    """
+    bare_names = {r.tool_name for r in rules if r.status == new_status}
+    executed = [
+        tc for tc in tool_calls
+        if getattr(tc, "status", None) == "executed"
+    ]
+    for tc in reversed(executed):
+        name = (tc.tool or "").split(":")[-1]
+        if name in bare_names:
+            return name
+    return None
+
+
+def _emit_status_changed_event(
+    *,
+    orch,
+    inc,
+    from_status: str,
+    to_status: str,
+    cause: str,
+) -> None:
+    """Emit a ``status_changed`` event through orch.event_log (when
+    present) and trigger the M5 lesson-extraction hook on terminal
+    statuses (no-op until M5 wires up LessonExtractor).
+    Resilient to shim test classes that don't carry ``event_log``.
+    """
+    event_log = getattr(orch, "event_log", None)
+    if event_log is not None:
+        try:
+            event_log.record(
+                inc.id,
+                "status_changed",
+                **{"from": from_status, "to": to_status, "cause": cause},
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break finalize
+            _log.debug(
+                "event_log.record(status_changed) failed", exc_info=True,
+            )
+
+    # M5 hook point: when ``to_status`` is terminal per app config,
+    # invoke the lesson extractor. M4 leaves it as a no-op; M5 swaps
+    # this body for the real ``LessonExtractor.extract`` call.
+    statuses = getattr(getattr(orch, "cfg", None), "orchestrator", None)
+    if statuses is None:
+        return
+    status_def = statuses.statuses.get(to_status)
+    if status_def is not None and status_def.terminal:
+        _extract_lesson_on_terminal(orch=orch, inc=inc)
+
+
+def _extract_lesson_on_terminal(*, orch, inc) -> None:
+    """M4 placeholder; M5 wires this to LessonExtractor.extract.
+
+    Kept as a module-level function so M5's edit is a single-function
+    swap with no need to re-thread arguments through the finalize path.
+    """
+    # No-op until M5 wires up LessonStore + LessonExtractor.
+    _ = (orch, inc)
+    return None
+
+
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -12967,6 +13043,10 @@ class Orchestrator(Generic[StateT]):
         _assert_envelope_invariant_on_finalize(inc)
 
         decision = self._infer_terminal_decision(inc.tool_calls)
+        # Capture from-status BEFORE any mutation so the M4 status_changed
+        # event carries the correct transition. Both branches below mutate
+        # inc.status.
+        from_status = inc.status
         if decision is None:
             default = self.cfg.orchestrator.default_terminal_status
             if default is None:
@@ -12978,6 +13058,11 @@ class Orchestrator(Generic[StateT]):
             inc.status = default
             inc.extra_fields["needs_review_reason"] = (
                 "graph completed without terminal tool call"
+            )
+            _emit_status_changed_event(
+                orch=self, inc=inc,
+                from_status=from_status, to_status=default,
+                cause="default_terminal_status",
             )
             return self._save_or_yield(inc, default)
 
@@ -12996,6 +13081,18 @@ class Orchestrator(Generic[StateT]):
             team = extracted.get("team")
             if team:
                 inc.extra_fields["escalated_to"] = team
+        # M4: emit status_changed with cause=<matched terminal tool>.
+        # The terminal-tool name from the matched rule is the most
+        # specific cause label downstream consumers (UI, learner) need.
+        cause_tool = _latest_terminal_tool_for_status(
+            self.cfg.orchestrator.terminal_tools,
+            inc.tool_calls, new_status,
+        )
+        _emit_status_changed_event(
+            orch=self, inc=inc,
+            from_status=from_status, to_status=new_status,
+            cause=cause_tool or "terminal_tool_match",
+        )
         return self._save_or_yield(inc, new_status)
 
     def _infer_terminal_decision(
