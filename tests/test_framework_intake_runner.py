@@ -289,10 +289,21 @@ def test_supervisor_node_passes_intake_context_to_runner() -> None:
 class _StubLessonRow:
     """Quack-typed SessionLessonRow stand-in for the test."""
 
-    def __init__(self, *, id: str, outcome_summary: str, tools: list[str]) -> None:
+    def __init__(
+        self,
+        *,
+        id: str,
+        outcome_summary: str,
+        tools: list[str],
+        source_session_id: str = "SES-PRIOR",
+    ) -> None:
         self.id = id
         self.outcome_summary = outcome_summary
         self.tool_sequence = [{"tool": t} for t in tools]
+        # M9: intake filters lessons whose source row is soft-deleted.
+        # The default value here points at a non-existent SQL row, so
+        # the in-memory engine returns "live" via the fallback path.
+        self.source_session_id = source_session_id
 
 
 class _StubLessonStore:

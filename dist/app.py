@@ -11819,6 +11819,37 @@ def _project_prior(session: Session) -> dict[str, Any]:
     return {"id": session.id, "status": session.status}
 
 
+def _source_session_is_live(lesson_store: Any, source_session_id: str) -> bool:
+    """M9: True iff the lesson's source IncidentRow exists AND its
+    ``deleted_at`` is NULL. Soft-deleted source sessions suppress
+    their lessons from downstream intake surfaces.
+
+    Best-effort: any lookup error is treated as "live" so a flaky DB
+    doesn't silently hide lessons. ``lesson_store.engine`` is the
+    canonical handle — falling back to ``True`` keeps the runner
+    permissive when the store has no engine attached (test stubs).
+    """
+    engine = getattr(lesson_store, "engine", None)
+    if engine is None:
+        return True
+    try:
+        from sqlalchemy import select
+        from sqlalchemy.orm import Session as SqlaSession
+
+
+        with SqlaSession(engine) as s:
+            row = s.execute(
+                select(IncidentRow.deleted_at).where(
+                    IncidentRow.id == source_session_id
+                )
+            ).first()
+        if row is None:
+            return False
+        return row[0] is None
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def default_intake_runner(
     state: Any,
     *,
@@ -11865,6 +11896,10 @@ def default_intake_runner(
     # agents — not a verdict. Best-effort: lesson_store failures are
     # logged and skipped so a misconfigured embedding backend never
     # blocks intake.
+    #
+    # M9 contract: lessons whose source session has been soft-deleted
+    # (incidents.deleted_at IS NOT NULL) MUST be filtered out so an
+    # operator-deleted prior session no longer biases new intakes.
     if ctx.lesson_store is not None and text:
         try:
             lesson_hits = ctx.lesson_store.find_similar(
@@ -11878,6 +11913,10 @@ def default_intake_runner(
                 "skipping for session %s", session.id, exc_info=True,
             )
             lesson_hits = []
+        live_hits = [
+            (lesson, score) for lesson, score in lesson_hits
+            if _source_session_is_live(ctx.lesson_store, lesson.source_session_id)
+        ]
         session.findings["lessons"] = [
             {
                 "id": lesson.id,
@@ -11886,7 +11925,7 @@ def default_intake_runner(
                     t.get("tool") for t in lesson.tool_sequence if t.get("tool")
                 ],
             }
-            for lesson, _score in lesson_hits
+            for lesson, _score in live_hits
         ]
         patch["session"] = session
 
