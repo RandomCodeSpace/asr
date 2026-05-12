@@ -39,6 +39,19 @@ llm:
       model: gpt-4o
       deployment: gpt-4o
       temperature: 0.0
+    # M8 (Ollama-via-LangChain proof point): every agent picks its
+    # model independently. ``gpt_oss`` / ``gpt_oss_cheap`` route to
+    # Ollama Cloud's open-weight gpt-oss model; swap an agent's
+    # ``model:`` field to one of these to run that agent on Ollama
+    # while leaving other agents on OpenRouter / Azure / etc.
+    gpt_oss:
+      provider: ollama_cloud
+      model: gpt-oss:20b
+      temperature: 0.0
+    gpt_oss_cheap:
+      provider: ollama_cloud
+      model: gpt-oss:20b
+      temperature: 0.4
   embedding:
     provider: ollama_local
     model: bge-m3
