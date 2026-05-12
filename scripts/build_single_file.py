@@ -81,6 +81,12 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # caller).
     (RUNTIME_ROOT, "storage/event_log.py"),
     (RUNTIME_ROOT, "storage/migrations.py"),
+    # M5 (per-step telemetry): lesson corpus store + auto-extractor.
+    # lesson_store depends on storage/vector.py (already above) and
+    # storage/models.py for SessionLessonRow. Bundled before
+    # orchestrator.py so it can instantiate the store at boot.
+    (RUNTIME_ROOT, "storage/lesson_store.py"),
+    (RUNTIME_ROOT, "learning/extractor.py"),
     # NOTE: the per-tool mcp_server modules
     # (observability/remediation/user_context) were relocated under
     # ``examples/incident_management/mcp_servers/`` in Phase 7

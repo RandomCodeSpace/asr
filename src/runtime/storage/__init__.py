@@ -15,8 +15,13 @@ from runtime.storage.engine import build_engine
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.event_log import EventLog
 from runtime.storage.history_store import HistoryStore
-from runtime.storage.migrations import migrate_add_session_columns, migrate_tool_calls_audit
-from runtime.storage.models import Base, IncidentRow, SessionRow
+from runtime.storage.lesson_store import LessonStore
+from runtime.storage.migrations import (
+    migrate_add_lesson_table,
+    migrate_add_session_columns,
+    migrate_tool_calls_audit,
+)
+from runtime.storage.models import Base, IncidentRow, SessionLessonRow, SessionRow
 from runtime.storage.session_store import SessionStore
 from runtime.storage.vector import build_vector_store
 
@@ -25,11 +30,14 @@ __all__ = [
     "EventLog",
     "HistoryStore",
     "IncidentRow",
+    "LessonStore",
+    "SessionLessonRow",
     "SessionRow",
     "SessionStore",
     "build_embedder",
     "build_engine",
     "build_vector_store",
+    "migrate_add_lesson_table",
     "migrate_add_session_columns",
     "migrate_tool_calls_audit",
 ]

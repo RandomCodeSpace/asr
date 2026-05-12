@@ -180,7 +180,7 @@ Vector similarity lives in a separate LangChain VectorStore (landed in M3).
 """
 
 from datetime import datetime
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -380,6 +380,49 @@ from sqlalchemy import inspect, text
 # so every entry here is nullable — Pydantic hydrates the missing keys
 # at read time. Append-only: never reorder, never delete. Removing a
 # column needs a separate destructive migration with explicit sign-off.
+# ----- imports for runtime/storage/lesson_store.py -----
+"""M5: vector-indexed corpus of past resolved sessions ("lessons").
+
+``LessonStore`` mirrors :class:`HistoryStore`'s public surface — ``add``
+persists a row + vector embedding, ``find_similar`` runs k-NN over the
+corpus and returns the top hits above a threshold.
+
+The relational rows live in ``session_lessons`` (see
+:class:`SessionLessonRow`); the embeddings live in whatever LangChain
+``VectorStore`` the caller wires (FAISS dir or pgvector collection,
+typically ``<vector.path>/lessons`` or collection ``lessons``).
+
+Both writes are best-effort serialised: the relational row is persisted
+FIRST so a vector-store failure leaves a recoverable on-disk record
+the M7 refresher can re-embed.
+"""
+
+
+import logging
+
+
+
+# ----- imports for runtime/learning/extractor.py -----
+"""M5: lesson extractor — distills a terminal session's event log +
+final session row into a :class:`SessionLessonRow` suitable for the
+:class:`LessonStore` corpus.
+
+Pure data-flow: walks ``event_log.iter_for(session.id)`` for tool calls,
+reads ``session.agents_run`` for the final confidence + summary, and
+composes a canonical ``embedding_text`` string the vector backend
+embeds for retrieval. The same input session + event log always
+produces the same ``embedding_text`` (modulo the ``created_at``
+timestamp and uuid id) so M7's idempotency check can compare
+``embedding_text`` to decide whether a re-extract is needed.
+"""
+
+
+from typing import Any, Optional
+
+
+
+
+
 # ----- imports for runtime/mcp_loader.py -----
 """Load MCP servers (in_process / stdio / http / sse) and build a tool registry.
 
@@ -450,7 +493,6 @@ state across cases.
 
 
 import concurrent.futures
-import logging
 import threading
 from typing import Any, Awaitable, Coroutine, TypeVar, cast
 
@@ -3659,6 +3701,47 @@ class SessionEventRow(Base):
     payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     ts: Mapped[str] = mapped_column(String, nullable=False)
 
+
+class SessionLessonRow(Base):
+    """M5: distilled "lesson" extracted from one resolved session.
+
+    Each lesson captures (a) the symptom that started the session
+    (via ``embedding_text`` which seeds the vector index), (b) the
+    tool sequence the framework ran, (c) the final outcome
+    (status + confidence + summary), and (d) provenance metadata so
+    callers can tell auto-extracted lessons from operator-curated
+    ones. The intake runner reads lessons via ``LessonStore
+    .find_similar`` and surfaces the top-k as ``findings["lessons"]``
+    on each new session.
+
+    Append-only by convention — :class:`LessonStore` provides ``add``
+    but no ``update``. M7's nightly refresher writes a fresh row when
+    the extractor version changes; older rows stay queryable.
+    """
+    __tablename__ = "session_lessons"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    source_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("incidents.id"), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    signals: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    tool_sequence: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    outcome_status: Mapped[str] = mapped_column(String, nullable=False)
+    outcome_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    confidence_final: Mapped[float | None] = mapped_column(Float, nullable=True)
+    embedding_text: Mapped[str] = mapped_column(Text, nullable=False)
+    provenance: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        Index("ix_session_lessons_source_session_id", "source_session_id"),
+        Index(
+            "ix_session_lessons_outcome_status_created_at",
+            "outcome_status", "created_at",
+        ),
+    )
+
 # ====== module: runtime/storage/engine.py ======
 
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -4928,6 +5011,29 @@ def migrate_tool_calls_audit(engine: Engine) -> dict[str, int]:
     }
 
 
+def migrate_add_lesson_table(engine: Engine) -> dict[str, int]:
+    """M5: create the ``session_lessons`` table if missing. Idempotent.
+
+    Older databases predating M5 lack this table; we use
+    ``Base.metadata.create_all`` scoped to the lesson table so the
+    DDL is generated by SQLAlchemy (handles SQLite / Postgres / etc.)
+    rather than handwritten ALTER statements. Running on a freshly-
+    created database is a no-op (``create_all`` checks existence).
+
+    Returns ``{"tables_added": N}``.
+    """
+
+
+    inspector = inspect(engine)
+    if "session_lessons" in inspector.get_table_names():
+        return {"tables_added": 0}
+    Base.metadata.create_all(
+        engine,
+        tables=[SessionLessonRow.__table__],  # pyright: ignore[reportArgumentType]
+    )
+    return {"tables_added": 1}
+
+
 def migrate_add_session_columns(engine: Engine) -> dict[str, int]:
     """Add post-initial columns to ``incidents`` if missing. Idempotent.
 
@@ -4964,6 +5070,265 @@ def migrate_add_session_columns(engine: Engine) -> dict[str, int]:
                 conn.execute(text(f"CREATE INDEX {idx_name} ON {table} ({col})"))
                 added_idx += 1
     return {"columns_added": added_cols, "indexes_added": added_idx}
+
+# ====== module: runtime/storage/lesson_store.py ======
+
+_log = logging.getLogger("runtime.storage.lesson_store")
+
+
+class LessonStore:
+    """Append-only lesson corpus with vector similarity lookup.
+
+    Telemetry / refresher writes through ``add(row)``; the intake
+    runner reads through ``find_similar(query=...)``.
+    """
+
+    def __init__(
+        self,
+        *,
+        engine: Engine,
+        vector_store: Optional[VectorStore] = None,
+        distance_strategy: str = "cosine",
+        similarity_threshold: float = 0.7,
+    ) -> None:
+        self.engine = engine
+        self.vector_store = vector_store
+        self.distance_strategy = distance_strategy
+        self.similarity_threshold = similarity_threshold
+
+    def add(self, lesson: SessionLessonRow) -> None:
+        """Persist ``lesson`` to the relational table AND vector store.
+
+        Relational write goes first so a vector-store hiccup is
+        recoverable from disk. Vector failures are logged at WARNING
+        and swallowed — the row is still discoverable via SQL lookup
+        and the M7 refresher can re-embed on next pass.
+        """
+        # Snapshot the fields the vector-store call needs BEFORE the
+        # SQL transaction commits — once the session closes, the row
+        # detaches and attribute access raises DetachedInstanceError.
+        lesson_id = lesson.id
+        embedding_text = lesson.embedding_text
+        source_session_id = lesson.source_session_id
+        outcome_status = lesson.outcome_status
+
+        with SqlaSession(self.engine) as s:
+            with s.begin():
+                s.add(lesson)
+
+        if self.vector_store is None:
+            return
+        try:
+            self.vector_store.add_documents(
+                [
+                    Document(
+                        page_content=embedding_text,
+                        metadata={
+                            "id": lesson_id,
+                            "source_session_id": source_session_id,
+                            "outcome_status": outcome_status,
+                        },
+                    )
+                ],
+                ids=[lesson_id],
+            )
+        except Exception:  # noqa: BLE001 — vector backends raise a variety
+            _log.warning(
+                "LessonStore.add: vector_store write failed for lesson %s; "
+                "row is still queryable via SQL",
+                lesson_id, exc_info=True,
+            )
+
+    def find_similar(
+        self,
+        *,
+        query: str,
+        limit: int = 3,
+        threshold: Optional[float] = None,
+    ) -> list[tuple[SessionLessonRow, float]]:
+        """Return up to ``limit`` lessons whose vector similarity to the
+        embedded ``query`` is at or above ``threshold``. Returns an
+        empty list when no vector store is configured.
+
+        Result tuples are ``(row, similarity)`` sorted by descending
+        similarity. Soft-deleted source sessions are not filtered here
+        — the caller decides whether to honour them (M9 e2e covers the
+        soft-delete-suppression contract).
+        """
+        if self.vector_store is None:
+            return []
+        threshold = (
+            self.similarity_threshold if threshold is None else threshold
+        )
+
+
+        try:
+            raw = self.vector_store.similarity_search_with_score(
+                query, k=limit * 4,
+            )
+        except Exception:  # noqa: BLE001
+            _log.warning(
+                "LessonStore.find_similar: vector_store query failed",
+                exc_info=True,
+            )
+            return []
+        out: list[tuple[SessionLessonRow, float]] = []
+        for doc, distance in raw:
+            score = distance_to_similarity(
+                float(distance), self.distance_strategy,
+            )
+            if score < threshold:
+                continue
+            lid = doc.metadata.get("id")
+            if not lid:
+                continue
+            row = self._load(lid)
+            if row is None:
+                continue
+            out.append((row, score))
+            if len(out) >= limit:
+                break
+        return out
+
+    def _load(self, lesson_id: str) -> Optional[SessionLessonRow]:
+        with SqlaSession(self.engine) as s:
+            return s.get(SessionLessonRow, lesson_id)
+
+# ====== module: runtime/learning/extractor.py ======
+
+EXTRACTOR_VERSION = "1"
+
+
+def _project_signals(session: Session) -> dict[str, Any]:
+    """Carve a JSON-safe dict of categorical signals out of the
+    session's ``extra_fields``. Used as the lesson row's queryable
+    ``signals`` column — the intake runner can SQL-filter by these
+    later.
+
+    The framework is domain-neutral: every str / int / float /
+    bool value in ``extra_fields`` becomes a signal. Apps that
+    want richer filterability declare their state-class schema and
+    the relevant keys flow through automatically.
+    """
+    extra = session.extra_fields or {}
+    out: dict[str, Any] = {}
+    for k, v in extra.items():
+        if isinstance(v, (str, int, float, bool)) and v is not None:
+            out[k] = v
+    return out
+
+
+def _project_tool_sequence(event_log: EventLog, session_id: str) -> list[dict]:
+    """Walk the event log; produce a small ``[{tool, args_summary,
+    result_kind}]`` list for every ``tool_invoked`` event in order."""
+    seq: list[dict] = []
+    for ev in event_log.iter_for(session_id):
+        if ev.kind != "tool_invoked":
+            continue
+        seq.append({
+            "tool": ev.payload.get("tool"),
+            "args_summary": ev.payload.get("args", {}),
+            "result_kind": ev.payload.get("result_kind"),
+        })
+    return seq
+
+
+def _compose_embedding_text(
+    session: Session,
+    status: str,
+    tool_sequence: list[dict],
+    confidence_final: Optional[float],
+) -> str:
+    """Canonical embedding source. Same inputs -> identical string.
+
+    Form: ``<to_agent_input>\\n\\nOutcome: <status>\\nKey tools:
+    [<t1>, <t2>]\\nConfidence: <conf>``. Kept stable across releases
+    so M7 can detect unchanged rows without re-embedding.
+    """
+    tools = [t.get("tool") for t in tool_sequence if t.get("tool")]
+    return (
+        f"{session.to_agent_input()}\n\n"
+        f"Outcome: {status}\n"
+        f"Key tools: {tools}\n"
+        f"Confidence: {confidence_final}"
+    )
+
+
+class LessonExtractor:
+    """Distills a terminal session into a :class:`SessionLessonRow`.
+
+    Pure-function class — no I/O. The caller (orchestrator M4 hook or
+    M7 batch refresher) is responsible for persisting the row via
+    :class:`LessonStore.add` and emitting a ``lesson_extracted``
+    event.
+    """
+
+    @staticmethod
+    def extract(
+        *,
+        session: Session,
+        event_log: EventLog,
+        terminal_statuses: frozenset[str] | None = None,
+    ) -> Optional[SessionLessonRow]:
+        """Return a :class:`SessionLessonRow` for a terminal session,
+        or ``None`` when the session is not in a terminal status.
+
+        ``terminal_statuses`` is the configured terminal-status set
+        (typically every name in ``cfg.orchestrator.statuses`` whose
+        ``terminal=True``). When ``None``, no status check is applied
+        and the extractor produces a row for any session — useful
+        for tests that synthesise a pre-resolved session.
+        """
+        if terminal_statuses is not None and session.status not in terminal_statuses:
+            return None
+
+        tool_sequence = _project_tool_sequence(event_log, session.id)
+        signals = _project_signals(session)
+        confidence_final: Optional[float] = None
+        outcome_summary = ""
+        if session.agents_run:
+            last_run = session.agents_run[-1]
+            confidence_final = last_run.confidence
+            outcome_summary = last_run.summary
+
+        embedding_text = _compose_embedding_text(
+            session,
+            session.status,
+            tool_sequence,
+            confidence_final,
+        )
+
+        row = SessionLessonRow(
+            id=str(uuid4()),
+            source_session_id=session.id,
+            created_at=datetime.now(timezone.utc),
+            signals=signals,
+            tool_sequence=tool_sequence,
+            outcome_status=session.status,
+            outcome_summary=outcome_summary,
+            confidence_final=confidence_final,
+            embedding_text=embedding_text,
+            provenance={
+                "kind": "auto",
+                "model": "bge-m3",
+                "extractor_version": EXTRACTOR_VERSION,
+            },
+        )
+        # Emit the lesson_extracted event alongside the row so callers
+        # need not duplicate the bookkeeping. Telemetry failures are
+        # logged and dropped — the row is still returned.
+        try:
+            event_log.record(
+                session.id, "lesson_extracted",
+                lesson_id=row.id,
+                outcome_status=row.outcome_status,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block extraction
+            import logging
+            logging.getLogger("runtime.learning.extractor").debug(
+                "event_log.record(lesson_extracted) failed", exc_info=True,
+            )
+        return row
 
 # ====== module: runtime/mcp_loader.py ======
 
