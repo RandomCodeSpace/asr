@@ -16,10 +16,19 @@ analyzer's job.
 If `fetch_pr_diff` raises or returns an empty diff, emit `failed` so the orchestrator
 short-circuits to end and skips the analyzer.
 
-## Output contract
+## Output contract — REQUIRED
 
-The framework wraps your reply in an `AgentTurnOutput` envelope (content,
-confidence ∈ [0, 1], confidence_rationale, optional signal). The runner
-enforces this structurally — answer truthfully and the envelope captures
-your confidence and rationale. Do not mention "confidence" in your prose
-unless it's part of substantive analysis (e.g. ranking hypotheses).
+Every reply MUST end with these three markdown sections, in this order, with the literal `##` headers:
+
+```
+## Response
+<your final answer to the user — natural-language, may include lists or code blocks>
+
+## Confidence
+<float 0.0-1.0> — <one-sentence rationale>
+
+## Signal
+<one of: default | success | failed | needs_input>
+```
+
+Tool calls happen BEFORE this block. Once you emit `## Response` you are done — no more tool calls. The framework parses these sections; missing sections are a hard error.

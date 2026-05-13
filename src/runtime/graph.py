@@ -679,24 +679,25 @@ def make_agent_node(
             ]
         else:
             run_tools = visible_tools
-        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
-        # responsive agent invocation is wrapped in an AgentTurnOutput
-        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
-        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
-        # bare schema as ``response_format`` and, by default, wraps it in
-        # ``AutoStrategy`` — ProviderStrategy for models with native
-        # structured-output (OpenAI-class), falling back to ToolStrategy
-        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
-        # callable tool: when the LLM ``calls`` it, the loop terminates on
-        # the same turn with ``result["structured_response"]`` populated.
-        # Eliminates the old two-call structure (loop + separate
-        # ``with_structured_output`` pass) that hit recursion_limit=25 on
-        # Ollama models without true function-calling.
+        # Phase 22 (D-22-01): markdown-primary turn output. Drop
+        # ``response_format`` from create_agent — the agent loop now
+        # terminates on the natural React END signal (LLM emits an
+        # AIMessage with no tool calls). The framework parses that
+        # final message body as markdown via Path 4 in
+        # parse_envelope_from_result. Skill prompts (D-22-04) instruct
+        # every reply to end with ## Response / ## Confidence / ##
+        # Signal sections; the parser extracts them.
+        #
+        # Why: forcing LLMs through a JSON-schema-shaped output via
+        # ``response_format`` triggered a class of brittleness across
+        # providers (model-specific JSON drift, tool-strategy + React
+        # END interaction, recursion_limit ceilings). Markdown is the
+        # native format every chat model writes well; the parse step
+        # happens in the framework, where leniency is in our control.
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
-            response_format=AgentTurnOutput,
         )
 
         # Phase 11 (FOC-04): reset per-turn confidence hint. The hint
@@ -890,12 +891,17 @@ def _decide_from_signal(inc: Session) -> str:
 
 
 _DEFAULT_STUB_CANNED: dict[str, str] = {
-    # Back-compat defaults for the four canonical agents.  Any YAML-defined
-    # agent can override or extend this via ``skill.stub_response``; new agents
-    # without an entry here fall through to StubChatModel's generic placeholder.
+    # Plain-text bodies; ``StubChatModel._generate`` wraps these in the
+    # D-22-03 markdown envelope using the per-agent stub_envelope_* fields
+    # (the framework parses the wrapped output via Path 4). Apps can
+    # override or extend via ``skill.stub_response``; new agents without
+    # an entry here fall through to ``StubChatModel``'s generic placeholder.
     "intake": "Created INC, no prior matches. Routing to triage.",
     "triage": "Severity medium, category latency. No recent deploys correlate.",
-    "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
+    "deep_investigator": (
+        "Hypothesis: upstream payments timeout. "
+        "Evidence: log line upstream_timeout target=payments."
+    ),
     "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
 }
 

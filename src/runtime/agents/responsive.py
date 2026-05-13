@@ -35,7 +35,6 @@ from runtime.state import Session, _UTC_TS_FMT
 from runtime.storage.session_store import SessionStore
 from runtime.tools.gateway import wrap_tool
 from runtime.agents.turn_output import (
-    AgentTurnOutput,
     EnvelopeMissingError,
     parse_envelope_from_result,
     reconcile_confidence,
@@ -122,24 +121,14 @@ def make_agent_node(
             ]
         else:
             run_tools = tools
-        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
-        # responsive agent invocation is wrapped in an AgentTurnOutput
-        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
-        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
-        # bare schema as ``response_format`` and, by default, wraps it in
-        # ``AutoStrategy`` — ProviderStrategy for models with native
-        # structured-output (OpenAI-class), falling back to ToolStrategy
-        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
-        # callable tool: when the LLM ``calls`` it, the loop terminates on
-        # the same turn with ``result["structured_response"]`` populated.
-        # Eliminates the old two-call structure (loop + separate
-        # ``with_structured_output`` pass) that hit recursion_limit=25 on
-        # Ollama models without true function-calling.
+        # Phase 22 (D-22-01): markdown-primary turn output. Same
+        # change as graph.py:make_agent_node — drop response_format
+        # so the loop terminates on natural React END, then parse the
+        # final AIMessage via Path 4 in parse_envelope_from_result.
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
-            response_format=AgentTurnOutput,
         )
 
         # Phase 11 (FOC-04): reset per-turn confidence hint at the

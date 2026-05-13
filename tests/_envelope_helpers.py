@@ -62,12 +62,6 @@ class EnvelopeStubChatModel(BaseChatModel):
     canned_responses: dict[str, str] = Field(default_factory=dict)
     tool_call_plan: list[dict] | None = None
     _called_once: bool = False
-    # Phase 15 (LLM-COMPAT-01): same contract as ``StubChatModel`` --
-    # ``langchain.agents.create_agent``'s ToolStrategy injects
-    # ``AgentTurnOutput`` as a tool; ``bind_tools`` records the name
-    # so ``_generate`` can emit a closing envelope tool call once any
-    # pre-scripted ``tool_call_plan`` is exhausted.
-    _envelope_tool_name: str | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -80,7 +74,12 @@ class EnvelopeStubChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
-        text = self.canned_responses.get(self.role, self.envelope_content)
+        # Phase 22 (D-22-05): emit a markdown-shaped final message
+        # matching the framework's parse_markdown_envelope contract.
+        # The envelope_* fields drive the section bodies. When the
+        # caller supplies a per-role canned response we use that for
+        # the ``## Response`` body and keep the envelope_*
+        # confidence/rationale/signal as the trailing-section content.
         tool_calls: list[dict] = []
         if self.tool_call_plan and not self._called_once:
             for tc in self.tool_call_plan:
@@ -88,20 +87,20 @@ class EnvelopeStubChatModel(BaseChatModel):
                     {"name": tc["name"], "args": tc.get("args", {}), "id": str(uuid4())}
                 )
             self._called_once = True
-        elif self._envelope_tool_name is not None:
-            # Phase 15 (LLM-COMPAT-01): close the agent loop by emitting
-            # the envelope-shaped tool call ToolStrategy is waiting for.
-            tool_calls.append({
-                "name": self._envelope_tool_name,
-                "args": {
-                    "content": self.envelope_content,
-                    "confidence": self.envelope_confidence,
-                    "confidence_rationale": self.envelope_rationale,
-                    "signal": self.envelope_signal,
-                },
-                "id": str(uuid4()),
-            })
-        msg = AIMessage(content=text, tool_calls=tool_calls)
+
+        body = self.canned_responses.get(self.role, self.envelope_content)
+        # Phase 22 (D-22-05): explicit "none" when no signal so the
+        # parser maps to None — preserves pre-Phase-22 behaviour where a
+        # stub with no signal yielded envelope.signal=None.
+        signal_str = self.envelope_signal if self.envelope_signal is not None else "none"
+        md = (
+            f"{body}\n\n"
+            f"## Response\n{body}\n\n"
+            f"## Confidence\n{self.envelope_confidence:.4f} -- "
+            f"{self.envelope_rationale}\n\n"
+            f"## Signal\n{signal_str}\n"
+        )
+        msg = AIMessage(content=md, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
     async def _agenerate(
@@ -114,18 +113,9 @@ class EnvelopeStubChatModel(BaseChatModel):
         return self._generate(messages, stop, run_manager, **kwargs)
 
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
-        # Phase 15 (LLM-COMPAT-01): record the AgentTurnOutput tool
-        # name so ``_generate`` can emit a closing tool call. See
-        # ``StubChatModel.bind_tools`` for the matching heuristic.
-        for t in tools or []:
-            name = (
-                getattr(t, "__name__", None)
-                or getattr(t, "name", None)
-                or (isinstance(t, dict) and t.get("name"))
-            )
-            if isinstance(name, str) and name == "AgentTurnOutput":
-                self._envelope_tool_name = name
-                break
+        # Phase 22 (D-22-05): no-op tool binding. The envelope-as-tool
+        # synthesis is gone; the markdown closing turn is emitted
+        # directly by _generate.
         return self
 
     def with_structured_output(self, schema, *, include_raw: bool = False, **kwargs):

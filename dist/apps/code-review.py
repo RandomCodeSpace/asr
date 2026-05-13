@@ -550,7 +550,7 @@ graph is acyclic.
 
 
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 # ----- imports for runtime/tools/gateway.py -----
 """Risk-rated tool gateway: pure resolver + ``BaseTool`` HITL wrapper.
@@ -1180,6 +1180,7 @@ MCP tools is not exposed.
 """
 
 
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ----- imports for runtime/memory/knowledge_graph.py -----
@@ -3184,17 +3185,13 @@ class StubChatModel(BaseChatModel):
     ``stub_envelope_confidence`` / ``stub_envelope_rationale`` /
     ``stub_envelope_signal``.
 
-    Phase 15 (LLM-COMPAT-01): ``langchain.agents.create_agent`` with
-    ``response_format=AgentTurnOutput`` (via ``AutoStrategy`` ->
-    ``ToolStrategy`` for non-native-structured-output models, including
-    this stub) injects ``AgentTurnOutput`` as a CALLABLE TOOL. The
-    agent loop only terminates when the LLM emits a tool call NAMED
-    ``AgentTurnOutput``. ``bind_tools`` records that envelope-tool name
-    so ``_generate`` can auto-emit a closing tool call after any
-    user-configured ``tool_call_plan`` is exhausted -- preserving the
-    pre-Phase-15 stub semantics (canned text + optional pre-scripted
-    tool calls) while satisfying the new tool-loop termination
-    contract.
+    Phase 22 (D-22-05): the loop terminates on natural React END now
+    that ``response_format=AgentTurnOutput`` is gone — tests drive
+    markdown-shaped canned text (the framework parses it via Path 4
+    in :func:`runtime.agents.turn_output.parse_envelope_from_result`).
+    The Phase 15 envelope-as-callable-tool auto-emit is removed; the
+    stub is back to its pre-Phase-15 simple semantics (canned text +
+    optional pre-scripted ``tool_call_plan``).
     """
     role: str = "default"
     canned_responses: dict[str, str] = Field(default_factory=dict)
@@ -3203,12 +3200,6 @@ class StubChatModel(BaseChatModel):
     stub_envelope_rationale: str = "stub envelope rationale"
     stub_envelope_signal: str | None = None
     _called_once: bool = False
-    # Phase 15 (LLM-COMPAT-01): set by ``bind_tools`` when
-    # ``langchain.agents.create_agent`` injects a structured-output tool
-    # for ``AgentTurnOutput``. Holds the bare tool name (e.g.
-    # ``"AgentTurnOutput"``) so ``_generate`` can emit a final
-    # envelope-shaped tool call to close the agent loop.
-    _envelope_tool_name: str | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -3216,33 +3207,37 @@ class StubChatModel(BaseChatModel):
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                   run_manager: Any = None, **kwargs: Any) -> ChatResult:
-        text = self.canned_responses.get(self.role, f"[stub:{self.role}] no canned response")
+        # Phase 22 (D-22-05): tool-call rounds emit the scripted tool
+        # calls with a placeholder content body; the closing turn (no
+        # remaining tool_call_plan entries) emits the canned text
+        # wrapped in the D-22-03 markdown contract that
+        # parse_markdown_envelope reads. The stub_envelope_*
+        # parameters drive the trailing-section bodies so tests can
+        # exercise specific confidence / rationale / signal paths
+        # without authoring markdown by hand.
         tool_calls: list[dict] = []
         if self.tool_call_plan and not self._called_once:
             for tc in self.tool_call_plan:
-                tool_calls.append({"name": tc["name"], "args": tc.get("args", {}), "id": str(uuid4())})
+                tool_calls.append(
+                    {"name": tc["name"], "args": tc.get("args", {}), "id": str(uuid4())}
+                )
             self._called_once = True
-        elif self._envelope_tool_name is not None:
-            # Phase 15 (LLM-COMPAT-01): the tool_call_plan is exhausted
-            # (or wasn't configured) AND ``langchain.agents.create_agent``
-            # has bound the AgentTurnOutput envelope as a tool. Emit a
-            # closing tool call so the loop terminates with a populated
-            # ``structured_response``. The args mirror the
-            # ``with_structured_output`` path's envelope construction so
-            # tests see the same confidence / rationale / signal regardless
-            # of whether the new tool-strategy or the legacy structured-
-            # output path is in play.
-            tool_calls.append({
-                "name": self._envelope_tool_name,
-                "args": {
-                    "content": text or ".",
-                    "confidence": self.stub_envelope_confidence,
-                    "confidence_rationale": self.stub_envelope_rationale,
-                    "signal": self.stub_envelope_signal,
-                },
-                "id": str(uuid4()),
-            })
-        msg = AIMessage(content=text, tool_calls=tool_calls)
+
+        body = self.canned_responses.get(
+            self.role, f"[stub:{self.role}] no canned response",
+        )
+        # Phase 22 (D-22-05): explicit "none" when no signal so the
+        # parser maps to None — preserves pre-Phase-22 behaviour where a
+        # stub with no signal yielded envelope.signal=None.
+        signal_str = self.stub_envelope_signal if self.stub_envelope_signal is not None else "none"
+        md = (
+            f"{body}\n\n"
+            f"## Response\n{body}\n\n"
+            f"## Confidence\n{self.stub_envelope_confidence:.4f} -- "
+            f"{self.stub_envelope_rationale}\n\n"
+            f"## Signal\n{signal_str}\n"
+        )
+        msg = AIMessage(content=md, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
     async def _agenerate(self, messages: list[BaseMessage], stop: list[str] | None = None,
@@ -3250,30 +3245,15 @@ class StubChatModel(BaseChatModel):
         return self._generate(messages, stop, run_manager, **kwargs)
 
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
-        """Record the AgentTurnOutput envelope-tool name when present.
+        """Phase 22 (D-22-05): no-op tool binding.
 
-        Phase 15 (LLM-COMPAT-01): ``langchain.agents.create_agent`` with
-        ``response_format=AgentTurnOutput`` calls ``bind_tools(...)``
-        with the user's tools PLUS the envelope-as-a-tool. We scan the
-        list for the AgentTurnOutput-shaped tool (matched by ``__name__``
-        on Pydantic schemas, ``name`` on ``BaseTool`` instances, or the
-        ``"name"`` key on dict-shaped tool specs) and remember it on the
-        instance so ``_generate`` can close the agent loop with a
-        synthetic envelope tool call after any pre-scripted
-        ``tool_call_plan`` is exhausted. Tools bound by the framework
-        itself (real BaseTools the agent should call) flow through
-        unchanged -- the stub still emits them only via
-        ``tool_call_plan``.
+        ``langchain.agents.create_agent`` calls ``bind_tools`` to wire
+        the agent's BaseTool list onto the chat model. The stub does
+        not actually invoke those tools (test fixtures script tool
+        calls via ``tool_call_plan`` instead), so we just return self
+        unchanged. The pre-Phase-22 envelope-tool detection is gone
+        because the framework no longer asks for ``response_format``.
         """
-        for t in tools or []:
-            name = (
-                getattr(t, "__name__", None)
-                or getattr(t, "name", None)
-                or (isinstance(t, dict) and t.get("name"))
-            )
-            if isinstance(name, str) and name == "AgentTurnOutput":
-                self._envelope_tool_name = name
-                break
         return self
 
     # ``BaseChatModel.with_structured_output`` returns ``Runnable[..., dict | BaseModel]``
@@ -6654,6 +6634,127 @@ class EnvelopeMissingError(Exception):
         super().__init__(message or f"envelope_missing: {field} (agent={agent})")
 
 
+_HEADER_SPLIT = re.compile(r"^#{2,}\s+(\w+)\s*$", re.MULTILINE)
+_CONF_LINE = re.compile(
+    # Leftmost float (allows int form), optional rationale after em-dash /
+    # ASCII dash / hyphen separator. ``re.DOTALL`` so a multi-line rationale
+    # is captured wholesale.
+    r"^\s*(-?[0-9]*\.?[0-9]+)\s*(?:[\u2014\-]+\s*(.*))?$",
+    re.DOTALL,
+)
+
+
+def _clamp_unit(x: float) -> float:
+    """Clamp a confidence float into [0, 1] without raising. The skill
+    prompt asks for [0, 1]; an LLM occasionally emits ``1.05`` or
+    ``-0.1`` — clamp rather than reject so the parse step is forgiving."""
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def parse_markdown_envelope(
+    content: str, *, agent: str = "",
+) -> "AgentTurnOutput":
+    """D-22-03 — parse the trailing markdown contract block into an
+    :class:`AgentTurnOutput`.
+
+    Expects three sections ``## Response`` / ``## Confidence`` /
+    ``## Signal`` (case-insensitive headers, ``##+`` accepted) at the
+    end of the LLM's reply. The free-text body of ``## Response``
+    becomes ``content``; the float on the ``## Confidence`` line
+    becomes ``confidence`` (clamped to [0, 1]); the rest of that line
+    after ``-`` / ``--`` / ``\u2014`` becomes ``confidence_rationale``;
+    the ``## Signal`` body becomes ``signal`` (with ``none``/``null``/
+    blank coerced to ``None``).
+
+    Raises :class:`EnvelopeMissingError` only when the parse cannot
+    produce a valid envelope at all — missing ``## Confidence`` line,
+    unparseable confidence value, or empty ``## Response`` body.
+    """
+    if not isinstance(content, str) or not content.strip():
+        raise EnvelopeMissingError(
+            agent=agent, field="content",
+            message=f"envelope_missing: empty content (agent={agent!r})",
+        )
+
+    # ``re.split`` with the header capture-group yields:
+    #   [pre, h1, body1, h2, body2, ...]
+    # Pre is the prose before the first heading; we ignore it for parse.
+    parts = _HEADER_SPLIT.split(content)
+    sections: dict[str, str] = {}
+    if len(parts) >= 3:
+        for i in range(1, len(parts) - 1, 2):
+            key = parts[i].strip().lower()
+            body = parts[i + 1].strip()
+            # Don't overwrite an earlier section with a later same-named
+            # one (unusual but possible in pathological prompts).
+            sections.setdefault(key, body)
+
+    response_body = sections.get("response", "").strip()
+    raw_conf = sections.get("confidence", "").strip()
+
+    if not raw_conf:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence section absent or empty "
+                f"(agent={agent!r})"
+            ),
+        )
+
+    m = _CONF_LINE.match(raw_conf)
+    if not m:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence section did not parse "
+                f"(agent={agent!r}, raw={raw_conf!r})"
+            ),
+        )
+    try:
+        conf_value = _clamp_unit(float(m.group(1)))
+    except (TypeError, ValueError) as exc:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence value not a float "
+                f"(agent={agent!r}, raw={raw_conf!r})"
+            ),
+        ) from exc
+    rationale = (m.group(2) or "").strip() or "(no rationale provided)"
+
+    signal_raw = sections.get("signal", "").strip().lower() or None
+    if signal_raw in {"none", "null", "", "n/a"}:
+        signal_raw = None
+
+    if not response_body:
+        raise EnvelopeMissingError(
+            agent=agent, field="content",
+            message=(
+                f"envelope_missing: response section empty (agent={agent!r})"
+            ),
+        )
+
+    try:
+        return AgentTurnOutput(
+            content=response_body,
+            confidence=conf_value,
+            confidence_rationale=rationale,
+            signal=signal_raw,
+        )
+    except ValidationError as exc:
+        raise EnvelopeMissingError(
+            agent=agent, field="validation",
+            message=(
+                f"envelope_missing: pydantic validation rejected the "
+                f"parsed values (agent={agent!r}): {exc}"
+            ),
+        ) from exc
+
+
 def parse_envelope_from_result(
     result: dict,
     *,
@@ -6711,13 +6812,33 @@ def parse_envelope_from_result(
             continue
         break
 
-    # Path 3: fail loudly
+    # Path 4 (D-22-01): markdown-primary parse on the last AIMessage's
+    # content. Producers that emit the new ``## Response / ## Confidence /
+    # ## Signal`` section block land here when Paths 1+2 yield nothing.
+    for msg in reversed(messages):
+        if msg.__class__.__name__ != "AIMessage":
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            return parse_markdown_envelope(content, agent=agent)
+        except EnvelopeMissingError:
+            # This AIMessage didnt carry a parseable markdown contract.
+            # Continue scanning earlier messages on the off-chance a
+            # nested loop emitted the contract one step back.
+            continue
+        break
+
+    # Path 5 (terminal): fail loudly. None of the four paths produced a
+    # valid envelope — this is a real prompt-drift signal worth
+    # surfacing as a structured agent_run error.
     raise EnvelopeMissingError(
         agent=agent,
         field="structured_response",
         message=(
-            f"envelope_missing: no structured_response or JSON-decodable "
-            f"AIMessage envelope found (agent={agent})"
+            f"envelope_missing: no structured_response, JSON-decodable, or "
+            f"markdown-decodable AIMessage envelope found (agent={agent})"
         ),
     )
 
@@ -6764,6 +6885,7 @@ __all__ = [
     "AgentTurnOutput",
     "EnvelopeMissingError",
     "parse_envelope_from_result",
+    "parse_markdown_envelope",
     "reconcile_confidence",
 ]
 
@@ -8289,24 +8411,14 @@ def make_agent_node(
             ]
         else:
             run_tools = tools
-        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
-        # responsive agent invocation is wrapped in an AgentTurnOutput
-        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
-        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
-        # bare schema as ``response_format`` and, by default, wraps it in
-        # ``AutoStrategy`` — ProviderStrategy for models with native
-        # structured-output (OpenAI-class), falling back to ToolStrategy
-        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
-        # callable tool: when the LLM ``calls`` it, the loop terminates on
-        # the same turn with ``result["structured_response"]`` populated.
-        # Eliminates the old two-call structure (loop + separate
-        # ``with_structured_output`` pass) that hit recursion_limit=25 on
-        # Ollama models without true function-calling.
+        # Phase 22 (D-22-01): markdown-primary turn output. Same
+        # change as graph.py:make_agent_node — drop response_format
+        # so the loop terminates on natural React END, then parse the
+        # final AIMessage via Path 4 in parse_envelope_from_result.
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
-            response_format=AgentTurnOutput,
         )
 
         # Phase 11 (FOC-04): reset per-turn confidence hint at the
@@ -9772,24 +9884,25 @@ def make_agent_node(
             ]
         else:
             run_tools = visible_tools
-        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
-        # responsive agent invocation is wrapped in an AgentTurnOutput
-        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
-        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
-        # bare schema as ``response_format`` and, by default, wraps it in
-        # ``AutoStrategy`` — ProviderStrategy for models with native
-        # structured-output (OpenAI-class), falling back to ToolStrategy
-        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
-        # callable tool: when the LLM ``calls`` it, the loop terminates on
-        # the same turn with ``result["structured_response"]`` populated.
-        # Eliminates the old two-call structure (loop + separate
-        # ``with_structured_output`` pass) that hit recursion_limit=25 on
-        # Ollama models without true function-calling.
+        # Phase 22 (D-22-01): markdown-primary turn output. Drop
+        # ``response_format`` from create_agent — the agent loop now
+        # terminates on the natural React END signal (LLM emits an
+        # AIMessage with no tool calls). The framework parses that
+        # final message body as markdown via Path 4 in
+        # parse_envelope_from_result. Skill prompts (D-22-04) instruct
+        # every reply to end with ## Response / ## Confidence / ##
+        # Signal sections; the parser extracts them.
+        #
+        # Why: forcing LLMs through a JSON-schema-shaped output via
+        # ``response_format`` triggered a class of brittleness across
+        # providers (model-specific JSON drift, tool-strategy + React
+        # END interaction, recursion_limit ceilings). Markdown is the
+        # native format every chat model writes well; the parse step
+        # happens in the framework, where leniency is in our control.
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
-            response_format=AgentTurnOutput,
         )
 
         # Phase 11 (FOC-04): reset per-turn confidence hint. The hint
@@ -9983,12 +10096,17 @@ def _decide_from_signal(inc: Session) -> str:
 
 
 _DEFAULT_STUB_CANNED: dict[str, str] = {
-    # Back-compat defaults for the four canonical agents.  Any YAML-defined
-    # agent can override or extend this via ``skill.stub_response``; new agents
-    # without an entry here fall through to StubChatModel's generic placeholder.
+    # Plain-text bodies; ``StubChatModel._generate`` wraps these in the
+    # D-22-03 markdown envelope using the per-agent stub_envelope_* fields
+    # (the framework parses the wrapped output via Path 4). Apps can
+    # override or extend via ``skill.stub_response``; new agents without
+    # an entry here fall through to ``StubChatModel``'s generic placeholder.
     "intake": "Created INC, no prior matches. Routing to triage.",
     "triage": "Severity medium, category latency. No recent deploys correlate.",
-    "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
+    "deep_investigator": (
+        "Hypothesis: upstream payments timeout. "
+        "Evidence: log line upstream_timeout target=payments."
+    ),
     "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
 }
 
