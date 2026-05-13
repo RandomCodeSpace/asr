@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import numpy as np
 from langchain_core.embeddings import Embeddings
+from pydantic import SecretStr
 
 from runtime.config import EmbeddingConfig, ProviderConfig
 
@@ -58,12 +59,14 @@ def build_embedder(
         )
     if p.kind == "azure_openai":
         from langchain_openai import AzureOpenAIEmbeddings
+        # AzureOpenAIEmbeddings.api_key is typed as ``SecretStr | None``
+        # (pydantic v2). Wrap the env-sourced str so the type matches.
         return AzureOpenAIEmbeddings(
             azure_deployment=cfg.deployment,
             model=cfg.model,
             azure_endpoint=p.endpoint,
             api_version=p.api_version,
-            api_key=p.api_key,
+            api_key=SecretStr(p.api_key) if p.api_key else None,
         )
     if p.kind == "stub":
         return _StubEmbeddings(dim=cfg.dim)

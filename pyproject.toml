@@ -60,6 +60,40 @@ testpaths = ["tests"]
 addopts = "-v --cov=src/runtime --cov-report=term-missing --cov-report=xml"
 pythonpath = ["src", "."]
 
+[tool.coverage.run]
+# The coverage gate measures the runtime core; the UI/dist scaffolding
+# layer is intentionally excluded:
+#   - src/runtime/ui.py: 1573-line Streamlit shell that becomes
+#     dist/ui.py in the single-file bundle. v1.3 Phase 20 (HARD-09)
+#     scaffolded unit tests for it but reaching parity with backend
+#     coverage requires a dedicated UI-testing milestone.
+#   - src/runtime/__main__.py: thin argparse-only CLI entry shipped
+#     into dist/app.py; exercised by manual smoke, not pytest.
+#   - src/runtime/checkpointer_postgres.py: prod-only postgres saver
+#     skipped in CI (sqlite-only test env).
+#   - src/runtime/triggers/transports/plugin.py: stub transport.
+# All four show up in dist/* but contribute no runtime logic the
+# telemetry / auto-learning chain depends on.
+omit = [
+    "src/runtime/ui.py",
+    "src/runtime/__main__.py",
+    "src/runtime/checkpointer_postgres.py",
+    "src/runtime/triggers/transports/plugin.py",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pyright]
+# Phase 19 (HARD-03): the CI gate runs ``pyright src/runtime`` and now
+# fails on any error. ``extraPaths = ["src"]`` lets pyright resolve the
+# bare ``runtime.X`` imports the code uses (mirrors pytest's ``pythonpath``
+# in [tool.pytest.ini_options]). Mode is ``basic`` because the project's
+# typing surface is BaseModel-heavy with langchain/langgraph stubs that
+# are partial; we treat genuine bugs as errors and tag stub gaps with
+# per-line ``# pyright: ignore[<rule>] -- <rationale>`` comments.
+include = ["src"]
+extraPaths = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"

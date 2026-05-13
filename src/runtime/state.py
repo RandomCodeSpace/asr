@@ -104,6 +104,17 @@ class Session(BaseModel):
     # with a stale version raise ``StaleVersionError`` so the caller can
     # reload + retry.
     version: int = 1
+    # Phase 11 (FOC-04): transient per-turn confidence hint set by the
+    # agent runner (graph.py / responsive.py) AFTER each
+    # _harvest_tool_calls_and_patches call so the gateway's should_gate
+    # boundary can apply low_confidence gating using whatever
+    # confidence the agent has emitted so far. Reset to ``None`` at
+    # turn start; never persisted (``Field(exclude=True)``). The
+    # framework treats ``None`` as "no signal yet" and does NOT fire a
+    # low_confidence gate -- this avoids a false-positive gate on the
+    # very first tool call of a turn before any envelope/tool-arg
+    # carrying confidence has surfaced.
+    turn_confidence_hint: float | None = Field(default=None, exclude=True)
 
     # ------------------------------------------------------------------
     # App-overridable agent-input formatter hook.

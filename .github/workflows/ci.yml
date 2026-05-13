@@ -21,25 +21,79 @@ jobs:
         uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Pin uv version for reproducible CI; bump deliberately when bumping locally.
+          version: "0.11.7"
+          enable-cache: true
+
+      - name: Lockfile freshness gate (HARD-02)
+        # Fails the build if pyproject.toml drifts from uv.lock — no silent
+        # resolves on CI, no surprise transitive upgrades. Phase 14 / SC-4.
+        run: uv lock --check
+
+      - name: Install dependencies (from lockfile)
+        # `--frozen` forbids re-resolving; uv installs the exact set pinned in
+        # uv.lock with hash verification. Phase 14 / SC-3.
+        run: uv sync --frozen --extra dev
+
+      - name: Bundle staleness gate (HARD-08)
+        # Regenerates dist/* from src/runtime + examples/* and fails the
+        # build if anything in dist/ would change. Forces every PR that
+        # touches src/runtime, examples/, or the bundler to commit fresh
+        # bundles — the air-gap deploy bundle stays repaired by
+        # construction (Phase 16 / BUNDLER-01 + HARD-08). Contributors
+        # run `python scripts/build_single_file.py` before every push;
+        # see docs/DEVELOPMENT.md.
+        run: |
+          uv run python scripts/build_single_file.py
+          git diff --exit-code dist/
 
       - name: Lint (ruff)
-        run: ruff check src/ tests/
+        run: uv run ruff check src/ tests/
 
-      - name: Type check (pyright)
-        # Pyright was previously pointed at src/orchestrator (a shim layer
-        # of star-imports) so its real coverage of the framework was nil.
-        # After deleting src/orchestrator, the target moved to src/runtime
-        # and surfaces ~41 pre-existing generic/typed-dict issues. Don't
-        # block the build on those; track via the follow-up cleanup plan.
-        continue-on-error: true
-        run: pyright src/runtime
+      - name: Type check (pyright) (HARD-03)
+        # Phase 19 -- the gate is now fail-on-error against ``src/runtime``.
+        # The earlier 54-error backlog was resolved via type-annotation
+        # tightening + per-line ``# pyright: ignore[<rule>] -- <rationale>``
+        # comments for legitimate stub gaps. ``pyproject.toml`` carries
+        # the ``[tool.pyright]`` block (``include = ["src"]``,
+        # ``extraPaths = ["src"]``, ``typeCheckingMode = "basic"``).
+        # Test files and ``dist/`` bundles are out of scope for this
+        # phase; future phases may extend coverage outward.
+        run: uv run pyright src/runtime
 
       - name: Test with coverage
-        run: pytest --cov=src/runtime --cov-report=xml --junitxml=junit.xml
+        # Dummy env vars satisfy the strict ``_interpolate`` check that
+        # config.yaml's ``${OLLAMA_API_KEY}`` / ``${OPENROUTER_API_KEY}``
+        # placeholders trigger when ``load_config()`` runs. Tests don't
+        # call live providers; values just need to exist. Live smoke
+        # tests are gated separately by ``OLLAMA_LIVE=1``.
+        env:
+          # Empty API keys so live-provider smoke tests gated by
+          # ``if not os.environ.get(KEY)`` correctly skip. The
+          # ``_interpolate`` strict-mode check only requires the var
+          # to EXIST in the environment (any value, incl. empty).
+          OLLAMA_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          AZURE_OPENAI_KEY: ""
+          AZURE_DEPLOYMENT: ""
+          AZURE_ENDPOINT: https://ci-dummy.example/
+          EXTERNAL_MCP_URL: https://ci-dummy.example/
+          EXT_TOKEN: ci-dummy
+        run: uv run pytest --cov=src/runtime --cov-report=xml --junitxml=junit.xml
+
+      - name: Skill-prompt-vs-schema lint (SKILL-LINTER-01)
+        # Phase 21. Walks every examples/*/skills/*/system.md and asserts
+        # that every referenced tool name + arg field exists in the
+        # canonically discovered tool inventory (AST-extracted from
+        # examples/*/mcp_server*.py + mcp_servers/*.py) and the typed
+        # patch models (UpdateIncidentPatch). Catches LLM-emit-vs-schema
+        # drift like `findings_triage` vs `findings.triage`, hallucinated
+        # injected args, and unknown tool names. Binary-pass gate.
+        run: uv run python scripts/lint_skill_prompts.py
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v8.0.0

@@ -40,14 +40,17 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Coroutine, TypeVar, cast
 
 from runtime.config import AppConfig
 from runtime.mcp_loader import build_fastmcp_client
+
+_log = logging.getLogger("runtime.service")
 
 T = TypeVar("T")
 
@@ -73,9 +76,6 @@ class _ActiveSession:
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-_lock = threading.Lock()
-_instance: "OrchestratorService | None" = None
-
 
 class SessionCapExceeded(RuntimeError):
     """Raised by ``start_session`` when the service is already running
@@ -100,7 +100,21 @@ class OrchestratorService:
     Surface: construction, singleton accessor, ``start()`` /
     ``shutdown()``, coroutine submission bridge, and the shared MCP
     client pool.
+
+    Thread-safety (HARD-06): ``get_or_create()`` and
+    ``_reset_singleton()`` serialise singleton mutation through a
+    class-level ``threading.Lock``. Concurrent first-callers
+    (Streamlit warmup + FastAPI startup hook racing during process
+    boot) all observe the same instance — the loser of the race blocks
+    on the lock briefly, then short-circuits on the
+    ``_instance is None`` check inside the critical section.
     """
+
+    # Class-level singleton state. Guarded by ``_lock`` so concurrent
+    # ``get_or_create()`` callers can't double-construct the service.
+    # Reset on ``shutdown()`` via :meth:`_reset_singleton`.
+    _lock: threading.Lock = threading.Lock()
+    _instance: "OrchestratorService | None" = None
 
     def __init__(
         self,
@@ -144,6 +158,10 @@ class OrchestratorService:
         # ``cfg.runtime.gateway`` is configured; otherwise None and the
         # lifecycle hooks are no-ops.
         self._approval_watchdog: Any | None = None
+        # M7 nightly lesson refresher. Started in ``start()`` iff the
+        # orchestrator has a lesson_store; otherwise None (the lifecycle
+        # hooks short-circuit).
+        self._lesson_refresher: Any | None = None
 
     @classmethod
     def get_or_create(cls, cfg: AppConfig) -> "OrchestratorService":
@@ -153,12 +171,17 @@ class OrchestratorService:
         existing instance — there is exactly one orchestrator service per
         Python process. To rebuild with a new config, call
         ``shutdown()`` first.
+
+        Thread-safe (HARD-06): the check-and-construct pair runs inside
+        a class-level ``threading.Lock``. A concurrent second caller
+        either blocks until the first caller's ``__init__`` returns and
+        then short-circuits on the ``_instance is not None`` check, or
+        wins the race and constructs alone — no double construction.
         """
-        global _instance
-        with _lock:
-            if _instance is None:
-                _instance = cls(cfg)
-            return _instance
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls(cfg)
+            return cls._instance
 
     def start(self) -> None:
         """Spin up the background thread + asyncio loop.
@@ -197,6 +220,7 @@ class OrchestratorService:
             )
             self._approval_watchdog.start(self._loop)
 
+
     def _run_loop(self) -> None:
         assert self._loop is not None
         asyncio.set_event_loop(self._loop)
@@ -232,7 +256,14 @@ class OrchestratorService:
             )
         if not self._loop.is_running():
             raise RuntimeError("OrchestratorService loop is not running")
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # Public signature accepts ``Awaitable[T]`` for caller flexibility;
+        # ``run_coroutine_threadsafe`` requires a ``Coroutine``. Every
+        # in-tree caller passes ``async def fn()`` — a Coroutine — so the
+        # cast is sound. Outside callers passing a non-coroutine
+        # Awaitable would already fail at runtime.
+        return asyncio.run_coroutine_threadsafe(
+            cast(Coroutine[Any, Any, T], coro), self._loop,
+        )
 
     def submit_and_wait(
         self, coro: Awaitable[T], timeout: float | None = None
@@ -269,7 +300,10 @@ class OrchestratorService:
             )
         if not self._loop.is_running():
             raise RuntimeError("OrchestratorService loop is not running")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        # See ``submit`` above for the Awaitable-vs-Coroutine cast.
+        fut = asyncio.run_coroutine_threadsafe(
+            cast(Coroutine[Any, Any, T], coro), self._loop,
+        )
         return await asyncio.wrap_future(fut)
 
     async def get_mcp_client(self, server_name: str) -> Any:
@@ -339,7 +373,50 @@ class OrchestratorService:
                 # load time (orchestrator transitively imports a lot).
                 from runtime.orchestrator import Orchestrator
                 self._orch = await Orchestrator.create(self.cfg)
+                # M7: nightly lesson refresher. Wired on first
+                # orchestrator build so the engine + lesson_store +
+                # event_log handles are already populated.
+                self._maybe_start_lesson_refresher(self._orch)
             return self._orch
+
+    def _maybe_start_lesson_refresher(self, orch: Any) -> None:
+        """Arm the M7 nightly refresher on first orchestrator build.
+        No-op when the orchestrator has no lesson_store / event_log
+        (test fixtures, apps that disable the corpus) or when the
+        refresher is already armed."""
+        if self._lesson_refresher is not None:
+            return
+        lesson_store = getattr(orch, "lesson_store", None)
+        event_log = getattr(orch, "event_log", None)
+        if lesson_store is None or event_log is None:
+            return
+        from runtime.learning.scheduler import LessonRefresher
+
+        framework_cfg = getattr(orch, "framework_cfg", None)
+        cron = getattr(framework_cfg, "lesson_refresh_cron", "0 3 * * *")
+        window_days = getattr(framework_cfg, "lesson_refresh_window_days", 7)
+        terminal_statuses = frozenset(
+            name for name, sdef in self.cfg.orchestrator.statuses.items()
+            if getattr(sdef, "terminal", False)
+        )
+        if not terminal_statuses or self._loop is None:
+            return
+        self._lesson_refresher = LessonRefresher(
+            engine=orch.store.engine,
+            lesson_store=lesson_store,
+            event_log=event_log,
+            terminal_statuses=terminal_statuses,
+            cron=cron,
+            window_days=window_days,
+        )
+        try:
+            self._lesson_refresher.start(self._loop)
+        except Exception:  # noqa: BLE001 — don't break orch build on cron failure
+            _log.warning(
+                "LessonRefresher start failed; corpus refresh disabled",
+                exc_info=True,
+            )
+            self._lesson_refresher = None
 
     def start_session(
         self,
@@ -463,7 +540,23 @@ class OrchestratorService:
                         )
                     except asyncio.CancelledError:
                         raise
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is a
+                        # pending-approval pause, not a failure. Don't stamp
+                        # status='error' on the registry entry -- let
+                        # LangGraph's checkpointer hold the paused state
+                        # and let the UI's Approve/Reject action drive
+                        # resume.
+                        try:
+                            from langgraph.errors import GraphInterrupt
+                            if isinstance(exc, GraphInterrupt):
+                                # Propagate so the underlying Task
+                                # observer (stop_session etc.) still
+                                # sees the exception, but skip the
+                                # status='error' write.
+                                raise
+                        except ImportError:  # pragma: no cover
+                            pass
                         # Mark the registry entry so any concurrent snapshot
                         # observes the failure before the done-callback
                         # evicts it. The exception itself is preserved on
@@ -515,8 +608,13 @@ class OrchestratorService:
                     pass
                 except Exception:  # noqa: BLE001
                     # The graph itself may have raised; we still want to
-                    # mark the row stopped below. Swallow here.
-                    pass
+                    # mark the row stopped below. Swallow here, but log
+                    # so post-mortem reveals the underlying failure.
+                    _log.warning(
+                        "stop_session: graph raised during cancel-await for %s",
+                        session_id,
+                        exc_info=True,
+                    )
             # Persist the stopped status. The orchestrator may not have
             # been built yet (caller passed an unknown id before any
             # session ran) — in that case there's nothing to persist.
@@ -525,7 +623,13 @@ class OrchestratorService:
                 try:
                     inc = orch.store.load(session_id)
                 except Exception:  # noqa: BLE001
-                    # Unknown id: nothing to persist; treat as no-op.
+                    # Unknown id: nothing to persist; treat as no-op. A
+                    # genuine store failure is still observable via the log.
+                    _log.debug(
+                        "stop_session: store.load(%s) failed; treating as unknown id",
+                        session_id,
+                        exc_info=True,
+                    )
                     inc = None
                 if inc is not None:
                     inc.status = "stopped"
@@ -594,8 +698,27 @@ class OrchestratorService:
                 )
                 fut.result(timeout=timeout)
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: shutdown must continue even if the watchdog
+                # refuses to stop cleanly. Surface the cause so it doesn't
+                # silently rot.
+                _log.warning(
+                    "shutdown: approval watchdog stop failed",
+                    exc_info=True,
+                )
             self._approval_watchdog = None
+        # M7: stop the nightly lesson refresher symmetrically with the
+        # watchdog. Same best-effort discipline.
+        if loop.is_running() and self._lesson_refresher is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._lesson_refresher.stop(), loop,
+                )
+                fut.result(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "shutdown: lesson refresher stop failed", exc_info=True,
+                )
+            self._lesson_refresher = None
         # Cancel in-flight session tasks first so they observe a
         # CancelledError before the orchestrator's underlying
         # resources (DB engine, FastMCP transports) are torn down.
@@ -605,8 +728,13 @@ class OrchestratorService:
                     self._cancel_all_sessions(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: a stuck task that ignores cancellation must
+                # not block the loop teardown below. Surface for diagnosis.
+                _log.warning(
+                    "shutdown: cancel_all_sessions failed",
+                    exc_info=True,
+                )
         # Close the shared orchestrator on the loop, releasing its
         # checkpointer connection / MCP exit-stack.
         if loop.is_running() and self._orch is not None:
@@ -615,8 +743,13 @@ class OrchestratorService:
                     self._close_orchestrator(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: a misbehaving aclose() must not block
+                # the loop / thread join below. Surface for diagnosis.
+                _log.warning(
+                    "shutdown: orchestrator close failed",
+                    exc_info=True,
+                )
         # Close MCP clients on the loop *before* stopping it.
         if loop.is_running() and self._mcp_stack is not None:
             try:
@@ -624,9 +757,13 @@ class OrchestratorService:
                     self._close_mcp_pool(), loop
                 )
                 fut.result(timeout=timeout)
-            except Exception:
-                # Best-effort: don't block shutdown on a misbehaving client.
-                pass
+            except Exception:  # noqa: BLE001
+                # Best-effort: don't block shutdown on a misbehaving
+                # client. Log so diagnostics survive the silent cleanup.
+                _log.warning(
+                    "shutdown: MCP pool close failed",
+                    exc_info=True,
+                )
         if loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
@@ -667,7 +804,13 @@ class OrchestratorService:
         try:
             await orch.aclose()
         except Exception:  # noqa: BLE001
-            pass
+            # Best-effort cleanup: a checkpointer / MCP exit-stack that
+            # blew up on close still leaves the process to exit cleanly.
+            # Surface so the failure is observable post-mortem.
+            _log.warning(
+                "_close_orchestrator: orch.aclose() failed",
+                exc_info=True,
+            )
 
     async def _close_mcp_pool(self) -> None:
         if self._mcp_stack is None:
@@ -679,8 +822,11 @@ class OrchestratorService:
         self._mcp_locks.clear()
         self._mcp_build_locks.clear()
 
-    @staticmethod
-    def _reset_singleton() -> None:
-        global _instance
-        with _lock:
-            _instance = None
+    @classmethod
+    def _reset_singleton(cls) -> None:
+        """Clear the class-level singleton under the same lock that
+        ``get_or_create`` uses — so a reset racing with a fresh
+        ``get_or_create`` call cannot leak the stale instance.
+        """
+        with cls._lock:
+            cls._instance = None

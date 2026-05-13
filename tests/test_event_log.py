@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine
 
 from runtime.storage.models import Base
-from runtime.storage.event_log import EventLog, SessionEvent
+from runtime.storage.event_log import EventLog, SessionEvent, _VALID_EVENT_KINDS
 
 
 @pytest.fixture
@@ -46,3 +46,45 @@ def test_iter_returns_session_event_dataclass(log):
     assert e.payload == {"key": "value"}
     assert isinstance(e.seq, int)
     assert isinstance(e.ts, str) and e.ts  # non-empty ISO timestamp
+
+
+# M2 — record(kind, **payload) helper + EventKind literal validation.
+
+def test_record_helper_stamps_kind_and_payload(log):
+    """``record(sid, "tool_invoked", tool="x", latency_ms=12)`` writes a
+    row equivalent to ``append`` with the kwargs collected into a payload
+    dict, and ``iter_for`` round-trips it."""
+    log.record("INC-1", "tool_invoked", tool="x", latency_ms=12)
+    events = list(log.iter_for("INC-1"))
+    assert len(events) == 1
+    e = events[0]
+    assert e.kind == "tool_invoked"
+    assert e.payload == {"tool": "x", "latency_ms": 12}
+    # ts populated by append's _now() — sanity-check it's a non-empty str
+    assert isinstance(e.ts, str) and e.ts
+
+
+def test_event_kind_literal_rejects_unknown(log):
+    """Passing a kind outside :data:`EventKind` raises ``ValueError`` at
+    ``record`` time so typos don't silently pollute the log."""
+    with pytest.raises(ValueError) as exc:
+        log.record("INC-1", "totally_made_up_kind", foo="bar")  # type: ignore[arg-type]
+    assert "totally_made_up_kind" in str(exc.value)
+    # Sanity: no row was written.
+    assert list(log.iter_for("INC-1")) == []
+
+
+def test_event_kind_literal_lists_full_vocabulary():
+    """Lock the vocabulary so adding a kind requires updating tests +
+    callers in the same commit. If this fails after intentionally
+    growing the vocabulary, bump the expected set here."""
+    assert _VALID_EVENT_KINDS == frozenset({
+        "agent_started",
+        "agent_finished",
+        "tool_invoked",
+        "confidence_emitted",
+        "route_decided",
+        "gate_fired",
+        "status_changed",
+        "lesson_extracted",
+    })

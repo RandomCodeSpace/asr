@@ -9,13 +9,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Any, Iterator, Literal, get_args
 
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from runtime.storage.models import SessionEventRow
+
+# M2 (per-step telemetry): stable kind vocabulary for the event log.
+# Adding a new kind without updating callers is intentional — but
+# emitting a kind outside this Literal is a typo and raises at
+# record() time so the typo doesn't silently pollute the log.
+EventKind = Literal[
+    "agent_started",
+    "agent_finished",
+    "tool_invoked",
+    "confidence_emitted",
+    "route_decided",
+    "gate_fired",
+    "status_changed",
+    "lesson_extracted",
+]
+
+_VALID_EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
 
 
 @dataclass(frozen=True)
@@ -55,14 +72,45 @@ class EventLog:
                     ts=_now(),
                 ))
 
-    def iter_for(self, session_id: str) -> Iterator[SessionEvent]:
-        """Yield events for ``session_id`` in monotonic insertion order."""
+    def record(
+        self,
+        session_id: str,
+        kind: EventKind,
+        **payload: Any,
+    ) -> None:
+        """Convenience over ``append`` for the common kwargs shape.
+
+        ``record(sid, "tool_invoked", tool="x", latency_ms=12)`` is
+        equivalent to ``append(sid, "tool_invoked", {"tool": "x",
+        "latency_ms": 12})`` but validates ``kind`` against the
+        :data:`EventKind` Literal at call time — a typo is a hard
+        failure, not a silently-malformed row.
+        """
+        if kind not in _VALID_EVENT_KINDS:
+            raise ValueError(
+                f"unknown event kind {kind!r}; allowed: "
+                f"{sorted(_VALID_EVENT_KINDS)}"
+            )
+        self.append(session_id, kind, payload)
+
+    def iter_for(
+        self, session_id: str, *, since: int | None = None,
+    ) -> Iterator[SessionEvent]:
+        """Yield events for ``session_id`` in monotonic insertion order.
+
+        ``since``: optional ``seq`` watermark. When supplied, only events
+        with ``seq > since`` are returned — enables SSE / WebSocket
+        streaming clients to resume from their last observed seq without
+        re-receiving the backlog.
+        """
         with Session(self.engine) as s:
             stmt = (
                 select(SessionEventRow)
                 .where(SessionEventRow.session_id == session_id)
                 .order_by(SessionEventRow.seq)
             )
+            if since is not None:
+                stmt = stmt.where(SessionEventRow.seq > since)
             for row in s.execute(stmt).scalars():
                 yield SessionEvent(
                     seq=row.seq,

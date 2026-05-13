@@ -20,18 +20,21 @@ from typing import Any, Generic, Mapping, Optional, Type, TypeVar
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session as SqlaSession
 
+from runtime.state import Session
 from runtime.storage.models import IncidentRow
 
-# Mirrors the bound on ``SessionStore.StateT`` — kept permissive at
-# ``BaseModel`` so framework code does not need to import the
-# example-app subclass. The resolver in :mod:`runtime.state_resolver`
-# enforces a ``runtime.state.Session`` subclass at config time.
-StateT = TypeVar("StateT", bound=BaseModel)
+# Mirrors the bound on ``SessionStore.StateT`` — tightened from
+# ``BaseModel`` to ``runtime.state.Session`` in Phase 19 (HARD-03) so
+# pyright sees the typed fields (``id``, ``status``, ``deleted_at`` …)
+# this store reads. The resolver in :mod:`runtime.state_resolver`
+# already enforces a ``Session`` subclass at config time, and every
+# in-tree caller passes either bare ``Session`` or a ``Session``
+# subclass.
+StateT = TypeVar("StateT", bound=Session)
 
 # Allowed ``filter_kwargs`` keys = IncidentRow column names.
 # Computed at module load so we can produce a precise error for typos.
@@ -83,7 +86,7 @@ class HistoryStore(Generic[StateT]):
         return self._converter._row_to_incident(row)
 
     def _load(self, incident_id: str) -> StateT:
-        with Session(self.engine) as session:
+        with SqlaSession(self.engine) as session:
             row = session.get(IncidentRow, incident_id)
             if row is None:
                 raise FileNotFoundError(incident_id)
@@ -94,7 +97,7 @@ class HistoryStore(Generic[StateT]):
 
         Pure SQL prefilter — used by both vector and keyword paths.
         """
-        with Session(self.engine) as session:
+        with SqlaSession(self.engine) as session:
             stmt = select(IncidentRow).where(IncidentRow.deleted_at.is_(None))
             for col, val in filter_kwargs.items():
                 stmt = stmt.where(getattr(IncidentRow, col) == val)
@@ -151,7 +154,12 @@ class HistoryStore(Generic[StateT]):
         threshold = self.similarity_threshold if threshold is None else threshold
         from runtime.storage.vector import distance_to_similarity
         vec = self.embedder.embed_query(query)
-        raw = self.vector_store.similarity_search_with_score_by_vector(vec, k=limit * 4)
+        # ``similarity_search_with_score_by_vector`` is provided by the
+        # concrete FAISS / pgvector / langchain-postgres backends (and
+        # validated by ``runtime.storage.vector.build_vector_store``)
+        # but the abstract ``langchain_core.vectorstores.VectorStore``
+        # base class does not declare it.
+        raw = self.vector_store.similarity_search_with_score_by_vector(vec, k=limit * 4)  # pyright: ignore[reportAttributeAccessIssue]
         out: list[tuple[StateT, float]] = []
         for doc, distance in raw:
             score = distance_to_similarity(float(distance), self.distance_strategy)
@@ -188,7 +196,7 @@ class HistoryStore(Generic[StateT]):
             if getattr(i, "status", None) == status_filter
             and getattr(i, "deleted_at", None) is None
         ]
-        def _ef(i, key, default=""):
+        def _ef(i, key, default: Any = ""):
             """Read a field from typed attribute first, then extra_fields."""
             val = getattr(i, key, None)
             if val:

@@ -50,10 +50,21 @@ Thumbs.db
 # --- Claude tooling artifacts ----------------------------------------
 AGENTS.md
 ASR.md
-docs/
+.claude/ralph-loop.local.md
+.claude/worktrees/
+.plan/
+# Tracked docs are explicitly listed below; everything else under docs/
+# is Claude scratch (plans, brainstorm output, etc) and stays gitignored.
+#   - AIRGAP_INSTALL.md: Phase 14 (HARD-02) air-gap install path.
+#   - DEVELOPMENT.md:    Phase 16 (BUNDLER-01) contributor workflow.
+docs/*
+!docs/AIRGAP_INSTALL.md
+!docs/DEVELOPMENT.md
 REVIEW_*.md
 review_*.md
 .planning/
+# Dev integration test driver (out-of-repo tool, runs against live UI).
+scripts/integration_scenarios.py
 
 # Coverage / CI artefacts
 coverage.xml

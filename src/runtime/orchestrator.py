@@ -5,7 +5,7 @@ import logging
 import warnings
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import AsyncIterator, Generic, Type, TypeVar
+from typing import Any, AsyncIterator, Generic, Type, TypeVar
 from datetime import datetime, timezone
 
 from pydantic import BaseModel
@@ -30,12 +30,15 @@ from runtime.intake import IntakeContext
 from runtime.llm import get_llm
 from runtime.skill import load_all_skills, Skill
 from runtime.mcp_loader import load_tools, ToolRegistry
+from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
 from runtime.graph import build_graph, GraphState
+from runtime.policy import RetryDecision, should_retry
 from runtime.state import Session, ToolCall
 from runtime.state_resolver import resolve_state_class
 from runtime.storage.engine import build_engine
+from runtime.storage.event_log import EventLog
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.history_store import HistoryStore
 from runtime.storage.models import Base
@@ -44,6 +47,25 @@ from runtime.storage.vector import build_vector_store
 from runtime.locks import SessionLockRegistry
 
 _log = logging.getLogger("runtime.orchestrator")
+
+
+def _assert_envelope_invariant_on_finalize(session: "Session") -> None:
+    """Phase 10 (FOC-03) defence-in-depth log sweep.
+
+    Hard rejection of envelope-less turns happens at the agent runner
+    (``parse_envelope_from_result`` raises ``EnvelopeMissingError``,
+    which the runner converts into an agent_run marked ``error``).
+    This finalize hook only logs WARNING for forensics on legacy on-disk
+    sessions whose agent_runs predate the envelope contract. Never
+    raises.
+    """
+    for ar in session.agents_run:
+        if ar.confidence is None:
+            _log.warning(
+                "agent_run.envelope_missing agent=%s session_id=%s",
+                ar.agent,
+                session.id,
+            )
 
 
 def _default_text_extractor(session) -> str:
@@ -195,6 +217,99 @@ def _metadata_url(cfg: AppConfig) -> str:
     return f"sqlite:///{Path(cfg.paths.incidents_dir) / 'incidents.db'}"
 
 
+# ---------------------------------------------------------------------
+# M4 (per-step telemetry): status_changed emission helpers. Kept at
+# module scope so test shims that build a partial _O class with only
+# specific Orchestrator methods attached still drive the finalize
+# path without needing every new helper in their attribute list.
+# ---------------------------------------------------------------------
+
+def _latest_terminal_tool_for_status(
+    rules,
+    tool_calls,
+    new_status: str,
+) -> str | None:
+    """Return the bare name of the most recent executed terminal-tool
+    that maps to ``new_status``, for use as the ``cause`` field on the
+    ``status_changed`` event. Returns ``None`` if no rule matches.
+    """
+    bare_names = {r.tool_name for r in rules if r.status == new_status}
+    executed = [
+        tc for tc in tool_calls
+        if getattr(tc, "status", None) == "executed"
+    ]
+    for tc in reversed(executed):
+        name = (tc.tool or "").split(":")[-1]
+        if name in bare_names:
+            return name
+    return None
+
+
+def _emit_status_changed_event(
+    *,
+    orch,
+    inc,
+    from_status: str,
+    to_status: str,
+    cause: str,
+) -> None:
+    """Emit a ``status_changed`` event through orch.event_log (when
+    present) and trigger the M5 lesson-extraction hook on terminal
+    statuses (no-op until M5 wires up LessonExtractor).
+    Resilient to shim test classes that don't carry ``event_log``.
+    """
+    event_log = getattr(orch, "event_log", None)
+    if event_log is not None:
+        try:
+            event_log.record(
+                inc.id,
+                "status_changed",
+                **{"from": from_status, "to": to_status, "cause": cause},
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break finalize
+            _log.debug(
+                "event_log.record(status_changed) failed", exc_info=True,
+            )
+
+    # M5 hook point: when ``to_status`` is terminal per app config,
+    # invoke the lesson extractor. M4 leaves it as a no-op; M5 swaps
+    # this body for the real ``LessonExtractor.extract`` call.
+    statuses = getattr(getattr(orch, "cfg", None), "orchestrator", None)
+    if statuses is None:
+        return
+    status_def = statuses.statuses.get(to_status)
+    if status_def is not None and status_def.terminal:
+        _extract_lesson_on_terminal(orch=orch, inc=inc)
+
+
+def _extract_lesson_on_terminal(*, orch, inc) -> None:
+    """M6: run the LessonExtractor against the finalized session and
+    persist the row through the LessonStore. No-op when either the
+    event log or the lesson store is unavailable (shim test classes,
+    apps that disable the corpus, etc).
+
+    Failures here are logged and dropped — terminal-status routing
+    must never fail because the corpus write hiccupped.
+    """
+    event_log = getattr(orch, "event_log", None)
+    lesson_store = getattr(orch, "lesson_store", None)
+    if event_log is None or lesson_store is None:
+        return None
+    try:
+        from runtime.learning import LessonExtractor
+
+        row = LessonExtractor.extract(session=inc, event_log=event_log)
+        if row is None:
+            return None
+        lesson_store.add(row)
+    except Exception:  # noqa: BLE001 — finalize must never break on corpus write
+        _log.warning(
+            "lesson extraction failed for session %s; finalize continues",
+            inc.id, exc_info=True,
+        )
+    return None
+
+
 class Orchestrator(Generic[StateT]):
     """High-level facade. Construct via ``await Orchestrator.create(cfg)``.
 
@@ -213,6 +328,8 @@ class Orchestrator(Generic[StateT]):
                  framework_cfg: FrameworkAppConfig | None = None,
                  state_cls: Type[StateT] = Session,  # type: ignore[assignment]
                  history: HistoryStore | None = None,
+                 event_log: EventLog | None = None,
+                 lesson_store: "Any | None" = None,
                  checkpointer=None,
                  checkpointer_close=None,
                  dedup_pipeline: "DedupPipeline | None" = None):
@@ -227,6 +344,14 @@ class Orchestrator(Generic[StateT]):
         # vector store; ``history`` is optional for callers that don't
         # need similarity lookups.
         self.history = history
+        # M1 (per-step telemetry): append-only event sink. Single instance
+        # shared with framework_cfg.intake_context.event_log so module-level
+        # supervisor runners can emit via the same handle.
+        self.event_log = event_log
+        # M5/M6: lesson corpus store. Shared with
+        # framework_cfg.intake_context.lesson_store so the default intake
+        # runner reads from the same handle the finalize hook writes to.
+        self.lesson_store = lesson_store
         self.skills = skills
         self.registry = registry
         # A single compiled graph drives both fresh runs and resume-
@@ -361,6 +486,35 @@ class Orchestrator(Generic[StateT]):
                 similarity_threshold=framework_cfg.similarity_threshold,
                 distance_strategy=cfg.storage.vector.distance_strategy,
             )
+            # M1 (per-step telemetry): append-only event sink writing into
+            # session_events; shared by AgentRunRecorder, gateway, and the
+            # status-finalize hook (M3/M4). One row per agent boundary or
+            # tool call — never mutated.
+            event_log = EventLog(engine=engine)
+            # M5 + M6: lesson corpus + vector index. Reuses the same
+            # backend/distance strategy as the main session vector store;
+            # collection_name="lessons" produces a sibling FAISS file
+            # under the same path (or a separate pgvector row family
+            # under collection "lessons").
+            from runtime.config import VectorConfig as _VectorConfig
+            from runtime.storage import LessonStore as _LessonStore
+            from runtime.storage.migrations import migrate_add_lesson_table
+            migrate_add_lesson_table(engine)
+            _lesson_vector_cfg = _VectorConfig(
+                backend=cfg.storage.vector.backend,
+                path=cfg.storage.vector.path,
+                collection_name="lessons",
+                distance_strategy=cfg.storage.vector.distance_strategy,
+            )
+            lesson_vector_store = build_vector_store(
+                _lesson_vector_cfg, embedder, engine,
+            )
+            lesson_store = _LessonStore(
+                engine=engine,
+                vector_store=lesson_vector_store,
+                distance_strategy=cfg.storage.vector.distance_strategy,
+                similarity_threshold=framework_cfg.intake_similarity_threshold,
+            )
             # Attach intake_context onto framework_cfg so supervisor nodes can
             # reach the live stores via app_cfg.intake_context. FrameworkAppConfig
             # is a Pydantic model; use object.__setattr__ to set a runtime
@@ -371,6 +525,8 @@ class Orchestrator(Generic[StateT]):
                 IntakeContext(
                     history_store=history,
                     dedup_pipeline=None,  # dedup_pipeline built below; patched after
+                    event_log=event_log,
+                    lesson_store=lesson_store,
                     top_k=framework_cfg.intake_top_k,
                     similarity_threshold=framework_cfg.intake_similarity_threshold,
                 ),
@@ -458,7 +614,8 @@ class Orchestrator(Generic[StateT]):
             graph = await build_graph(cfg=cfg, skills=skills, store=store,
                                       registry=registry,
                                       checkpointer=checkpointer,
-                                      framework_cfg=framework_cfg)
+                                      framework_cfg=framework_cfg,
+                                      event_log=event_log)
             # Build the dedup pipeline iff the app has opted in AND the
             # configured stage 2 model resolves in the LLM registry.
             # When the registry doesn't include the configured model
@@ -483,10 +640,14 @@ class Orchestrator(Generic[StateT]):
                 if dedup_cfg.stage2_model in cfg.llm.models:
                     _llm_cfg_capture = cfg.llm
                     _model_name = dedup_cfg.stage2_model
+                    _default_timeout_capture = (
+                        cfg.orchestrator.default_llm_request_timeout
+                    )
 
                     def _factory():
                         return get_llm(
                             _llm_cfg_capture, _model_name, role="dedup",
+                            default_llm_request_timeout=_default_timeout_capture,
                         )
 
                     dedup_pipeline = DedupPipeline(
@@ -498,15 +659,25 @@ class Orchestrator(Generic[StateT]):
             # Backfill dedup_pipeline into the IntakeContext now that it is built.
             # The IntakeContext was constructed with dedup_pipeline=None above
             # because the pipeline is built after graph construction.
+            # ``intake_context`` was attached via ``object.__setattr__`` ~140
+            # lines up; pyright doesn't see dynamic Pydantic attrs, so go
+            # via getattr for the type-checker.
             if dedup_pipeline is not None:
-                framework_cfg.intake_context.dedup_pipeline = dedup_pipeline
+                getattr(framework_cfg, "intake_context").dedup_pipeline = dedup_pipeline
             # No bespoke resume graph — resume runs through the main
             # graph via ``Command(resume=...)`` against the same
             # thread_id, with the checkpointer rehydrating paused state.
+            # ``repo_state_cls: Type[BaseModel]`` matches the loose
+            # bound on ``Orchestrator.StateT`` (also ``BaseModel``) at
+            # the call site, but pyright sees the un-narrowed
+            # ``StateT`` placeholder. Concrete narrowing happens via
+            # the runtime resolver enforced earlier in this method.
             instance = cls(cfg, store, skills, registry, graph,
                            stack, framework_cfg=framework_cfg,
-                           state_cls=repo_state_cls,
+                           state_cls=repo_state_cls,  # pyright: ignore[reportArgumentType]
                            history=history,
+                           event_log=event_log,
+                           lesson_store=lesson_store,
                            checkpointer=checkpointer,
                            checkpointer_close=checkpointer_close,
                            dedup_pipeline=dedup_pipeline)
@@ -521,7 +692,13 @@ class Orchestrator(Generic[StateT]):
             try:
                 await checkpointer_close()  # pyright: ignore[reportPossiblyUnboundVariable]
             except Exception:  # noqa: BLE001
-                pass
+                # The original BaseException is what the caller cares
+                # about; this cleanup failure must not mask it. Log so
+                # the FD-leak path stays observable.
+                _log.warning(
+                    "build: checkpointer_close failed during error rollback",
+                    exc_info=True,
+                )
             await stack.aclose()
             raise
 
@@ -533,7 +710,13 @@ class Orchestrator(Generic[StateT]):
             try:
                 await self._checkpointer_close()
             except Exception:  # noqa: BLE001
-                pass
+                # Best-effort: the rest of aclose() (exit_stack drain)
+                # must still run so MCP transports don't leak. Log so
+                # checkpointer-close failures stay observable.
+                _log.warning(
+                    "aclose: checkpointer close failed",
+                    exc_info=True,
+                )
             self._checkpointer_close = None
         await self._exit_stack.aclose()
 
@@ -612,7 +795,17 @@ class Orchestrator(Generic[StateT]):
         if inc.status not in ("new", "in_progress"):
             return None
 
+        # Phase 10 (FOC-03) defence-in-depth: hard rejection of envelope-less
+        # turns happens at the agent runner; this hook only logs WARNING for
+        # forensics on legacy on-disk sessions whose agent_runs predate the
+        # envelope contract. Never raises.
+        _assert_envelope_invariant_on_finalize(inc)
+
         decision = self._infer_terminal_decision(inc.tool_calls)
+        # Capture from-status BEFORE any mutation so the M4 status_changed
+        # event carries the correct transition. Both branches below mutate
+        # inc.status.
+        from_status = inc.status
         if decision is None:
             default = self.cfg.orchestrator.default_terminal_status
             if default is None:
@@ -624,6 +817,11 @@ class Orchestrator(Generic[StateT]):
             inc.status = default
             inc.extra_fields["needs_review_reason"] = (
                 "graph completed without terminal tool call"
+            )
+            _emit_status_changed_event(
+                orch=self, inc=inc,
+                from_status=from_status, to_status=default,
+                cause="default_terminal_status",
             )
             return self._save_or_yield(inc, default)
 
@@ -642,6 +840,18 @@ class Orchestrator(Generic[StateT]):
             team = extracted.get("team")
             if team:
                 inc.extra_fields["escalated_to"] = team
+        # M4: emit status_changed with cause=<matched terminal tool>.
+        # The terminal-tool name from the matched rule is the most
+        # specific cause label downstream consumers (UI, learner) need.
+        cause_tool = _latest_terminal_tool_for_status(
+            self.cfg.orchestrator.terminal_tools,
+            inc.tool_calls, new_status,
+        )
+        _emit_status_changed_event(
+            orch=self, inc=inc,
+            from_status=from_status, to_status=new_status,
+            cause=cause_tool or "terminal_tool_match",
+        )
         return self._save_or_yield(inc, new_status)
 
     def _infer_terminal_decision(
@@ -720,6 +930,118 @@ class Orchestrator(Generic[StateT]):
             return new_status
         except StaleVersionError:
             return None
+
+    @staticmethod
+    def _is_graph_interrupt(exc: BaseException) -> bool:
+        """Phase 11 (FOC-04 / D-11-04): identify a LangGraph HITL pause.
+
+        ``GraphInterrupt`` is NOT an error -- it signals a checkpointed
+        ``pending_approval`` state. Real exceptions still flow through
+        the normal failure path. Helper kept on the orchestrator so
+        callers don't each re-import langgraph internals.
+        """
+        return isinstance(exc, GraphInterrupt)
+
+    @staticmethod
+    def _extract_last_error(inc: "Session") -> Exception | None:
+        """Reconstruct the last error from a Session in status='error'.
+
+        The graph runner stores failures as an AgentRun with
+        ``summary='agent failed: <repr>'`` (graph.py:_handle_agent_failure).
+        We can't recover the original Exception type, so we return a
+        synthetic representative whose CLASS matches a _PERMANENT_TYPES
+        / _TRANSIENT_TYPES whitelist entry where possible -- that's all
+        :func:`runtime.policy.should_retry` needs (it does isinstance
+        checks).
+
+        Mapping (first match wins per AgentRun.summary scan, newest
+        first):
+
+          - "EnvelopeMissingError" in body -> EnvelopeMissingError
+          - "ValidationError"     in body -> pydantic.ValidationError
+          - "TimeoutError" / "timed out"  -> TimeoutError
+          - "OSError" / "ConnectionError" -> OSError
+          - everything else               -> RuntimeError (falls
+            through to permanent_error per fail-closed default in
+            should_retry)
+        """
+        from runtime.agents.turn_output import (
+            EnvelopeMissingError as _EnvelopeMissingError,
+        )
+        import pydantic as _pydantic
+        for run in reversed(inc.agents_run):
+            summary = (run.summary or "")
+            if not summary.startswith("agent failed:"):
+                continue
+            body = summary.removeprefix("agent failed:").strip()
+            if "EnvelopeMissingError" in body:
+                return _EnvelopeMissingError(
+                    agent=run.agent or "unknown",
+                    field="confidence",
+                    message=body,
+                )
+            if "ValidationError" in body or "validation error" in body:
+                # Build a synthetic ValidationError; pydantic v2 supports
+                # ValidationError.from_exception_data.
+                try:
+                    return _pydantic.ValidationError.from_exception_data(
+                        title="reconstructed", line_errors=[],
+                    )
+                except Exception:  # pragma: no cover -- pydantic API drift
+                    return RuntimeError(body)
+            if ("TimeoutError" in body or "timed out" in body
+                    or "asyncio.TimeoutError" in body):
+                return TimeoutError(body)
+            if "OSError" in body or "ConnectionError" in body:
+                return OSError(body)
+            return RuntimeError(body)
+        return None
+
+    @staticmethod
+    def _extract_last_confidence(inc: "Session") -> float | None:
+        """Return the last recorded turn-level confidence on the session,
+        or None if no AgentRun carries one. should_retry treats None as
+        'no signal yet' and skips the low-confidence gate.
+        """
+        for run in reversed(inc.agents_run):
+            if run.confidence is not None:
+                return run.confidence
+        return None
+
+    def preview_retry_decision(
+        self, session_id: str,
+    ) -> "RetryDecision":
+        """Phase 12 (FOC-05 / D-12-04): return the framework's retry
+        decision WITHOUT executing anything. The UI calls this to render
+        the retry button label + disabled state.
+
+        Pure: same inputs always yield identical RetryDecision. Loads
+        the session from store; reads (retry_count, last_error,
+        last_confidence) and consults the same policy
+        ``runtime.policy.should_retry`` that ``_retry_session_locked``
+        uses. No mutation, no thread-id bump, no lock acquired.
+
+        For sessions whose status is not "error" (i.e. nothing to
+        retry), returns ``RetryDecision(retry=False,
+        reason="permanent_error")`` -- a defensive caller-friendly
+        outcome that lets the UI render a "cannot auto-retry" state
+        without inventing a new reason value.
+        """
+        try:
+            inc = self.store.load(session_id)
+        except FileNotFoundError:
+            return RetryDecision(retry=False, reason="permanent_error")
+        if inc.status != "error":
+            return RetryDecision(retry=False, reason="permanent_error")
+        retry_count = int(inc.extra_fields.get("retry_count", 0))
+        last_error = self._extract_last_error(inc)
+        last_confidence = self._extract_last_confidence(inc)
+        return should_retry(
+            retry_count=retry_count,
+            error=last_error,
+            confidence=last_confidence,
+            cfg=self.cfg.orchestrator,
+        )
 
     async def _finalize_session_status_async(
         self, session_id: str,
@@ -1043,7 +1365,15 @@ class Orchestrator(Generic[StateT]):
                 tool_args: dict = {"incident_id": incident_id, "message": message}
                 if team is not None:
                     tool_args["team"] = team
-                tool_result = await self._invoke_tool(tool_name, tool_args)
+                # Phase 9 (D-09-01): expose the live session to
+                # _invoke_tool's injection branch via the implicit slot.
+                # try/finally so a failed tool call doesn't leak the
+                # reference into the next orchestrator-driven call.
+                self._current_session_for_invoke = inc_loaded
+                try:
+                    tool_result = await self._invoke_tool(tool_name, tool_args)
+                finally:
+                    self._current_session_for_invoke = None
                 inc_loaded.tool_calls.append(ToolCall(
                     agent="orchestrator",
                     tool=tool_name,
@@ -1162,6 +1492,30 @@ class Orchestrator(Generic[StateT]):
                    "reason": f"not in error state (status={inc.status})",
                    "ts": _event_ts()}
             return
+        # Phase 12 (FOC-05 / D-12-04): consult the framework's pure
+        # retry policy BEFORE mutating session state. The decision is
+        # derived from (retry_count, last_error, last_turn_confidence,
+        # cfg) -- LLM intent is not consulted. On retry=False, emit
+        # retry_rejected with the policy's reason and DO NOT bump the
+        # retry_count or thread id (preserves the "not retryable"
+        # state on disk for UI re-rendering and retry-budget audits).
+        prior_retry_count = int(inc.extra_fields.get("retry_count", 0))
+        last_error = self._extract_last_error(inc)
+        last_confidence = self._extract_last_confidence(inc)
+        decision = should_retry(
+            retry_count=prior_retry_count,
+            error=last_error,
+            confidence=last_confidence,
+            cfg=self.cfg.orchestrator,
+        )
+        if not decision.retry:
+            _log.info(
+                "retry_session policy-rejected: id=%s reason=%s",
+                session_id, decision.reason,
+            )
+            yield {"event": "retry_rejected", "incident_id": session_id,
+                   "reason": decision.reason, "ts": _event_ts()}
+            return
         # Drop the failed AgentRun(s) so the timeline only retains
         # successful runs. Retry attempts then append fresh runs.
         inc.agents_run = [
@@ -1220,6 +1574,14 @@ class Orchestrator(Generic[StateT]):
                 config=self._thread_config(incident_id),
             ):
                 yield self._to_ui_event(ev, incident_id)
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): a resume that re-paused via
+            # a fresh HITL gate. Don't restore the prior pending_intervention
+            # block (the new pending_approval ToolCall row is the
+            # canonical pause record now). Propagate so LangGraph's
+            # checkpointer captures the new pause; the UI's
+            # _render_pending_approvals_block surfaces the resume target.
+            raise
         except Exception as exc:  # noqa: BLE001 — restore on any failure
             # Reload from disk to absorb any partial writes from tools
             # that ran before the failure, then restore intervention
@@ -1245,6 +1607,14 @@ class Orchestrator(Generic[StateT]):
         Used for orchestrator-driven tool calls (e.g. an app-registered
         escalation tool invoked from the awaiting_input gate) that aren't
         initiated by an LLM.
+
+        Phase 9 (D-09-01): orchestrator-driven calls also flow through
+        injection so the tool gets the canonical session-derived arg set
+        even when the orchestrator only passed intent-args. The current
+        session is read off ``self._current_session_for_invoke`` (set
+        by callers via try/finally) so the public signature stays
+        unchanged. When no session is reachable the injection step is
+        a no-op — the existing escalation path keeps working unchanged.
         """
         entry = next(
             (e for e in self.registry.entries.values() if e.name == name),
@@ -1252,6 +1622,19 @@ class Orchestrator(Generic[StateT]):
         )
         if entry is None:
             raise KeyError(f"tool '{name}' not registered")
+        session = getattr(self, "_current_session_for_invoke", None)
+        cfg_inject = self.cfg.orchestrator.injected_args
+        if session is not None and cfg_inject:
+            from runtime.tools.arg_injection import (
+                accepted_params_for_tool, inject_injected_args,
+            )
+            args = inject_injected_args(
+                args,
+                session=session,
+                injected_args_cfg=cfg_inject,
+                tool_name=name,
+                accepted_params=accepted_params_for_tool(entry.tool),
+            )
         return await entry.tool.ainvoke(args)
 
     @staticmethod

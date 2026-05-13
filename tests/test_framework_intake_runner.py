@@ -280,3 +280,150 @@ def test_supervisor_node_passes_intake_context_to_runner() -> None:
     asyncio.run(node({"session": _mk_session(), "dispatch_depth": 0}))
 
     assert captured["app_cfg"].intake_context.history_store is history
+
+
+# ---------------------------------------------------------------------------
+# M6: default_intake_runner reads from LessonStore alongside HistoryStore
+# ---------------------------------------------------------------------------
+
+class _StubLessonRow:
+    """Quack-typed SessionLessonRow stand-in for the test."""
+
+    def __init__(
+        self,
+        *,
+        id: str,
+        outcome_summary: str,
+        tools: list[str],
+        source_session_id: str = "SES-PRIOR",
+    ) -> None:
+        self.id = id
+        self.outcome_summary = outcome_summary
+        self.tool_sequence = [{"tool": t} for t in tools]
+        # M9: intake filters lessons whose source row is soft-deleted.
+        # The default value here points at a non-existent SQL row, so
+        # the in-memory engine returns "live" via the fallback path.
+        self.source_session_id = source_session_id
+
+
+class _StubLessonStore:
+    """Stub matching LessonStore.find_similar(query, limit, threshold)."""
+
+    def __init__(self, hits: list[_StubLessonRow]) -> None:
+        self._hits = hits
+        self.calls: list[dict[str, Any]] = []
+
+    def find_similar(
+        self, *, query: str, limit: int = 3, threshold: float | None = None,
+    ) -> list[tuple[_StubLessonRow, float]]:
+        self.calls.append({"query": query, "limit": limit, "threshold": threshold})
+        return [(h, 0.87) for h in self._hits]
+
+
+def test_default_intake_runner_populates_lessons() -> None:
+    """M6: when lesson_store is wired, the runner stamps findings["lessons"]
+    with {id, summary, tools} for every hit. prior_similar continues to
+    populate from history_store; the two surfaces coexist."""
+    prior = _mk_session("S-PRIOR")
+    history = _StubHistoryStore(hits=[prior])
+    lessons = _StubLessonStore(hits=[
+        _StubLessonRow(
+            id="L-1", outcome_summary="rolled back bad deploy",
+            tools=["get_logs", "rollback_deploy"],
+        ),
+        _StubLessonRow(
+            id="L-2", outcome_summary="restarted unhealthy pod",
+            tools=["restart_pod"],
+        ),
+    ])
+    state = {"session": _mk_session("S-NEW")}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=None,
+        lesson_store=lessons,
+        top_k=3, similarity_threshold=0.7,
+    )})()
+
+    patch = default_intake_runner(state, app_cfg=app_cfg)
+
+    assert patch is not None
+    sess = patch["session"]
+    # prior_similar still populated.
+    assert sess.findings["prior_similar"] == [
+        {"id": "S-PRIOR", "status": "in_progress"}
+    ]
+    # lessons stamped with the expected shape and ordering.
+    assert sess.findings["lessons"] == [
+        {"id": "L-1", "summary": "rolled back bad deploy",
+         "tools": ["get_logs", "rollback_deploy"]},
+        {"id": "L-2", "summary": "restarted unhealthy pod",
+         "tools": ["restart_pod"]},
+    ]
+    # find_similar received the configured top_k / threshold.
+    assert lessons.calls[0]["limit"] == 3
+    assert lessons.calls[0]["threshold"] == 0.7
+
+
+def test_default_intake_runner_skips_lessons_when_store_absent() -> None:
+    """No lesson_store -> no findings["lessons"] key. prior_similar
+    still populates."""
+    history = _StubHistoryStore(hits=[_mk_session("S-PRIOR")])
+    state = {"session": _mk_session("S-NEW")}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=None,
+        lesson_store=None,
+    )})()
+
+    patch = default_intake_runner(state, app_cfg=app_cfg)
+    assert patch is not None
+    assert "lessons" not in patch["session"].findings
+    assert "prior_similar" in patch["session"].findings
+
+
+def test_default_intake_runner_dedup_short_circuits_with_lessons() -> None:
+    """When both lesson_store + dedup_pipeline are wired and dedup
+    fires, the dedup short-circuit still wins — but lessons (and
+    prior_similar) get populated first as side-effects, so the
+    operator UI showing the duplicate can still surface them."""
+    new_session = _mk_session("S-NEW")
+    history = _StubHistoryStore(hits=[_mk_session("S-PRIOR")])
+    lessons = _StubLessonStore(hits=[
+        _StubLessonRow(id="L-9", outcome_summary="ok", tools=["t"]),
+    ])
+    pipeline = _StubDedupPipeline(
+        parent_session_id="S-PRIOR", rationale="same outage",
+    )
+    state = {"session": new_session}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=pipeline,
+        lesson_store=lessons,
+    )})()
+
+    patch = default_intake_runner(state, app_cfg=app_cfg)
+    assert patch is not None
+    # Dedup wins.
+    assert patch["next_route"] == "__end__"
+    assert patch["session"].status == "duplicate"
+    # Lessons + prior_similar were populated before the short-circuit.
+    assert patch["session"].findings.get("lessons") == [
+        {"id": "L-9", "summary": "ok", "tools": ["t"]},
+    ]
+    assert "prior_similar" in patch["session"].findings
+
+
+def test_default_intake_runner_lesson_failure_is_non_fatal() -> None:
+    """A raising lesson_store doesn't break the intake runner —
+    findings["lessons"] is set to []."""
+    class _RaisingLessonStore:
+        def find_similar(self, **kwargs):
+            raise RuntimeError("vector backend down")
+
+    history = _StubHistoryStore(hits=[])
+    state = {"session": _mk_session("S-NEW")}
+    app_cfg = type("AC", (), {"intake_context": IntakeContext(
+        history_store=history, dedup_pipeline=None,
+        lesson_store=_RaisingLessonStore(),
+    )})()
+
+    patch = default_intake_runner(state, app_cfg=app_cfg)
+    assert patch is not None
+    assert patch["session"].findings["lessons"] == []

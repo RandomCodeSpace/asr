@@ -41,6 +41,20 @@ paths:
 # When no rule fires the session falls through to ``unreviewed``
 # (the v1.0 framework-default failure mode).
 orchestrator:
+  # Phase 11 (FOC-04): declarative HITL gating policy. Framework
+  # default threshold (0.7) -- code review is less prod-blast-radius
+  # than incident remediation so the stricter incident threshold
+  # (0.8) is unwarranted here.
+  gate_policy:
+    confidence_threshold: 0.7
+    gated_environments: [production]
+    gated_risk_actions: [approve]
+  # Phase 12 (FOC-05): declarative retry policy. Framework default --
+  # max_retries=2, transient retries on, confidence floor 0.4.
+  retry_policy:
+    max_retries: 2
+    retry_on_transient: true
+    retry_low_confidence_threshold: 0.4
   entry_agent: intake
   default_terminal_status: unreviewed
   statuses:
@@ -85,6 +99,16 @@ orchestrator:
   # state_overrides; orchestrator validates start_session's
   # state_overrides kwarg against this class.
   state_overrides_schema: examples.code_review.state.CodeReviewStateOverrides
+  # Phase 9 (D-09-02 / FOC-01 / FOC-02): session-derived tool-arg
+  # injection map. code_review's pr_url / repo live under
+  # ``Session.extra_fields`` (the framework-default Session has no
+  # typed fields for them) so the dotted paths reach into the dict.
+  # The framework's ``_resolve_dotted`` walks dict-valued attrs
+  # transparently.
+  injected_args:
+    session_id: session.id
+    pr_url: session.extra_fields.pr_url
+    repo: session.extra_fields.repo
 # Cross-cutting framework knobs read directly off AppConfig.framework.
 framework:
   # Per-app session-id prefix. Threaded through SessionStore into

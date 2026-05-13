@@ -23,7 +23,6 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, TypedDict
 
 from fastmcp import FastMCP
@@ -34,8 +33,14 @@ from runtime.intake import (
     default_intake_runner,
     hydrate_from_memory,
 )
-from runtime.memory import knowledge_graph as _knowledge_graph_mod
-from runtime.memory.knowledge_graph import KnowledgeGraphStore
+# Phase 16 (BUNDLER-01): use the sibling-defined ``_SEED_ROOT`` constant
+# instead of an aliased module reference. The bundler's intra-import
+# stripper removes ``from runtime.memory import knowledge_graph as
+# _knowledge_graph_mod`` from the bundled source, leaving
+# ``_knowledge_graph_mod.__file__`` as a NameError at module load. The
+# import below is also stripped, but ``_SEED_ROOT`` survives module
+# flattening because it's defined at module scope in knowledge_graph.py.
+from runtime.memory.knowledge_graph import KnowledgeGraphStore, _SEED_ROOT
 from runtime.memory.playbook_store import PlaybookStore
 from runtime.memory.release_context import ReleaseContextStore
 from runtime.memory.session_state import (
@@ -151,7 +156,7 @@ _NON_TERMINAL_STATUSES: frozenset[str] = frozenset({
 _TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{2,}")
 
 
-_DEFAULT_SEEDS = Path(_knowledge_graph_mod.__file__).parent / "seeds"
+_DEFAULT_SEEDS = _SEED_ROOT.parent  # parent of seeds/kg/ -> seeds/
 
 
 # ---------------------------------------------------------------------------
@@ -526,15 +531,17 @@ def make_default_supervisor_runner(
     return compose_runners(default_intake_runner, asr_runner)
 
 
-# Build the default runner exactly once at import time so per-call
-# overhead is just a closure invocation. Constructor stays cheap:
-# the stores read seed JSON lazily on first access.
-_BUILT_DEFAULT_RUNNER = make_default_supervisor_runner(
-    kg_store=KnowledgeGraphStore(_DEFAULT_SEEDS / "kg"),
-    release_store=ReleaseContextStore(_DEFAULT_SEEDS / "releases"),
-    playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
-    get_active_sessions=lambda: [],
-)
+# Phase 16 (BUNDLER-01): build the default runner LAZILY on first call.
+# ``KnowledgeGraphStore.__init__`` eagerly reads ``components.json`` from
+# disk, so building the runner at module-import time forced the seed
+# directory to exist before ``import app`` could complete. That pattern
+# broke the bundle's boot path on hosts where the seed bundle hasn't been
+# laid down yet (the bundle is shipped as a 7-file copy-only payload).
+# Constructing the runner on first call lets the bundle import cleanly
+# and surfaces a genuine ``FileNotFoundError`` only when the runner is
+# actually invoked — at which point the operator can see a configured,
+# actionable error path rather than a cryptic import-time crash.
+_BUILT_DEFAULT_RUNNER: Any = None
 
 
 def default_supervisor_runner(
@@ -553,6 +560,14 @@ def default_supervisor_runner(
     If the framework short-circuits (``next_route='__end__'``), the
     hydration step is skipped.
     """
+    global _BUILT_DEFAULT_RUNNER
+    if _BUILT_DEFAULT_RUNNER is None:
+        _BUILT_DEFAULT_RUNNER = make_default_supervisor_runner(
+            kg_store=KnowledgeGraphStore(_DEFAULT_SEEDS / "kg"),
+            release_store=ReleaseContextStore(_DEFAULT_SEEDS / "releases"),
+            playbook_store=PlaybookStore(_DEFAULT_SEEDS / "playbooks"),
+            get_active_sessions=lambda: [],
+        )
     return _BUILT_DEFAULT_RUNNER(state, app_cfg=app_cfg)
 
 

@@ -1,5 +1,11 @@
 description: Intake supervisor — framework similarity retrieval + ASR memory hydration; dispatches to triage
 kind: supervisor
+# M8: per-agent provider swap. Uncomment the line below to route this
+# agent through the Ollama Cloud gpt-oss model defined in
+# ``config/config.yaml``; the rest of the agents stay on the default
+# ``workhorse`` model. graph.py:_build_agent_nodes reads skill.model
+# and resolves it via the per-app LLMConfig.models registry.
+#   model: gpt_oss_cheap
 subordinates:
   - triage
 dispatch_strategy: rule

@@ -240,7 +240,11 @@ def _badge(label: str, color: str) -> None:
     the rest of the UI can call ``_status_badge(...)`` etc. without
     touching the palette dicts directly.
     """
-    st.badge(label, color=color)
+    # ``st.badge`` declares ``color`` as a fixed Literal; at runtime any
+    # string in the Streamlit palette works (and we control the palette
+    # dicts above). Keeping the parameter as ``str`` lets callers pass
+    # values resolved from the dict lookups without per-site casts.
+    st.badge(label, color=color)  # pyright: ignore[reportArgumentType]
 
 
 def _status_badge(status: str | None) -> None:
@@ -685,11 +689,16 @@ def _fmt_duration(seconds: int) -> str:
 def _fmt_confidence_badge(conf: float | None) -> str:
     """Inline coloured badge for an agent confidence value.
 
-    Green ≥0.75, amber 0.5–0.75, red <0.5, grey when None. Markdown only —
-    no HTML — so the badge survives Streamlit's sanitizer.
+    Green ≥0.75, amber 0.5–0.75, red <0.5. Markdown only — no HTML — so the
+    badge survives Streamlit's sanitizer.
+
+    Phase 10 (FOC-03): None now indicates a structural failure (envelope
+    missing) — visually flag with a red 🛑 hard-error badge, never the
+    silent ⚪ fallback. The runner rejects envelope-less turns upfront;
+    None here means a legacy on-disk row predating the envelope contract.
     """
     if conf is None:
-        return "⚪ confidence —"
+        return "🛑 confidence missing"
     if conf >= 0.75:
         glyph = "🟢"
     elif conf >= 0.5:
@@ -1046,15 +1055,42 @@ def _render_hypothesis_trail_block(sess: dict) -> None:
                         st.caption(rationale)
 
 
+def _should_render_retry_block(sess: dict) -> bool:
+    """Phase 11 (FOC-04 / D-11-04) predicate.
+
+    The retry block exists for terminally failed sessions only. A
+    session in ``status='error'`` that ALSO has a ``pending_approval``
+    ToolCall row is genuinely paused on a HITL gate -- the
+    pending-approvals block (rendered separately) carries the
+    Approve/Reject action; the retry block would be wrong-mode here.
+    Returning ``False`` keeps the two blocks mutually exclusive.
+
+    Tolerates both pydantic ``ToolCall`` objects and dict
+    representations (Streamlit's ``model_dump`` on the loaded session
+    yields dicts, but defensive reads from the live ``Session.tool_calls``
+    return pydantic objects).
+    """
+    if sess.get("status") != "error":
+        return False
+    for tc in (sess.get("tool_calls") or []):
+        status = (
+            tc.get("status") if isinstance(tc, dict)
+            else getattr(tc, "status", None)
+        )
+        if status == "pending_approval":
+            return False
+    return True
+
+
 def _render_pending_approvals_block(sess: dict, session_id: str) -> None:
-    """Render the ### Pending Approvals section for high-risk tool calls
-    paused on the gateway's HITL approval handshake.
+    """Render the ### Pending Approvals section for tool calls the
+    framework's pure-policy gate has paused for human approval.
 
     Iterates ``tool_calls`` looking for entries with
     ``status="pending_approval"``. Each pending row gets a small card
     with the tool name + args, a free-text rationale input, and two
-    buttons (Approve / Reject) that resolve the pending interrupt via
-    the OrchestratorService bridge.
+    buttons (Approve / Reject) that resolve the pending pause via the
+    OrchestratorService bridge.
     """
     tool_calls = sess.get("tool_calls", [])
     pending = [
@@ -1130,9 +1166,10 @@ def render_session_detail(store: SessionStore,
         _render_summary_meta(sess, app_cfg)
         if sess.get("status") == "awaiting_input" and sess.get("pending_intervention"):
             _render_intervention_block(sess, session_id, app_cfg, agent_names)
-        if sess.get("status") == "error":
+        if _should_render_retry_block(sess):
             _render_retry_block(sess, session_id, agent_names)
-        # Pending tool-approval cards (risk-rated gateway HITL).
+        # Pending tool-approval cards (paused via the framework's
+        # pure-policy gate; see ``runtime.policy.should_gate``).
         # Rendered above the agents/tool-calls blocks so a paused
         # approval is the first action surface the operator sees.
         _render_pending_approvals_block(sess, session_id)
@@ -1274,15 +1311,91 @@ async def _resume_async(cfg: AppConfig, session_id: str, decision: dict,
     return outcome
 
 
+def _retry_button_state_for(
+    *,
+    reason: str,
+    retry_count: int,
+    cap: int,
+    last_confidence: float | None,
+    threshold: float,
+) -> tuple[str, bool]:
+    """Phase 12 (FOC-05 / D-12-04): pure helper that maps a
+    :class:`runtime.policy.RetryDecision` reason to a
+    ``(button_label, disabled)`` tuple. Mirrors the 5-case map.
+
+    Extracted from ``_render_retry_block`` so the mapping can be unit-
+    tested without spinning up Streamlit. Returns:
+
+      ``auto_retry``              -> ("Retry",                                False)
+      ``max_retries_exceeded``    -> ("Max retries reached (rc/cap)",        True)
+      ``permanent_error``         -> ("Permanent error -- cannot auto-retry", True)
+      ``low_confidence_no_retry`` -> ("Confidence too low (N% < th%)",       True)
+      ``transient_disabled``      -> ("Auto-retry disabled in policy",       True)
+    """
+    if reason == "auto_retry":
+        return "Retry", False
+    if reason == "max_retries_exceeded":
+        return f"Max retries reached ({retry_count}/{cap})", True
+    if reason == "permanent_error":
+        return "Permanent error -- cannot auto-retry", True
+    if reason == "low_confidence_no_retry":
+        conf_pct = (
+            f"{last_confidence*100:.0f}%"
+            if isinstance(last_confidence, (int, float))
+            else "?"
+        )
+        th_pct = f"{threshold*100:.0f}%"
+        return f"Confidence too low ({conf_pct} < {th_pct})", True
+    if reason == "transient_disabled":
+        return "Auto-retry disabled in policy", True
+    # Future-proof against new reasons added without UI update.
+    return f"Cannot retry ({reason})", True
+
+
+def _preview_retry_decision_sync(cfg, session_id: str):
+    """Phase 12 (FOC-05 / D-12-04): call
+    ``Orchestrator.preview_retry_decision`` from a sync Streamlit
+    render-pass. Pure read; no mutation; no lock.
+
+    ``Orchestrator.create()`` is async (it builds engines / vector
+    stores / MCP loaders), so we run it in a transient event loop --
+    the same pattern ``_retry_async`` uses on click. The cost is one
+    SessionStore.load() + a few isinstance() checks per render-pass on
+    a terminally-failed session; rebuilding the orchestrator is the
+    expensive part. Apps that profile this hot can wrap the call in
+    ``st.cache_resource`` keyed on (cfg fingerprint, session_id).
+
+    Returns a :class:`runtime.policy.RetryDecision`.
+    """
+
+    async def _build_and_query():
+        orch = await Orchestrator.create(cfg)
+        try:
+            return orch.preview_retry_decision(session_id)
+        finally:
+            await orch.aclose()
+
+    return asyncio.run(_build_and_query())
+
+
 def _render_retry_block(sess: dict, session_id: str,
                         agent_names: frozenset[str] = frozenset()) -> None:
     """Render a retry control for failed sessions.
 
-    Sessions land in ``status="error"`` when a graph node raises and
-    the framework's auto-retry on transient 5xxs (see
-    :data:`runtime.graph._TRANSIENT_MARKERS`) has already been
-    exhausted. Surfaces the failed agent + the recorded exception so
-    the operator can decide whether to retry.
+    Phase 12 (FOC-05 / D-12-04): the framework's pure
+    ``runtime.policy.should_retry`` policy decides whether retry is
+    permitted. The UI surfaces that decision (button label + disabled
+    state) but never drives it -- if a user somehow clicks an enabled
+    button concurrently with a policy change, the orchestrator's
+    ``_retry_session_locked`` re-runs the check and emits
+    ``retry_rejected`` with the same reason.
+
+    The 5-case label/disabled map mirrors RetryDecision.reason:
+      auto_retry              -> enabled, "Retry"
+      max_retries_exceeded    -> disabled, "Max retries reached (rc/cap)"
+      permanent_error         -> disabled, "Permanent error -- cannot auto-retry"
+      low_confidence_no_retry -> disabled, "Confidence too low (N% < th%)"
+      transient_disabled      -> disabled, "Auto-retry disabled in policy"
     """
     cfg = load_config(CONFIG_PATH)
     failed_run = next(
@@ -1293,6 +1406,19 @@ def _render_retry_block(sess: dict, session_id: str,
     failed_agent = (failed_run or {}).get("agent", "unknown")
     failure_msg = ((failed_run or {}).get("summary") or "").removeprefix("agent failed:").strip()
     retry_count = int((sess.get("extra_fields") or {}).get("retry_count", 0))
+
+    # Phase 12: read the framework's preview decision.
+    decision = _preview_retry_decision_sync(cfg, session_id)
+    rp = cfg.orchestrator.retry_policy
+    last_conf = (failed_run or {}).get("confidence")
+    label, disabled = _retry_button_state_for(
+        reason=decision.reason,
+        retry_count=retry_count,
+        cap=rp.max_retries,
+        last_confidence=last_conf,
+        threshold=rp.retry_low_confidence_threshold,
+    )
+
     with st.container(border=True):
         st.markdown(f"#### 🔴 Agent failed — `{failed_agent}`")
         if failure_msg:
@@ -1300,12 +1426,16 @@ def _render_retry_block(sess: dict, session_id: str,
         if retry_count:
             st.caption(f"Previous retry attempts: {retry_count}")
         st.caption(
-            "Retry re-runs the graph from the entry node. The framework "
-            "already retried transient 5xx errors automatically — this "
-            "is for cases where the underlying issue may now be cleared "
-            "(provider hiccup, transient network, etc.)."
+            "Retry re-runs the graph from the entry node. The framework's "
+            "retry_policy decides whether auto-retry is permitted -- this "
+            "surface mirrors that decision."
         )
-        if st.button("Retry", type="primary", key=f"retry_btn_{session_id}"):
+        clicked = st.button(
+            label, type="primary",
+            key=f"retry_btn_{session_id}",
+            disabled=disabled,
+        )
+        if clicked and not disabled:
             log_area = st.empty()
             lines: list[str] = []
             outcome = asyncio.run(_retry_async(

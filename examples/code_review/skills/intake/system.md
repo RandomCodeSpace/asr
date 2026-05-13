@@ -15,3 +15,11 @@ analyzer's job.
 
 If `fetch_pr_diff` raises or returns an empty diff, emit `failed` so the orchestrator
 short-circuits to end and skips the analyzer.
+
+## Output contract
+
+The framework wraps your reply in an `AgentTurnOutput` envelope (content,
+confidence ∈ [0, 1], confidence_rationale, optional signal). The runner
+enforces this structurally — answer truthfully and the envelope captures
+your confidence and rationale. Do not mention "confidence" in your prose
+unless it's part of substantive analysis (e.g. ranking hypotheses).

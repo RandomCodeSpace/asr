@@ -4,10 +4,11 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import yaml
 
 from runtime.terminal_tools import StatusDef, TerminalToolRule
+from runtime.errors import LLMConfigError   # NEW Phase 13 (D-13-05/06)
 
 
 # Session-id prefix grammar. The framework mints session ids of the form
@@ -18,7 +19,7 @@ from runtime.terminal_tools import StatusDef, TerminalToolRule
 _SESSION_ID_PREFIX_RE = re.compile(r"^[A-Za-z0-9-]{1,16}$")
 
 
-ProviderKind = Literal["ollama", "azure_openai", "stub"]
+ProviderKind = Literal["ollama", "azure_openai", "openai_compat", "stub"]
 
 
 class ProviderConfig(BaseModel):
@@ -26,12 +27,35 @@ class ProviderConfig(BaseModel):
 
     Multiple named ``ModelConfig`` entries can reference the same provider
     so that, e.g., two Ollama models share a single base_url + api_key.
+
+    Phase 13 (HARD-01 / D-13-01): per-provider ``request_timeout``
+    override (None means "use OrchestratorConfig.default_llm_request_timeout").
+    Phase 13 (HARD-05 / D-13-06): ollama providers MUST declare
+    ``base_url``; the @model_validator below catches the omission at
+    config-load and raises ``LLMConfigError``. The hardcoded public
+    Ollama fallback in ``runtime.llm`` is removed in the same phase.
     """
     kind: ProviderKind
-    base_url: str | None = None       # ollama
+    base_url: str | None = None       # ollama (REQUIRED via validator)
     api_key: str | None = None        # ollama, azure_openai
-    endpoint: str | None = None       # azure_openai
+    endpoint: str | None = None       # azure_openai (validated lazily in builder)
     api_version: str | None = None    # azure_openai
+    request_timeout: float | None = Field(
+        default=None, gt=0, le=600,
+    )  # NEW Phase 13 (D-13-01) — None -> OrchestratorConfig default
+
+    @model_validator(mode="after")
+    def _validate_required_fields(self) -> "ProviderConfig":
+        # D-13-06: only ollama is promoted to config-load validation in
+        # Phase 13. azure_openai (`endpoint`) and openai_compat
+        # (`base_url` + `api_key`) keep their existing first-request
+        # ValueError raises in `_build_*_chat`. Promoting them is a
+        # potential follow-up; see CONTEXT.md "Deferred Ideas".
+        if self.kind == "ollama" and not self.base_url:
+            raise LLMConfigError(
+                provider="ollama", missing_field="base_url",
+            )
+        return self
 
 
 class ModelConfig(BaseModel):
@@ -138,6 +162,76 @@ class Paths(BaseModel):
     incidents_dir: str = "incidents"
 
 
+class GatePolicy(BaseModel):
+    """Phase 11 (FOC-04): declarative HITL gating policy.
+
+    Drives the framework's pure ``should_gate`` boundary. The LLM never
+    sees this config -- flow control is a framework decision, not a
+    skill-prompt incantation.
+
+    ``confidence_threshold`` is the strict-less-than predicate the gate
+    applies to the active turn confidence; tool calls below the
+    threshold fire a low_confidence pause for any non-auto-rated tool.
+
+    ``gated_environments`` enumerates Session.environment values that
+    automatically gate every non-auto-rated tool call regardless of
+    confidence -- lifecycle defence against blast radius in production.
+
+    ``gated_risk_actions`` enumerates GatewayAction Literal values
+    (``auto``/``notify``/``approve``) that ALWAYS trigger a gate
+    regardless of env or confidence. Default ``{"approve"}`` mirrors
+    v1.0 HITL behaviour.
+
+    Phase 11 chooses ``"approve"`` (the actual GatewayAction literal)
+    over CONTEXT.md's sketched ``"hitl"`` -- see
+    src/runtime/tools/gateway.py:32 for the canonical 3-valued
+    GatewayAction Literal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    gated_environments: set[str] = Field(
+        default_factory=lambda: {"production"},
+    )
+    gated_risk_actions: set[str] = Field(
+        default_factory=lambda: {"approve"},
+    )
+
+
+class RetryPolicy(BaseModel):
+    """Phase 12 (FOC-05): declarative retry policy.
+
+    Drives the framework's pure ``should_retry`` boundary. The LLM never
+    sees this config -- flow control is a framework decision, not a
+    skill-prompt incantation. Mirrors GatePolicy's shape so the
+    OrchestratorConfig surface stays uniform.
+
+    ``max_retries`` is the absolute cap on automatic retries (compared
+    with ``retry_count`` via ``>=``). 0 disables auto-retry entirely;
+    the recommended default 2 mirrors the v1.2 ROADMAP sketch and the
+    existing transient-5xx auto-retry budget in graph.py.
+
+    ``retry_on_transient`` lets apps with strict SLOs disable framework
+    auto-retry of transient errors entirely (escalate immediately
+    instead).
+
+    ``retry_low_confidence_threshold`` is the strict-less-than predicate
+    for "the LLM gave up; don't burn budget on a retry". Defaults to
+    0.4 -- well below the typical gate_policy 0.7-0.8 threshold so a
+    low-confidence escalation triggers HITL intervention before the
+    retry path even considers it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_retries: int = Field(default=2, ge=0, le=10)
+    retry_on_transient: bool = True
+    retry_low_confidence_threshold: float = Field(
+        default=0.4, ge=0.0, le=1.0,
+    )
+
+
 class OrchestratorConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -228,6 +322,41 @@ class OrchestratorConfig(BaseModel):
     # bad path raises at boot with a useful message (DECOUPLE-05 / D-08-01).
     state_overrides_schema: str | None = None
 
+    # Phase 9 (D-09-02 / FOC-01): map of LLM-visible-arg -> dotted-path
+    # on the live Session. Tools whose param name matches a key in this
+    # dict get the param stripped from the LLM-visible signature, and
+    # the framework supplies the resolved value at _invoke_tool /
+    # _GatedTool._run / _arun time. Apps declare what to inject; the
+    # framework stays generic. Empty default = no injection (legacy
+    # behaviour). Validated at config-load: keys are non-empty
+    # identifiers, values are dotted paths starting with "session.".
+    injected_args: dict[str, str] = Field(default_factory=dict)
+
+    # Phase 11 (FOC-04): declarative HITL gating policy. Apps tune
+    # thresholds in YAML; the framework's should_gate boundary reads
+    # this struct and the LLM never sees it. Default keeps v1.1
+    # behaviour (production gates "approve"-risk tools, threshold 0.7).
+    gate_policy: "GatePolicy" = Field(default_factory=lambda: GatePolicy())
+
+    # Phase 12 (FOC-05): declarative retry policy. Apps tune
+    # max_retries / retry_on_transient / low-confidence threshold in
+    # YAML; the framework's should_retry boundary reads this struct
+    # and the LLM never sees it. Default keeps v1.2 behaviour
+    # (max_retries=2, transient retries enabled, confidence floor 0.4).
+    retry_policy: "RetryPolicy" = Field(
+        default_factory=lambda: RetryPolicy(),
+    )
+
+    # Phase 13 (HARD-01 / D-13-02): framework-default LLM HTTP request
+    # timeout in seconds. Per-provider ``ProviderConfig.request_timeout``
+    # overrides this; ``None`` on the provider means "use this default".
+    # Bounded to catch indefinite hangs (CONCERNS C1) while leaving room
+    # for slow CPU Ollama runs (e.g., gpt-oss:120b). 600s upper bound
+    # prevents accidentally-disabling the protection.
+    default_llm_request_timeout: float = Field(
+        default=120.0, gt=0, le=600,
+    )
+
     @field_validator("state_overrides_schema")
     @classmethod
     def _validate_state_overrides_schema_format(
@@ -260,6 +389,38 @@ class OrchestratorConfig(BaseModel):
                 f"path (expected `module.path:ClassName` or "
                 f"`module.path.ClassName`)"
             )
+        return v
+
+    @field_validator("injected_args")
+    @classmethod
+    def _validate_injected_args(
+        cls, v: dict[str, str],
+    ) -> dict[str, str]:
+        """Phase 9 (D-09-02): config-load validation for injected_args.
+
+        Each entry is ``arg_name -> dotted_path`` where ``arg_name`` must
+        be a valid Python identifier (it is the keyword name on a tool
+        signature) and ``dotted_path`` must be a non-empty string with at
+        least one dot (e.g. ``session.environment``). Real attribute
+        resolution happens at injection time in
+        :func:`runtime.tools.arg_injection.inject_injected_args` so
+        config-load doesn't drag the live ``Session`` into every consumer.
+        """
+        for key, path in v.items():
+            if not key or not key.isidentifier():
+                raise ValueError(
+                    f"injected_args key {key!r} must be a non-empty "
+                    f"Python identifier"
+                )
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(
+                    f"injected_args[{key!r}] must be a non-empty dotted path"
+                )
+            if "." not in path:
+                raise ValueError(
+                    f"injected_args[{key!r}]={path!r} must be a dotted path "
+                    f"(e.g. 'session.environment')"
+                )
         return v
 
     @model_validator(mode="after")
@@ -495,6 +656,12 @@ class FrameworkAppConfig(BaseModel):
     # Intake runner knobs: forwarded into IntakeContext at graph-build time.
     intake_top_k: int = 3
     intake_similarity_threshold: float = 0.7
+    # M7: lesson refresher knobs. ``lesson_refresh_cron`` is a 5-field
+    # cron expression evaluated in UTC; default ``0 3 * * *`` runs daily
+    # at 03:00 UTC. ``lesson_refresh_window_days`` bounds how far back
+    # the refresher walks for terminal-status sessions on each tick.
+    lesson_refresh_cron: str = "0 3 * * *"
+    lesson_refresh_window_days: int = 7
     # Per-app session-id prefix. Threaded through ``SessionStore`` to
     # ``Session.id_format`` so each app picks its own id namespace
     # (``INC`` for incident management, ``REVIEW`` for code review,
@@ -552,6 +719,23 @@ def resolve_framework_app_config(
     return cfg
 
 
+class ApiConfig(BaseModel):
+    """API surface knobs surfaced to the React frontend."""
+
+    # CORS origins allowed by the FastAPI CORSMiddleware. Default
+    # covers the two common React dev-server URLs (Vite, CRA/Next).
+    # Production deployments override via YAML to lock down to their
+    # actual frontend origin.
+    cors_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://localhost:3000",
+        ]
+    )
+    # Allow credentials on cross-origin requests (cookies, auth headers).
+    cors_allow_credentials: bool = True
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
@@ -560,6 +744,7 @@ class AppConfig(BaseModel):
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
     # Cross-cutting framework knobs (confidence threshold, escalation
     # roster, severity aliases, dedup prompt, intake tuning) read by
     # the runtime directly off the loaded ``AppConfig`` — no
@@ -597,7 +782,11 @@ class AppConfig(BaseModel):
         if isinstance(self.dedup, DedupConfig):
             return self
         if isinstance(self.dedup, dict):
-            self.__dict__["dedup"] = DedupConfig(**self.dedup)
+            # ``BaseModel.__dict__`` is typed as ``MappingProxyType`` in
+            # the pydantic stub; the documented post-validator mutation
+            # path is direct ``__dict__`` assignment, which works at
+            # runtime (pydantic stores fields in a plain dict).
+            self.__dict__["dedup"] = DedupConfig(**self.dedup)  # pyright: ignore[reportIndexIssue]
             return self
         raise ValueError(
             f"app.dedup must be a DedupConfig or dict; got "
@@ -643,8 +832,9 @@ class AppConfig(BaseModel):
                 )
             coerced.append(cls(**raw))
         # Pydantic v2 stores fields in ``__dict__``; assigning here is
-        # the documented way to mutate after validation.
-        self.__dict__["triggers"] = coerced
+        # the documented way to mutate after validation. (Stub types
+        # ``__dict__`` as MappingProxyType; runtime is a plain dict.)
+        self.__dict__["triggers"] = coerced  # pyright: ignore[reportIndexIssue]
         return self
 
 

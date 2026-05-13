@@ -90,6 +90,12 @@ class ApprovalWatchdog:
         self._poll_interval_seconds = poll_interval_seconds
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
+        # HARD-07: ``stop()`` is idempotent. Once a stop has been
+        # initiated (or completed), subsequent calls return immediately
+        # rather than racing on ``_task`` / ``_stop_event`` which the
+        # first caller is already clearing. Mutated only on the loop
+        # thread (where ``stop()`` runs), so no extra lock needed.
+        self._stopped: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -106,6 +112,9 @@ class ApprovalWatchdog:
             return
 
         async def _arm() -> None:
+            # Re-arm: a previous ``stop()`` may have flipped this; a
+            # fresh ``start()`` re-enables ``stop()``.
+            self._stopped = False
             self._stop_event = asyncio.Event()
             self._task = asyncio.create_task(
                 self._run(), name="approval_watchdog",
@@ -117,28 +126,85 @@ class ApprovalWatchdog:
     async def stop(self) -> None:
         """Signal the polling loop to exit and await termination.
 
+        HARD-07: Idempotent and abrupt-shutdown safe. Safe to call:
+          * before ``start()`` (no-op),
+          * multiple times (subsequent calls short-circuit on
+            ``_stopped`` after the first caller flips it),
+          * concurrently from two callers — the first claims ownership
+            of ``_task`` and drains it; the second sees the task is
+            already gone and returns.
+
+        Cancellation strategy: signal via ``_stop_event`` first so the
+        polling loop exits its ``wait_for`` cleanly; then bound the
+        drain by ``asyncio.wait_for(task, timeout=1.0)``. If the task
+        ignores the event (or the event loop is being torn down under
+        us), fall back to ``task.cancel()`` and one final drain.
+        ``CancelledError`` and ``TimeoutError`` are suppressed — there
+        is no useful recovery from a watchdog that won't die.
+
         Runs on the loop thread (called from ``OrchestratorService._close_*``
-        helpers). Idempotent — a no-op when the watchdog never started.
+        helpers, or as a graceful no-op cleanup hook).
         """
-        if self._stop_event is not None:
-            self._stop_event.set()
-        task = self._task  # LOCAL variable — guards against concurrent stop() calls
-        if task is not None and not task.done():
+        # First-call wins. Subsequent callers (and the after-shutdown
+        # path) see ``_stopped`` and return without re-running the
+        # drain — protects against double-await on ``_task``.
+        if self._stopped:
+            return
+        self._stopped = True
+        # Snapshot to LOCAL variables so concurrent ``stop()`` calls
+        # never re-await the same task. We do NOT null out ``_task`` /
+        # ``_stop_event`` until after the drain because ``_run()``
+        # reads ``self._stop_event`` on every loop iteration; clearing
+        # it before signalling would crash the polling loop with
+        # ``AttributeError: 'NoneType' object has no attribute
+        # 'is_set'`` and produce exactly the noisy teardown this fix
+        # is meant to prevent.
+        task = self._task
+        stop_event = self._stop_event
+        if stop_event is not None:
+            stop_event.set()
+        if task is None or task.done():
+            self._task = None
+            self._stop_event = None
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
             try:
-                await asyncio.wait_for(task, timeout=5.0)
+                await asyncio.wait_for(task, timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
-                task.cancel()
-                try:
-                    await task  # drain LOCAL task ref; suppresses CancelledError
-                except asyncio.CancelledError:
-                    pass
-        self._task = None
-        self._stop_event = None
+                # Task is wedged or the loop is shutting down under us.
+                # The ``cancel()`` call above is enough to flip the task
+                # state; ``run_loop`` 's final ``gather`` pass will sweep
+                # it during loop teardown. Don't block shutdown further.
+                pass
+        finally:
+            # Always clear the bookkeeping refs so a subsequent
+            # ``start()`` arms cleanly and ``is_running`` reports False.
+            self._task = None
+            self._stop_event = None
+
+    async def close(self) -> None:
+        """Alias for :meth:`stop` — symmetric with aiohttp/httpx.
+
+        Idempotent. Provided so callers using a "close-on-cleanup"
+        pattern (``async with`` on parent owners) read naturally.
+        """
+        await self.stop()
 
     async def _run(self) -> None:
-        """Polling loop. Runs until ``_stop_event`` is set."""
-        assert self._stop_event is not None
-        while not self._stop_event.is_set():
+        """Polling loop. Runs until ``_stop_event`` is set.
+
+        We bind ``stop_event`` to a LOCAL variable on entry so a
+        concurrent ``stop()`` cannot null out ``self._stop_event``
+        from underneath us mid-iteration (HARD-07: that nulling-while-
+        running was the original source of ``AttributeError`` at
+        teardown).
+        """
+        stop_event = self._stop_event
+        assert stop_event is not None
+        while not stop_event.is_set():
             try:
                 await self._tick()
             except asyncio.CancelledError:
@@ -147,7 +213,7 @@ class ApprovalWatchdog:
                 logger.exception("approval watchdog tick failed")
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(),
+                    stop_event.wait(),
                     timeout=self._poll_interval_seconds,
                 )
             except asyncio.TimeoutError:

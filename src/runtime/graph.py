@@ -1,14 +1,15 @@
 """LangGraph state, routing helpers, and node runner."""
 from __future__ import annotations
 import asyncio
+import json
 import logging
-from typing import TypedDict, Callable, Awaitable
+from typing import TYPE_CHECKING, Any, TypedDict, Callable, Awaitable
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from langgraph.graph import StateGraph, END
 
 from runtime.state import Session, ToolCall, AgentRun, TokenUsage, _UTC_TS_FMT
@@ -16,6 +17,7 @@ from runtime.skill import Skill
 from runtime.config import (
     AppConfig,
     FrameworkAppConfig,
+    GatePolicy,
     GatewayConfig,
     resolve_framework_app_config,
 )
@@ -23,6 +25,20 @@ from runtime.llm import get_llm
 from runtime.mcp_loader import ToolRegistry
 from runtime.storage.session_store import SessionStore
 from runtime.tools.gateway import wrap_tool
+
+if TYPE_CHECKING:
+    from runtime.storage.event_log import EventLog
+# Phase 11 (FOC-04 / D-11-04): GraphInterrupt is the LangGraph
+# pending-approval pause signal. It is NOT an error and must NOT route
+# through _handle_agent_failure -- the orchestrator's interrupt-aware
+# bridge handles the resume protocol via the checkpointer.
+from langgraph.errors import GraphInterrupt
+from runtime.agents.turn_output import (
+    AgentTurnOutput,
+    EnvelopeMissingError,
+    parse_envelope_from_result,
+    reconcile_confidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +209,21 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
+            # Phase 15 (LLM-COMPAT-01): the recursion_limit=25 workaround
+            # introduced in 3ba099f as a safety net is gone — the
+            # ``langchain.agents.create_agent`` migration replaces the
+            # old two-call structure (loop + separate
+            # ``with_structured_output`` pass) with a single tool-loop
+            # whose terminal signal is the AgentTurnOutput tool call
+            # itself (AutoStrategy → ToolStrategy fallback for non-
+            # function-calling Ollama models). The default langgraph
+            # recursion bound is now a true upper bound, not a workaround.
             return await executor.ainvoke(input_)
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): never retry a HITL pause.
+            # GraphInterrupt is a checkpointed pending_approval signal,
+            # not a transient error.
+            raise
         except Exception as exc:  # noqa: BLE001
             msg = str(exc).lower()
             transient = any(m in msg for m in _TRANSIENT_MARKERS)
@@ -361,6 +391,30 @@ def _extract_final_text(messages: list) -> str:
     return ""
 
 
+def _first_terminal_tool_called_this_turn(
+    messages: list,
+    terminal_tool_names: frozenset[str],
+) -> str | None:
+    """Return the bare name of the first typed-terminal tool called this turn.
+
+    Phase 10 (FOC-03 / D-10-03): used to label the reconciliation log so
+    operators can correlate envelope-vs-tool-arg confidence divergences
+    against a specific tool. Tool names may be MCP-prefixed
+    (``<server>:<tool>``); we rsplit on the rightmost colon to recover the
+    bare name and match against the configured ``terminal_tool_names``.
+    Returns None when no terminal tool fired this turn.
+    """
+    if not terminal_tool_names:
+        return None
+    for msg in messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            name = tc.get("name", "")
+            bare = name.rsplit(":", 1)[-1]
+            if bare in terminal_tool_names:
+                return bare
+    return None
+
+
 def _sum_token_usage(messages: list) -> TokenUsage:
     """Sum input/output token counts across all messages that report usage_metadata."""
     agent_in = agent_out = 0
@@ -373,6 +427,50 @@ def _sum_token_usage(messages: list) -> TokenUsage:
         output_tokens=agent_out,
         total_tokens=agent_in + agent_out,
     )
+
+
+def _try_recover_envelope_from_raw(raw: str) -> AgentTurnOutput | None:
+    """Attempt to extract an :class:`AgentTurnOutput` from a raw LLM
+    string when LangGraph's structured-output pass raised
+    ``OutputParserException``.
+
+    Strategy:
+    1. Parse the whole string as JSON.
+    2. If that fails, scan for the first balanced ``{...}`` substring
+       and try parsing that (handles markdown-fenced JSON or trailing
+       chatter).
+    3. Validate the parsed dict against :class:`AgentTurnOutput`.
+
+    Returns the parsed envelope on success, ``None`` on any failure.
+    """
+    if not raw or not raw.strip():
+        return None
+    candidates: list[str] = [raw]
+    # Markdown-fenced JSON: ```json\n{...}\n```
+    if "```" in raw:
+        for chunk in raw.split("```"):
+            stripped = chunk.strip()
+            if stripped.startswith("json"):
+                stripped = stripped[4:].lstrip()
+            if stripped.startswith("{"):
+                candidates.append(stripped)
+    # Greedy: first '{' through last '}'
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if 0 <= first < last:
+        candidates.append(raw[first:last + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            return AgentTurnOutput.model_validate(payload)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def _handle_agent_failure(
@@ -449,6 +547,9 @@ def make_agent_node(
     gateway_cfg: GatewayConfig | None = None,
     terminal_tool_names: frozenset[str] = frozenset(),
     patch_tool_names: frozenset[str] = frozenset(),
+    injected_args: dict[str, str] | None = None,
+    gate_policy: "GatePolicy | None" = None,
+    event_log: "EventLog | None" = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -469,6 +570,14 @@ def make_agent_node(
     union ``OrchestratorConfig.harvest_terminal_tools`` /
     ``OrchestratorConfig.patch_tools``). Empty defaults preserve the
     "no harvester recognition" behavior for legacy callers.
+
+    ``injected_args`` (Phase 9 / D-09-01) is the orchestrator-wide
+    map of ``arg_name -> dotted_path`` declared in
+    :attr:`OrchestratorConfig.injected_args`. Every entry is stripped
+    from each tool's LLM-visible signature (so the LLM cannot emit a
+    value for it) and re-supplied at invocation time from session
+    state. When ``None`` or empty, tools pass through to the LLM
+    unchanged — preserves legacy callers and the framework default.
     """
 
     async def node(state: GraphState) -> dict:
@@ -476,32 +585,181 @@ def make_agent_node(
         inc_id = incident.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
+        # M3 (per-step telemetry): emit agent_started.
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "agent_started",
+                    agent=skill.name, started_at=started_at,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not break the agent
+                logger.debug(
+                    "event_log.record(agent_started) failed", exc_info=True,
+                )
+
+        # Phase 9 (D-09-01): strip injected-arg keys from every tool's
+        # LLM-visible signature BEFORE create_react_agent serialises the
+        # tool surface — so the LLM literally cannot emit values for
+        # those params. The framework re-supplies them at invocation
+        # time inside the gateway (or an inject-only wrapper) below.
+        from runtime.tools.arg_injection import (
+            inject_injected_args as _inject_args,
+            strip_injected_params,
+        )
+        injected_keys = frozenset((injected_args or {}).keys())
+        if injected_keys:
+            visible_tools = [
+                strip_injected_params(t, injected_keys) for t in tools
+            ]
+        else:
+            visible_tools = tools
+
         # Wrap tools per-invocation so each wrap closes over the live
         # ``Session`` for this run. When the gateway is unconfigured,
         # the original tools pass through untouched and
         # ``create_react_agent`` sees the same surface as before.
         if gateway_cfg is not None:
+            # Pass ORIGINAL tools (pre-strip) to wrap_tool — the gateway
+            # wrapper strips internally for the LLM-visible schema while
+            # keeping ``inner.args_schema`` intact so
+            # ``accepted_params_for_tool`` correctly recognises injected
+            # keys (e.g. ``environment``) as accepted by the underlying
+            # tool. Stripping twice (here AND in wrap_tool) hides those
+            # keys from ``accepted_params``, the inject step skips them,
+            # and FastMCP rejects the call as missing required arg.
             run_tools = [
                 wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
-                          agent_name=skill.name, store=store)
+                          agent_name=skill.name, store=store,
+                          injected_args=injected_args or {},
+                          gate_policy=gate_policy,
+                          event_log=event_log)
                 for t in tools
             ]
+        elif injected_keys:
+            # No gateway, but injected_args is configured — wrap each
+            # tool in an inject-only ``StructuredTool`` so the LLM-visible
+            # sig matches ``visible_tools`` while the underlying call
+            # still receives the framework-supplied values.
+            from langchain_core.tools import StructuredTool
+
+            _inject_cfg = injected_args or {}
+
+            def _make_inject_only_wrapper(
+                base: BaseTool, llm_visible: BaseTool, sess: Session,
+            ) -> BaseTool:
+                async def _arun(**kwargs: Any) -> Any:
+                    new_kwargs = _inject_args(
+                        kwargs,
+                        session=sess,
+                        injected_args_cfg=_inject_cfg,
+                        tool_name=base.name,
+                    )
+                    return await base.ainvoke(new_kwargs)
+
+                def _run(**kwargs: Any) -> Any:
+                    new_kwargs = _inject_args(
+                        kwargs,
+                        session=sess,
+                        injected_args_cfg=_inject_cfg,
+                        tool_name=base.name,
+                    )
+                    return base.invoke(new_kwargs)
+
+                return StructuredTool.from_function(
+                    func=_run,
+                    coroutine=_arun,
+                    name=base.name,
+                    description=base.description,
+                    args_schema=llm_visible.args_schema,
+                )
+
+            run_tools = [
+                _make_inject_only_wrapper(orig, vis, incident)
+                for orig, vis in zip(tools, visible_tools)
+            ]
         else:
-            run_tools = tools
-        agent_executor = create_react_agent(
-            llm, run_tools, prompt=skill.system_prompt,
+            run_tools = visible_tools
+        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
+        # responsive agent invocation is wrapped in an AgentTurnOutput
+        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
+        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
+        # bare schema as ``response_format`` and, by default, wraps it in
+        # ``AutoStrategy`` — ProviderStrategy for models with native
+        # structured-output (OpenAI-class), falling back to ToolStrategy
+        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
+        # callable tool: when the LLM ``calls`` it, the loop terminates on
+        # the same turn with ``result["structured_response"]`` populated.
+        # Eliminates the old two-call structure (loop + separate
+        # ``with_structured_output`` pass) that hit recursion_limit=25 on
+        # Ollama models without true function-calling.
+        agent_executor = create_agent(
+            model=llm,
+            tools=run_tools,
+            system_prompt=skill.system_prompt,
+            response_format=AgentTurnOutput,
         )
+
+        # Phase 11 (FOC-04): reset per-turn confidence hint. The hint
+        # is updated below after _harvest_tool_calls_and_patches; on
+        # re-entry from a HITL pause the hint resets cleanly so a new
+        # turn starts from "no signal yet" (None).
+        try:
+            incident.turn_confidence_hint = None
+        except (AttributeError, ValueError):
+            pass
 
         try:
             result = await _ainvoke_with_retry(
                 agent_executor,
                 {"messages": [HumanMessage(content=_format_agent_input(incident))]},
             )
+        except GraphInterrupt:
+            # Phase 11 (FOC-04 / D-11-04): HITL pause is NOT an error.
+            # Re-raise so LangGraph's checkpointer captures the paused
+            # state. Session.status is left to the orchestrator's
+            # interrupt-aware bridge, NOT _handle_agent_failure.
+            raise
         except Exception as exc:  # noqa: BLE001
-            return _handle_agent_failure(
-                skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
-            )
+            # Phase 10 follow-up: when LangGraph's structured-output pass
+            # raises ``OutputParserException`` (Ollama / non-OpenAI
+            # providers don't always honor ``response_format`` cleanly),
+            # try to recover by parsing the raw LLM output ourselves.
+            # The exception's ``llm_output`` carries the model's reply
+            # verbatim; if it contains JSON matching the envelope schema,
+            # build a synthetic ``result`` and continue. On unrecoverable
+            # failure, log the raw output for diagnosis and fall through
+            # to ``_handle_agent_failure``.
+            try:
+                from langchain_core.exceptions import OutputParserException
+            except ImportError:  # pragma: no cover — langchain always present
+                OutputParserException = ()  # type: ignore[assignment]
+            if isinstance(exc, OutputParserException):
+                raw = getattr(exc, "llm_output", "") or ""
+                logger.warning(
+                    "agent.structured_output_parse_failure agent=%s "
+                    "raw_len=%d raw_preview=%r",
+                    skill.name, len(raw), raw[:500],
+                )
+                recovered = _try_recover_envelope_from_raw(raw)
+                if recovered is not None:
+                    logger.info(
+                        "agent.structured_output_recovered agent=%s",
+                        skill.name,
+                    )
+                    result = {
+                        "messages": [],
+                        "structured_response": recovered,
+                    }
+                else:
+                    return _handle_agent_failure(
+                        skill_name=skill.name, started_at=started_at, exc=exc,
+                        inc_id=inc_id, store=store, fallback=incident,
+                    )
+            else:
+                return _handle_agent_failure(
+                    skill_name=skill.name, started_at=started_at, exc=exc,
+                    inc_id=inc_id, store=store, fallback=incident,
+                )
 
         # Tools (e.g. registered patch tools) write straight to disk.
         # Reload so the node's own append of agent_run + tool_calls
@@ -519,22 +777,97 @@ def make_agent_node(
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
+        # Phase 11 (FOC-04): update hint so any subsequent in-turn
+        # tool call sees the harvested confidence at the gateway.
+        if agent_confidence is not None:
+            try:
+                incident.turn_confidence_hint = agent_confidence
+            except (AttributeError, ValueError):
+                pass
 
         # Pair tool responses with their tool calls.
         _pair_tool_responses(messages, incident)
 
+        # Phase 10 (FOC-03 / D-10-03): parse the structural envelope and
+        # reconcile its confidence against any typed-terminal-tool arg
+        # confidence harvested above. Envelope failure is a hard error —
+        # mark the agent_run failed with structured cause.
+        try:
+            envelope = parse_envelope_from_result(result, agent=skill.name)
+        except EnvelopeMissingError as exc:
+            return _handle_agent_failure(
+                skill_name=skill.name, started_at=started_at, exc=exc,
+                inc_id=inc_id, store=store, fallback=incident,
+            )
+
+        terminal_tool_for_log = _first_terminal_tool_called_this_turn(
+            messages, terminal_tool_names,
+        )
+        final_confidence = reconcile_confidence(
+            envelope.confidence,
+            agent_confidence,
+            agent=skill.name,
+            session_id=inc_id,
+            tool_name=terminal_tool_for_log,
+        )
+        final_rationale = agent_rationale or envelope.confidence_rationale
+        final_signal = agent_signal if agent_signal is not None else envelope.signal
+
         # Final summary text and token usage.
-        final_text = _extract_final_text(messages)
+        # Envelope content takes precedence over last AIMessage scrape.
+        final_text = envelope.content or _extract_final_text(messages)
         usage = _sum_token_usage(messages)
+
+        # M3: emit confidence_emitted after reconcile lands.
+        if event_log is not None and final_confidence is not None:
+            try:
+                event_log.record(
+                    inc_id, "confidence_emitted",
+                    agent=skill.name,
+                    value=float(final_confidence),
+                    rationale=final_rationale or "",
+                    signal=final_signal,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(confidence_emitted) failed", exc_info=True,
+                )
 
         _record_success_run(
             incident=incident, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
-            confidence=agent_confidence, rationale=agent_rationale, signal=agent_signal,
+            confidence=final_confidence, rationale=final_rationale, signal=final_signal,
             store=store,
         )
         next_route_signal = decide_route(incident)
         next_node = route_from_skill(skill, next_route_signal)
+
+        # M3: emit route_decided + agent_finished (carrying token_usage).
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc_id, "route_decided",
+                    agent=skill.name,
+                    signal=next_route_signal,
+                    next_node=next_node,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(route_decided) failed", exc_info=True,
+                )
+            try:
+                event_log.record(
+                    inc_id, "agent_finished",
+                    agent=skill.name,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    total_tokens=usage.total_tokens,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "event_log.record(agent_finished) failed", exc_info=True,
+                )
+
         return {"session": incident, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
@@ -564,6 +897,16 @@ _DEFAULT_STUB_CANNED: dict[str, str] = {
     "triage": "Severity medium, category latency. No recent deploys correlate.",
     "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
     "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
+}
+
+# Phase 10 (FOC-03): per-agent default envelope confidence for the stub
+# LLM. Pre-Phase-10 the deep_investigator stub emitted no confidence at
+# all, so the gate (threshold 0.75) always interrupted on the first
+# call. Post-Phase-10 every agent must emit a confidence value — drive
+# DI's stub envelope below threshold to preserve gate-pause behavior in
+# existing tests. Other agents default to 0.85 (above threshold).
+_DEFAULT_STUB_ENVELOPE_CONFIDENCE: dict[str, float] = {
+    "deep_investigator": 0.30,
 }
 
 
@@ -714,7 +1057,8 @@ def make_gate_node(
 
 
 def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
-                       registry: ToolRegistry) -> dict:
+                       registry: ToolRegistry,
+                       event_log: "EventLog | None" = None) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
 
     Dispatches on ``skill.kind``:
@@ -734,6 +1078,10 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     valid_signals = frozenset(cfg.orchestrator.signals)
     gateway_cfg = getattr(cfg.runtime, "gateway", None)
+    # Phase 11 (FOC-04): thread the orchestrator's gate_policy down to
+    # wrap_tool so should_gate can apply the configured per-app
+    # confidence threshold + gated environments / risk actions.
+    gate_policy = getattr(cfg.orchestrator, "gate_policy", None)
     # Build the harvester's tool-name sets once per graph-build. The
     # union of ``terminal_tools`` (status-transitioning) and
     # ``harvest_terminal_tools`` (harvest-only) gives the full
@@ -752,7 +1100,10 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
         if kind == "supervisor":
             llm = None
             if skill.dispatch_strategy == "llm":
-                llm = get_llm(cfg.llm, skill.model, role=agent_name)
+                llm = get_llm(
+                    cfg.llm, skill.model, role=agent_name,
+                    default_llm_request_timeout=cfg.orchestrator.default_llm_request_timeout,
+                )
             nodes[agent_name] = make_supervisor_node(skill=skill, llm=llm)
             continue
         # Default / "responsive" path.
@@ -762,11 +1113,16 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             stub_canned = {agent_name: _DEFAULT_STUB_CANNED[agent_name]}
         else:
             stub_canned = None
+        # Phase 10 (FOC-03): wire a per-agent default envelope confidence
+        # into the stub so pre-Phase-10 gate-pause-on-DI tests still pass.
+        stub_env_conf = _DEFAULT_STUB_ENVELOPE_CONFIDENCE.get(agent_name)
         llm = get_llm(
             cfg.llm,
             skill.model,
             role=agent_name,
             stub_canned=stub_canned,
+            stub_envelope_confidence=stub_env_conf,
+            default_llm_request_timeout=cfg.orchestrator.default_llm_request_timeout,
         )
         tools = registry.resolve(skill.tools, cfg.mcp)
         decide = _decide_from_signal
@@ -777,6 +1133,9 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             gateway_cfg=gateway_cfg,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
+            injected_args=cfg.orchestrator.injected_args,
+            gate_policy=gate_policy,
+            event_log=event_log,
         )
     return nodes
 
@@ -833,7 +1192,8 @@ def _collect_gated_edges(skills: dict) -> dict[tuple[str, str], str]:
 async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
                       registry: ToolRegistry,
                       checkpointer=None,
-                      framework_cfg: FrameworkAppConfig | None = None):
+                      framework_cfg: FrameworkAppConfig | None = None,
+                      event_log: "EventLog | None" = None):
     """Compile the main LangGraph from configured skills and routes.
 
     The entry agent is read from ``cfg.orchestrator.entry_agent``. Gate
@@ -873,10 +1233,15 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
             )
         else:
             framework_cfg = getattr(cfg, "framework", None) or resolve_framework_app_config(None)
+    # ``resolve_framework_app_config(None)`` always returns a bare
+    # ``FrameworkAppConfig`` (never None), so the chain above is
+    # exhaustive — assert for pyright's flow narrowing.
+    assert framework_cfg is not None
     gated_edges = _collect_gated_edges(skills)
 
     sg = StateGraph(GraphState)
-    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store, registry=registry)
+    nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store,
+                                registry=registry, event_log=event_log)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
     sg.add_node("gate", make_gate_node(

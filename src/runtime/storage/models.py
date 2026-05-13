@@ -6,7 +6,7 @@ Vector similarity lives in a separate LangChain VectorStore (landed in M3).
 """
 from __future__ import annotations
 from datetime import datetime
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -113,3 +113,44 @@ class SessionEventRow(Base):
     kind: Mapped[str] = mapped_column(String, nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     ts: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class SessionLessonRow(Base):
+    """M5: distilled "lesson" extracted from one resolved session.
+
+    Each lesson captures (a) the symptom that started the session
+    (via ``embedding_text`` which seeds the vector index), (b) the
+    tool sequence the framework ran, (c) the final outcome
+    (status + confidence + summary), and (d) provenance metadata so
+    callers can tell auto-extracted lessons from operator-curated
+    ones. The intake runner reads lessons via ``LessonStore
+    .find_similar`` and surfaces the top-k as ``findings["lessons"]``
+    on each new session.
+
+    Append-only by convention — :class:`LessonStore` provides ``add``
+    but no ``update``. M7's nightly refresher writes a fresh row when
+    the extractor version changes; older rows stay queryable.
+    """
+    __tablename__ = "session_lessons"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    source_session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("incidents.id"), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    signals: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    tool_sequence: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    outcome_status: Mapped[str] = mapped_column(String, nullable=False)
+    outcome_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    confidence_final: Mapped[float | None] = mapped_column(Float, nullable=True)
+    embedding_text: Mapped[str] = mapped_column(Text, nullable=False)
+    provenance: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    __table_args__ = (
+        Index("ix_session_lessons_source_session_id", "source_session_id"),
+        Index(
+            "ix_session_lessons_outcome_status_created_at",
+            "outcome_status", "created_at",
+        ),
+    )

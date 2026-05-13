@@ -21,10 +21,14 @@ llm:
       endpoint: ${AZURE_ENDPOINT}
       api_version: 2024-08-01-preview
       api_key: ${AZURE_OPENAI_KEY}
+    openrouter:
+      kind: openai_compat
+      base_url: https://openrouter.ai/api/v1
+      api_key: ${OPENROUTER_API_KEY}
   models:
     workhorse:
-      provider: ollama_cloud
-      model: gpt-oss:120b
+      provider: openrouter
+      model: openai/gpt-4o-mini
       temperature: 0.0
     cheap:
       provider: ollama_cloud
@@ -35,6 +39,19 @@ llm:
       model: gpt-4o
       deployment: gpt-4o
       temperature: 0.0
+    # M8 (Ollama-via-LangChain proof point): every agent picks its
+    # model independently. ``gpt_oss`` / ``gpt_oss_cheap`` route to
+    # Ollama Cloud's open-weight gpt-oss model; swap an agent's
+    # ``model:`` field to one of these to run that agent on Ollama
+    # while leaving other agents on OpenRouter / Azure / etc.
+    gpt_oss:
+      provider: ollama_cloud
+      model: gpt-oss:20b
+      temperature: 0.0
+    gpt_oss_cheap:
+      provider: ollama_cloud
+      model: gpt-oss:20b
+      temperature: 0.4
   embedding:
     provider: ollama_local
     model: bge-m3
@@ -135,6 +152,19 @@ dedup:
 # ``incident_management.yaml`` since this is the bundled deployment
 # config for the example app.
 orchestrator:
+  # Phase 11 (FOC-04): declarative HITL gating policy. Framework
+  # default (threshold 0.7) -- mirrors incident_management v1.1
+  # behaviour with the production-class environment gate.
+  gate_policy:
+    confidence_threshold: 0.7
+    gated_environments: [production]
+    gated_risk_actions: [approve]
+  # Phase 12 (FOC-05): declarative retry policy. Framework default --
+  # max_retries=2, transient retries on, confidence floor 0.4.
+  retry_policy:
+    max_retries: 2
+    retry_on_transient: true
+    retry_low_confidence_threshold: 0.4
   entry_agent: intake
   default_terminal_status: needs_review
   statuses:
@@ -186,6 +216,15 @@ orchestrator:
   # state_overrides; orchestrator validates the start_session
   # kwarg against this class.
   state_overrides_schema: examples.incident_management.state.IncidentStateOverrides
+  # Phase 9 (D-09-02 / FOC-01 / FOC-02): session-derived tool-arg
+  # injection map. Strips the named args from each tool's LLM-visible
+  # signature and re-supplies them from the live Session at invocation
+  # time. Mirrors incident_management.yaml since this file is the
+  # bundled deployment config for the example app.
+  injected_args:
+    environment: session.extra_fields.environment
+    incident_id: session.id
+    session_id: session.id
 runtime:
   # Wires the orchestrator and storage layer to the incident-management
   # domain state class (see examples/incident_management/state.py).

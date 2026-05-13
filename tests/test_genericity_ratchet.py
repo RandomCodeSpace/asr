@@ -50,7 +50,31 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                thread-id. Generic session-id terminology elsewhere; the
 #                helper itself is older and keeps its parameter name for
 #                callers in the same file.
-BASELINE_TOTAL = 147
+#   147 -> 149   Phase 10 (FOC-03): mandatory per-turn confidence wrapped
+#                each ``create_react_agent`` call site (graph.py, responsive.py)
+#                in an envelope-parse + reconcile + EnvelopeMissingError-handler
+#                block. The two new ``_handle_agent_failure(..., fallback=incident)``
+#                calls reuse the pre-existing local ``incident`` variable name
+#                (the runner's domain Session) on the new envelope-error
+#                branch — no new domain concept, just two new uses of the
+#                existing variable on a structurally required code path.
+#   149 -> 153   Phase 11 (FOC-04): pure-policy HITL gating + GraphInterrupt-vs-error
+#                fix. The runner's per-turn confidence-hint reset / update lines
+#                in graph.py and responsive.py reuse the same ``incident`` local
+#                variable name introduced in Phase 10 (the runner's domain
+#                Session). Net +4 ``incident`` tokens, all reuses of the
+#                existing local on structurally required code paths -- no new
+#                domain concept introduced.
+#   153 -> 154   Phase 12 (FOC-05/06): framework-owned retry policy + E2E
+#                genericity test. ``Orchestrator._retry_session_locked``
+#                consults ``should_retry`` and yields ``retry_rejected`` events
+#                that include the reason; the new accessor / preview helpers
+#                reuse the existing ``incident`` local in orchestrator.py on
+#                the policy-gate code path. Net +1 ``incident`` token reuse,
+#                no new domain concept introduced (was missed in the Phase 12
+#                atomic commit; counted retroactively in the v1.2 follow-up
+#                that consolidates injection-path bug fixes).
+BASELINE_TOTAL = 154
 
 
 def test_runtime_leaks_at_or_below_baseline():

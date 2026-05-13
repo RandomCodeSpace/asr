@@ -37,12 +37,16 @@ from runtime.storage.models import IncidentRow
 _INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
 _SESSION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-\d{8}-\d{3}$")
 
-# StateT is bound to ``BaseModel`` so callers can pass either bare
-# ``Session`` or any pydantic subclass. The resolver in
-# :mod:`runtime.state_resolver` enforces a ``runtime.state.Session``
-# subclass at config time; the looser bound here keeps the storage
-# layer usable by ad-hoc tests that build a ``BaseModel`` directly.
-StateT = TypeVar("StateT", bound=BaseModel)
+# StateT is bound to ``Session`` (not bare ``BaseModel``) because the
+# store body reads typed fields (``id``, ``status``, ``version``,
+# ``updated_at`` …) that are declared on ``runtime.state.Session`` and
+# not on ``pydantic.BaseModel``. The resolver in
+# :mod:`runtime.state_resolver` already enforces a ``Session`` subclass
+# at config time, and every existing caller (production + tests) passes
+# either bare ``Session`` or a ``Session`` subclass — see
+# Phase 19 / HARD-03 for the rationale (was: ``bound=BaseModel`` which
+# made pyright flag every typed-field access).
+StateT = TypeVar("StateT", bound=Session)
 
 
 def _embed_source(inc: BaseModel) -> str:
@@ -240,7 +244,12 @@ class SessionStore(Generic[StateT]):
             raise ValueError(
                 f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
-        incident.updated_at = _iso(_now())
+        # ``_iso(_now())`` returns ``str`` here -- the input datetime is
+        # never None -- but the helper's signature is the broader
+        # ``Optional[str]``. ``or ""`` keeps pyright + the typed
+        # ``Session.updated_at: str`` field consistent without changing
+        # behaviour (real value is always present).
+        incident.updated_at = _iso(_now()) or ""
         sess = incident  # local alias — avoids repeating the domain token in new code
         expected_version = getattr(sess, "version", 1)
         # Bump in-memory BEFORE building the row dict so the persisted
@@ -385,12 +394,16 @@ class SessionStore(Generic[StateT]):
         from pathlib import Path
         folder = Path(self.vector_path)
         folder.mkdir(parents=True, exist_ok=True)
-        self.vector_store.save_local(
+        # ``save_local`` is FAISS-specific; the runtime ``hasattr`` guard
+        # at the top of this method already ensured this codepath only
+        # runs against FAISS (other VectorStores omit the method).
+        # ``langchain_core.vectorstores.VectorStore`` doesn't declare it.
+        self.vector_store.save_local(  # pyright: ignore[reportAttributeAccessIssue]
             folder_path=str(folder),
             index_name=self.vector_index_name,
         )
 
-    def _add_vector(self, inc: BaseModel) -> None:
+    def _add_vector(self, inc: Session) -> None:
         if self.vector_store is None or self.embedder is None:
             return
         text = _embed_source(inc)
@@ -403,7 +416,7 @@ class SessionStore(Generic[StateT]):
         )
         self._persist_vector()
 
-    def _refresh_vector(self, inc: BaseModel, *, prior_text: str) -> None:
+    def _refresh_vector(self, inc: Session, *, prior_text: str) -> None:
         if self.vector_store is None or self.embedder is None:
             return
         text = _embed_source(inc)
@@ -578,7 +591,13 @@ class SessionStore(Generic[StateT]):
                 merged_extras[k] = v
             kwargs["extra_fields"] = merged_extras
 
-        return self._state_cls(**kwargs)
+        # ``kwargs`` is built up from heterogeneous sources (typed row
+        # columns + ``extra_fields`` blob) so pyright infers each value
+        # as ``object``. At runtime each entry matches the concrete
+        # ``state_cls`` field type by construction (the row schema is
+        # the source of truth); pydantic's own validation rejects bad
+        # shapes at the constructor.
+        return self._state_cls(**kwargs)  # pyright: ignore[reportArgumentType]
 
     def _incident_to_row_dict(self, inc: StateT) -> dict:
         """Serialize a state instance into a row-shaped dict.

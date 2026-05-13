@@ -43,7 +43,10 @@ def test_build_embedder_unknown_kind_raises():
     from runtime.config import EmbeddingConfig, ProviderConfig
     from runtime.storage.embeddings import build_embedder
     cfg = EmbeddingConfig(provider="x", model="m")
-    bad = ProviderConfig(kind="ollama")
+    # Phase 13 (HARD-05): ollama now requires base_url at config-load,
+    # so seed from a no-required-field kind (stub) and mutate to "nonsense"
+    # to exercise the unknown-kind dispatch path.
+    bad = ProviderConfig(kind="stub")
     bad.kind = "nonsense"  # bypass pydantic for the test
     with pytest.raises(ValueError, match="unknown provider kind"):
         build_embedder(cfg, {"x": bad})

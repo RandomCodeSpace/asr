@@ -51,6 +51,16 @@ OUT_CODE_REVIEW_APP = Path("dist/apps/code-review.py")
 # are included only in the incident-management app bundle (not in the
 # runtime-only bundle).
 RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
+    # Phase 13 (HARD-01/HARD-05): typed runtime errors. Leaf module
+    # (no runtime.* imports). MUST precede config.py because
+    # config.py imports LLMConfigError for the ProviderConfig
+    # @model_validator (D-13-05/06).
+    (RUNTIME_ROOT, "errors.py"),
+    # Phase 16 (BUNDLER-01): generic terminal-tool registry types
+    # (StatusDef, TerminalToolRule). Imported at the top of config.py
+    # (line 10), so MUST precede config.py — otherwise the bundled
+    # config.py raises NameError at module-execution time.
+    (RUNTIME_ROOT, "terminal_tools.py"),
     (RUNTIME_ROOT, "config.py"),
     (RUNTIME_ROOT, "state.py"),
     (RUNTIME_ROOT, "state_resolver.py"),
@@ -63,6 +73,23 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     (RUNTIME_ROOT, "storage/vector.py"),
     (RUNTIME_ROOT, "storage/history_store.py"),
     (RUNTIME_ROOT, "storage/session_store.py"),
+    # Phase 16 (BUNDLER-01): event-log + idempotent migrations. Both
+    # depend only on storage/models.py (already above). event_log is
+    # required by orchestrator.py's status finalizer; migrations is
+    # invoked at startup (storage/__init__.py wires it but __init__
+    # files aren't bundled, so the orchestrator path is the surviving
+    # caller).
+    (RUNTIME_ROOT, "storage/event_log.py"),
+    (RUNTIME_ROOT, "storage/migrations.py"),
+    # M5 (per-step telemetry): lesson corpus store + auto-extractor.
+    # lesson_store depends on storage/vector.py (already above) and
+    # storage/models.py for SessionLessonRow. Bundled before
+    # orchestrator.py so it can instantiate the store at boot.
+    (RUNTIME_ROOT, "storage/lesson_store.py"),
+    (RUNTIME_ROOT, "learning/extractor.py"),
+    # M7: nightly lesson refresher (APScheduler cron). Depends on
+    # extractor + lesson_store (both above).
+    (RUNTIME_ROOT, "learning/scheduler.py"),
     # NOTE: the per-tool mcp_server modules
     # (observability/remediation/user_context) were relocated under
     # ``examples/incident_management/mcp_servers/`` in Phase 7
@@ -73,6 +100,43 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # consequently boots without any incident-vocabulary MCP servers
     # (its ``orchestrator.mcp_servers`` list is empty).
     (RUNTIME_ROOT, "mcp_loader.py"),
+    # Phase 16 (BUNDLER-01): long-lived OrchestratorService — the
+    # Streamlit UI's `from app import OrchestratorService` import is
+    # the headline ImportError this phase fixes. Depends only on
+    # config.py and mcp_loader.py (both above). Lazy-imports
+    # tools.approval_watchdog at start-up (added below).
+    (RUNTIME_ROOT, "service.py"),
+    # Phase 10 (FOC-03): AgentTurnOutput envelope + EnvelopeMissingError.
+    # Phase 12 (FOC-05) bundles policy.py with a module-level reference
+    # to EnvelopeMissingError in _PERMANENT_TYPES, so turn_output MUST
+    # precede policy.py in the bundle. (Pre-Phase-12 dists referenced
+    # EnvelopeMissingError only inside function bodies, where the strip-
+    # plus-rebuild order didn't surface a NameError at import time.)
+    (RUNTIME_ROOT, "agents/turn_output.py"),
+    # Phase 16 (BUNDLER-01): risk-rated tool gateway. Imported at
+    # module level by policy.py, graph.py, agents/responsive.py — so
+    # gateway.py MUST precede policy.py. Depends only on config.py +
+    # state.py (both already above). arg_injection is its sibling and
+    # is lazy-imported from gateway / orchestrator / graph.
+    (RUNTIME_ROOT, "tools/gateway.py"),
+    (RUNTIME_ROOT, "tools/arg_injection.py"),
+    # Phase 16 (BUNDLER-01): pending-approval timeout watchdog,
+    # lazy-imported by service.py:189. Bundled here (after gateway, so
+    # gateway-related approval state is in scope) but before any module
+    # that might trigger the lazy import path.
+    (RUNTIME_ROOT, "tools/approval_watchdog.py"),
+    # Phase 11 (FOC-04): pure-policy HITL gating boundary. Imported by
+    # tools.gateway, which graph.py uses -- so policy.py must precede
+    # graph.py in the bundle.
+    (RUNTIME_ROOT, "policy.py"),
+    # Phase 16 (BUNDLER-01): agent-kind node builders, used by graph.py
+    # at construction time. Each depends on skill.py + state.py (both
+    # already above) and on gateway.py / turn_output.py / session_store.py
+    # for responsive. Bundled BEFORE graph.py so the symbols are in
+    # module scope when graph.py's body executes.
+    (RUNTIME_ROOT, "agents/responsive.py"),
+    (RUNTIME_ROOT, "agents/supervisor.py"),
+    (RUNTIME_ROOT, "agents/monitor.py"),
     (RUNTIME_ROOT, "graph.py"),
     (RUNTIME_ROOT, "checkpointer_postgres.py"),
     (RUNTIME_ROOT, "checkpointer.py"),
@@ -110,6 +174,13 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # Per-session task-reentrant asyncio locks + SessionBusy exception.
     # Must precede orchestrator.py which instantiates SessionLockRegistry.
     (RUNTIME_ROOT, "locks.py"),
+    # Phase 16 (BUNDLER-01): load-time skill validator + checkpoint GC.
+    # Both lazy-imported from orchestrator.py (lines 447, 472). Bundled
+    # before orchestrator.py so the lazy import resolves to in-bundle
+    # symbols rather than failing with ModuleNotFoundError after the
+    # intra-import stripper removes the original `from runtime.X` line.
+    (RUNTIME_ROOT, "skill_validator.py"),
+    (RUNTIME_ROOT, "storage/checkpoint_gc.py"),
     (RUNTIME_ROOT, "orchestrator.py"),
     (RUNTIME_ROOT, "api.py"),
     # Retraction routes are a side-car router so they don't bloat
@@ -195,9 +266,30 @@ def _read(path: Path) -> str:
     return path.read_text()
 
 
+# Phase 16 (BUNDLER-01): after stripping intra-imports, ``if TYPE_CHECKING:``
+# blocks whose only body line was a ``from runtime.X import Y`` end up as a
+# naked ``if`` with no suite — IndentationError at module load. Neutralize
+# any orphaned ``if TYPE_CHECKING:`` (followed by blank lines and then a
+# dedented top-level statement) by giving it a ``pass`` body. We only target
+# top-level ``if TYPE_CHECKING:`` (no leading whitespace) because nested
+# guards are rare in this codebase and a wider rewrite risks corrupting
+# function-body conditionals.
+# NOTE: the inner alternation uses ``[ \t]*\n`` (NOT ``\s*\n``).
+# Using ``\s`` would let the inner pattern match the newline anchor
+# itself, making ``(\s*\n)*`` a textbook polynomial-backtracking
+# trap on long blank-line runs (CodeQL py/redos). ``[ \t]*\n``
+# matches exactly one blank-line per iteration with no overlap, so
+# the engine takes O(n).
+_ORPHANED_TYPE_CHECKING_RE = re.compile(
+    r"^if\s+TYPE_CHECKING\s*:\s*\n([ \t]*\n)*(?=\S)",
+    re.MULTILINE,
+)
+
+
 def _strip_intra_imports(src: str) -> str:
     src = INTRA_IMPORT_RE.sub("", src)
     src = INTRA_IMPORT_NAME_RE.sub("", src)
+    src = _ORPHANED_TYPE_CHECKING_RE.sub("if TYPE_CHECKING:\n    pass\n", src)
     return src
 
 
