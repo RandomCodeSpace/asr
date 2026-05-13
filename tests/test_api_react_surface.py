@@ -550,3 +550,118 @@ async def test_react_surface_e2e_terminal_session(cfg):
         kinds = {f["kind"] for f in frames}
         assert "status_changed" in kinds
         assert "lesson_extracted" in kinds
+
+
+
+# ===================================================================
+# Sonar-coverage padding: error-path coverage on the new SSE/WS
+# endpoints. These exercise the broad-except branches that
+# render the structured error envelope onto the wire when the
+# underlying orchestrator coroutine raises. Without these, Sonar's
+# "coverage on new code" metric stays below the 80% gate.
+# ===================================================================
+
+def test_post_resume_sse_yields_error_envelope_on_orchestrator_failure(cfg):
+    """When ``orch.resume_investigation`` raises, the SSE wrapper must
+    yield exactly one structured ``{"error":{...}}`` frame and close
+    the stream. No raw exception text reaches the wire."""
+    app = build_app(cfg)
+    with TestClient(app) as client:
+        orch = app.state.orchestrator
+
+        async def _boom(*_a, **_k):
+            raise RuntimeError("synthetic resume failure")
+            yield  # pragma: no cover — generator marker
+
+        orch.resume_investigation = _boom  # type: ignore[method-assign]
+
+        with client.stream(
+            "POST", "/sessions/SES-RESUME-FAIL/resume",
+            json={"decision": "resume_with_input", "user_input": "go"},
+        ) as resp:
+            assert resp.status_code == 200
+            frames: list[dict] = []
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    frames.append(json.loads(line[len("data: "):]))
+                if frames:
+                    break
+    assert len(frames) == 1
+    err = frames[0]["error"]
+    assert err["code"] == "resume_failed"
+    assert err["message"] == "RuntimeError"
+    # No raw exception text leaks into the message field.
+    assert "synthetic" not in err["message"]
+
+
+def test_post_retry_sse_yields_error_envelope_on_orchestrator_failure(cfg):
+    """Same contract for ``POST /sessions/{sid}/retry``."""
+    app = build_app(cfg)
+    with TestClient(app) as client:
+        orch = app.state.orchestrator
+
+        async def _boom(*_a, **_k):
+            raise RuntimeError("synthetic retry failure")
+            yield  # pragma: no cover — generator marker
+
+        orch.retry_session = _boom  # type: ignore[method-assign]
+
+        with client.stream(
+            "POST", "/sessions/SES-RETRY-FAIL/retry",
+        ) as resp:
+            assert resp.status_code == 200
+            frames: list[dict] = []
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    frames.append(json.loads(line[len("data: "):]))
+                if frames:
+                    break
+    assert len(frames) == 1
+    err = frames[0]["error"]
+    assert err["code"] == "retry_failed"
+    assert err["message"] == "RuntimeError"
+    assert "synthetic" not in err["message"]
+
+
+def test_get_session_lessons_503_when_lesson_store_absent(cfg):
+    """``GET /sessions/{sid}/lessons`` returns an empty list (not 404)
+    when the orchestrator has no lesson_store wired — the orchestrator
+    fixture always carries one, so explicitly drop it for this test."""
+    app = build_app(cfg)
+    with TestClient(app) as client:
+        orch = app.state.orchestrator
+        orch.lesson_store = None
+        res = client.get("/sessions/ANY/lessons")
+    assert res.status_code == 200
+    assert res.json() == []
+
+
+def test_websocket_close_when_event_log_absent(cfg):
+    """``WS /ws/sessions/{sid}/events`` closes with code 1011 when the
+    orchestrator carries no event_log."""
+    from starlette.websockets import WebSocketDisconnect
+
+    app = build_app(cfg)
+    with TestClient(app) as client:
+        orch = app.state.orchestrator
+        orch.event_log = None
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect(
+                "/ws/sessions/ANY/events?since=0",
+            ) as ws:
+                ws.receive_json()
+    assert excinfo.value.code == 1011
+
+
+def test_websocket_handles_invalid_since_param(cfg):
+    """Non-integer ``?since=`` defaults to 0 (the WS handler swallows
+    the ValueError on parse). The connection completes, no error."""
+    app = build_app(cfg)
+    with TestClient(app) as client:
+        orch = app.state.orchestrator
+        orch.event_log.record("SES-WS-BAD", "agent_started", agent="a")
+        with client.websocket_connect(
+            "/ws/sessions/SES-WS-BAD/events?since=not-a-number",
+        ) as ws:
+            f = ws.receive_json()
+    assert f["kind"] == "agent_started"
