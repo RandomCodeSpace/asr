@@ -93,14 +93,24 @@ class EventLog:
             )
         self.append(session_id, kind, payload)
 
-    def iter_for(self, session_id: str) -> Iterator[SessionEvent]:
-        """Yield events for ``session_id`` in monotonic insertion order."""
+    def iter_for(
+        self, session_id: str, *, since: int | None = None,
+    ) -> Iterator[SessionEvent]:
+        """Yield events for ``session_id`` in monotonic insertion order.
+
+        ``since``: optional ``seq`` watermark. When supplied, only events
+        with ``seq > since`` are returned — enables SSE / WebSocket
+        streaming clients to resume from their last observed seq without
+        re-receiving the backlog.
+        """
         with Session(self.engine) as s:
             stmt = (
                 select(SessionEventRow)
                 .where(SessionEventRow.session_id == session_id)
                 .order_by(SessionEventRow.seq)
             )
+            if since is not None:
+                stmt = stmt.where(SessionEventRow.seq > since)
             for row in s.execute(stmt).scalars():
                 yield SessionEvent(
                     seq=row.seq,

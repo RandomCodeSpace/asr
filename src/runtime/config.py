@@ -719,6 +719,23 @@ def resolve_framework_app_config(
     return cfg
 
 
+class ApiConfig(BaseModel):
+    """API surface knobs surfaced to the React frontend."""
+
+    # CORS origins allowed by the FastAPI CORSMiddleware. Default
+    # covers the two common React dev-server URLs (Vite, CRA/Next).
+    # Production deployments override via YAML to lock down to their
+    # actual frontend origin.
+    cors_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://localhost:3000",
+        ]
+    )
+    # Allow credentials on cross-origin requests (cookies, auth headers).
+    cors_allow_credentials: bool = True
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig
     mcp: MCPConfig
@@ -727,6 +744,7 @@ class AppConfig(BaseModel):
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
     # Cross-cutting framework knobs (confidence threshold, escalation
     # roster, severity aliases, dedup prompt, intake tuning) read by
     # the runtime directly off the loaded ``AppConfig`` — no
