@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 _LOG = logging.getLogger("runtime.orchestrator")
 
@@ -87,6 +88,127 @@ class EnvelopeMissingError(Exception):
         super().__init__(message or f"envelope_missing: {field} (agent={agent})")
 
 
+_HEADER_SPLIT = re.compile(r"^#{2,}\s+(\w+)\s*$", re.MULTILINE)
+_CONF_LINE = re.compile(
+    # Leftmost float (allows int form), optional rationale after em-dash /
+    # ASCII dash / hyphen separator. ``re.DOTALL`` so a multi-line rationale
+    # is captured wholesale.
+    r"^\s*(-?[0-9]*\.?[0-9]+)\s*(?:[\u2014\-]+\s*(.*))?$",
+    re.DOTALL,
+)
+
+
+def _clamp_unit(x: float) -> float:
+    """Clamp a confidence float into [0, 1] without raising. The skill
+    prompt asks for [0, 1]; an LLM occasionally emits ``1.05`` or
+    ``-0.1`` — clamp rather than reject so the parse step is forgiving."""
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def parse_markdown_envelope(
+    content: str, *, agent: str = "",
+) -> "AgentTurnOutput":
+    """D-22-03 — parse the trailing markdown contract block into an
+    :class:`AgentTurnOutput`.
+
+    Expects three sections ``## Response`` / ``## Confidence`` /
+    ``## Signal`` (case-insensitive headers, ``##+`` accepted) at the
+    end of the LLM's reply. The free-text body of ``## Response``
+    becomes ``content``; the float on the ``## Confidence`` line
+    becomes ``confidence`` (clamped to [0, 1]); the rest of that line
+    after ``-`` / ``--`` / ``\u2014`` becomes ``confidence_rationale``;
+    the ``## Signal`` body becomes ``signal`` (with ``none``/``null``/
+    blank coerced to ``None``).
+
+    Raises :class:`EnvelopeMissingError` only when the parse cannot
+    produce a valid envelope at all — missing ``## Confidence`` line,
+    unparseable confidence value, or empty ``## Response`` body.
+    """
+    if not isinstance(content, str) or not content.strip():
+        raise EnvelopeMissingError(
+            agent=agent, field="content",
+            message=f"envelope_missing: empty content (agent={agent!r})",
+        )
+
+    # ``re.split`` with the header capture-group yields:
+    #   [pre, h1, body1, h2, body2, ...]
+    # Pre is the prose before the first heading; we ignore it for parse.
+    parts = _HEADER_SPLIT.split(content)
+    sections: dict[str, str] = {}
+    if len(parts) >= 3:
+        for i in range(1, len(parts) - 1, 2):
+            key = parts[i].strip().lower()
+            body = parts[i + 1].strip()
+            # Don't overwrite an earlier section with a later same-named
+            # one (unusual but possible in pathological prompts).
+            sections.setdefault(key, body)
+
+    response_body = sections.get("response", "").strip()
+    raw_conf = sections.get("confidence", "").strip()
+
+    if not raw_conf:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence section absent or empty "
+                f"(agent={agent!r})"
+            ),
+        )
+
+    m = _CONF_LINE.match(raw_conf)
+    if not m:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence section did not parse "
+                f"(agent={agent!r}, raw={raw_conf!r})"
+            ),
+        )
+    try:
+        conf_value = _clamp_unit(float(m.group(1)))
+    except (TypeError, ValueError) as exc:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence value not a float "
+                f"(agent={agent!r}, raw={raw_conf!r})"
+            ),
+        ) from exc
+    rationale = (m.group(2) or "").strip() or "(no rationale provided)"
+
+    signal_raw = sections.get("signal", "").strip().lower() or None
+    if signal_raw in {"none", "null", "", "n/a"}:
+        signal_raw = None
+
+    if not response_body:
+        raise EnvelopeMissingError(
+            agent=agent, field="content",
+            message=(
+                f"envelope_missing: response section empty (agent={agent!r})"
+            ),
+        )
+
+    try:
+        return AgentTurnOutput(
+            content=response_body,
+            confidence=conf_value,
+            confidence_rationale=rationale,
+            signal=signal_raw,
+        )
+    except ValidationError as exc:
+        raise EnvelopeMissingError(
+            agent=agent, field="validation",
+            message=(
+                f"envelope_missing: pydantic validation rejected the "
+                f"parsed values (agent={agent!r}): {exc}"
+            ),
+        ) from exc
+
+
 def parse_envelope_from_result(
     result: dict,
     *,
@@ -144,13 +266,33 @@ def parse_envelope_from_result(
             continue
         break
 
-    # Path 3: fail loudly
+    # Path 4 (D-22-01): markdown-primary parse on the last AIMessage's
+    # content. Producers that emit the new ``## Response / ## Confidence /
+    # ## Signal`` section block land here when Paths 1+2 yield nothing.
+    for msg in reversed(messages):
+        if msg.__class__.__name__ != "AIMessage":
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            return parse_markdown_envelope(content, agent=agent)
+        except EnvelopeMissingError:
+            # This AIMessage didnt carry a parseable markdown contract.
+            # Continue scanning earlier messages on the off-chance a
+            # nested loop emitted the contract one step back.
+            continue
+        break
+
+    # Path 5 (terminal): fail loudly. None of the four paths produced a
+    # valid envelope — this is a real prompt-drift signal worth
+    # surfacing as a structured agent_run error.
     raise EnvelopeMissingError(
         agent=agent,
         field="structured_response",
         message=(
-            f"envelope_missing: no structured_response or JSON-decodable "
-            f"AIMessage envelope found (agent={agent})"
+            f"envelope_missing: no structured_response, JSON-decodable, or "
+            f"markdown-decodable AIMessage envelope found (agent={agent})"
         ),
     )
 
@@ -197,5 +339,6 @@ __all__ = [
     "AgentTurnOutput",
     "EnvelopeMissingError",
     "parse_envelope_from_result",
+    "parse_markdown_envelope",
     "reconcile_confidence",
 ]
