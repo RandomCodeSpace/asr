@@ -289,3 +289,107 @@ def test_parse_envelope_from_result_raises_when_no_path_yields():
     result = {"messages": [_ai("just prose, no sections")]}
     with pytest.raises(EnvelopeMissingError):
         parse_envelope_from_result(result, agent="triage")
+
+
+def test_en_dash_rationale_gpt_oss_pattern():
+    """gpt-oss:20b emits the EN DASH (U+2013) as the confidence
+    separator, not the EM DASH (U+2014). The parser must accept the
+    full Unicode dash-punctuation family."""
+    md = "## Response\nbody\n## Confidence\n0.88 – strong evidence\n## Signal\nsuccess\n"
+    env = parse_markdown_envelope(md)
+    assert env.confidence == 0.88
+    assert env.confidence_rationale == "strong evidence"
+    assert env.signal == "success"
+
+
+@pytest.mark.parametrize("sep", ["-", "‐", "‑", "‒", "–", "—", "―"])
+def test_dash_family_variants_all_parse(sep):
+    """Sanity sweep: every Unicode dash in the regex class round-trips."""
+    md = f"## Response\nbody\n## Confidence\n0.5 {sep} ok\n## Signal\ndefault\n"
+    env = parse_markdown_envelope(md)
+    assert env.confidence == 0.5
+    assert env.confidence_rationale == "ok"
+
+
+def test_path5_synthesises_envelope_from_terminal_tool_args():
+    """gpt-oss:20b sometimes emits an empty closing AIMessage after
+    calling a terminal tool. Path 5 synthesises the envelope from
+    the tool's confidence + confidence_rationale args (mark_resolved
+    style)."""
+    from runtime.agents.turn_output import parse_envelope_from_result
+
+    def _ai_with_tool(name: str, args: dict, content: str = ""):
+        obj = type("AIMessage", (), {})()
+        obj.content = content
+        obj.tool_calls = [{"name": name, "args": args, "id": "t1"}]
+        return obj
+
+    def _ai_empty():
+        obj = type("AIMessage", (), {})()
+        obj.content = ""
+        obj.tool_calls = []
+        return obj
+
+    messages = [
+        _ai_with_tool(
+            "mark_resolved",
+            {
+                "incident_id": "INC-1",
+                "resolution_summary": "rolled back v1.120",
+                "confidence": 0.92,
+                "confidence_rationale": "deploy timeline correlates",
+            },
+        ),
+        _ai_empty(),  # empty closing message
+    ]
+    result = {"messages": messages, "structured_response": None}
+    env = parse_envelope_from_result(result, agent="resolution")
+    assert env.content == "rolled back v1.120"
+    assert env.confidence == 0.92
+    assert env.confidence_rationale == "deploy timeline correlates"
+
+
+def test_path5_synthesis_clamps_oob_confidence():
+    """Synthesis path also clamps out-of-range confidence."""
+    from runtime.agents.turn_output import parse_envelope_from_result
+
+    obj = type("AIMessage", (), {})()
+    obj.content = ""
+    obj.tool_calls = [{
+        "name": "mark_escalated",
+        "args": {
+            "team": "platform-oncall",
+            "reason": "needs human review",
+            "confidence": 1.5,
+            "confidence_rationale": "manual escalation",
+        },
+        "id": "t1",
+    }]
+    result = {"messages": [obj]}
+    env = parse_envelope_from_result(result, agent="resolution")
+    assert env.confidence == 1.0  # clamped
+    assert env.content == "needs human review"
+
+
+def test_path6_synthesises_minimal_envelope_from_any_tool_call():
+    """Path 6: when no markdown + no typed-terminal-tool-with-conf,
+    but the model DID call some tool, synthesise a low-confidence
+    placeholder envelope so the session reaches a reviewable terminal
+    status instead of hard-failing."""
+    from runtime.agents.turn_output import parse_envelope_from_result
+
+    obj = type("AIMessage", (), {})()
+    obj.content = ""
+    obj.tool_calls = [
+        {"name": "propose_fix", "args": {"hypothesis": "deploy regression"}, "id": "t1"},
+        {"name": "apply_fix", "args": {"proposal_id": "p1"}, "id": "t2"},
+    ]
+    closing = type("AIMessage", (), {})()
+    closing.content = ""
+    closing.tool_calls = []
+    result = {"messages": [obj, closing], "structured_response": None}
+    env = parse_envelope_from_result(result, agent="resolution")
+    assert env.confidence == 0.30
+    assert "propose_fix" in env.content
+    assert "apply_fix" in env.content
+    assert env.signal is None

@@ -31,4 +31,6 @@ Every reply MUST end with these three markdown sections, in this order, with the
 <one of: default | success | failed | needs_input>
 ```
 
-Tool calls happen BEFORE this block. Once you emit `## Response` you are done — no more tool calls. The framework parses these sections; missing sections are a hard error.
+**CRITICAL — final-reply rule:** After your last tool call returns, your NEXT reply IS the final reply. That reply MUST contain the three sections above as plain text — DO NOT emit an empty message, DO NOT emit only tool calls, DO NOT defer to "the framework handles it". The framework parses your final reply text; if it is empty or missing the section headers, the run fails with `envelope_missing`.
+
+Tool calls happen BEFORE the final reply. Once you have called every tool you need (including terminal tools like `mark_resolved` / `mark_escalated`), emit the three sections as your final response.

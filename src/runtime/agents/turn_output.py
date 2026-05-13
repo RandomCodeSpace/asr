@@ -93,7 +93,7 @@ _CONF_LINE = re.compile(
     # Leftmost float (allows int form), optional rationale after em-dash /
     # ASCII dash / hyphen separator. ``re.DOTALL`` so a multi-line rationale
     # is captured wholesale.
-    r"^\s*(-?[0-9]*\.?[0-9]+)\s*(?:[\u2014\-]+\s*(.*))?$",
+    r"^\s*(-?[0-9]*\.?[0-9]+)\s*(?:[\-\u2010\u2011\u2012\u2013\u2014\u2015]+\s*(.*))?$",
     re.DOTALL,
 )
 
@@ -284,9 +284,138 @@ def parse_envelope_from_result(
             continue
         break
 
-    # Path 5 (terminal): fail loudly. None of the four paths produced a
+    # Path 5 (D-22-fallback): some models (gpt-oss:20b in particular)
+    # treat a terminal-tool call as the completion and emit an empty
+    # closing AIMessage. Apps configure typed-terminal tools with
+    # ``confidence`` + ``confidence_rationale`` args by contract —
+    # synthesise an envelope from those args when the markdown path
+    # yielded nothing. Skip if any earlier path succeeded.
+    for msg in reversed(messages):
+        tcs = getattr(msg, "tool_calls", None)
+        if not tcs:
+            continue
+        for tc in tcs:
+            args = tc.get("args") or {}
+            if not isinstance(args, dict):
+                continue
+            conf = args.get("confidence")
+            rat = args.get("confidence_rationale") or args.get("rationale")
+            if conf is None or not rat:
+                continue
+            try:
+                conf_f = float(conf)
+            except (TypeError, ValueError):
+                continue
+            content_body = (
+                args.get("resolution_summary")
+                or args.get("reason")
+                or args.get("summary")
+                or f"terminal tool {tc.get('name', '<unknown>')} invoked"
+            )
+            if not isinstance(content_body, str) or not content_body.strip():
+                content_body = f"terminal tool {tc.get('name', '<unknown>')} invoked"
+            try:
+                env = AgentTurnOutput(
+                    content=content_body,
+                    confidence=max(0.0, min(1.0, conf_f)),
+                    confidence_rationale=str(rat),
+                    signal=args.get("signal"),
+                )
+            except ValidationError:
+                continue
+            _LOG.info(
+                "envelope_synthesized_from_tool_args agent=%s tool=%s "
+                "confidence=%.2f",
+                agent, tc.get("name"), env.confidence,
+            )
+            return env
+
+    # Path 6 (D-22-fallback-permissive): the model called at least one
+    # tool but never emitted the markdown contract or a typed-terminal
+    # tool with confidence args. Rather than hard-failing the run,
+    # synthesise a minimal envelope so the session reaches a terminal
+    # status (typically default_terminal_status -> needs_review) and
+    # the operator can review what happened. Confidence is intentionally
+    # low (0.30) so any HITL gate fires.
+    invoked_tool_names: list[str] = []
+    for msg in messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            n = tc.get("name")
+            if n:
+                invoked_tool_names.append(n)
+    if invoked_tool_names:
+        body = (
+            f"Agent {agent} invoked "
+            f"{', '.join(invoked_tool_names)} but did not emit a final "
+            f"summary. Review the tool-call audit for outcome."
+        )
+        try:
+            env = AgentTurnOutput(
+                content=body,
+                confidence=0.30,
+                confidence_rationale=(
+                    "synthesized: agent invoked tools but emitted no "
+                    "closing message"
+                ),
+                signal=None,
+            )
+            _LOG.warning(
+                "envelope_synthesized_permissive agent=%s tools=%s",
+                agent, invoked_tool_names,
+            )
+            return env
+        except ValidationError:
+            pass
+
+    # Path 7 (terminal): fail loudly. None of the six paths produced a
     # valid envelope — this is a real prompt-drift signal worth
-    # surfacing as a structured agent_run error.
+    # surfacing as a structured agent_run error. Log the last
+    # AIMessage content (capped) so operators can diagnose whether
+    # the LLM emitted the wrong shape vs nothing at all.
+    last_ai_content = ""
+    for msg in reversed(messages):
+        if msg.__class__.__name__ == "AIMessage":
+            c = getattr(msg, "content", None)
+            if isinstance(c, str):
+                last_ai_content = c
+                break
+    # Also dump every tool_call across all AIMessages so we can see
+    # whether the model called any tool with confidence args (Path 5
+    # would have fired) or whether it called a non-terminal tool only.
+    tool_call_summary = []
+    for msg in messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            args = tc.get("args") or {}
+            tool_call_summary.append({
+                "name": tc.get("name"),
+                "arg_keys": sorted(args.keys()) if isinstance(args, dict) else "?",
+                "has_confidence": isinstance(args, dict) and "confidence" in args,
+                "has_rationale": isinstance(args, dict) and (
+                    "confidence_rationale" in args or "rationale" in args
+                ),
+            })
+    # Detailed per-message dump so we can see exactly what shape the
+    # conversation took when the parse failed.
+    msg_summary = []
+    for m in messages:
+        kind = m.__class__.__name__
+        c = getattr(m, "content", None)
+        c_len = len(c) if isinstance(c, str) else (
+            f"list[{len(c)}]" if isinstance(c, list) else type(c).__name__
+        )
+        tcs = [tc.get("name") for tc in (getattr(m, "tool_calls", None) or [])]
+        msg_summary.append({"kind": kind, "content_len": c_len, "tool_calls": tcs})
+    _LOG.warning(
+        "envelope_missing: agent=%s last_ai_message_content=%r "
+        "structured_response_type=%s message_count=%d tool_calls=%r "
+        "msg_trace=%r",
+        agent,
+        last_ai_content[:1500] if last_ai_content else "<empty>",
+        type(result.get("structured_response")).__name__,
+        len(messages),
+        tool_call_summary,
+        msg_summary,
+    )
     raise EnvelopeMissingError(
         agent=agent,
         field="structured_response",
