@@ -166,12 +166,42 @@ async def test_get_session_detail_returns_row(cfg):
 
 @pytest.mark.asyncio
 async def test_get_retry_preview_404_for_unknown(cfg):
+    """An id that fails the SessionStore format check raises
+    ValueError ahead of ``preview_retry_decision``'s FileNotFoundError
+    branch, which the endpoint maps to 404."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         res = await client.get("/sessions/UNKNOWN/retry/preview")
     assert res.status_code == 404
     body = res.json()
     assert body["error"]["code"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_get_retry_preview_happy_path_returns_decision(cfg):
+    """Seed a session in ``status=error`` and assert preview returns
+    a typed RetryDecisionPreview."""
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        orch = app.state.orchestrator
+        inc = orch.store.create(
+            query="latency", environment="staging",
+            reporter_id="u", reporter_team="t",
+        )
+        inc.status = "error"
+        inc.extra_fields["retry_count"] = 0
+        orch.store.save(inc)
+        res = await client.get(f"/sessions/{inc.id}/retry/preview")
+    assert res.status_code == 200
+    body = res.json()
+    assert isinstance(body["retry"], bool)
+    assert isinstance(body["reason"], str)
+    # The framework's default policy with retry_count=0 + no error
+    # signal yields a recognised reason value.
+    assert body["reason"] in {
+        "auto_retry", "max_retries_exceeded", "permanent_error",
+        "low_confidence_no_retry", "transient_disabled",
+    }
 
 
 @pytest.mark.asyncio
@@ -306,6 +336,83 @@ def test_event_log_iter_for_since_filters_backlog(cfg):
         orch.event_log.record("SES-SKIP", "tool_invoked", tool="x")
         after = list(orch.event_log.iter_for("SES-SKIP", since=max_seq))
         assert [e.kind for e in after] == ["tool_invoked"]
+
+
+# ===================================================================
+# Resume + retry SSE happy paths — these exercise the full HTTP
+# round-trip on SSE endpoints that yield a finite event stream and
+# close naturally (resume / retry orchestrator generators terminate
+# when the underlying coroutine completes, unlike the open-ended
+# events stream whose poll loop is bounded by client-disconnect).
+# The events SSE wire format is covered by:
+#   * test_sse_events_replays_backlog (direct generator),
+#   * test_websocket_event_stream_replays_backlog (same envelope
+#     shape, real transport).
+# ===================================================================
+
+def test_post_resume_sse_returns_event_stream(cfg):
+    """POST /sessions/{sid}/resume returns text/event-stream and
+    produces at least one frame (event or structured error envelope —
+    the orchestrator may produce an error on an unresumable session,
+    which the handler maps to the structured envelope)."""
+    app = build_app(cfg)
+    with TestClient(app) as client:
+        orch = app.state.orchestrator
+        sid = _seed_resolved_session(orch, query="resume-target")
+        with client.stream(
+            "POST", f"/sessions/{sid}/resume",
+            json={"decision": "resume_with_input", "user_input": "go"},
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+            frame_payloads: list[dict] = []
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    frame_payloads.append(json.loads(line[len("data: "):]))
+                # Resume on an already-resolved session emits a small
+                # number of frames or a single error envelope; stop
+                # after first frame so the test never hangs on a tail
+                # poll.
+                if frame_payloads:
+                    break
+
+    assert len(frame_payloads) >= 1
+    f = frame_payloads[0]
+    # Either an orchestrator event ({event: ...}) or the structured
+    # error envelope when the session can't be resumed in this state.
+    assert isinstance(f, dict)
+
+
+def test_post_retry_sse_returns_event_stream(cfg):
+    """POST /sessions/{sid}/retry returns text/event-stream.
+    Mirrors the resume contract; the orchestrator's retry path
+    emits framed events the React client renders."""
+    app = build_app(cfg)
+    with TestClient(app) as client:
+        orch = app.state.orchestrator
+        # A session in error state is the realistic retry target;
+        # seed one so the handler exercises the orchestrator path.
+        inc = orch.store.create(
+            query="retry-target", environment="staging",
+            reporter_id="u", reporter_team="t",
+        )
+        inc.status = "error"
+        orch.store.save(inc)
+
+        with client.stream(
+            "POST", f"/sessions/{inc.id}/retry",
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+            frame_payloads: list[dict] = []
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    frame_payloads.append(json.loads(line[len("data: "):]))
+                if frame_payloads:
+                    break
+
+    assert len(frame_payloads) >= 1
+    assert isinstance(frame_payloads[0], dict)
 
 
 # ===================================================================
