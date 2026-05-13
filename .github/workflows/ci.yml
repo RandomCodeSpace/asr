@@ -72,9 +72,14 @@ jobs:
         # call live providers; values just need to exist. Live smoke
         # tests are gated separately by ``OLLAMA_LIVE=1``.
         env:
-          OLLAMA_API_KEY: ci-dummy
-          OPENROUTER_API_KEY: ci-dummy
-          AZURE_OPENAI_KEY: ci-dummy
+          # Empty API keys so live-provider smoke tests gated by
+          # ``if not os.environ.get(KEY)`` correctly skip. The
+          # ``_interpolate`` strict-mode check only requires the var
+          # to EXIST in the environment (any value, incl. empty).
+          OLLAMA_API_KEY: ""
+          OPENROUTER_API_KEY: ""
+          AZURE_OPENAI_KEY: ""
+          AZURE_DEPLOYMENT: ""
           AZURE_ENDPOINT: https://ci-dummy.example/
           EXTERNAL_MCP_URL: https://ci-dummy.example/
           EXT_TOKEN: ci-dummy
