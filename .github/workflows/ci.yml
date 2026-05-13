@@ -66,6 +66,18 @@ jobs:
         run: uv run pyright src/runtime
 
       - name: Test with coverage
+        # Dummy env vars satisfy the strict ``_interpolate`` check that
+        # config.yaml's ``${OLLAMA_API_KEY}`` / ``${OPENROUTER_API_KEY}``
+        # placeholders trigger when ``load_config()`` runs. Tests don't
+        # call live providers; values just need to exist. Live smoke
+        # tests are gated separately by ``OLLAMA_LIVE=1``.
+        env:
+          OLLAMA_API_KEY: ci-dummy
+          OPENROUTER_API_KEY: ci-dummy
+          AZURE_OPENAI_KEY: ci-dummy
+          AZURE_ENDPOINT: https://ci-dummy.example/
+          EXTERNAL_MCP_URL: https://ci-dummy.example/
+          EXT_TOKEN: ci-dummy
         run: uv run pytest --cov=src/runtime --cov-report=xml --junitxml=junit.xml
 
       - name: Skill-prompt-vs-schema lint (SKILL-LINTER-01)

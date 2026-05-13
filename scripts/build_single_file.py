@@ -274,8 +274,14 @@ def _read(path: Path) -> str:
 # top-level ``if TYPE_CHECKING:`` (no leading whitespace) because nested
 # guards are rare in this codebase and a wider rewrite risks corrupting
 # function-body conditionals.
+# NOTE: the inner alternation uses ``[ \t]*\n`` (NOT ``\s*\n``).
+# Using ``\s`` would let the inner pattern match the newline anchor
+# itself, making ``(\s*\n)*`` a textbook polynomial-backtracking
+# trap on long blank-line runs (CodeQL py/redos). ``[ \t]*\n``
+# matches exactly one blank-line per iteration with no overlap, so
+# the engine takes O(n).
 _ORPHANED_TYPE_CHECKING_RE = re.compile(
-    r"^if\s+TYPE_CHECKING\s*:\s*\n(\s*\n)*(?=\S)",
+    r"^if\s+TYPE_CHECKING\s*:\s*\n([ \t]*\n)*(?=\S)",
     re.MULTILINE,
 )
 

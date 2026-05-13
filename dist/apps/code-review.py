@@ -15133,7 +15133,19 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 async for ev in orch.resume_investigation(incident_id, decision):
                     yield f"data: {json.dumps(ev, default=str)}\n\n"
             except Exception as exc:  # noqa: BLE001
-                yield f"data: {json.dumps({'event': 'error', 'error': str(exc)}, default=str)}\n\n"
+                # CodeQL py/stack-trace-exposure: never serialise raw
+                # str(exc) into a client-bound stream — exception text
+                # can carry stack-trace-equivalent details (file paths,
+                # internal IDs). Use the exception class name + the
+                # structured envelope shape the rest of the API uses.
+                err = {
+                    "error": {
+                        "code": "resume_failed",
+                        "message": exc.__class__.__name__,
+                        "details": {},
+                    }
+                }
+                yield f"data: {json.dumps(err, default=str)}\n\n"
 
         return StreamingResponse(_events(), media_type="text/event-stream")
 
