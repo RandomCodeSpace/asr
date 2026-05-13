@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v6.7.0
         with:
           # Pin uv version for reproducible CI; bump deliberately when bumping locally.
           version: "0.11.7"
