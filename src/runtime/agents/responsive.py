@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
@@ -59,6 +59,7 @@ def make_agent_node(
     patch_tool_names: frozenset[str] = frozenset(),
     gate_policy: "GatePolicy | None" = None,
     event_log: "EventLog | None" = None,
+    checkpointer: Any = None,
 ):
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -80,7 +81,7 @@ def make_agent_node(
     # call time — both modules are fully imported before ``node()`` runs.
     from runtime.graph import (
         GraphState,
-        _ainvoke_with_retry,
+        _drive_agent_with_resume,
         _format_agent_input,
         _handle_agent_failure,
         _harvest_tool_calls_and_patches,
@@ -93,9 +94,18 @@ def make_agent_node(
     )
 
     async def node(state: GraphState) -> dict:
-        incident: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-        inc_id = incident.id
+        state_session: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        inc_id = state_session.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+        # Always reload from store at entry — outer Pregel checkpoints
+        # at step boundaries, not mid-node, so ``state["session"]`` is
+        # stale relative to DB when a HITL gate paused mid-step. See
+        # the same reload comment in ``runtime.graph.make_agent_node``
+        # for the full rationale.
+        try:
+            incident: Session = store.load(inc_id)
+        except FileNotFoundError:
+            incident = state_session
 
         # M3: emit agent_started telemetry before any work happens.
         if event_log is not None:
@@ -125,11 +135,21 @@ def make_agent_node(
         # change as graph.py:make_agent_node — drop response_format
         # so the loop terminates on natural React END, then parse the
         # final AIMessage via Path 4 in parse_envelope_from_result.
+        # The inner agent gets the orchestrator's checkpointer so a
+        # HITL pause inside ``interrupt()`` can be resumed via
+        # ``Command(resume=verdict)`` on a stable per-invocation
+        # thread id (see ``_drive_agent_with_resume`` in
+        # ``runtime.graph`` for the full rationale).
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
+            checkpointer=checkpointer,
         )
+        inner_thread_id = (
+            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+        )
+        inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
         # Phase 11 (FOC-04): reset per-turn confidence hint at the
         # start of each agent step so the gateway treats the first
@@ -140,9 +160,15 @@ def make_agent_node(
             pass
 
         try:
-            result = await _ainvoke_with_retry(
-                agent_executor,
-                {"messages": [HumanMessage(content=_format_agent_input(incident))]},
+            result = await _drive_agent_with_resume(
+                agent_executor=agent_executor,
+                inner_cfg=inner_cfg,
+                inner_has_checkpointer=checkpointer is not None,
+                initial_input={
+                    "messages": [
+                        HumanMessage(content=_format_agent_input(incident))
+                    ]
+                },
             )
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): HITL pause -- propagate up.

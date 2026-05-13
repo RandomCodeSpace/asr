@@ -74,7 +74,18 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                no new domain concept introduced (was missed in the Phase 12
 #                atomic commit; counted retroactively in the v1.2 follow-up
 #                that consolidates injection-path bug fixes).
-BASELINE_TOTAL = 154
+#   154 -> 156   HITL pause-resume fix for langgraph 1.x. Both
+#                ``runtime.graph.make_agent_node`` and
+#                ``runtime.agents.responsive.make_agent_node`` derive a
+#                per-invocation inner thread id of the form
+#                ``f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"``
+#                so the inner ``create_agent`` checkpointer can persist a
+#                paused tool across an outer Pregel pause and resume. The
+#                count uses the existing ``incident`` local (the runner's
+#                domain Session) on a structurally required code path —
+#                same pattern as the Phase 10/11/12 entries. Net +2
+#                ``incident`` token reuses, no new domain concept.
+BASELINE_TOTAL = 156
 
 
 def test_runtime_leaks_at_or_below_baseline():

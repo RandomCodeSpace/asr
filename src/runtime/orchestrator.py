@@ -1057,6 +1057,29 @@ class Orchestrator(Generic[StateT]):
         async with self._locks.acquire(session_id):
             return self._finalize_session_status(session_id)
 
+    async def _is_graph_paused(self, session_id: str) -> bool:
+        """Return True iff the compiled graph has a pending step waiting
+        to resume (i.e. it's paused at an ``interrupt()`` boundary).
+
+        langgraph 1.x surfaces a HITL pause via the result dict's
+        ``__interrupt__`` field rather than raising
+        :class:`GraphInterrupt`. After ``astream_events`` (or
+        ``ainvoke``) returns, the only way to tell "the run paused"
+        from "the run completed" is to query the checkpointed graph
+        state — a non-empty ``next`` tuple means the graph has steps
+        queued to run when resumed. The stream/retry call sites use
+        this to skip ``_finalize_session_status_async`` on a pause —
+        finalizing on a pause would stamp ``default_terminal_status``
+        on a session that's actually waiting on operator approval, and
+        the orphaned ``pending_approval`` ToolCall row written by the
+        gateway would never get its resume.
+        """
+        try:
+            state = await self.graph.aget_state(self._thread_config(session_id))
+        except Exception:  # noqa: BLE001 — defensive; missing checkpoint == not paused
+            return False
+        return bool(getattr(state, "next", ()) or ())
+
     def _thread_config(self, incident_id: str) -> dict:
         """Build the LangGraph ``config`` dict for a per-session thread.
 
@@ -1266,10 +1289,18 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(inc.id),
         ):
             yield self._to_ui_event(ev, inc.id)
-        new_status = await self._finalize_session_status_async(inc.id)
-        if new_status:
-            yield {"event": "status_auto_finalized", "incident_id": inc.id,
-                   "status": new_status, "ts": _event_ts()}
+        # Skip finalize when the graph paused on an interrupt — the
+        # session is waiting for operator approval, not done. Stamping
+        # default_terminal_status here would orphan the pending_approval
+        # ToolCall row written by the gateway just before the pause.
+        if await self._is_graph_paused(inc.id):
+            yield {"event": "session_paused", "incident_id": inc.id,
+                   "ts": _event_ts()}
+        else:
+            new_status = await self._finalize_session_status_async(inc.id)
+            if new_status:
+                yield {"event": "status_auto_finalized", "incident_id": inc.id,
+                       "status": new_status, "ts": _event_ts()}
         yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _event_ts()}
 
     async def stream_investigation(self, *, query: str, environment: str,
@@ -1542,10 +1573,17 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(session_id),
         ):
             yield self._to_ui_event(ev, session_id)
-        new_status = await self._finalize_session_status_async(session_id)
-        if new_status:
-            yield {"event": "status_auto_finalized", "incident_id": session_id,
-                   "status": new_status, "ts": _event_ts()}
+        # See ``stream_session`` for why pause-detection guards the
+        # finalize call: a HITL pause must not be coerced into a
+        # terminal status.
+        if await self._is_graph_paused(session_id):
+            yield {"event": "session_paused", "incident_id": session_id,
+                   "ts": _event_ts()}
+        else:
+            new_status = await self._finalize_session_status_async(session_id)
+            if new_status:
+                yield {"event": "status_auto_finalized", "incident_id": session_id,
+                       "status": new_status, "ts": _event_ts()}
         yield {"event": "retry_completed", "incident_id": session_id,
                "ts": _event_ts()}
 

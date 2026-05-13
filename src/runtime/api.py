@@ -621,6 +621,16 @@ def build_app(cfg: AppConfig) -> FastAPI:
                     Command(resume=decision_payload),
                     config=orch._thread_config(session_id),
                 )
+                # Finalize after the verdict-driven run completes so
+                # the session row reflects the terminal status (or
+                # falls through to ``default_terminal_status``). Skip
+                # if a fresh interrupt re-paused the graph — the
+                # session is again awaiting operator input. Mirrors
+                # the same guard in the UI's
+                # ``_submit_approval_via_service`` and the
+                # ``stream_session`` finalize call site.
+                if not await orch._is_graph_paused(session_id):
+                    await orch._finalize_session_status_async(session_id)
 
         # Submit the resume onto the long-lived service loop so we
         # don't fight the lifespan thread for the same FastMCP/SQLite

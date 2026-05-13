@@ -199,8 +199,104 @@ _TRANSIENT_MARKERS = (
 )
 
 
+async def _drive_agent_with_resume(
+    *,
+    agent_executor,
+    inner_cfg: dict,
+    inner_has_checkpointer: bool,
+    initial_input: dict,
+):
+    """Run an inner ``create_agent`` executor, surfacing HITL pauses to
+    the outer Pregel graph and forwarding resume verdicts back to the
+    inner agent.
+
+    langgraph 1.x changed the ``interrupt()`` contract: a tool that
+    calls :func:`langgraph.types.interrupt` no longer raises
+    :class:`GraphInterrupt` to the caller. Instead, the agent's
+    ``ainvoke`` returns normally with the pause captured in
+    ``result["__interrupt__"]``. To make HITL approval actually work
+    end-to-end the framework must:
+
+    1. **First call** — invoke the agent with the initial messages.
+       If the result carries ``__interrupt__``, raise
+       :class:`GraphInterrupt` so the *outer* Pregel pauses too. The
+       outer pause is what surfaces ``__interrupt__`` to the
+       orchestrator and lets the UI render Approve / Reject.
+
+    2. **Resume call** — when the outer is resumed via
+       ``Command(resume=verdict)``, this helper is re-entered. The
+       inner's checkpointer remembers the pause; we detect that via
+       ``aget_state(...).next`` being non-empty and call
+       :func:`langgraph.types.interrupt` at the *outer* level to fetch
+       the verdict, then forward it to the inner via
+       ``Command(resume=verdict)``. This is the only path that
+       actually re-runs the gated tool with the verdict — calling
+       ``inner.ainvoke({"messages": [...]})`` on a paused thread
+       silently skips the tool.
+
+    A while loop covers the case where a single agent turn pauses
+    multiple times (e.g. two high-risk tool calls in sequence).
+
+    When ``inner_has_checkpointer`` is False (legacy callers and most
+    unit tests that build agents without a checkpointer), the helper
+    falls back to the simple "invoke + re-raise on ``__interrupt__``"
+    contract. That path can pause the outer graph but the resume
+    verdict cannot reach the inner tool — which is acceptable because
+    legacy callers without a checkpointer never had a working HITL
+    resume path to begin with.
+    """
+    # Local imports keep callers that never touch HITL out of the
+    # langgraph.types import cost path. ``Command`` and ``interrupt``
+    # are tiny but the explicit lazy import documents the dependency.
+    from langgraph.types import Command, interrupt
+
+    # Resume-detection branch: only meaningful when the inner agent
+    # has its own checkpointer (otherwise ``aget_state`` on a fresh
+    # in-memory pregel raises). The detection asks: "does the inner
+    # have a paused step waiting?". A non-empty ``next`` means yes.
+    if inner_has_checkpointer:
+        try:
+            inner_state = await agent_executor.aget_state(inner_cfg)
+            inner_paused = bool(getattr(inner_state, "next", ()) or ())
+        except Exception:  # noqa: BLE001 — defensive; missing checkpoint == fresh
+            inner_paused = False
+    else:
+        inner_paused = False
+
+    if inner_paused:
+        # Outer is being resumed; pull the verdict via the outer's own
+        # interrupt() and forward it. The payload here is informational —
+        # the only thing the outer cares about is the resume value.
+        verdict = interrupt({"resume_inner_agent": inner_cfg["configurable"]["thread_id"]})
+        result = await _ainvoke_with_retry(
+            agent_executor, Command(resume=verdict), config=inner_cfg,
+        )
+    else:
+        result = await _ainvoke_with_retry(
+            agent_executor, initial_input, config=inner_cfg,
+        )
+
+    # Multi-pause loop: if the inner pauses again (or resumes into a
+    # second gated tool call), surface each pause to the outer the
+    # same way until the inner is fully done.
+    while isinstance(result, dict) and result.get("__interrupt__"):
+        if not inner_has_checkpointer:
+            # No checkpointer => no Command(resume=...) path is
+            # available; surface the pause to the outer Pregel and
+            # stop. Resume cannot deliver the verdict to the gated
+            # tool, but that matches legacy behavior.
+            raise GraphInterrupt(result["__interrupt__"])
+        verdict = interrupt(result["__interrupt__"])
+        result = await _ainvoke_with_retry(
+            agent_executor, Command(resume=verdict), config=inner_cfg,
+        )
+
+    return result
+
+
 async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
-                              base_delay: float = 1.5):
+                              base_delay: float = 1.5,
+                              config: dict | None = None):
     """Wrap a LangGraph agent invocation with retry on transient cloud errors.
 
     Retries on common Ollama Cloud / streaming hiccups (500, status -1, etc.).
@@ -218,6 +314,14 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
             # itself (AutoStrategy → ToolStrategy fallback for non-
             # function-calling Ollama models). The default langgraph
             # recursion bound is now a true upper bound, not a workaround.
+            #
+            # ``config`` (default ``None``) carries the per-thread
+            # ``configurable.thread_id`` for callers that need a
+            # checkpointer-scoped invocation (HITL resume path —
+            # see :func:`_drive_agent_with_resume`). Legacy callers
+            # pass nothing and the executor's default thread is used.
+            if config is not None:
+                return await executor.ainvoke(input_, config=config)
             return await executor.ainvoke(input_)
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): never retry a HITL pause.
@@ -550,6 +654,7 @@ def make_agent_node(
     injected_args: dict[str, str] | None = None,
     gate_policy: "GatePolicy | None" = None,
     event_log: "EventLog | None" = None,
+    checkpointer: Any = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -581,9 +686,22 @@ def make_agent_node(
     """
 
     async def node(state: GraphState) -> dict:
-        incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
-        inc_id = incident.id
+        state_session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
+        inc_id = state_session.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # Always reload from the persistent store at entry. Outer Pregel
+        # checkpoints at step boundaries, not mid-node — so on a HITL
+        # resume, ``state["session"]`` reflects the prior step's output
+        # (e.g. deep_investigator's), not the gateway's pending_approval
+        # row + version bump that happened mid-step in the original run.
+        # If we trust ``state["session"]`` here, the gateway sees no
+        # pending row, appends a duplicate, then ``store.save`` raises
+        # ``StaleVersionError`` because DB has already moved on.
+        try:
+            incident = store.load(inc_id)
+        except FileNotFoundError:
+            incident = state_session
 
         # M3 (per-step telemetry): emit agent_started.
         if event_log is not None:
@@ -694,11 +812,28 @@ def make_agent_node(
         # END interaction, recursion_limit ceilings). Markdown is the
         # native format every chat model writes well; the parse step
         # happens in the framework, where leniency is in our control.
+        # The inner agent gets a checkpointer so a HITL pause inside
+        # ``interrupt()`` can be resumed via ``Command(resume=verdict)``
+        # on the SAME inner thread. langgraph 1.x semantics require the
+        # checkpointer here — without it ``Command(resume=...)`` raises
+        # ``RuntimeError: Cannot use Command(resume=...) without
+        # checkpointer``. The thread id is derived deterministically
+        # from session + agent + the upcoming agent_run index so it is:
+        #   * STABLE across the inner pause and the outer resume that
+        #     follows (both observe the same ``len(incident.agents_run)``
+        #     because no new run is recorded mid-pause), and
+        #   * UNIQUE per agent invocation so previous invocations of the
+        #     same agent within the same session don't bleed in.
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
+            checkpointer=checkpointer,
         )
+        inner_thread_id = (
+            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+        )
+        inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
         # Phase 11 (FOC-04): reset per-turn confidence hint. The hint
         # is updated below after _harvest_tool_calls_and_patches; on
@@ -710,9 +845,15 @@ def make_agent_node(
             pass
 
         try:
-            result = await _ainvoke_with_retry(
-                agent_executor,
-                {"messages": [HumanMessage(content=_format_agent_input(incident))]},
+            result = await _drive_agent_with_resume(
+                agent_executor=agent_executor,
+                inner_cfg=inner_cfg,
+                inner_has_checkpointer=checkpointer is not None,
+                initial_input={
+                    "messages": [
+                        HumanMessage(content=_format_agent_input(incident))
+                    ]
+                },
             )
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): HITL pause is NOT an error.
@@ -1064,7 +1205,8 @@ def make_gate_node(
 
 def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
                        registry: ToolRegistry,
-                       event_log: "EventLog | None" = None) -> dict:
+                       event_log: "EventLog | None" = None,
+                       checkpointer: Any = None) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
 
     Dispatches on ``skill.kind``:
@@ -1142,6 +1284,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             injected_args=cfg.orchestrator.injected_args,
             gate_policy=gate_policy,
             event_log=event_log,
+            checkpointer=checkpointer,
         )
     return nodes
 
@@ -1247,7 +1390,8 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store,
-                                registry=registry, event_log=event_log)
+                                registry=registry, event_log=event_log,
+                                checkpointer=checkpointer)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
     sg.add_node("gate", make_gate_node(
