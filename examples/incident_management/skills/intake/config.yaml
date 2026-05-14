@@ -1,11 +1,12 @@
 description: Intake supervisor — framework similarity retrieval + ASR memory hydration; dispatches to triage
 kind: supervisor
-# M8: per-agent provider swap. Uncomment the line below to route this
-# agent through the Ollama Cloud gpt-oss model defined in
-# ``config/config.yaml``; the rest of the agents stay on the default
-# ``workhorse`` model. graph.py:_build_agent_nodes reads skill.model
-# and resolves it via the per-app LLMConfig.models registry.
-#   model: gpt_oss_cheap
+# v1.5-C (M8 proof point): per-agent provider swap. Intake runs through
+# the Ollama Cloud gpt-oss model defined in ``config/config.yaml``;
+# downstream agents follow the runtime ``llm.default``. The framework
+# resolves this via ``graph.py:_build_agent_nodes`` -> ``get_llm(cfg.llm,
+# skill.model, ...)`` which falls back to ``cfg.default`` when ``model``
+# is None. Comment this back out to force every agent onto the default.
+model: gpt_oss_cheap
 subordinates:
   - triage
 dispatch_strategy: rule
