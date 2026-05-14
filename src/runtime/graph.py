@@ -160,11 +160,11 @@ def route_from_skill(skill: Skill, signal: str) -> str:
 
 
 class AgentRunRecorder:
-    """Helper to capture an agent's run + tool calls into the incident."""
+    """Helper to capture an agent's run + tool calls into the session."""
 
-    def __init__(self, *, agent: str, incident: Session):
+    def __init__(self, *, agent: str, session: Session):
         self.agent = agent
-        self.incident = incident
+        self.session = session
         self._started_at: str | None = None
 
     def start(self) -> None:
@@ -172,13 +172,13 @@ class AgentRunRecorder:
 
     def record_tool_call(self, tool: str, args: dict, result) -> None:
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-        self.incident.tool_calls.append(
+        self.session.tool_calls.append(
             ToolCall(agent=self.agent, tool=tool, args=args, result=result, ts=ts)
         )
 
     def finish(self, *, summary: str) -> None:
         ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-        self.incident.agents_run.append(AgentRun(
+        self.session.agents_run.append(AgentRun(
             agent=self.agent,
             started_at=self._started_at or ended_at,
             ended_at=ended_at,
@@ -338,7 +338,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     raise last_exc or RuntimeError("retry exhausted with no attempts")  # pragma: no cover
 
 
-def _format_agent_input(incident: Session) -> str:
+def _format_agent_input(session: Session) -> str:
     """Build the human-message preamble each agent receives.
 
     Delegates to ``Session.to_agent_input`` so each app subclass owns the
@@ -346,7 +346,7 @@ def _format_agent_input(incident: Session) -> str:
     session id + status; ``IncidentState`` and ``CodeReviewState``
     override with their respective shapes.
     """
-    return incident.to_agent_input()
+    return session.to_agent_input()
 
 
 def _merge_patch_metadata(
@@ -420,7 +420,7 @@ def _harvest_patch_tool(
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
-    incident: Session,
+    session: Session,
     ts: str,
     valid_signals: frozenset[str] | None = None,
     terminal_tool_names: frozenset[str] = frozenset(),
@@ -463,7 +463,7 @@ def _harvest_tool_calls_and_patches(
             # colon; rsplit on the rightmost colon recovers the bare
             # tool name for both prefixed and unprefixed forms.
             tc_original = tc_name.rsplit(":", 1)[-1]
-            incident.tool_calls.append(ToolCall(
+            session.tool_calls.append(ToolCall(
                 agent=skill_name, tool=tc_name, args=tc_args,
                 result=None, ts=ts,
             ))
@@ -477,11 +477,11 @@ def _harvest_tool_calls_and_patches(
     return state
 
 
-def _pair_tool_responses(messages: list, incident: Session) -> None:
+def _pair_tool_responses(messages: list, session: Session) -> None:
     """Match ToolMessage responses back to their corresponding ToolCall entries."""
     for msg in messages:
         if msg.__class__.__name__ == "ToolMessage":
-            for entry in reversed(incident.tool_calls):
+            for entry in reversed(session.tool_calls):
                 if entry.tool == getattr(msg, "name", None) and entry.result is None:
                     entry.result = getattr(msg, "content", None)
                     break
@@ -586,18 +586,18 @@ def _handle_agent_failure(
     store: "SessionStore",
     fallback: "Session",
 ) -> dict:
-    """Reload incident (absorbing partial tool writes), stamp a failure AgentRun,
+    """Reload session (absorbing partial tool writes), stamp a failure AgentRun,
     persist, and return the error state dict for the LangGraph node.
 
-    ``fallback`` is the in-memory incident from the caller; we use it only
+    ``fallback`` is the in-memory session from the caller; we use it only
     when the on-disk state has gone missing (FileNotFoundError on reload).
     """
     try:
-        incident = store.load(inc_id)
+        session = store.load(inc_id)
     except FileNotFoundError:
-        incident = fallback
+        session = fallback
     ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-    incident.agents_run.append(AgentRun(
+    session.agents_run.append(AgentRun(
         agent=skill_name, started_at=started_at, ended_at=ended_at,
         summary=f"agent failed: {exc}",
         token_usage=TokenUsage(),
@@ -605,15 +605,15 @@ def _handle_agent_failure(
     # Mark the session as terminally failed so the UI can render a
     # retry control. The retry path (``Orchestrator.retry_session``)
     # is the only documented way to move out of this state.
-    incident.status = "error"
-    store.save(incident)
-    return {"session": incident, "next_route": None,
+    session.status = "error"
+    store.save(session)
+    return {"session": session, "next_route": None,
             "last_agent": skill_name, "error": str(exc)}
 
 
 def _record_success_run(
     *,
-    incident: "Session",
+    session: "Session",
     skill_name: str,
     started_at: str,
     final_text: str,
@@ -623,10 +623,10 @@ def _record_success_run(
     signal: str | None,
     store: "SessionStore",
 ) -> None:
-    """Append the success-path AgentRun, update the incident's running token
-    totals, and persist. Mutates ``incident`` in place."""
+    """Append the success-path AgentRun, update the session's running token
+    totals, and persist. Mutates ``session`` in place."""
     ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-    incident.agents_run.append(AgentRun(
+    session.agents_run.append(AgentRun(
         agent=skill_name, started_at=started_at, ended_at=ended_at,
         summary=final_text or f"{skill_name} completed",
         token_usage=usage,
@@ -634,10 +634,10 @@ def _record_success_run(
         confidence_rationale=rationale,
         signal=signal,
     ))
-    incident.token_usage.input_tokens += usage.input_tokens
-    incident.token_usage.output_tokens += usage.output_tokens
-    incident.token_usage.total_tokens += usage.total_tokens
-    store.save(incident)
+    session.token_usage.input_tokens += usage.input_tokens
+    session.token_usage.output_tokens += usage.output_tokens
+    session.token_usage.total_tokens += usage.total_tokens
+    store.save(session)
 
 
 def make_agent_node(
@@ -699,9 +699,9 @@ def make_agent_node(
         # pending row, appends a duplicate, then ``store.save`` raises
         # ``StaleVersionError`` because DB has already moved on.
         try:
-            incident = store.load(inc_id)
+            session = store.load(inc_id)
         except FileNotFoundError:
-            incident = state_session
+            session = state_session
 
         # M3 (per-step telemetry): emit agent_started.
         if event_log is not None:
@@ -746,7 +746,7 @@ def make_agent_node(
             # keys from ``accepted_params``, the inject step skips them,
             # and FastMCP rejects the call as missing required arg.
             run_tools = [
-                wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
+                wrap_tool(t, session=session, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
                           injected_args=injected_args or {},
                           gate_policy=gate_policy,
@@ -792,7 +792,7 @@ def make_agent_node(
                 )
 
             run_tools = [
-                _make_inject_only_wrapper(orig, vis, incident)
+                _make_inject_only_wrapper(orig, vis, session)
                 for orig, vis in zip(tools, visible_tools)
             ]
         else:
@@ -820,7 +820,7 @@ def make_agent_node(
         # checkpointer``. The thread id is derived deterministically
         # from session + agent + the upcoming agent_run index so it is:
         #   * STABLE across the inner pause and the outer resume that
-        #     follows (both observe the same ``len(incident.agents_run)``
+        #     follows (both observe the same ``len(session.agents_run)``
         #     because no new run is recorded mid-pause), and
         #   * UNIQUE per agent invocation so previous invocations of the
         #     same agent within the same session don't bleed in.
@@ -831,7 +831,7 @@ def make_agent_node(
             checkpointer=checkpointer,
         )
         inner_thread_id = (
-            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+            f"{inc_id}:agent:{skill.name}:turn{len(session.agents_run)}"
         )
         inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
@@ -840,7 +840,7 @@ def make_agent_node(
         # re-entry from a HITL pause the hint resets cleanly so a new
         # turn starts from "no signal yet" (None).
         try:
-            incident.turn_confidence_hint = None
+            session.turn_confidence_hint = None
         except (AttributeError, ValueError):
             pass
 
@@ -851,7 +851,7 @@ def make_agent_node(
                 inner_has_checkpointer=checkpointer is not None,
                 initial_input={
                     "messages": [
-                        HumanMessage(content=_format_agent_input(incident))
+                        HumanMessage(content=_format_agent_input(session))
                     ]
                 },
             )
@@ -895,19 +895,19 @@ def make_agent_node(
                 else:
                     return _handle_agent_failure(
                         skill_name=skill.name, started_at=started_at, exc=exc,
-                        inc_id=inc_id, store=store, fallback=incident,
+                        inc_id=inc_id, store=store, fallback=session,
                     )
             else:
                 return _handle_agent_failure(
                     skill_name=skill.name, started_at=started_at, exc=exc,
-                    inc_id=inc_id, store=store, fallback=incident,
+                    inc_id=inc_id, store=store, fallback=session,
                 )
 
         # Tools (e.g. registered patch tools) write straight to disk.
         # Reload so the node's own append of agent_run + tool_calls
         # happens against the tool-mutated state — otherwise saving
         # the stale in-memory object clobbers the tools' writes.
-        incident = store.load(inc_id)
+        session = store.load(inc_id)
 
         messages = result.get("messages", [])
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
@@ -915,7 +915,7 @@ def make_agent_node(
         # Record tool calls and harvest confidence/signal from configured
         # patch / typed-terminal tools.
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
-            messages, skill.name, incident, ts, valid_signals,
+            messages, skill.name, session, ts, valid_signals,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
@@ -923,12 +923,12 @@ def make_agent_node(
         # tool call sees the harvested confidence at the gateway.
         if agent_confidence is not None:
             try:
-                incident.turn_confidence_hint = agent_confidence
+                session.turn_confidence_hint = agent_confidence
             except (AttributeError, ValueError):
                 pass
 
         # Pair tool responses with their tool calls.
-        _pair_tool_responses(messages, incident)
+        _pair_tool_responses(messages, session)
 
         # Phase 10 (FOC-03 / D-10-03): parse the structural envelope and
         # reconcile its confidence against any typed-terminal-tool arg
@@ -939,7 +939,7 @@ def make_agent_node(
         except EnvelopeMissingError as exc:
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
+                inc_id=inc_id, store=store, fallback=session,
             )
 
         terminal_tool_for_log = _first_terminal_tool_called_this_turn(
@@ -976,12 +976,12 @@ def make_agent_node(
                 )
 
         _record_success_run(
-            incident=incident, skill_name=skill.name, started_at=started_at,
+            session=session, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
             confidence=final_confidence, rationale=final_rationale, signal=final_signal,
             store=store,
         )
-        next_route_signal = decide_route(incident)
+        next_route_signal = decide_route(session)
         next_node = route_from_skill(skill, next_route_signal)
 
         # M3: emit route_decided + agent_finished (carrying token_usage).
@@ -1010,7 +1010,7 @@ def make_agent_node(
                     "event_log.record(agent_finished) failed", exc_info=True,
                 )
 
-        return {"session": incident, "next_route": next_node,
+        return {"session": session, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
     return node
@@ -1057,7 +1057,7 @@ _DEFAULT_STUB_ENVELOPE_CONFIDENCE: dict[str, float] = {
 }
 
 
-def _latest_run_for(incident: Session, agent_name: str | None):
+def _latest_run_for(session: Session, agent_name: str | None):
     """Return the most recent ``AgentRun`` for ``agent_name``, or None.
 
     ``agent_name`` is whichever agent ran immediately before the gate,
@@ -1067,7 +1067,7 @@ def _latest_run_for(incident: Session, agent_name: str | None):
     """
     if not agent_name:
         return None
-    for run in reversed(incident.agents_run):
+    for run in reversed(session.agents_run):
         if run.agent == agent_name:
             return run
     return None
@@ -1129,7 +1129,7 @@ def make_gate_node(
         # value on subsequent executions of the same node.
         from langgraph.types import interrupt
 
-        incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
+        session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
         upstream = state.get("last_agent")
         # Capture the intended downstream target before we overwrite next_route.
         # The upstream agent set next_route to the gated target; we stash it in
@@ -1137,13 +1137,13 @@ def make_gate_node(
         intended_target = state.get("next_route")
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
-            incident = store.load(incident.id)
+            session = store.load(session.id)
         except FileNotFoundError:
             pass
-        upstream_run = _latest_run_for(incident, upstream)
+        upstream_run = _latest_run_for(session, upstream)
         upstream_conf = upstream_run.confidence if upstream_run else None
         if upstream_conf is None or upstream_conf < threshold:
-            incident.status = "awaiting_input"
+            session.status = "awaiting_input"
             # Surface the upstream agent's own summary + rationale so the
             # human reviewer can decide what input to give without scrolling
             # through every step of the agents-run log.
@@ -1158,13 +1158,13 @@ def make_gate_node(
                 "escalation_teams": teams,
                 "intended_target": intended_target,
             }
-            incident.pending_intervention = payload
+            session.pending_intervention = payload
             # CRITICAL ORDERING: persist the Session row BEFORE calling
             # ``interrupt()``. ``interrupt()`` raises ``GraphInterrupt`` on
             # first execution; if we reversed the order the UI (which
             # polls Session.pending_intervention) would never see the
             # pending state. See plan R4 / "Streamlit hand-off".
-            store.save(incident)
+            store.save(session)
             # First execution: this raises GraphInterrupt and the
             # checkpointer captures the paused state.
             # Resume: this returns the value supplied via
@@ -1187,17 +1187,17 @@ def make_gate_node(
                 if isinstance(raw, str) and raw.strip():
                     user_text = raw.strip()
             if user_text is not None:
-                incident.user_inputs.append(user_text)
-            incident.pending_intervention = None
-            incident.status = "in_progress"
-            store.save(incident)
-            return {"session": incident, "next_route": "default",
+                session.user_inputs.append(user_text)
+            session.pending_intervention = None
+            session.status = "in_progress"
+            store.save(session)
+            return {"session": session, "next_route": "default",
                     "gated_target": intended_target, "last_agent": "gate", "error": None}
         # Confidence met threshold — clear any stale intervention payload.
-        if incident.pending_intervention is not None:
-            incident.pending_intervention = None
-            store.save(incident)
-        return {"session": incident, "next_route": "default",
+        if session.pending_intervention is not None:
+            session.pending_intervention = None
+            store.save(session)
+        return {"session": session, "next_route": "default",
                 "gated_target": intended_target, "last_agent": "gate", "error": None}
 
     return gate

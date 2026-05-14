@@ -444,10 +444,10 @@ class OrchestratorService:
         through to app-specific MCP tools.
 
         ``submitter`` is a free-form dict the calling app interprets.
-        For incident-management it is ``{"id": "...", "team": "..."}``;
+        For the example incident-management app it is ``{"id": "...", "team": "..."}``;
         other apps can carry app-specific keys (e.g. code-review's
         ``{"id": "<github-username>", "pr_url": "..."}``). The framework
-        only projects ``id``/``team`` onto the row's reporter columns.
+        only projects ``id``/``team`` onto the row's submitter columns.
 
         Deprecated kwargs (coerced and warned):
           * ``environment`` -> ``state_overrides={"environment": ...}``

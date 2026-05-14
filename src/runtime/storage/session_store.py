@@ -9,7 +9,7 @@ vector write-through (``_persist_vector``, ``_add_vector``,
 The class is parametrised as ``Generic[StateT]`` and routes row
 hydration through ``self._state_cls(...)`` so apps can plug in their
 own ``Session`` subclass via ``RuntimeConfig.state_class``. The row
-schema remains incident-shaped, but unused fields are dropped via
+schema remains the row-level shape, but unused fields are dropped via
 Pydantic's default ``extra='ignore'`` when a narrower ``state_cls`` is
 supplied.
 """
@@ -112,7 +112,7 @@ class StaleVersionError(RuntimeError):
 
 
 class SessionStore(Generic[StateT]):
-    """Active session/incident lifecycle store, parametrised on ``StateT``.
+    """Active session lifecycle store, parametrised on ``StateT``.
 
     Owns CRUD on the row schema plus the vector write-through. Read-only
     similarity search lives in ``HistoryStore``.
@@ -231,7 +231,7 @@ class SessionStore(Generic[StateT]):
     def load(self, incident_id: str) -> StateT:
         if not _SESSION_ID_RE.match(incident_id):
             raise ValueError(
-                f"Invalid incident id {incident_id!r}; expected PREFIX-YYYYMMDD-NNN"
+                f"Invalid session id {incident_id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         with SqlSession(self.engine) as session:
             row = session.get(IncidentRow, incident_id)
@@ -239,40 +239,39 @@ class SessionStore(Generic[StateT]):
                 raise FileNotFoundError(incident_id)
             return self._row_to_incident(row)
 
-    def save(self, incident: StateT) -> None:
-        if not _SESSION_ID_RE.match(incident.id):
+    def save(self, session: StateT) -> None:
+        if not _SESSION_ID_RE.match(session.id):
             raise ValueError(
-                f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
+                f"Invalid session id {session.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         # ``_iso(_now())`` returns ``str`` here -- the input datetime is
         # never None -- but the helper's signature is the broader
         # ``Optional[str]``. ``or ""`` keeps pyright + the typed
         # ``Session.updated_at: str`` field consistent without changing
         # behaviour (real value is always present).
-        incident.updated_at = _iso(_now()) or ""
-        sess = incident  # local alias — avoids repeating the domain token in new code
-        expected_version = getattr(sess, "version", 1)
+        session.updated_at = _iso(_now()) or ""
+        expected_version = getattr(session, "version", 1)
         # Bump in-memory BEFORE building the row dict so the persisted
         # row reflects the new version.
-        sess.version = expected_version + 1
-        with SqlSession(self.engine) as session:
-            existing = session.get(IncidentRow, sess.id)
+        session.version = expected_version + 1
+        with SqlSession(self.engine) as db_session:
+            existing = db_session.get(IncidentRow, session.id)
             prior_text = _embed_source_from_row(existing) if existing is not None else ""
             if existing is not None and existing.version != expected_version:
                 # Roll back the in-memory bump so the caller can reload + retry.
-                sess.version = expected_version
+                session.version = expected_version
                 raise StaleVersionError(
-                    f"session {sess.id} version is {existing.version}, "
+                    f"session {session.id} version is {existing.version}, "
                     f"expected {expected_version}"
                 )
-            data = self._incident_to_row_dict(incident)
+            data = self._incident_to_row_dict(session)
             if existing is None:
-                session.add(IncidentRow(**data))
+                db_session.add(IncidentRow(**data))
             else:
                 for k, v in data.items():
                     setattr(existing, k, v)
-            session.commit()
-        self._refresh_vector(incident, prior_text=prior_text)
+            db_session.commit()
+        self._refresh_vector(session, prior_text=prior_text)
 
     def delete(self, incident_id: str) -> StateT:
         with SqlSession(self.engine) as session:
@@ -471,10 +470,10 @@ class SessionStore(Generic[StateT]):
 
         Fields are pulled from typed columns when the state class
         declares them; everything else is merged in from the
-        ``extra_fields`` JSON bag. ``reporter`` is reconstituted from
+        ``extra_fields`` JSON bag. The ``reporter`` field (when present) is reconstituted from
         the typed ``reporter_id`` / ``reporter_team`` columns *only* when
-        the state class has a ``reporter`` field — otherwise it's
-        omitted so apps without a reporter concept (code-review) don't
+        the state class declares it — otherwise it's
+        omitted so apps without that concept (code-review) don't
         receive an unexpected attribute.
         """
         model_fields = self._state_cls.model_fields

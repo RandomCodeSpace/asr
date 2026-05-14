@@ -134,7 +134,7 @@ class MCPConfig(BaseModel):
 
 
 class MetadataConfig(BaseModel):
-    """Relational store for incident metadata. SQLite (dev) or Postgres (prod)."""
+    """Relational store for session metadata. SQLite (dev) or Postgres (prod)."""
     url: str = "sqlite:///incidents/incidents.db"
     pool_size: int = 5      # postgres only; sqlite uses NullPool
     echo: bool = False

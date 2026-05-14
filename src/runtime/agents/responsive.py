@@ -103,9 +103,9 @@ def make_agent_node(
         # the same reload comment in ``runtime.graph.make_agent_node``
         # for the full rationale.
         try:
-            incident: Session = store.load(inc_id)
+            session: Session = store.load(inc_id)
         except FileNotFoundError:
-            incident = state_session
+            session = state_session
 
         # M3: emit agent_started telemetry before any work happens.
         if event_log is not None:
@@ -123,7 +123,7 @@ def make_agent_node(
         # live ``Session`` for this run.
         if gateway_cfg is not None:
             run_tools = [
-                wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
+                wrap_tool(t, session=session, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
                           gate_policy=gate_policy,
                           event_log=event_log)
@@ -147,7 +147,7 @@ def make_agent_node(
             checkpointer=checkpointer,
         )
         inner_thread_id = (
-            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+            f"{inc_id}:agent:{skill.name}:turn{len(session.agents_run)}"
         )
         inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
@@ -155,7 +155,7 @@ def make_agent_node(
         # start of each agent step so the gateway treats the first
         # tool call of the turn as "no signal yet".
         try:
-            incident.turn_confidence_hint = None
+            session.turn_confidence_hint = None
         except (AttributeError, ValueError):
             pass
 
@@ -166,7 +166,7 @@ def make_agent_node(
                 inner_has_checkpointer=checkpointer is not None,
                 initial_input={
                     "messages": [
-                        HumanMessage(content=_format_agent_input(incident))
+                        HumanMessage(content=_format_agent_input(session))
                     ]
                 },
             )
@@ -176,19 +176,19 @@ def make_agent_node(
         except Exception as exc:  # noqa: BLE001
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
+                inc_id=inc_id, store=store, fallback=session,
             )
 
         # Tools (e.g. registered patch tools) write straight to disk.
         # Reload so the node's own append of agent_run + tool_calls
         # happens against the tool-mutated state.
-        incident = store.load(inc_id)
+        session = store.load(inc_id)
 
         messages = result.get("messages", [])
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
-            messages, skill.name, incident, ts, valid_signals,
+            messages, skill.name, session, ts, valid_signals,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
@@ -196,10 +196,10 @@ def make_agent_node(
         # tool call sees the harvested confidence.
         if agent_confidence is not None:
             try:
-                incident.turn_confidence_hint = agent_confidence
+                session.turn_confidence_hint = agent_confidence
             except (AttributeError, ValueError):
                 pass
-        _pair_tool_responses(messages, incident)
+        _pair_tool_responses(messages, session)
 
         # Phase 10 (FOC-03 / D-10-03): parse envelope; reconcile against
         # any typed-terminal-tool-arg confidence. Envelope failure is a
@@ -209,7 +209,7 @@ def make_agent_node(
         except EnvelopeMissingError as exc:
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
+                inc_id=inc_id, store=store, fallback=session,
             )
 
         terminal_tool_for_log = _first_terminal_tool_called_this_turn(
@@ -245,13 +245,13 @@ def make_agent_node(
                 )
 
         _record_success_run(
-            incident=incident, skill_name=skill.name, started_at=started_at,
+            session=session, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
             confidence=final_confidence, rationale=final_rationale,
             signal=final_signal,
             store=store,
         )
-        next_route_signal = decide_route(incident)
+        next_route_signal = decide_route(session)
         next_node = route_from_skill(skill, next_route_signal)
 
         # M3: emit route_decided + agent_finished. agent_finished carries
@@ -282,7 +282,7 @@ def make_agent_node(
                     "event_log.record(agent_finished) failed", exc_info=True,
                 )
 
-        return {"session": incident, "next_route": next_node,
+        return {"session": session, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
     return node

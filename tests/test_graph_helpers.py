@@ -38,7 +38,7 @@ def test_recorder_appends_agent_run_and_tool_calls():
             "reporter": {"id": "u", "team": "t"},
         },
     )
-    rec = AgentRunRecorder(agent="intake", incident=inc)
+    rec = AgentRunRecorder(agent="intake", session=inc)
     rec.start()
     rec.record_tool_call("get_user_context", {"user_id": "u"}, {"team": "platform"})
     rec.finish(summary="created INC")

@@ -57,7 +57,7 @@ def _safe_eval(expr: str, ctx: dict[str, Any]) -> Any:
     return eval(code, {"__builtins__": {}}, ctx)  # noqa: S307 — AST-whitelisted
 
 
-def _ctx_for_session(incident: Session) -> dict[str, Any]:
+def _ctx_for_session(session: Session) -> dict[str, Any]:
     """Build the variable namespace dispatch-rule expressions see.
 
     Exposes the live session payload as ``session`` plus a few
@@ -66,7 +66,7 @@ def _ctx_for_session(incident: Session) -> dict[str, Any]:
     AST checker already restricts the language so we don't need to
     sandbox the namespace any further.
     """
-    payload = incident.model_dump()
+    payload = session.model_dump()
     return {
         "session": payload,
         "status": payload.get("status"),
@@ -112,7 +112,7 @@ def _llm_pick_target(
     *,
     skill: Skill,
     llm: BaseChatModel,
-    incident: Session,
+    session: Session,
 ) -> str:
     """One-shot LLM dispatch: ask the model to choose a subordinate.
 
@@ -127,7 +127,7 @@ def _llm_pick_target(
         f"Choose ONE of: {', '.join(skill.subordinates)}.\n"
         f"Reply with only the agent name."
     )
-    payload = json.dumps(incident.model_dump(), default=str)
+    payload = json.dumps(session.model_dump(), default=str)
     msgs = [
         SystemMessage(content=prompt),
         HumanMessage(content=payload),
@@ -154,7 +154,7 @@ def _llm_pick_target(
 def _rule_pick_target(
     *,
     skill: Skill,
-    incident: Session,
+    session: Session,
 ) -> tuple[str, str | None]:
     """Walk dispatch_rules in order; return (target, matched_when).
 
@@ -162,7 +162,7 @@ def _rule_pick_target(
     fallback case carries ``matched_when=None`` so the audit log can
     distinguish "default" from "rule X matched".
     """
-    ctx = _ctx_for_session(incident)
+    ctx = _ctx_for_session(session)
     for rule in skill.dispatch_rules:
         try:
             if bool(_safe_eval(rule.when, ctx)):
@@ -337,7 +337,7 @@ def make_supervisor_node(
 
         rule_matched: str | None = None
         if skill.dispatch_strategy == "rule":
-            target, rule_matched = _rule_pick_target(skill=skill, incident=sess)
+            target, rule_matched = _rule_pick_target(skill=skill, session=sess)
         else:  # "llm"
             if llm is None:
                 logger.warning(
@@ -346,7 +346,7 @@ def make_supervisor_node(
                 )
                 target = skill.subordinates[0]
             else:
-                target = _llm_pick_target(skill=skill, llm=llm, incident=sess)
+                target = _llm_pick_target(skill=skill, llm=llm, session=sess)
 
         # Audit: one structured log entry per dispatch.
         try:

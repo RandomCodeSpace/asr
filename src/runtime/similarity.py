@@ -1,4 +1,4 @@
-"""Similarity scoring for incident matching."""
+"""Similarity scoring for session matching."""
 from __future__ import annotations
 from typing import Protocol
 import re

@@ -5,7 +5,7 @@ Applications extend this via subclassing::
 
     class IncidentState(Session):
         environment: str
-        reporter: Reporter
+        submitter: Submitter
         ...
 
 ``Session`` deliberately contains *no* domain-specific fields. Adding one
@@ -124,7 +124,7 @@ class Session(BaseModel):
 
         Apps subclass ``Session`` and override this to surface the
         domain shape (``Incident X / Environment Y / Query Z`` for the
-        incident-management app, ``PR title / repo / diff stats`` for
+        example app, ``PR title / repo / diff stats`` for
         code review, etc.). The framework default keeps the prompt
         framework-agnostic — id + status only — so that any app that
         has not overridden the hook still gets a usable preamble.
@@ -156,7 +156,7 @@ class Session(BaseModel):
 
         ``prefix`` is supplied by ``SessionStore._next_id`` from
         ``FrameworkAppConfig.session_id_prefix`` so each app picks its
-        own namespace via plain config (e.g. ``INC`` for incident
+        own namespace via plain config (e.g. ``INC`` for the example incident
         management, ``REVIEW`` for code review, ``HR`` for HR cases,
         ...). Apps with truly bespoke id shapes can still override this
         classmethod on their ``Session`` subclass and ignore ``prefix``.
