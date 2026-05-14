@@ -58,10 +58,26 @@ ASR.md
 #   - DESIGN.md:         consolidated architecture + decision log.
 #   - AIRGAP_INSTALL.md: Phase 14 (HARD-02) air-gap install path.
 #   - DEVELOPMENT.md:    Phase 16 (BUNDLER-01) contributor workflow.
+#   - 00-…-11-…:         brownfield documentation set (per-topic).
+#   - adr/*.md:          Architecture Decision Records.
 docs/*
 !docs/DESIGN.md
 !docs/AIRGAP_INSTALL.md
 !docs/DEVELOPMENT.md
+!docs/00-project-overview.md
+!docs/01-local-setup.md
+!docs/02-architecture.md
+!docs/03-code-map.md
+!docs/04-main-flows.md
+!docs/05-configuration.md
+!docs/06-data-model.md
+!docs/07-integrations.md
+!docs/08-testing.md
+!docs/09-build-deploy-release.md
+!docs/10-known-risks-and-todos.md
+!docs/11-agent-handoff.md
+!docs/adr/
+!docs/adr/*.md
 REVIEW_*.md
 review_*.md
 .planning/
