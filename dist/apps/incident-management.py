@@ -6647,10 +6647,18 @@ class EnvelopeMissingError(Exception):
 
 _HEADER_SPLIT = re.compile(r"^#{2,}\s+(\w+)\s*$", re.MULTILINE)
 _CONF_LINE = re.compile(
-    # Leftmost float (allows int form), optional rationale after em-dash /
-    # ASCII dash / hyphen separator. ``re.DOTALL`` so a multi-line rationale
-    # is captured wholesale.
-    r"^\s*(-?[0-9]*\.?[0-9]+)\s*(?:[\-\u2010\u2011\u2012\u2013\u2014\u2015]+\s*(.*))?$",
+    # Leftmost float (also accepts ``.5`` and ``5.`` int-like forms), optional
+    # rationale after a dash from the full Pd block (em / en / hyphen / etc.).
+    # ``re.DOTALL`` so a multi-line rationale is captured wholesale.
+    #
+    # The number alternation ``(?:\d+\.?\d*|\.\d+)`` is intentionally split
+    # into two non-overlapping arms \u2014 Sonar's S5852 (regex DoS via
+    # backtracking) flags the equivalent ``[0-9]*\.?[0-9]+`` because the
+    # ``[0-9]*`` and ``[0-9]+`` arms can both match the same digit run and
+    # the engine has to try every split. The alternation here is determined
+    # by the leading character (digit vs dot), so there is exactly one
+    # match path per input.
+    r"^\s*(-?(?:\d+\.?\d*|\.\d+))\s*(?:[\-\u2010-\u2015]+\s*(.*))?$",
     re.DOTALL,
 )
 
@@ -7200,6 +7208,51 @@ def _evaluate_gate(
     return decision
 
 
+def _record_pending_resolution(
+    *,
+    session: Session,
+    pending_idx: int,
+    agent_name: str,
+    tool_name: str,
+    pending_args: dict,
+    pending_ts: str,
+    status: ToolStatus,
+    result: Any,
+    approver: str | None,
+    rationale: str | None,
+    store: "SessionStore | None",
+) -> None:
+    """Replace the ``pending_approval`` row at ``pending_idx`` with the
+    resolved row (``approved``/``rejected``/``timeout``) and persist
+    the change so the DB reflects the actual outcome.
+
+    Without the persist step, the DB row stays at ``pending_approval``
+    forever — the in-memory mutation is invisible to the UI's
+    ``_render_pending_approvals_block`` predicate (which polls from
+    DB), so the operator keeps seeing Approve / Reject buttons after
+    they've already approved or rejected.
+
+    Centralised here so the three transition branches in both ``_run``
+    and ``_arun`` share one implementation rather than carrying six
+    near-identical 12-line blocks. The dedup also keeps Sonar's
+    "new duplicated lines" metric below the project's quality gate.
+    """
+    session.tool_calls[pending_idx] = ToolCall(
+        agent=agent_name,
+        tool=tool_name,
+        args=pending_args,
+        result=result,
+        ts=pending_ts,
+        risk="high",
+        status=status,
+        approver=approver,
+        approved_at=_now_iso(),
+        approval_rationale=rationale,
+    )
+    if store is not None:
+        store.save(session)
+
+
 class _GatedToolMarker(BaseTool):
     """Marker base class so ``isinstance(t, _GatedToolMarker)`` identifies
     a tool that has already been wrapped by :func:`wrap_tool`. Used to
@@ -7479,25 +7532,15 @@ def wrap_tool(
                 )
                 verdict_str = str(verdict).lower()
                 if verdict_str == "reject":
-                    if pending_idx is not None:
-                        session.tool_calls[pending_idx] = ToolCall(
-                            agent=agent_name,
-                            tool=inner.name,
-                            args=pending_args,
-                            result={"rejected": True, "rationale": rationale},
-                            ts=pending_ts,
-                            risk="high",
-                            status="rejected",
-                            approver=approver,
-                            approved_at=_now_iso(),
-                            approval_rationale=rationale,
-                        )
-                        # Persist the status transition. Without this,
-                        # the DB row stays at ``pending_approval`` and
-                        # the UI keeps offering the buttons forever.
-                        if store is not None:
-                            store.save(session)
                     rejected_result = {"rejected": True, "rationale": rationale}
+                    if pending_idx is not None:
+                        _record_pending_resolution(
+                            session=session, pending_idx=pending_idx,
+                            agent_name=agent_name, tool_name=inner.name,
+                            pending_args=pending_args, pending_ts=pending_ts,
+                            status="rejected", result=rejected_result,
+                            approver=approver, rationale=rationale, store=store,
+                        )
                     _emit_invoked(
                         status="rejected", risk="high",
                         args_dict=pending_args, result=rejected_result,
@@ -7510,22 +7553,15 @@ def wrap_tool(
                     # downstream consumers (UI, retraining) can
                     # distinguish operator-initiated rejections from
                     # automatic timeouts.
-                    if pending_idx is not None:
-                        session.tool_calls[pending_idx] = ToolCall(
-                            agent=agent_name,
-                            tool=inner.name,
-                            args=pending_args,
-                            result={"timeout": True, "rationale": rationale},
-                            ts=pending_ts,
-                            risk="high",
-                            status="timeout",
-                            approver=approver,
-                            approved_at=_now_iso(),
-                            approval_rationale=rationale,
-                        )
-                        if store is not None:
-                            store.save(session)
                     timeout_result = {"timeout": True, "rationale": rationale}
+                    if pending_idx is not None:
+                        _record_pending_resolution(
+                            session=session, pending_idx=pending_idx,
+                            agent_name=agent_name, tool_name=inner.name,
+                            pending_args=pending_args, pending_ts=pending_ts,
+                            status="timeout", result=timeout_result,
+                            approver=approver, rationale=rationale, store=store,
+                        )
                     _emit_invoked(
                         status="timeout", risk="high",
                         args_dict=pending_args, result=timeout_result,
@@ -7535,20 +7571,13 @@ def wrap_tool(
                 # Approved -> run the tool, then update the audit row.
                 result = _sync_invoke_inner(kwargs if kwargs else args[0] if args else {})
                 if pending_idx is not None:
-                    session.tool_calls[pending_idx] = ToolCall(
-                        agent=agent_name,
-                        tool=inner.name,
-                        args=pending_args,
-                        result=result,
-                        ts=pending_ts,
-                        risk="high",
-                        status="approved",
-                        approver=approver,
-                        approved_at=_now_iso(),
-                        approval_rationale=rationale,
+                    _record_pending_resolution(
+                        session=session, pending_idx=pending_idx,
+                        agent_name=agent_name, tool_name=inner.name,
+                        pending_args=pending_args, pending_ts=pending_ts,
+                        status="approved", result=result,
+                        approver=approver, rationale=rationale, store=store,
                     )
-                    if store is not None:
-                        store.save(session)
                 _emit_invoked(
                     status="approved", risk="high",
                     args_dict=pending_args, result=result,
@@ -7666,25 +7695,15 @@ def wrap_tool(
                 )
                 verdict_str = str(verdict).lower()
                 if verdict_str == "reject":
-                    if pending_idx is not None:
-                        session.tool_calls[pending_idx] = ToolCall(
-                            agent=agent_name,
-                            tool=inner.name,
-                            args=pending_args,
-                            result={"rejected": True, "rationale": rationale},
-                            ts=pending_ts,
-                            risk="high",
-                            status="rejected",
-                            approver=approver,
-                            approved_at=_now_iso(),
-                            approval_rationale=rationale,
-                        )
-                        # Persist the status transition (mirror of the
-                        # sync path) so the DB row reflects the actual
-                        # outcome instead of staying at pending_approval.
-                        if store is not None:
-                            store.save(session)
                     rejected_result = {"rejected": True, "rationale": rationale}
+                    if pending_idx is not None:
+                        _record_pending_resolution(
+                            session=session, pending_idx=pending_idx,
+                            agent_name=agent_name, tool_name=inner.name,
+                            pending_args=pending_args, pending_ts=pending_ts,
+                            status="rejected", result=rejected_result,
+                            approver=approver, rationale=rationale, store=store,
+                        )
                     _emit_invoked(
                         status="rejected", risk="high",
                         args_dict=pending_args, result=rejected_result,
@@ -7692,22 +7711,15 @@ def wrap_tool(
                     )
                     return rejected_result
                 if verdict_str == "timeout":
-                    if pending_idx is not None:
-                        session.tool_calls[pending_idx] = ToolCall(
-                            agent=agent_name,
-                            tool=inner.name,
-                            args=pending_args,
-                            result={"timeout": True, "rationale": rationale},
-                            ts=pending_ts,
-                            risk="high",
-                            status="timeout",
-                            approver=approver,
-                            approved_at=_now_iso(),
-                            approval_rationale=rationale,
-                        )
-                        if store is not None:
-                            store.save(session)
                     timeout_result = {"timeout": True, "rationale": rationale}
+                    if pending_idx is not None:
+                        _record_pending_resolution(
+                            session=session, pending_idx=pending_idx,
+                            agent_name=agent_name, tool_name=inner.name,
+                            pending_args=pending_args, pending_ts=pending_ts,
+                            status="timeout", result=timeout_result,
+                            approver=approver, rationale=rationale, store=store,
+                        )
                     _emit_invoked(
                         status="timeout", risk="high",
                         args_dict=pending_args, result=timeout_result,
@@ -7716,20 +7728,13 @@ def wrap_tool(
                     return timeout_result
                 result = await inner.ainvoke(kwargs if kwargs else args[0] if args else {})
                 if pending_idx is not None:
-                    session.tool_calls[pending_idx] = ToolCall(
-                        agent=agent_name,
-                        tool=inner.name,
-                        args=pending_args,
-                        result=result,
-                        ts=pending_ts,
-                        risk="high",
-                        status="approved",
-                        approver=approver,
-                        approved_at=_now_iso(),
-                        approval_rationale=rationale,
+                    _record_pending_resolution(
+                        session=session, pending_idx=pending_idx,
+                        agent_name=agent_name, tool_name=inner.name,
+                        pending_args=pending_args, pending_ts=pending_ts,
+                        status="approved", result=result,
+                        approver=approver, rationale=rationale, store=store,
                     )
-                    if store is not None:
-                        store.save(session)
                 _emit_invoked(
                     status="approved", risk="high",
                     args_dict=pending_args, result=result,
