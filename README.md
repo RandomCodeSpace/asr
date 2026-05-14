@@ -1,5 +1,15 @@
 # ASR — Multi-Agent Runtime Framework
 
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-1.x-orange?style=for-the-badge)](https://github.com/langchain-ai/langgraph)
+[![FastMCP](https://img.shields.io/badge/FastMCP-2.x-purple?style=for-the-badge)](https://github.com/jlowin/fastmcp)
+[![CI](https://img.shields.io/github/actions/workflow/status/RandomCodeSpace/asr/ci.yml?branch=main&style=for-the-badge&logo=github)](https://github.com/RandomCodeSpace/asr/actions/workflows/ci.yml)
+[![Quality Gate](https://img.shields.io/sonar/quality_gate/RandomCodeSpace_asr?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/project/overview?id=RandomCodeSpace_asr)
+[![Coverage](https://img.shields.io/sonar/coverage/RandomCodeSpace_asr?server=https%3A%2F%2Fsonarcloud.io&style=for-the-badge&logo=sonarcloud)](https://sonarcloud.io/component_measures?id=RandomCodeSpace_asr&metric=coverage)
+[![Tests](https://img.shields.io/badge/tests-1265%20passing-brightgreen?style=for-the-badge)](https://github.com/RandomCodeSpace/asr/actions)
+[![Ruff](https://img.shields.io/badge/lint-ruff-261230?style=for-the-badge&logo=ruff)](https://github.com/astral-sh/ruff)
+[![Pyright](https://img.shields.io/badge/types-pyright-yellow?style=for-the-badge)](https://github.com/microsoft/pyright)
+
 Python multi-agent runtime built on **LangGraph** (orchestration) +
 **FastMCP** (tool dispatch), with HITL gate, markdown turn-output
 contract, and a single-file deploy bundle for air-gapped corporate
