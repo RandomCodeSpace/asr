@@ -1691,6 +1691,15 @@ class LLMConfig(BaseModel):
     models: dict[str, ModelConfig] = Field(
         default_factory=lambda: {
             "stub_default": ModelConfig(provider="stub", model="stub-1"),
+            # Aliases for the example apps' per-agent model overrides
+            # (e.g. incident_management's intake skill carries
+            # ``model: gpt_oss_cheap`` for the v1.5-C / M8 proof point).
+            # Tests + ``LLMConfig.stub()`` callers route them to the
+            # same stub provider so the skill validator passes without
+            # forcing every test to re-declare the registry.
+            "gpt_oss": ModelConfig(provider="stub", model="stub-1"),
+            "gpt_oss_cheap": ModelConfig(provider="stub", model="stub-1"),
+            "workhorse": ModelConfig(provider="stub", model="stub-1"),
         }
     )
     embedding: EmbeddingConfig | None = None
