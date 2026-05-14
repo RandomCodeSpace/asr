@@ -90,10 +90,18 @@ class EnvelopeMissingError(Exception):
 
 _HEADER_SPLIT = re.compile(r"^#{2,}\s+(\w+)\s*$", re.MULTILINE)
 _CONF_LINE = re.compile(
-    # Leftmost float (allows int form), optional rationale after em-dash /
-    # ASCII dash / hyphen separator. ``re.DOTALL`` so a multi-line rationale
-    # is captured wholesale.
-    r"^\s*(-?[0-9]*\.?[0-9]+)\s*(?:[\-\u2010\u2011\u2012\u2013\u2014\u2015]+\s*(.*))?$",
+    # Leftmost float (also accepts ``.5`` and ``5.`` int-like forms), optional
+    # rationale after a dash from the full Pd block (em / en / hyphen / etc.).
+    # ``re.DOTALL`` so a multi-line rationale is captured wholesale.
+    #
+    # The number alternation ``(?:\d+\.?\d*|\.\d+)`` is intentionally split
+    # into two non-overlapping arms \u2014 Sonar's S5852 (regex DoS via
+    # backtracking) flags the equivalent ``[0-9]*\.?[0-9]+`` because the
+    # ``[0-9]*`` and ``[0-9]+`` arms can both match the same digit run and
+    # the engine has to try every split. The alternation here is determined
+    # by the leading character (digit vs dot), so there is exactly one
+    # match path per input.
+    r"^\s*(-?(?:\d+\.?\d*|\.\d+))\s*(?:[\-\u2010-\u2015]+\s*(.*))?$",
     re.DOTALL,
 )
 
