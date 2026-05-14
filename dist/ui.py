@@ -29,21 +29,6 @@ import asyncio
 import logging as _logging
 import os
 import time
-
-# Optional: env-driven log config so manual runs (streamlit run, etc.)
-# can crank verbosity to INFO/DEBUG without modifying the source. The
-# default keeps the production-quiet WARNING level.
-
-
-# ====== module: src/runtime/ui.py ======
-
-_log_level = os.environ.get("ASR_LOG_LEVEL", "").upper().strip()
-if _log_level in {"DEBUG", "INFO", "WARNING", "ERROR"}:
-    _logging.basicConfig(
-        level=getattr(_logging, _log_level),
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        force=True,
-    )
 from datetime import datetime, timezone
 from pathlib import Path
 import streamlit as st
@@ -54,6 +39,27 @@ import streamlit as st
 
 
 
+
+
+# Optional: env-driven log config so manual runs (streamlit run, etc.)
+# can crank verbosity to INFO/DEBUG without modifying the source. The
+# default keeps the production-quiet WARNING level. ``force=True``
+# overrides any handler streamlit set up during import.
+
+
+# ====== module: src/runtime/ui.py ======
+
+def _maybe_configure_logging() -> None:
+    level = os.environ.get("ASR_LOG_LEVEL", "").upper().strip()
+    if level in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        _logging.basicConfig(
+            level=getattr(_logging, level),
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+            force=True,
+        )
+
+
+_maybe_configure_logging()
 
 
 # Default config path; apps override via the ``APP_CONFIG`` env var.
