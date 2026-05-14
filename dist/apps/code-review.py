@@ -6634,21 +6634,65 @@ class EnvelopeMissingError(Exception):
 
 
 _HEADER_SPLIT = re.compile(r"^#{2,}\s+(\w+)\s*$", re.MULTILINE)
-_CONF_LINE = re.compile(
-    # Leftmost float (also accepts ``.5`` and ``5.`` int-like forms), optional
-    # rationale after a dash from the full Pd block (em / en / hyphen / etc.).
-    # ``re.DOTALL`` so a multi-line rationale is captured wholesale.
-    #
-    # The number alternation ``(?:\d+\.?\d*|\.\d+)`` is intentionally split
-    # into two non-overlapping arms \u2014 Sonar's S5852 (regex DoS via
-    # backtracking) flags the equivalent ``[0-9]*\.?[0-9]+`` because the
-    # ``[0-9]*`` and ``[0-9]+`` arms can both match the same digit run and
-    # the engine has to try every split. The alternation here is determined
-    # by the leading character (digit vs dot), so there is exactly one
-    # match path per input.
-    r"^\s*(-?(?:\d+\.?\d*|\.\d+))\s*(?:[\-\u2010-\u2015]+\s*(.*))?$",
-    re.DOTALL,
-)
+
+# Dash separators between the confidence number and its rationale \u2014
+# accept the full Pd block so gpt-oss's preferred EN DASH (\u2013) and
+# the spec's EM DASH (\u2014) both parse, plus the ASCII hyphen.
+_DASH_CHARS = frozenset("\u2010\u2011\u2012\u2013\u2014\u2015-")
+
+
+def _parse_confidence_line(raw: str) -> tuple[float, str] | None:
+    """Procedural confidence-line parser. Returns ``(value, rationale)`` on
+    success, ``None`` on shape mismatch.
+
+    Replaces an earlier regex implementation that Sonar's S5852 flagged
+    as polynomial-time backtracking-vulnerable. A linear scan over the
+    leading whitespace + number + optional dash-prefixed rationale has
+    no backtracking surface to attack.
+
+    Accepted shapes (on the first non-empty line of the section body):
+      * ``"0.85"``
+      * ``"0.85 \u2014 rationale"`` (or ASCII ``--`` / ``-`` / any Pd dash)
+      * ``"-0.5 - rationale"``
+      * ``"1"`` / ``"1."`` / ``".5"``
+    """
+    body = raw.lstrip()
+    if not body:
+        return None
+
+    # Pull the leading number token: optional minus, then any combination
+    # of digits and at most one dot. Stop at the first character that
+    # cannot be part of a number.
+    pos = 0
+    if body[pos] == "-":
+        pos += 1
+    num_start = pos
+    saw_dot = False
+    saw_digit = False
+    while pos < len(body):
+        ch = body[pos]
+        if ch.isdigit():
+            saw_digit = True
+            pos += 1
+            continue
+        if ch == "." and not saw_dot:
+            saw_dot = True
+            pos += 1
+            continue
+        break
+    if not saw_digit:
+        return None
+    try:
+        value = float(body[: pos] if pos > num_start else "0")
+    except ValueError:
+        return None
+
+    # Skip whitespace + dash-cluster + whitespace before the rationale.
+    rest = body[pos:].lstrip()
+    while rest and rest[0] in _DASH_CHARS:
+        rest = rest[1:]
+    rationale = rest.lstrip()
+    return value, rationale
 
 
 def _clamp_unit(x: float) -> float:
@@ -6712,8 +6756,8 @@ def parse_markdown_envelope(
             ),
         )
 
-    m = _CONF_LINE.match(raw_conf)
-    if not m:
+    parsed = _parse_confidence_line(raw_conf)
+    if parsed is None:
         raise EnvelopeMissingError(
             agent=agent, field="confidence",
             message=(
@@ -6721,17 +6765,8 @@ def parse_markdown_envelope(
                 f"(agent={agent!r}, raw={raw_conf!r})"
             ),
         )
-    try:
-        conf_value = _clamp_unit(float(m.group(1)))
-    except (TypeError, ValueError) as exc:
-        raise EnvelopeMissingError(
-            agent=agent, field="confidence",
-            message=(
-                f"envelope_missing: confidence value not a float "
-                f"(agent={agent!r}, raw={raw_conf!r})"
-            ),
-        ) from exc
-    rationale = (m.group(2) or "").strip() or "(no rationale provided)"
+    conf_value = _clamp_unit(parsed[0])
+    rationale = parsed[1].strip() or "(no rationale provided)"
 
     signal_raw = sections.get("signal", "").strip().lower() or None
     if signal_raw in {"none", "null", "", "n/a"}:
