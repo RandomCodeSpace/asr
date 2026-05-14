@@ -50,17 +50,9 @@ from runtime.storage.session_store import SessionStore
 _OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 _OLLAMA_KEY = os.environ.get("OLLAMA_API_KEY")
 _OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL")
-
-
-pytestmark = pytest.mark.skipif(
-    not (_OPENROUTER_KEY and _OLLAMA_KEY and _OLLAMA_BASE_URL),
-    reason=(
-        "Phase 15 integration driver S1 requires live LLM access. "
-        "Set OPENROUTER_API_KEY + OLLAMA_API_KEY + OLLAMA_BASE_URL to "
-        "exercise. See .planning/phases/15-real-llm-tool-loop-termination/"
-        "15-VERIFICATION.md for the manual run procedure."
-    ),
-)
+_AZURE_KEY = os.environ.get("AZURE_OPENAI_KEY")
+_AZURE_ENDPOINT = os.environ.get("AZURE_ENDPOINT")
+_AZURE_DEPLOYMENT = os.environ.get("AZURE_DEPLOYMENT", "gpt-4o")
 
 
 def _make_repo(tmp_path: Path) -> SessionStore:
@@ -74,40 +66,89 @@ def _make_repo(tmp_path: Path) -> SessionStore:
 
 
 def _build_llm_cfg() -> LLMConfig:
-    """Two providers + two named models — what ``get_llm`` consumes."""
-    return LLMConfig(
-        default="workhorse",
-        providers={
-            "openrouter": ProviderConfig(
-                kind="openai_compat",
-                base_url="https://openrouter.ai/api/v1",
-                api_key=_OPENROUTER_KEY,
-            ),
-            "ollama": ProviderConfig(
-                kind="ollama",
-                base_url=_OLLAMA_BASE_URL,
-                api_key=_OLLAMA_KEY,
-            ),
-        },
-        models={
-            "workhorse": ModelConfig(
-                provider="openrouter", model="openai/gpt-4o-mini",
-            ),
-            "local": ModelConfig(provider="ollama", model="gpt-oss:20b"),
-        },
-    )
+    """Three providers + three named models — what ``get_llm`` consumes.
+
+    OpenRouter, Ollama Cloud, and Azure OpenAI are each declared. The
+    parametrize arms below skip per-leg if the corresponding key is
+    missing, so a partial-key environment exercises whichever
+    providers it can reach.
+    """
+    providers: dict = {}
+    models: dict = {}
+    if _OPENROUTER_KEY:
+        providers["openrouter"] = ProviderConfig(
+            kind="openai_compat",
+            base_url="https://openrouter.ai/api/v1",
+            api_key=_OPENROUTER_KEY,
+        )
+        models["workhorse"] = ModelConfig(
+            provider="openrouter", model="openai/gpt-4o-mini",
+        )
+    if _OLLAMA_KEY and _OLLAMA_BASE_URL:
+        providers["ollama"] = ProviderConfig(
+            kind="ollama",
+            base_url=_OLLAMA_BASE_URL,
+            api_key=_OLLAMA_KEY,
+        )
+        models["local"] = ModelConfig(provider="ollama", model="gpt-oss:20b")
+    if _AZURE_KEY and _AZURE_ENDPOINT:
+        providers["azure"] = ProviderConfig(
+            kind="azure_openai",
+            endpoint=_AZURE_ENDPOINT,
+            api_version="2024-08-01-preview",
+            api_key=_AZURE_KEY,
+        )
+        models["azure"] = ModelConfig(
+            provider="azure", model="gpt-4o", deployment=_AZURE_DEPLOYMENT,
+        )
+    if not models:
+        # Fallback so the LLMConfig validator (which requires the
+        # default to exist in models) passes when the test is being
+        # collected but every provider is keyless. The actual test
+        # invocations are then skipped per-arm.
+        from runtime.config import ProviderConfig as _PC, ModelConfig as _MC
+        providers["stub"] = _PC(kind="stub")
+        models["stub_default"] = _MC(provider="stub", model="stub-1")
+        default = "stub_default"
+    else:
+        # Pick whichever model is available, in priority order.
+        default = next(
+            (m for m in ("local", "workhorse", "azure") if m in models),
+            next(iter(models)),
+        )
+    return LLMConfig(default=default, providers=providers, models=models)
+
+
+_PER_MODEL_SKIP_REASON = {
+    "workhorse": (
+        "OPENROUTER_API_KEY not set — set it to exercise the OpenAI-compatible leg",
+        lambda: not _OPENROUTER_KEY,
+    ),
+    "local": (
+        "OLLAMA_API_KEY + OLLAMA_BASE_URL not set — set both to exercise the Ollama leg",
+        lambda: not (_OLLAMA_KEY and _OLLAMA_BASE_URL),
+    ),
+    "azure": (
+        "AZURE_OPENAI_KEY + AZURE_ENDPOINT not set — set both to exercise the Azure leg",
+        lambda: not (_AZURE_KEY and _AZURE_ENDPOINT),
+    ),
+}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", ["workhorse", "local"])
+@pytest.mark.parametrize("model_name", ["workhorse", "local", "azure"])
 async def test_integration_driver_s1_terminal_state(tmp_path, model_name):
-    """S1: agent_node reaches a terminal state across providers.
+    """S1: agent_node reaches a terminal state across live providers.
 
-    This is the live-LLM analogue of the stub-mode termination tests.
-    A failure here means the migration regressed for at least one
-    provider; rerun with ``--log-cli-level=DEBUG`` to capture the
-    full message sequence for diagnosis.
+    Parametrize arms (``workhorse`` / ``local`` / ``azure``) cover the
+    three production provider kinds. Each arm skips independently if
+    its keys are absent — partial-key environments still exercise
+    whichever providers they can reach.
     """
+    skip_reason, predicate = _PER_MODEL_SKIP_REASON[model_name]
+    if predicate():
+        pytest.skip(skip_reason)
+
     cfg = _build_llm_cfg()
     llm = get_llm(cfg, model_name)
 
@@ -122,9 +163,27 @@ async def test_integration_driver_s1_terminal_state(tmp_path, model_name):
         name="responder",
         description="Brief responder skill for integration test.",
         routes=[RouteRule(when="default", next="__end__")],
+        # Phase 22 contract: every reply MUST end with the markdown
+        # envelope so the framework's parse_envelope_from_result Path 4
+        # can lift confidence + signal. Without this prompt the live
+        # LLM emits plain prose, hits no tool / no envelope, and Path
+        # 7 (terminal) raises EnvelopeMissingError. Mirror of the
+        # contract documented in
+        # ``examples/incident_management/skills/*/system.md``.
         system_prompt=(
             "You are a concise assistant. Respond to the user's prompt "
-            "in one sentence. Do not invoke any tools."
+            "in one sentence. Do not invoke any tools.\n\n"
+            "## Output contract — REQUIRED\n"
+            "Every final reply MUST end with these three sections, in"
+            " order, each preceded by a level-2 markdown header:\n"
+            "  ## Response\n"
+            "  <one-sentence reply>\n"
+            "  ## Confidence\n"
+            "  <0.0-1.0 float> -- <one-line rationale>\n"
+            "  ## Signal\n"
+            "  none\n"
+            "**CRITICAL — final-reply rule:** the markdown envelope is"
+            " mandatory; the framework hard-fails if it is missing."
         ),
     )
     node = make_agent_node(
