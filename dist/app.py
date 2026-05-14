@@ -9573,6 +9573,26 @@ _TRANSIENT_MARKERS = (
     "connection reset",
 )
 
+# 429 markers are kept separate from ``_TRANSIENT_MARKERS`` so the
+# retry loop can apply a longer backoff. Free / shared upstream models
+# (e.g. OpenRouter ``…:free`` tier) throttle on short windows that
+# need 30-60s recovery — the 5xx default backoff (1.5s/3s/4.5s) is
+# too aggressive and exhausts retries before the window clears.
+# ``" 429"`` (with leading space) and ``"429 "`` cover bare-number
+# error strings (e.g. "Provider returned 429"), with the spaces
+# guarding against false positives on other 4-digit numbers like 1429.
+_RATE_LIMIT_MARKERS = (
+    "status code: 429",
+    "error code: 429",
+    " 429",
+    "429 ",
+    "ratelimiterror",
+    "rate limited",
+    "rate-limited",
+    "rate limit",
+    "too many requests",
+)
+
 
 async def _drive_agent_with_resume(
     *,
@@ -9671,11 +9691,22 @@ async def _drive_agent_with_resume(
 
 async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
                               base_delay: float = 1.5,
+                              rate_limit_base_delay: float = 7.5,
                               config: dict | None = None):
     """Wrap a LangGraph agent invocation with retry on transient cloud errors.
 
-    Retries on common Ollama Cloud / streaming hiccups (500, status -1, etc.).
-    Non-transient exceptions (4xx, validation, etc.) propagate immediately.
+    Two backoff regimes:
+
+    * 5xx / connection-reset / streaming hiccups → ``base_delay``
+      (1.5s/3s/4.5s for 3 attempts) — these usually clear within a
+      few seconds.
+    * 429 rate-limit responses → ``rate_limit_base_delay`` (7.5s/15s
+      /22.5s) — free / shared upstream tiers (e.g. OpenRouter
+      ``…:free`` models) throttle on short windows that need
+      30-60s to clear.
+
+    Non-transient exceptions (4xx other than 429, validation, schema
+    drift, etc.) propagate immediately.
     """
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
@@ -9705,11 +9736,13 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
             raise
         except Exception as exc:  # noqa: BLE001
             msg = str(exc).lower()
-            transient = any(m in msg for m in _TRANSIENT_MARKERS)
-            if not transient or attempt == max_attempts - 1:
+            is_5xx = any(m in msg for m in _TRANSIENT_MARKERS)
+            is_429 = any(m in msg for m in _RATE_LIMIT_MARKERS)
+            if not (is_5xx or is_429) or attempt == max_attempts - 1:
                 raise
             last_exc = exc
-            await asyncio.sleep(base_delay * (attempt + 1))
+            delay = (rate_limit_base_delay if is_429 else base_delay)
+            await asyncio.sleep(delay * (attempt + 1))
     raise last_exc or RuntimeError("retry exhausted with no attempts")  # pragma: no cover
 
 

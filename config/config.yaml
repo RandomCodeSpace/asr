@@ -7,7 +7,7 @@ storage:
     collection_name: "incidents"
     distance_strategy: cosine
 llm:
-  default: gpt_oss
+  default: workhorse
   providers:
     ollama_cloud:
       kind: ollama
@@ -28,7 +28,7 @@ llm:
   models:
     workhorse:
       provider: openrouter
-      model: openai/gpt-4o-mini
+      model: inclusionai/ring-2.6-1t:free
       temperature: 0.0
     cheap:
       provider: ollama_cloud
