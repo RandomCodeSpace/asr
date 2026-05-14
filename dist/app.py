@@ -51,7 +51,7 @@ Applications extend this via subclassing::
 
     class IncidentState(Session):
         environment: str
-        reporter: Reporter
+        submitter: Submitter
         ...
 
 ``Session`` deliberately contains *no* domain-specific fields. Adding one
@@ -86,7 +86,7 @@ from typing import Type
 
 
 # ----- imports for runtime/similarity.py -----
-"""Similarity scoring for incident matching."""
+"""Similarity scoring for session matching."""
 
 from typing import Protocol
 
@@ -265,8 +265,8 @@ than the framework default.
 
 ``find_similar`` accepts an arbitrary ``filter_kwargs`` mapping — keys
 must correspond to ``IncidentRow`` columns. This decouples the
-framework from incident-specific filter dimensions: apps with a
-``severity``-only schema, or a multi-tenant ``tenant_id`` schema, or
+framework from app-specific filter dimensions: apps with a
+schema with a single status-tier field, a multi-tenant ``tenant_id`` schema, or
 anything else, build their filter on the fly.
 """
 
@@ -297,7 +297,7 @@ vector write-through (``_persist_vector``, ``_add_vector``,
 The class is parametrised as ``Generic[StateT]`` and routes row
 hydration through ``self._state_cls(...)`` so apps can plug in their
 own ``Session`` subclass via ``RuntimeConfig.state_class``. The row
-schema remains incident-shaped, but unused fields are dropped via
+schema remains the row-level shape, but unused fields are dropped via
 Pydantic's default ``extra='ignore'`` when a narrower ``state_cls`` is
 supplied.
 """
@@ -1113,7 +1113,7 @@ Stage 2 — LLM confirmation on the top-K candidates with Pydantic-typed
 structured output {is_duplicate, confidence, rationale}.
 
 The pipeline is **framework-level** and never imports the
-incident-management state class (R4 in the Phase-7 plan). Apps inject
+domain-specific Session subclass (R4 in the Phase-7 plan). Apps inject
 domain-specific text via a ``text_extractor: Callable[[Session], str]``
 callable.
 
@@ -1684,7 +1684,7 @@ class MCPConfig(BaseModel):
 
 
 class MetadataConfig(BaseModel):
-    """Relational store for incident metadata. SQLite (dev) or Postgres (prod)."""
+    """Relational store for session metadata. SQLite (dev) or Postgres (prod)."""
     url: str = "sqlite:///incidents/incidents.db"
     pool_size: int = 5      # postgres only; sqlite uses NullPool
     echo: bool = False
@@ -2516,7 +2516,7 @@ class Session(BaseModel):
 
         Apps subclass ``Session`` and override this to surface the
         domain shape (``Incident X / Environment Y / Query Z`` for the
-        incident-management app, ``PR title / repo / diff stats`` for
+        example app, ``PR title / repo / diff stats`` for
         code review, etc.). The framework default keeps the prompt
         framework-agnostic — id + status only — so that any app that
         has not overridden the hook still gets a usable preamble.
@@ -2548,7 +2548,7 @@ class Session(BaseModel):
 
         ``prefix`` is supplied by ``SessionStore._next_id`` from
         ``FrameworkAppConfig.session_id_prefix`` so each app picks its
-        own namespace via plain config (e.g. ``INC`` for incident
+        own namespace via plain config (e.g. ``INC`` for the example incident
         management, ``REVIEW`` for code review, ``HR`` for HR cases,
         ...). Apps with truly bespoke id shapes can still override this
         classmethod on their ``Session`` subclass and ignore ``prefix``.
@@ -4115,7 +4115,7 @@ class HistoryStore(Generic[StateT]):
                     _ef(i, "summary", "") or "",
                     " ".join(_ef(i, "tags", []) or []),
                 ])),
-                "incident": i,
+                "session": i,
             }
             for i in candidates_inc
         ]
@@ -4125,7 +4125,7 @@ class HistoryStore(Generic[StateT]):
             threshold=self.similarity_threshold if threshold is None else threshold,
             limit=limit,
         )
-        return [(c["incident"], float(s)) for c, s in results]
+        return [(c["session"], float(s)) for c, s in results]
 
 # ====== module: runtime/storage/session_store.py ======
 
@@ -4207,7 +4207,7 @@ class StaleVersionError(RuntimeError):
 
 
 class SessionStore(Generic[StateT]):
-    """Active session/incident lifecycle store, parametrised on ``StateT``.
+    """Active session lifecycle store, parametrised on ``StateT``.
 
     Owns CRUD on the row schema plus the vector write-through. Read-only
     similarity search lives in ``HistoryStore``.
@@ -4326,7 +4326,7 @@ class SessionStore(Generic[StateT]):
     def load(self, incident_id: str) -> StateT:
         if not _SESSION_ID_RE.match(incident_id):
             raise ValueError(
-                f"Invalid incident id {incident_id!r}; expected PREFIX-YYYYMMDD-NNN"
+                f"Invalid session id {incident_id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         with SqlSession(self.engine) as session:
             row = session.get(IncidentRow, incident_id)
@@ -4334,40 +4334,39 @@ class SessionStore(Generic[StateT]):
                 raise FileNotFoundError(incident_id)
             return self._row_to_incident(row)
 
-    def save(self, incident: StateT) -> None:
-        if not _SESSION_ID_RE.match(incident.id):
+    def save(self, session: StateT) -> None:
+        if not _SESSION_ID_RE.match(session.id):
             raise ValueError(
-                f"Invalid incident id {incident.id!r}; expected PREFIX-YYYYMMDD-NNN"
+                f"Invalid session id {session.id!r}; expected PREFIX-YYYYMMDD-NNN"
             )
         # ``_iso(_now())`` returns ``str`` here -- the input datetime is
         # never None -- but the helper's signature is the broader
         # ``Optional[str]``. ``or ""`` keeps pyright + the typed
         # ``Session.updated_at: str`` field consistent without changing
         # behaviour (real value is always present).
-        incident.updated_at = _iso(_now()) or ""
-        sess = incident  # local alias — avoids repeating the domain token in new code
-        expected_version = getattr(sess, "version", 1)
+        session.updated_at = _iso(_now()) or ""
+        expected_version = getattr(session, "version", 1)
         # Bump in-memory BEFORE building the row dict so the persisted
         # row reflects the new version.
-        sess.version = expected_version + 1
-        with SqlSession(self.engine) as session:
-            existing = session.get(IncidentRow, sess.id)
+        session.version = expected_version + 1
+        with SqlSession(self.engine) as db_session:
+            existing = db_session.get(IncidentRow, session.id)
             prior_text = _embed_source_from_row(existing) if existing is not None else ""
             if existing is not None and existing.version != expected_version:
                 # Roll back the in-memory bump so the caller can reload + retry.
-                sess.version = expected_version
+                session.version = expected_version
                 raise StaleVersionError(
-                    f"session {sess.id} version is {existing.version}, "
+                    f"session {session.id} version is {existing.version}, "
                     f"expected {expected_version}"
                 )
-            data = self._incident_to_row_dict(incident)
+            data = self._incident_to_row_dict(session)
             if existing is None:
-                session.add(IncidentRow(**data))
+                db_session.add(IncidentRow(**data))
             else:
                 for k, v in data.items():
                     setattr(existing, k, v)
-            session.commit()
-        self._refresh_vector(incident, prior_text=prior_text)
+            db_session.commit()
+        self._refresh_vector(session, prior_text=prior_text)
 
     def delete(self, incident_id: str) -> StateT:
         with SqlSession(self.engine) as session:
@@ -4566,10 +4565,10 @@ class SessionStore(Generic[StateT]):
 
         Fields are pulled from typed columns when the state class
         declares them; everything else is merged in from the
-        ``extra_fields`` JSON bag. ``reporter`` is reconstituted from
+        ``extra_fields`` JSON bag. The ``reporter`` field (when present) is reconstituted from
         the typed ``reporter_id`` / ``reporter_team`` columns *only* when
-        the state class has a ``reporter`` field — otherwise it's
-        omitted so apps without a reporter concept (code-review) don't
+        the state class declares it — otherwise it's
+        omitted so apps without that concept (code-review) don't
         receive an unexpected attribute.
         """
         model_fields = self._state_cls.model_fields
@@ -6131,10 +6130,10 @@ class OrchestratorService:
         through to app-specific MCP tools.
 
         ``submitter`` is a free-form dict the calling app interprets.
-        For incident-management it is ``{"id": "...", "team": "..."}``;
+        For the example incident-management app it is ``{"id": "...", "team": "..."}``;
         other apps can carry app-specific keys (e.g. code-review's
         ``{"id": "<github-username>", "pr_url": "..."}``). The framework
-        only projects ``id``/``team`` onto the row's reporter columns.
+        only projects ``id``/``team`` onto the row's submitter columns.
 
         Deprecated kwargs (coerced and warned):
           * ``environment`` -> ``state_overrides={"environment": ...}``
@@ -8526,9 +8525,9 @@ def make_agent_node(
         # the same reload comment in ``runtime.graph.make_agent_node``
         # for the full rationale.
         try:
-            incident: Session = store.load(inc_id)
+            session: Session = store.load(inc_id)
         except FileNotFoundError:
-            incident = state_session
+            session = state_session
 
         # M3: emit agent_started telemetry before any work happens.
         if event_log is not None:
@@ -8546,7 +8545,7 @@ def make_agent_node(
         # live ``Session`` for this run.
         if gateway_cfg is not None:
             run_tools = [
-                wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
+                wrap_tool(t, session=session, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
                           gate_policy=gate_policy,
                           event_log=event_log)
@@ -8570,7 +8569,7 @@ def make_agent_node(
             checkpointer=checkpointer,
         )
         inner_thread_id = (
-            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+            f"{inc_id}:agent:{skill.name}:turn{len(session.agents_run)}"
         )
         inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
@@ -8578,7 +8577,7 @@ def make_agent_node(
         # start of each agent step so the gateway treats the first
         # tool call of the turn as "no signal yet".
         try:
-            incident.turn_confidence_hint = None
+            session.turn_confidence_hint = None
         except (AttributeError, ValueError):
             pass
 
@@ -8589,7 +8588,7 @@ def make_agent_node(
                 inner_has_checkpointer=checkpointer is not None,
                 initial_input={
                     "messages": [
-                        HumanMessage(content=_format_agent_input(incident))
+                        HumanMessage(content=_format_agent_input(session))
                     ]
                 },
             )
@@ -8599,19 +8598,19 @@ def make_agent_node(
         except Exception as exc:  # noqa: BLE001
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
+                inc_id=inc_id, store=store, fallback=session,
             )
 
         # Tools (e.g. registered patch tools) write straight to disk.
         # Reload so the node's own append of agent_run + tool_calls
         # happens against the tool-mutated state.
-        incident = store.load(inc_id)
+        session = store.load(inc_id)
 
         messages = result.get("messages", [])
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
 
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
-            messages, skill.name, incident, ts, valid_signals,
+            messages, skill.name, session, ts, valid_signals,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
@@ -8619,10 +8618,10 @@ def make_agent_node(
         # tool call sees the harvested confidence.
         if agent_confidence is not None:
             try:
-                incident.turn_confidence_hint = agent_confidence
+                session.turn_confidence_hint = agent_confidence
             except (AttributeError, ValueError):
                 pass
-        _pair_tool_responses(messages, incident)
+        _pair_tool_responses(messages, session)
 
         # Phase 10 (FOC-03 / D-10-03): parse envelope; reconcile against
         # any typed-terminal-tool-arg confidence. Envelope failure is a
@@ -8632,7 +8631,7 @@ def make_agent_node(
         except EnvelopeMissingError as exc:
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
+                inc_id=inc_id, store=store, fallback=session,
             )
 
         terminal_tool_for_log = _first_terminal_tool_called_this_turn(
@@ -8668,13 +8667,13 @@ def make_agent_node(
                 )
 
         _record_success_run(
-            incident=incident, skill_name=skill.name, started_at=started_at,
+            session=session, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
             confidence=final_confidence, rationale=final_rationale,
             signal=final_signal,
             store=store,
         )
-        next_route_signal = decide_route(incident)
+        next_route_signal = decide_route(session)
         next_node = route_from_skill(skill, next_route_signal)
 
         # M3: emit route_decided + agent_finished. agent_finished carries
@@ -8705,7 +8704,7 @@ def make_agent_node(
                     "event_log.record(agent_finished) failed", exc_info=True,
                 )
 
-        return {"session": incident, "next_route": next_node,
+        return {"session": session, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
     return node
@@ -8738,7 +8737,7 @@ def _safe_eval(expr: str, ctx: dict[str, Any]) -> Any:
     return eval(code, {"__builtins__": {}}, ctx)  # noqa: S307 — AST-whitelisted
 
 
-def _ctx_for_session(incident: Session) -> dict[str, Any]:
+def _ctx_for_session(session: Session) -> dict[str, Any]:
     """Build the variable namespace dispatch-rule expressions see.
 
     Exposes the live session payload as ``session`` plus a few
@@ -8747,7 +8746,7 @@ def _ctx_for_session(incident: Session) -> dict[str, Any]:
     AST checker already restricts the language so we don't need to
     sandbox the namespace any further.
     """
-    payload = incident.model_dump()
+    payload = session.model_dump()
     return {
         "session": payload,
         "status": payload.get("status"),
@@ -8793,7 +8792,7 @@ def _llm_pick_target(
     *,
     skill: Skill,
     llm: BaseChatModel,
-    incident: Session,
+    session: Session,
 ) -> str:
     """One-shot LLM dispatch: ask the model to choose a subordinate.
 
@@ -8808,7 +8807,7 @@ def _llm_pick_target(
         f"Choose ONE of: {', '.join(skill.subordinates)}.\n"
         f"Reply with only the agent name."
     )
-    payload = json.dumps(incident.model_dump(), default=str)
+    payload = json.dumps(session.model_dump(), default=str)
     msgs = [
         SystemMessage(content=prompt),
         HumanMessage(content=payload),
@@ -8835,7 +8834,7 @@ def _llm_pick_target(
 def _rule_pick_target(
     *,
     skill: Skill,
-    incident: Session,
+    session: Session,
 ) -> tuple[str, str | None]:
     """Walk dispatch_rules in order; return (target, matched_when).
 
@@ -8843,7 +8842,7 @@ def _rule_pick_target(
     fallback case carries ``matched_when=None`` so the audit log can
     distinguish "default" from "rule X matched".
     """
-    ctx = _ctx_for_session(incident)
+    ctx = _ctx_for_session(session)
     for rule in skill.dispatch_rules:
         try:
             if bool(_safe_eval(rule.when, ctx)):
@@ -9018,7 +9017,7 @@ def make_supervisor_node(
 
         rule_matched: str | None = None
         if skill.dispatch_strategy == "rule":
-            target, rule_matched = _rule_pick_target(skill=skill, incident=sess)
+            target, rule_matched = _rule_pick_target(skill=skill, session=sess)
         else:  # "llm"
             if llm is None:
                 logger.warning(
@@ -9027,7 +9026,7 @@ def make_supervisor_node(
                 )
                 target = skill.subordinates[0]
             else:
-                target = _llm_pick_target(skill=skill, llm=llm, incident=sess)
+                target = _llm_pick_target(skill=skill, llm=llm, session=sess)
 
         # Audit: one structured log entry per dispatch.
         try:
@@ -9527,11 +9526,11 @@ def route_from_skill(skill: Skill, signal: str) -> str:
 
 
 class AgentRunRecorder:
-    """Helper to capture an agent's run + tool calls into the incident."""
+    """Helper to capture an agent's run + tool calls into the session."""
 
-    def __init__(self, *, agent: str, incident: Session):
+    def __init__(self, *, agent: str, session: Session):
         self.agent = agent
-        self.incident = incident
+        self.session = session
         self._started_at: str | None = None
 
     def start(self) -> None:
@@ -9539,13 +9538,13 @@ class AgentRunRecorder:
 
     def record_tool_call(self, tool: str, args: dict, result) -> None:
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-        self.incident.tool_calls.append(
+        self.session.tool_calls.append(
             ToolCall(agent=self.agent, tool=tool, args=args, result=result, ts=ts)
         )
 
     def finish(self, *, summary: str) -> None:
         ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-        self.incident.agents_run.append(AgentRun(
+        self.session.agents_run.append(AgentRun(
             agent=self.agent,
             started_at=self._started_at or ended_at,
             ended_at=ended_at,
@@ -9705,7 +9704,7 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
     raise last_exc or RuntimeError("retry exhausted with no attempts")  # pragma: no cover
 
 
-def _format_agent_input(incident: Session) -> str:
+def _format_agent_input(session: Session) -> str:
     """Build the human-message preamble each agent receives.
 
     Delegates to ``Session.to_agent_input`` so each app subclass owns the
@@ -9713,7 +9712,7 @@ def _format_agent_input(incident: Session) -> str:
     session id + status; ``IncidentState`` and ``CodeReviewState``
     override with their respective shapes.
     """
-    return incident.to_agent_input()
+    return session.to_agent_input()
 
 
 def _merge_patch_metadata(
@@ -9787,7 +9786,7 @@ def _harvest_patch_tool(
 def _harvest_tool_calls_and_patches(
     messages: list,
     skill_name: str,
-    incident: Session,
+    session: Session,
     ts: str,
     valid_signals: frozenset[str] | None = None,
     terminal_tool_names: frozenset[str] = frozenset(),
@@ -9830,7 +9829,7 @@ def _harvest_tool_calls_and_patches(
             # colon; rsplit on the rightmost colon recovers the bare
             # tool name for both prefixed and unprefixed forms.
             tc_original = tc_name.rsplit(":", 1)[-1]
-            incident.tool_calls.append(ToolCall(
+            session.tool_calls.append(ToolCall(
                 agent=skill_name, tool=tc_name, args=tc_args,
                 result=None, ts=ts,
             ))
@@ -9844,11 +9843,11 @@ def _harvest_tool_calls_and_patches(
     return state
 
 
-def _pair_tool_responses(messages: list, incident: Session) -> None:
+def _pair_tool_responses(messages: list, session: Session) -> None:
     """Match ToolMessage responses back to their corresponding ToolCall entries."""
     for msg in messages:
         if msg.__class__.__name__ == "ToolMessage":
-            for entry in reversed(incident.tool_calls):
+            for entry in reversed(session.tool_calls):
                 if entry.tool == getattr(msg, "name", None) and entry.result is None:
                     entry.result = getattr(msg, "content", None)
                     break
@@ -9953,18 +9952,18 @@ def _handle_agent_failure(
     store: "SessionStore",
     fallback: "Session",
 ) -> dict:
-    """Reload incident (absorbing partial tool writes), stamp a failure AgentRun,
+    """Reload session (absorbing partial tool writes), stamp a failure AgentRun,
     persist, and return the error state dict for the LangGraph node.
 
-    ``fallback`` is the in-memory incident from the caller; we use it only
+    ``fallback`` is the in-memory session from the caller; we use it only
     when the on-disk state has gone missing (FileNotFoundError on reload).
     """
     try:
-        incident = store.load(inc_id)
+        session = store.load(inc_id)
     except FileNotFoundError:
-        incident = fallback
+        session = fallback
     ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-    incident.agents_run.append(AgentRun(
+    session.agents_run.append(AgentRun(
         agent=skill_name, started_at=started_at, ended_at=ended_at,
         summary=f"agent failed: {exc}",
         token_usage=TokenUsage(),
@@ -9972,15 +9971,15 @@ def _handle_agent_failure(
     # Mark the session as terminally failed so the UI can render a
     # retry control. The retry path (``Orchestrator.retry_session``)
     # is the only documented way to move out of this state.
-    incident.status = "error"
-    store.save(incident)
-    return {"session": incident, "next_route": None,
+    session.status = "error"
+    store.save(session)
+    return {"session": session, "next_route": None,
             "last_agent": skill_name, "error": str(exc)}
 
 
 def _record_success_run(
     *,
-    incident: "Session",
+    session: "Session",
     skill_name: str,
     started_at: str,
     final_text: str,
@@ -9990,10 +9989,10 @@ def _record_success_run(
     signal: str | None,
     store: "SessionStore",
 ) -> None:
-    """Append the success-path AgentRun, update the incident's running token
-    totals, and persist. Mutates ``incident`` in place."""
+    """Append the success-path AgentRun, update the session's running token
+    totals, and persist. Mutates ``session`` in place."""
     ended_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
-    incident.agents_run.append(AgentRun(
+    session.agents_run.append(AgentRun(
         agent=skill_name, started_at=started_at, ended_at=ended_at,
         summary=final_text or f"{skill_name} completed",
         token_usage=usage,
@@ -10001,10 +10000,10 @@ def _record_success_run(
         confidence_rationale=rationale,
         signal=signal,
     ))
-    incident.token_usage.input_tokens += usage.input_tokens
-    incident.token_usage.output_tokens += usage.output_tokens
-    incident.token_usage.total_tokens += usage.total_tokens
-    store.save(incident)
+    session.token_usage.input_tokens += usage.input_tokens
+    session.token_usage.output_tokens += usage.output_tokens
+    session.token_usage.total_tokens += usage.total_tokens
+    store.save(session)
 
 
 def make_agent_node(
@@ -10066,9 +10065,9 @@ def make_agent_node(
         # pending row, appends a duplicate, then ``store.save`` raises
         # ``StaleVersionError`` because DB has already moved on.
         try:
-            incident = store.load(inc_id)
+            session = store.load(inc_id)
         except FileNotFoundError:
-            incident = state_session
+            session = state_session
 
         # M3 (per-step telemetry): emit agent_started.
         if event_log is not None:
@@ -10110,7 +10109,7 @@ def make_agent_node(
             # keys from ``accepted_params``, the inject step skips them,
             # and FastMCP rejects the call as missing required arg.
             run_tools = [
-                wrap_tool(t, session=incident, gateway_cfg=gateway_cfg,
+                wrap_tool(t, session=session, gateway_cfg=gateway_cfg,
                           agent_name=skill.name, store=store,
                           injected_args=injected_args or {},
                           gate_policy=gate_policy,
@@ -10156,7 +10155,7 @@ def make_agent_node(
                 )
 
             run_tools = [
-                _make_inject_only_wrapper(orig, vis, incident)
+                _make_inject_only_wrapper(orig, vis, session)
                 for orig, vis in zip(tools, visible_tools)
             ]
         else:
@@ -10184,7 +10183,7 @@ def make_agent_node(
         # checkpointer``. The thread id is derived deterministically
         # from session + agent + the upcoming agent_run index so it is:
         #   * STABLE across the inner pause and the outer resume that
-        #     follows (both observe the same ``len(incident.agents_run)``
+        #     follows (both observe the same ``len(session.agents_run)``
         #     because no new run is recorded mid-pause), and
         #   * UNIQUE per agent invocation so previous invocations of the
         #     same agent within the same session don't bleed in.
@@ -10195,7 +10194,7 @@ def make_agent_node(
             checkpointer=checkpointer,
         )
         inner_thread_id = (
-            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+            f"{inc_id}:agent:{skill.name}:turn{len(session.agents_run)}"
         )
         inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
@@ -10204,7 +10203,7 @@ def make_agent_node(
         # re-entry from a HITL pause the hint resets cleanly so a new
         # turn starts from "no signal yet" (None).
         try:
-            incident.turn_confidence_hint = None
+            session.turn_confidence_hint = None
         except (AttributeError, ValueError):
             pass
 
@@ -10215,7 +10214,7 @@ def make_agent_node(
                 inner_has_checkpointer=checkpointer is not None,
                 initial_input={
                     "messages": [
-                        HumanMessage(content=_format_agent_input(incident))
+                        HumanMessage(content=_format_agent_input(session))
                     ]
                 },
             )
@@ -10259,19 +10258,19 @@ def make_agent_node(
                 else:
                     return _handle_agent_failure(
                         skill_name=skill.name, started_at=started_at, exc=exc,
-                        inc_id=inc_id, store=store, fallback=incident,
+                        inc_id=inc_id, store=store, fallback=session,
                     )
             else:
                 return _handle_agent_failure(
                     skill_name=skill.name, started_at=started_at, exc=exc,
-                    inc_id=inc_id, store=store, fallback=incident,
+                    inc_id=inc_id, store=store, fallback=session,
                 )
 
         # Tools (e.g. registered patch tools) write straight to disk.
         # Reload so the node's own append of agent_run + tool_calls
         # happens against the tool-mutated state — otherwise saving
         # the stale in-memory object clobbers the tools' writes.
-        incident = store.load(inc_id)
+        session = store.load(inc_id)
 
         messages = result.get("messages", [])
         ts = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
@@ -10279,7 +10278,7 @@ def make_agent_node(
         # Record tool calls and harvest confidence/signal from configured
         # patch / typed-terminal tools.
         agent_confidence, agent_rationale, agent_signal = _harvest_tool_calls_and_patches(
-            messages, skill.name, incident, ts, valid_signals,
+            messages, skill.name, session, ts, valid_signals,
             terminal_tool_names=terminal_tool_names,
             patch_tool_names=patch_tool_names,
         )
@@ -10287,12 +10286,12 @@ def make_agent_node(
         # tool call sees the harvested confidence at the gateway.
         if agent_confidence is not None:
             try:
-                incident.turn_confidence_hint = agent_confidence
+                session.turn_confidence_hint = agent_confidence
             except (AttributeError, ValueError):
                 pass
 
         # Pair tool responses with their tool calls.
-        _pair_tool_responses(messages, incident)
+        _pair_tool_responses(messages, session)
 
         # Phase 10 (FOC-03 / D-10-03): parse the structural envelope and
         # reconcile its confidence against any typed-terminal-tool arg
@@ -10303,7 +10302,7 @@ def make_agent_node(
         except EnvelopeMissingError as exc:
             return _handle_agent_failure(
                 skill_name=skill.name, started_at=started_at, exc=exc,
-                inc_id=inc_id, store=store, fallback=incident,
+                inc_id=inc_id, store=store, fallback=session,
             )
 
         terminal_tool_for_log = _first_terminal_tool_called_this_turn(
@@ -10340,12 +10339,12 @@ def make_agent_node(
                 )
 
         _record_success_run(
-            incident=incident, skill_name=skill.name, started_at=started_at,
+            session=session, skill_name=skill.name, started_at=started_at,
             final_text=final_text, usage=usage,
             confidence=final_confidence, rationale=final_rationale, signal=final_signal,
             store=store,
         )
-        next_route_signal = decide_route(incident)
+        next_route_signal = decide_route(session)
         next_node = route_from_skill(skill, next_route_signal)
 
         # M3: emit route_decided + agent_finished (carrying token_usage).
@@ -10374,7 +10373,7 @@ def make_agent_node(
                     "event_log.record(agent_finished) failed", exc_info=True,
                 )
 
-        return {"session": incident, "next_route": next_node,
+        return {"session": session, "next_route": next_node,
                 "last_agent": skill.name, "error": None}
 
     return node
@@ -10421,7 +10420,7 @@ _DEFAULT_STUB_ENVELOPE_CONFIDENCE: dict[str, float] = {
 }
 
 
-def _latest_run_for(incident: Session, agent_name: str | None):
+def _latest_run_for(session: Session, agent_name: str | None):
     """Return the most recent ``AgentRun`` for ``agent_name``, or None.
 
     ``agent_name`` is whichever agent ran immediately before the gate,
@@ -10431,7 +10430,7 @@ def _latest_run_for(incident: Session, agent_name: str | None):
     """
     if not agent_name:
         return None
-    for run in reversed(incident.agents_run):
+    for run in reversed(session.agents_run):
         if run.agent == agent_name:
             return run
     return None
@@ -10493,7 +10492,7 @@ def make_gate_node(
         # value on subsequent executions of the same node.
         from langgraph.types import interrupt
 
-        incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
+        session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
         upstream = state.get("last_agent")
         # Capture the intended downstream target before we overwrite next_route.
         # The upstream agent set next_route to the gated target; we stash it in
@@ -10501,13 +10500,13 @@ def make_gate_node(
         intended_target = state.get("next_route")
         # Reload from disk in case earlier nodes wrote tool-driven patches.
         try:
-            incident = store.load(incident.id)
+            session = store.load(session.id)
         except FileNotFoundError:
             pass
-        upstream_run = _latest_run_for(incident, upstream)
+        upstream_run = _latest_run_for(session, upstream)
         upstream_conf = upstream_run.confidence if upstream_run else None
         if upstream_conf is None or upstream_conf < threshold:
-            incident.status = "awaiting_input"
+            session.status = "awaiting_input"
             # Surface the upstream agent's own summary + rationale so the
             # human reviewer can decide what input to give without scrolling
             # through every step of the agents-run log.
@@ -10522,13 +10521,13 @@ def make_gate_node(
                 "escalation_teams": teams,
                 "intended_target": intended_target,
             }
-            incident.pending_intervention = payload
+            session.pending_intervention = payload
             # CRITICAL ORDERING: persist the Session row BEFORE calling
             # ``interrupt()``. ``interrupt()`` raises ``GraphInterrupt`` on
             # first execution; if we reversed the order the UI (which
             # polls Session.pending_intervention) would never see the
             # pending state. See plan R4 / "Streamlit hand-off".
-            store.save(incident)
+            store.save(session)
             # First execution: this raises GraphInterrupt and the
             # checkpointer captures the paused state.
             # Resume: this returns the value supplied via
@@ -10551,17 +10550,17 @@ def make_gate_node(
                 if isinstance(raw, str) and raw.strip():
                     user_text = raw.strip()
             if user_text is not None:
-                incident.user_inputs.append(user_text)
-            incident.pending_intervention = None
-            incident.status = "in_progress"
-            store.save(incident)
-            return {"session": incident, "next_route": "default",
+                session.user_inputs.append(user_text)
+            session.pending_intervention = None
+            session.status = "in_progress"
+            store.save(session)
+            return {"session": session, "next_route": "default",
                     "gated_target": intended_target, "last_agent": "gate", "error": None}
         # Confidence met threshold — clear any stale intervention payload.
-        if incident.pending_intervention is not None:
-            incident.pending_intervention = None
-            store.save(incident)
-        return {"session": incident, "next_route": "default",
+        if session.pending_intervention is not None:
+            session.pending_intervention = None
+            store.save(session)
+        return {"session": session, "next_route": "default",
                 "gated_target": intended_target, "last_agent": "gate", "error": None}
 
     return gate
@@ -11909,7 +11908,7 @@ class DedupConfig(BaseModel):
     All numeric thresholds are inclusive at the lower bound (``>=``),
     so a candidate hitting exactly ``stage1_threshold`` is considered.
 
-    Defaults are tuned for the incident-management example. Apps that
+    Defaults are tuned for the example app. Apps that
     want different policies override via YAML.
     """
 
@@ -11941,7 +11940,7 @@ class DedupConfig(BaseModel):
         """Fail fast if ``stage2_model`` is missing from the LLM registry.
 
         Called at orchestrator boot when dedup is enabled. Raising here
-        is preferred over discovering the typo on the first incident.
+        is preferred over discovering the typo on the first session.
         """
         if self.stage2_model not in llm_cfg.models:
             raise ValueError(
@@ -12190,7 +12189,7 @@ class DedupPipeline(Generic[StateT]):
             if env:
                 filter_kwargs["environment"] = env
         # ``status_filter`` is the resolved session bucket — only_closed
-        # maps to "resolved" in the incident-management vocabulary.
+        # maps to "resolved" in the example app vocabulary.
         # Apps that disable only_closed get all statuses other than
         # in-flight via the empty filter (HistoryStore default behaviour
         # already screens deleted rows).
@@ -13546,7 +13545,7 @@ def _assert_envelope_invariant_on_finalize(session: "Session") -> None:
 
 
 def _default_text_extractor(session) -> str:
-    """Default text extraction for the incident-management example.
+    """Default text extraction for the example incident-management app.
 
     Concatenates the operator-supplied ``query``, the intake-summary
     (when present), and any tags. Keeps the framework agnostic of the
@@ -14651,10 +14650,10 @@ class Orchestrator(Generic[StateT]):
         kwargs once the row schema is fully generic).
 
         ``submitter`` is a free-form dict the app interprets. For
-        incident-management it is ``{"id": "...", "team": "..."}``; for
+        the example incident-management app it is ``{"id": "...", "team": "..."}``; for
         other apps it can carry app-specific keys (e.g. code-review's
         ``{"id": "<github-username>", "pr_url": "..."}``). The framework
-        only projects ``id``/``team`` onto the row's reporter columns;
+        only projects ``id``/``team`` onto the row's submitter columns;
         apps unpack the rest via their own MCP tools.
 
         Deprecated kwargs (coerced into ``state_overrides`` / ``submitter``
@@ -14732,7 +14731,7 @@ class Orchestrator(Generic[StateT]):
                              ) -> AsyncIterator[dict]:
         """Start a new session and stream UI events as it runs.
 
-        Internally builds a ``submitter`` dict so the row's reporter
+        Internally builds a ``submitter`` dict so the row's submitter
         columns are populated through the same coercion path
         ``start_session`` uses.
         """
@@ -14782,7 +14781,7 @@ class Orchestrator(Generic[StateT]):
         """Deprecated alias for ``stream_session``.
 
         Forwards the legacy positional surface into ``stream_session``;
-        the underlying flow already coerces the reporter pair into
+        the underlying flow already coerces the submitter pair into
         a submitter dict internally so no runtime deprecation fires.
         """
         async for event in self.stream_session(
