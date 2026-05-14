@@ -26,6 +26,7 @@ in).
 
 from app import AppConfig, Base, FrameworkAppConfig, MetadataConfig, Orchestrator, OrchestratorService, SessionStore, UIBadge, build_embedder, build_engine, build_vector_store, load_config, resolve_framework_app_config, resolve_state_class
 import asyncio
+import logging as _logging
 import os
 import time
 from datetime import datetime, timezone
@@ -40,11 +41,28 @@ import streamlit as st
 
 
 
-# Default config path; apps override via the ``APP_CONFIG`` env var.
+# Optional: env-driven log config so manual runs (streamlit run, etc.)
+# can crank verbosity to INFO/DEBUG without modifying the source. The
+# default keeps the production-quiet WARNING level. ``force=True``
+# overrides any handler streamlit set up during import.
 
 
 # ====== module: src/runtime/ui.py ======
 
+def _maybe_configure_logging() -> None:
+    level = os.environ.get("ASR_LOG_LEVEL", "").upper().strip()
+    if level in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        _logging.basicConfig(
+            level=getattr(_logging, level),
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+            force=True,
+        )
+
+
+_maybe_configure_logging()
+
+
+# Default config path; apps override via the ``APP_CONFIG`` env var.
 CONFIG_PATH = Path(os.environ.get("APP_CONFIG", "config/config.yaml"))
 
 
@@ -985,6 +1003,14 @@ def _submit_approval_via_service(
             Command(resume=payload),
             config=orch._thread_config(session_id),
         )
+        # The graph completes the agent run after the verdict is
+        # forwarded to the gated tool; finalize the session if it's
+        # not paused on a fresh interrupt. Without this, an approved
+        # session stays in ``in_progress`` because the resume path
+        # does not run through ``stream_session`` (the only other
+        # caller of finalize).
+        if not await orch._is_graph_paused(session_id):
+            await orch._finalize_session_status_async(session_id)
 
     svc.submit_and_wait(_drive(), timeout=60.0)
 

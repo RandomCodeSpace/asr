@@ -7,7 +7,7 @@ storage:
     collection_name: "incidents"
     distance_strategy: cosine
 llm:
-  default: workhorse
+  default: gpt_oss
   providers:
     ollama_cloud:
       kind: ollama

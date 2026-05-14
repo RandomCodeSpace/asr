@@ -497,6 +497,11 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        # Persist the status transition. Without this,
+                        # the DB row stays at ``pending_approval`` and
+                        # the UI keeps offering the buttons forever.
+                        if store is not None:
+                            store.save(session)
                     rejected_result = {"rejected": True, "rationale": rationale}
                     _emit_invoked(
                         status="rejected", risk="high",
@@ -523,6 +528,8 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        if store is not None:
+                            store.save(session)
                     timeout_result = {"timeout": True, "rationale": rationale}
                     _emit_invoked(
                         status="timeout", risk="high",
@@ -545,6 +552,8 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                    if store is not None:
+                        store.save(session)
                 _emit_invoked(
                     status="approved", risk="high",
                     args_dict=pending_args, result=result,
@@ -675,6 +684,11 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        # Persist the status transition (mirror of the
+                        # sync path) so the DB row reflects the actual
+                        # outcome instead of staying at pending_approval.
+                        if store is not None:
+                            store.save(session)
                     rejected_result = {"rejected": True, "rationale": rationale}
                     _emit_invoked(
                         status="rejected", risk="high",
@@ -696,6 +710,8 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        if store is not None:
+                            store.save(session)
                     timeout_result = {"timeout": True, "rationale": rationale}
                     _emit_invoked(
                         status="timeout", risk="high",
@@ -717,6 +733,8 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                    if store is not None:
+                        store.save(session)
                 _emit_invoked(
                     status="approved", risk="high",
                     args_dict=pending_args, result=result,

@@ -282,26 +282,27 @@ def test_no_create_react_agent_imports_in_production_runtime():
 # T4-bonus — StubChatModel.bind_tools registers the envelope tool name
 
 
-def test_stub_chat_model_records_envelope_tool_name_on_bind():
-    """``StubChatModel.bind_tools`` is the integration point that lets
-    the new ``create_agent`` loop terminate in stub mode. This test
-    locks the contract: when the bound tools include an
-    ``AgentTurnOutput``-named entry, the stub records it and emits a
-    closing tool call with that name on the next ``_generate``.
-    """
+def test_stub_chat_model_emits_markdown_envelope_block():
+    """Phase 22 (D-22-05) replaces the Phase 15 envelope-tool
+    synthesis. ``StubChatModel.bind_tools`` is now a no-op; ``_generate``
+    emits the closing turn as a markdown block matching the D-22-03
+    contract that ``parse_markdown_envelope`` reads."""
     llm = StubChatModel(role="agent", canned_responses={"agent": "ok"})
-    # Simulate what create_agent's ToolStrategy passes: a sequence of
-    # tool specs where the AgentTurnOutput-named tool is the structured-
-    # output sentinel.
-    llm.bind_tools([AgentTurnOutput])
-    assert llm._envelope_tool_name == "AgentTurnOutput"
+    # bind_tools no longer mutates state — it is a pass-through.
+    bound = llm.bind_tools([AgentTurnOutput])
+    assert bound is llm
+    assert not hasattr(llm, "_envelope_tool_name")
 
-    # Drive a single _generate and verify the closing tool call lands.
+    # Drive a single _generate and verify the closing AIMessage carries
+    # the markdown envelope (no tool_calls when no tool_call_plan).
     result = llm._generate(messages=[HumanMessage(content="go")])
     msg = result.generations[0].message
-    assert msg.tool_calls, "expected a closing envelope tool call"
-    assert msg.tool_calls[0]["name"] == "AgentTurnOutput"
-    args = msg.tool_calls[0]["args"]
-    assert args["content"] == "ok"
-    assert args["confidence"] == pytest.approx(0.85)
-    assert "confidence_rationale" in args
+    assert not msg.tool_calls
+    body = msg.content
+    assert "## Response" in body
+    assert "## Confidence" in body
+    assert "## Signal" in body
+    # The default stub_envelope_confidence (0.85) and the canned text
+    # ("ok") flow into the markdown body.
+    assert "ok" in body
+    assert "0.8500" in body

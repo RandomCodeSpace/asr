@@ -550,7 +550,7 @@ graph is acyclic.
 
 
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 # ----- imports for runtime/tools/gateway.py -----
 """Risk-rated tool gateway: pure resolver + ``BaseTool`` HITL wrapper.
@@ -713,7 +713,7 @@ under :mod:`runtime.agents` rather than piling more kinds into
 """
 
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
@@ -994,7 +994,6 @@ Per-request flow:
 """
 
 
-from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import ValidationError
@@ -1180,6 +1179,7 @@ MCP tools is not exposed.
 """
 
 
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ----- imports for runtime/memory/knowledge_graph.py -----
@@ -3131,17 +3131,13 @@ class StubChatModel(BaseChatModel):
     ``stub_envelope_confidence`` / ``stub_envelope_rationale`` /
     ``stub_envelope_signal``.
 
-    Phase 15 (LLM-COMPAT-01): ``langchain.agents.create_agent`` with
-    ``response_format=AgentTurnOutput`` (via ``AutoStrategy`` ->
-    ``ToolStrategy`` for non-native-structured-output models, including
-    this stub) injects ``AgentTurnOutput`` as a CALLABLE TOOL. The
-    agent loop only terminates when the LLM emits a tool call NAMED
-    ``AgentTurnOutput``. ``bind_tools`` records that envelope-tool name
-    so ``_generate`` can auto-emit a closing tool call after any
-    user-configured ``tool_call_plan`` is exhausted -- preserving the
-    pre-Phase-15 stub semantics (canned text + optional pre-scripted
-    tool calls) while satisfying the new tool-loop termination
-    contract.
+    Phase 22 (D-22-05): the loop terminates on natural React END now
+    that ``response_format=AgentTurnOutput`` is gone — tests drive
+    markdown-shaped canned text (the framework parses it via Path 4
+    in :func:`runtime.agents.turn_output.parse_envelope_from_result`).
+    The Phase 15 envelope-as-callable-tool auto-emit is removed; the
+    stub is back to its pre-Phase-15 simple semantics (canned text +
+    optional pre-scripted ``tool_call_plan``).
     """
     role: str = "default"
     canned_responses: dict[str, str] = Field(default_factory=dict)
@@ -3150,12 +3146,6 @@ class StubChatModel(BaseChatModel):
     stub_envelope_rationale: str = "stub envelope rationale"
     stub_envelope_signal: str | None = None
     _called_once: bool = False
-    # Phase 15 (LLM-COMPAT-01): set by ``bind_tools`` when
-    # ``langchain.agents.create_agent`` injects a structured-output tool
-    # for ``AgentTurnOutput``. Holds the bare tool name (e.g.
-    # ``"AgentTurnOutput"``) so ``_generate`` can emit a final
-    # envelope-shaped tool call to close the agent loop.
-    _envelope_tool_name: str | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -3163,33 +3153,37 @@ class StubChatModel(BaseChatModel):
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
                   run_manager: Any = None, **kwargs: Any) -> ChatResult:
-        text = self.canned_responses.get(self.role, f"[stub:{self.role}] no canned response")
+        # Phase 22 (D-22-05): tool-call rounds emit the scripted tool
+        # calls with a placeholder content body; the closing turn (no
+        # remaining tool_call_plan entries) emits the canned text
+        # wrapped in the D-22-03 markdown contract that
+        # parse_markdown_envelope reads. The stub_envelope_*
+        # parameters drive the trailing-section bodies so tests can
+        # exercise specific confidence / rationale / signal paths
+        # without authoring markdown by hand.
         tool_calls: list[dict] = []
         if self.tool_call_plan and not self._called_once:
             for tc in self.tool_call_plan:
-                tool_calls.append({"name": tc["name"], "args": tc.get("args", {}), "id": str(uuid4())})
+                tool_calls.append(
+                    {"name": tc["name"], "args": tc.get("args", {}), "id": str(uuid4())}
+                )
             self._called_once = True
-        elif self._envelope_tool_name is not None:
-            # Phase 15 (LLM-COMPAT-01): the tool_call_plan is exhausted
-            # (or wasn't configured) AND ``langchain.agents.create_agent``
-            # has bound the AgentTurnOutput envelope as a tool. Emit a
-            # closing tool call so the loop terminates with a populated
-            # ``structured_response``. The args mirror the
-            # ``with_structured_output`` path's envelope construction so
-            # tests see the same confidence / rationale / signal regardless
-            # of whether the new tool-strategy or the legacy structured-
-            # output path is in play.
-            tool_calls.append({
-                "name": self._envelope_tool_name,
-                "args": {
-                    "content": text or ".",
-                    "confidence": self.stub_envelope_confidence,
-                    "confidence_rationale": self.stub_envelope_rationale,
-                    "signal": self.stub_envelope_signal,
-                },
-                "id": str(uuid4()),
-            })
-        msg = AIMessage(content=text, tool_calls=tool_calls)
+
+        body = self.canned_responses.get(
+            self.role, f"[stub:{self.role}] no canned response",
+        )
+        # Phase 22 (D-22-05): explicit "none" when no signal so the
+        # parser maps to None — preserves pre-Phase-22 behaviour where a
+        # stub with no signal yielded envelope.signal=None.
+        signal_str = self.stub_envelope_signal if self.stub_envelope_signal is not None else "none"
+        md = (
+            f"{body}\n\n"
+            f"## Response\n{body}\n\n"
+            f"## Confidence\n{self.stub_envelope_confidence:.4f} -- "
+            f"{self.stub_envelope_rationale}\n\n"
+            f"## Signal\n{signal_str}\n"
+        )
+        msg = AIMessage(content=md, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
     async def _agenerate(self, messages: list[BaseMessage], stop: list[str] | None = None,
@@ -3197,30 +3191,15 @@ class StubChatModel(BaseChatModel):
         return self._generate(messages, stop, run_manager, **kwargs)
 
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
-        """Record the AgentTurnOutput envelope-tool name when present.
+        """Phase 22 (D-22-05): no-op tool binding.
 
-        Phase 15 (LLM-COMPAT-01): ``langchain.agents.create_agent`` with
-        ``response_format=AgentTurnOutput`` calls ``bind_tools(...)``
-        with the user's tools PLUS the envelope-as-a-tool. We scan the
-        list for the AgentTurnOutput-shaped tool (matched by ``__name__``
-        on Pydantic schemas, ``name`` on ``BaseTool`` instances, or the
-        ``"name"`` key on dict-shaped tool specs) and remember it on the
-        instance so ``_generate`` can close the agent loop with a
-        synthetic envelope tool call after any pre-scripted
-        ``tool_call_plan`` is exhausted. Tools bound by the framework
-        itself (real BaseTools the agent should call) flow through
-        unchanged -- the stub still emits them only via
-        ``tool_call_plan``.
+        ``langchain.agents.create_agent`` calls ``bind_tools`` to wire
+        the agent's BaseTool list onto the chat model. The stub does
+        not actually invoke those tools (test fixtures script tool
+        calls via ``tool_call_plan`` instead), so we just return self
+        unchanged. The pre-Phase-22 envelope-tool detection is gone
+        because the framework no longer asks for ``response_format``.
         """
-        for t in tools or []:
-            name = (
-                getattr(t, "__name__", None)
-                or getattr(t, "name", None)
-                or (isinstance(t, dict) and t.get("name"))
-            )
-            if isinstance(name, str) and name == "AgentTurnOutput":
-                self._envelope_tool_name = name
-                break
         return self
 
     # ``BaseChatModel.with_structured_output`` returns ``Runnable[..., dict | BaseModel]``
@@ -6601,6 +6580,127 @@ class EnvelopeMissingError(Exception):
         super().__init__(message or f"envelope_missing: {field} (agent={agent})")
 
 
+_HEADER_SPLIT = re.compile(r"^#{2,}\s+(\w+)\s*$", re.MULTILINE)
+_CONF_LINE = re.compile(
+    # Leftmost float (allows int form), optional rationale after em-dash /
+    # ASCII dash / hyphen separator. ``re.DOTALL`` so a multi-line rationale
+    # is captured wholesale.
+    r"^\s*(-?[0-9]*\.?[0-9]+)\s*(?:[\-\u2010\u2011\u2012\u2013\u2014\u2015]+\s*(.*))?$",
+    re.DOTALL,
+)
+
+
+def _clamp_unit(x: float) -> float:
+    """Clamp a confidence float into [0, 1] without raising. The skill
+    prompt asks for [0, 1]; an LLM occasionally emits ``1.05`` or
+    ``-0.1`` — clamp rather than reject so the parse step is forgiving."""
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def parse_markdown_envelope(
+    content: str, *, agent: str = "",
+) -> "AgentTurnOutput":
+    """D-22-03 — parse the trailing markdown contract block into an
+    :class:`AgentTurnOutput`.
+
+    Expects three sections ``## Response`` / ``## Confidence`` /
+    ``## Signal`` (case-insensitive headers, ``##+`` accepted) at the
+    end of the LLM's reply. The free-text body of ``## Response``
+    becomes ``content``; the float on the ``## Confidence`` line
+    becomes ``confidence`` (clamped to [0, 1]); the rest of that line
+    after ``-`` / ``--`` / ``\u2014`` becomes ``confidence_rationale``;
+    the ``## Signal`` body becomes ``signal`` (with ``none``/``null``/
+    blank coerced to ``None``).
+
+    Raises :class:`EnvelopeMissingError` only when the parse cannot
+    produce a valid envelope at all — missing ``## Confidence`` line,
+    unparseable confidence value, or empty ``## Response`` body.
+    """
+    if not isinstance(content, str) or not content.strip():
+        raise EnvelopeMissingError(
+            agent=agent, field="content",
+            message=f"envelope_missing: empty content (agent={agent!r})",
+        )
+
+    # ``re.split`` with the header capture-group yields:
+    #   [pre, h1, body1, h2, body2, ...]
+    # Pre is the prose before the first heading; we ignore it for parse.
+    parts = _HEADER_SPLIT.split(content)
+    sections: dict[str, str] = {}
+    if len(parts) >= 3:
+        for i in range(1, len(parts) - 1, 2):
+            key = parts[i].strip().lower()
+            body = parts[i + 1].strip()
+            # Don't overwrite an earlier section with a later same-named
+            # one (unusual but possible in pathological prompts).
+            sections.setdefault(key, body)
+
+    response_body = sections.get("response", "").strip()
+    raw_conf = sections.get("confidence", "").strip()
+
+    if not raw_conf:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence section absent or empty "
+                f"(agent={agent!r})"
+            ),
+        )
+
+    m = _CONF_LINE.match(raw_conf)
+    if not m:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence section did not parse "
+                f"(agent={agent!r}, raw={raw_conf!r})"
+            ),
+        )
+    try:
+        conf_value = _clamp_unit(float(m.group(1)))
+    except (TypeError, ValueError) as exc:
+        raise EnvelopeMissingError(
+            agent=agent, field="confidence",
+            message=(
+                f"envelope_missing: confidence value not a float "
+                f"(agent={agent!r}, raw={raw_conf!r})"
+            ),
+        ) from exc
+    rationale = (m.group(2) or "").strip() or "(no rationale provided)"
+
+    signal_raw = sections.get("signal", "").strip().lower() or None
+    if signal_raw in {"none", "null", "", "n/a"}:
+        signal_raw = None
+
+    if not response_body:
+        raise EnvelopeMissingError(
+            agent=agent, field="content",
+            message=(
+                f"envelope_missing: response section empty (agent={agent!r})"
+            ),
+        )
+
+    try:
+        return AgentTurnOutput(
+            content=response_body,
+            confidence=conf_value,
+            confidence_rationale=rationale,
+            signal=signal_raw,
+        )
+    except ValidationError as exc:
+        raise EnvelopeMissingError(
+            agent=agent, field="validation",
+            message=(
+                f"envelope_missing: pydantic validation rejected the "
+                f"parsed values (agent={agent!r}): {exc}"
+            ),
+        ) from exc
+
+
 def parse_envelope_from_result(
     result: dict,
     *,
@@ -6658,13 +6758,162 @@ def parse_envelope_from_result(
             continue
         break
 
-    # Path 3: fail loudly
+    # Path 4 (D-22-01): markdown-primary parse on the last AIMessage's
+    # content. Producers that emit the new ``## Response / ## Confidence /
+    # ## Signal`` section block land here when Paths 1+2 yield nothing.
+    for msg in reversed(messages):
+        if msg.__class__.__name__ != "AIMessage":
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            return parse_markdown_envelope(content, agent=agent)
+        except EnvelopeMissingError:
+            # This AIMessage didnt carry a parseable markdown contract.
+            # Continue scanning earlier messages on the off-chance a
+            # nested loop emitted the contract one step back.
+            continue
+        break
+
+    # Path 5 (D-22-fallback): some models (gpt-oss:20b in particular)
+    # treat a terminal-tool call as the completion and emit an empty
+    # closing AIMessage. Apps configure typed-terminal tools with
+    # ``confidence`` + ``confidence_rationale`` args by contract —
+    # synthesise an envelope from those args when the markdown path
+    # yielded nothing. Skip if any earlier path succeeded.
+    for msg in reversed(messages):
+        tcs = getattr(msg, "tool_calls", None)
+        if not tcs:
+            continue
+        for tc in tcs:
+            args = tc.get("args") or {}
+            if not isinstance(args, dict):
+                continue
+            conf = args.get("confidence")
+            rat = args.get("confidence_rationale") or args.get("rationale")
+            if conf is None or not rat:
+                continue
+            try:
+                conf_f = float(conf)
+            except (TypeError, ValueError):
+                continue
+            content_body = (
+                args.get("resolution_summary")
+                or args.get("reason")
+                or args.get("summary")
+                or f"terminal tool {tc.get('name', '<unknown>')} invoked"
+            )
+            if not isinstance(content_body, str) or not content_body.strip():
+                content_body = f"terminal tool {tc.get('name', '<unknown>')} invoked"
+            try:
+                env = AgentTurnOutput(
+                    content=content_body,
+                    confidence=max(0.0, min(1.0, conf_f)),
+                    confidence_rationale=str(rat),
+                    signal=args.get("signal"),
+                )
+            except ValidationError:
+                continue
+            _LOG.info(
+                "envelope_synthesized_from_tool_args agent=%s tool=%s "
+                "confidence=%.2f",
+                agent, tc.get("name"), env.confidence,
+            )
+            return env
+
+    # Path 6 (D-22-fallback-permissive): the model called at least one
+    # tool but never emitted the markdown contract or a typed-terminal
+    # tool with confidence args. Rather than hard-failing the run,
+    # synthesise a minimal envelope so the session reaches a terminal
+    # status (typically default_terminal_status -> needs_review) and
+    # the operator can review what happened. Confidence is intentionally
+    # low (0.30) so any HITL gate fires.
+    invoked_tool_names: list[str] = []
+    for msg in messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            n = tc.get("name")
+            if n:
+                invoked_tool_names.append(n)
+    if invoked_tool_names:
+        body = (
+            f"Agent {agent} invoked "
+            f"{', '.join(invoked_tool_names)} but did not emit a final "
+            f"summary. Review the tool-call audit for outcome."
+        )
+        try:
+            env = AgentTurnOutput(
+                content=body,
+                confidence=0.30,
+                confidence_rationale=(
+                    "synthesized: agent invoked tools but emitted no "
+                    "closing message"
+                ),
+                signal=None,
+            )
+            _LOG.warning(
+                "envelope_synthesized_permissive agent=%s tools=%s",
+                agent, invoked_tool_names,
+            )
+            return env
+        except ValidationError:
+            pass
+
+    # Path 7 (terminal): fail loudly. None of the six paths produced a
+    # valid envelope — this is a real prompt-drift signal worth
+    # surfacing as a structured agent_run error. Log the last
+    # AIMessage content (capped) so operators can diagnose whether
+    # the LLM emitted the wrong shape vs nothing at all.
+    last_ai_content = ""
+    for msg in reversed(messages):
+        if msg.__class__.__name__ == "AIMessage":
+            c = getattr(msg, "content", None)
+            if isinstance(c, str):
+                last_ai_content = c
+                break
+    # Also dump every tool_call across all AIMessages so we can see
+    # whether the model called any tool with confidence args (Path 5
+    # would have fired) or whether it called a non-terminal tool only.
+    tool_call_summary = []
+    for msg in messages:
+        for tc in (getattr(msg, "tool_calls", None) or []):
+            args = tc.get("args") or {}
+            tool_call_summary.append({
+                "name": tc.get("name"),
+                "arg_keys": sorted(args.keys()) if isinstance(args, dict) else "?",
+                "has_confidence": isinstance(args, dict) and "confidence" in args,
+                "has_rationale": isinstance(args, dict) and (
+                    "confidence_rationale" in args or "rationale" in args
+                ),
+            })
+    # Detailed per-message dump so we can see exactly what shape the
+    # conversation took when the parse failed.
+    msg_summary = []
+    for m in messages:
+        kind = m.__class__.__name__
+        c = getattr(m, "content", None)
+        c_len = len(c) if isinstance(c, str) else (
+            f"list[{len(c)}]" if isinstance(c, list) else type(c).__name__
+        )
+        tcs = [tc.get("name") for tc in (getattr(m, "tool_calls", None) or [])]
+        msg_summary.append({"kind": kind, "content_len": c_len, "tool_calls": tcs})
+    _LOG.warning(
+        "envelope_missing: agent=%s last_ai_message_content=%r "
+        "structured_response_type=%s message_count=%d tool_calls=%r "
+        "msg_trace=%r",
+        agent,
+        last_ai_content[:1500] if last_ai_content else "<empty>",
+        type(result.get("structured_response")).__name__,
+        len(messages),
+        tool_call_summary,
+        msg_summary,
+    )
     raise EnvelopeMissingError(
         agent=agent,
         field="structured_response",
         message=(
-            f"envelope_missing: no structured_response or JSON-decodable "
-            f"AIMessage envelope found (agent={agent})"
+            f"envelope_missing: no structured_response, JSON-decodable, or "
+            f"markdown-decodable AIMessage envelope found (agent={agent})"
         ),
     )
 
@@ -6711,6 +6960,7 @@ __all__ = [
     "AgentTurnOutput",
     "EnvelopeMissingError",
     "parse_envelope_from_result",
+    "parse_markdown_envelope",
     "reconcile_confidence",
 ]
 
@@ -7177,6 +7427,11 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        # Persist the status transition. Without this,
+                        # the DB row stays at ``pending_approval`` and
+                        # the UI keeps offering the buttons forever.
+                        if store is not None:
+                            store.save(session)
                     rejected_result = {"rejected": True, "rationale": rationale}
                     _emit_invoked(
                         status="rejected", risk="high",
@@ -7203,6 +7458,8 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        if store is not None:
+                            store.save(session)
                     timeout_result = {"timeout": True, "rationale": rationale}
                     _emit_invoked(
                         status="timeout", risk="high",
@@ -7225,6 +7482,8 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                    if store is not None:
+                        store.save(session)
                 _emit_invoked(
                     status="approved", risk="high",
                     args_dict=pending_args, result=result,
@@ -7355,6 +7614,11 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        # Persist the status transition (mirror of the
+                        # sync path) so the DB row reflects the actual
+                        # outcome instead of staying at pending_approval.
+                        if store is not None:
+                            store.save(session)
                     rejected_result = {"rejected": True, "rationale": rationale}
                     _emit_invoked(
                         status="rejected", risk="high",
@@ -7376,6 +7640,8 @@ def wrap_tool(
                             approved_at=_now_iso(),
                             approval_rationale=rationale,
                         )
+                        if store is not None:
+                            store.save(session)
                     timeout_result = {"timeout": True, "rationale": rationale}
                     _emit_invoked(
                         status="timeout", risk="high",
@@ -7397,6 +7663,8 @@ def wrap_tool(
                         approved_at=_now_iso(),
                         approval_rationale=rationale,
                     )
+                    if store is not None:
+                        store.save(session)
                 _emit_invoked(
                     status="approved", risk="high",
                     args_dict=pending_args, result=result,
@@ -8186,6 +8454,7 @@ def make_agent_node(
     patch_tool_names: frozenset[str] = frozenset(),
     gate_policy: "GatePolicy | None" = None,
     event_log: "EventLog | None" = None,
+    checkpointer: Any = None,
 ):
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -8208,9 +8477,18 @@ def make_agent_node(
 
 
     async def node(state: GraphState) -> dict:
-        incident: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-        inc_id = incident.id
+        state_session: Session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        inc_id = state_session.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+        # Always reload from store at entry — outer Pregel checkpoints
+        # at step boundaries, not mid-node, so ``state["session"]`` is
+        # stale relative to DB when a HITL gate paused mid-step. See
+        # the same reload comment in ``runtime.graph.make_agent_node``
+        # for the full rationale.
+        try:
+            incident: Session = store.load(inc_id)
+        except FileNotFoundError:
+            incident = state_session
 
         # M3: emit agent_started telemetry before any work happens.
         if event_log is not None:
@@ -8236,25 +8514,25 @@ def make_agent_node(
             ]
         else:
             run_tools = tools
-        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
-        # responsive agent invocation is wrapped in an AgentTurnOutput
-        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
-        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
-        # bare schema as ``response_format`` and, by default, wraps it in
-        # ``AutoStrategy`` — ProviderStrategy for models with native
-        # structured-output (OpenAI-class), falling back to ToolStrategy
-        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
-        # callable tool: when the LLM ``calls`` it, the loop terminates on
-        # the same turn with ``result["structured_response"]`` populated.
-        # Eliminates the old two-call structure (loop + separate
-        # ``with_structured_output`` pass) that hit recursion_limit=25 on
-        # Ollama models without true function-calling.
+        # Phase 22 (D-22-01): markdown-primary turn output. Same
+        # change as graph.py:make_agent_node — drop response_format
+        # so the loop terminates on natural React END, then parse the
+        # final AIMessage via Path 4 in parse_envelope_from_result.
+        # The inner agent gets the orchestrator's checkpointer so a
+        # HITL pause inside ``interrupt()`` can be resumed via
+        # ``Command(resume=verdict)`` on a stable per-invocation
+        # thread id (see ``_drive_agent_with_resume`` in
+        # ``runtime.graph`` for the full rationale).
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
-            response_format=AgentTurnOutput,
+            checkpointer=checkpointer,
         )
+        inner_thread_id = (
+            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+        )
+        inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
         # Phase 11 (FOC-04): reset per-turn confidence hint at the
         # start of each agent step so the gateway treats the first
@@ -8265,9 +8543,15 @@ def make_agent_node(
             pass
 
         try:
-            result = await _ainvoke_with_retry(
-                agent_executor,
-                {"messages": [HumanMessage(content=_format_agent_input(incident))]},
+            result = await _drive_agent_with_resume(
+                agent_executor=agent_executor,
+                inner_cfg=inner_cfg,
+                inner_has_checkpointer=checkpointer is not None,
+                initial_input={
+                    "messages": [
+                        HumanMessage(content=_format_agent_input(incident))
+                    ]
+                },
             )
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): HITL pause -- propagate up.
@@ -9242,8 +9526,104 @@ _TRANSIENT_MARKERS = (
 )
 
 
+async def _drive_agent_with_resume(
+    *,
+    agent_executor,
+    inner_cfg: dict,
+    inner_has_checkpointer: bool,
+    initial_input: dict,
+):
+    """Run an inner ``create_agent`` executor, surfacing HITL pauses to
+    the outer Pregel graph and forwarding resume verdicts back to the
+    inner agent.
+
+    langgraph 1.x changed the ``interrupt()`` contract: a tool that
+    calls :func:`langgraph.types.interrupt` no longer raises
+    :class:`GraphInterrupt` to the caller. Instead, the agent's
+    ``ainvoke`` returns normally with the pause captured in
+    ``result["__interrupt__"]``. To make HITL approval actually work
+    end-to-end the framework must:
+
+    1. **First call** — invoke the agent with the initial messages.
+       If the result carries ``__interrupt__``, raise
+       :class:`GraphInterrupt` so the *outer* Pregel pauses too. The
+       outer pause is what surfaces ``__interrupt__`` to the
+       orchestrator and lets the UI render Approve / Reject.
+
+    2. **Resume call** — when the outer is resumed via
+       ``Command(resume=verdict)``, this helper is re-entered. The
+       inner's checkpointer remembers the pause; we detect that via
+       ``aget_state(...).next`` being non-empty and call
+       :func:`langgraph.types.interrupt` at the *outer* level to fetch
+       the verdict, then forward it to the inner via
+       ``Command(resume=verdict)``. This is the only path that
+       actually re-runs the gated tool with the verdict — calling
+       ``inner.ainvoke({"messages": [...]})`` on a paused thread
+       silently skips the tool.
+
+    A while loop covers the case where a single agent turn pauses
+    multiple times (e.g. two high-risk tool calls in sequence).
+
+    When ``inner_has_checkpointer`` is False (legacy callers and most
+    unit tests that build agents without a checkpointer), the helper
+    falls back to the simple "invoke + re-raise on ``__interrupt__``"
+    contract. That path can pause the outer graph but the resume
+    verdict cannot reach the inner tool — which is acceptable because
+    legacy callers without a checkpointer never had a working HITL
+    resume path to begin with.
+    """
+    # Local imports keep callers that never touch HITL out of the
+    # langgraph.types import cost path. ``Command`` and ``interrupt``
+    # are tiny but the explicit lazy import documents the dependency.
+    from langgraph.types import Command, interrupt
+
+    # Resume-detection branch: only meaningful when the inner agent
+    # has its own checkpointer (otherwise ``aget_state`` on a fresh
+    # in-memory pregel raises). The detection asks: "does the inner
+    # have a paused step waiting?". A non-empty ``next`` means yes.
+    if inner_has_checkpointer:
+        try:
+            inner_state = await agent_executor.aget_state(inner_cfg)
+            inner_paused = bool(getattr(inner_state, "next", ()) or ())
+        except Exception:  # noqa: BLE001 — defensive; missing checkpoint == fresh
+            inner_paused = False
+    else:
+        inner_paused = False
+
+    if inner_paused:
+        # Outer is being resumed; pull the verdict via the outer's own
+        # interrupt() and forward it. The payload here is informational —
+        # the only thing the outer cares about is the resume value.
+        verdict = interrupt({"resume_inner_agent": inner_cfg["configurable"]["thread_id"]})
+        result = await _ainvoke_with_retry(
+            agent_executor, Command(resume=verdict), config=inner_cfg,
+        )
+    else:
+        result = await _ainvoke_with_retry(
+            agent_executor, initial_input, config=inner_cfg,
+        )
+
+    # Multi-pause loop: if the inner pauses again (or resumes into a
+    # second gated tool call), surface each pause to the outer the
+    # same way until the inner is fully done.
+    while isinstance(result, dict) and result.get("__interrupt__"):
+        if not inner_has_checkpointer:
+            # No checkpointer => no Command(resume=...) path is
+            # available; surface the pause to the outer Pregel and
+            # stop. Resume cannot deliver the verdict to the gated
+            # tool, but that matches legacy behavior.
+            raise GraphInterrupt(result["__interrupt__"])
+        verdict = interrupt(result["__interrupt__"])
+        result = await _ainvoke_with_retry(
+            agent_executor, Command(resume=verdict), config=inner_cfg,
+        )
+
+    return result
+
+
 async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
-                              base_delay: float = 1.5):
+                              base_delay: float = 1.5,
+                              config: dict | None = None):
     """Wrap a LangGraph agent invocation with retry on transient cloud errors.
 
     Retries on common Ollama Cloud / streaming hiccups (500, status -1, etc.).
@@ -9261,6 +9641,14 @@ async def _ainvoke_with_retry(executor, input_, *, max_attempts: int = 3,
             # itself (AutoStrategy → ToolStrategy fallback for non-
             # function-calling Ollama models). The default langgraph
             # recursion bound is now a true upper bound, not a workaround.
+            #
+            # ``config`` (default ``None``) carries the per-thread
+            # ``configurable.thread_id`` for callers that need a
+            # checkpointer-scoped invocation (HITL resume path —
+            # see :func:`_drive_agent_with_resume`). Legacy callers
+            # pass nothing and the executor's default thread is used.
+            if config is not None:
+                return await executor.ainvoke(input_, config=config)
             return await executor.ainvoke(input_)
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): never retry a HITL pause.
@@ -9593,6 +9981,7 @@ def make_agent_node(
     injected_args: dict[str, str] | None = None,
     gate_policy: "GatePolicy | None" = None,
     event_log: "EventLog | None" = None,
+    checkpointer: Any = None,
 ) -> Callable[[GraphState], Awaitable[dict]]:
     """Factory: build a LangGraph node that runs a ReAct agent and decides a route.
 
@@ -9624,9 +10013,22 @@ def make_agent_node(
     """
 
     async def node(state: GraphState) -> dict:
-        incident = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
-        inc_id = incident.id
+        state_session = state["session"]  # pyright: ignore[reportTypedDictNotRequiredAccess] — orchestrator runtime always supplies session
+        inc_id = state_session.id
         started_at = datetime.now(timezone.utc).strftime(_UTC_TS_FMT)
+
+        # Always reload from the persistent store at entry. Outer Pregel
+        # checkpoints at step boundaries, not mid-node — so on a HITL
+        # resume, ``state["session"]`` reflects the prior step's output
+        # (e.g. deep_investigator's), not the gateway's pending_approval
+        # row + version bump that happened mid-step in the original run.
+        # If we trust ``state["session"]`` here, the gateway sees no
+        # pending row, appends a duplicate, then ``store.save`` raises
+        # ``StaleVersionError`` because DB has already moved on.
+        try:
+            incident = store.load(inc_id)
+        except FileNotFoundError:
+            incident = state_session
 
         # M3 (per-step telemetry): emit agent_started.
         if event_log is not None:
@@ -9719,25 +10121,43 @@ def make_agent_node(
             ]
         else:
             run_tools = visible_tools
-        # Phase 10 (FOC-03 / D-10-02) + Phase 15 (LLM-COMPAT-01): every
-        # responsive agent invocation is wrapped in an AgentTurnOutput
-        # envelope. ``langchain.agents.create_agent`` (the non-deprecated
-        # successor to ``langgraph.prebuilt.create_react_agent``) accepts a
-        # bare schema as ``response_format`` and, by default, wraps it in
-        # ``AutoStrategy`` — ProviderStrategy for models with native
-        # structured-output (OpenAI-class), falling back to ToolStrategy
-        # otherwise (Ollama). ToolStrategy injects AgentTurnOutput as a
-        # callable tool: when the LLM ``calls`` it, the loop terminates on
-        # the same turn with ``result["structured_response"]`` populated.
-        # Eliminates the old two-call structure (loop + separate
-        # ``with_structured_output`` pass) that hit recursion_limit=25 on
-        # Ollama models without true function-calling.
+        # Phase 22 (D-22-01): markdown-primary turn output. Drop
+        # ``response_format`` from create_agent — the agent loop now
+        # terminates on the natural React END signal (LLM emits an
+        # AIMessage with no tool calls). The framework parses that
+        # final message body as markdown via Path 4 in
+        # parse_envelope_from_result. Skill prompts (D-22-04) instruct
+        # every reply to end with ## Response / ## Confidence / ##
+        # Signal sections; the parser extracts them.
+        #
+        # Why: forcing LLMs through a JSON-schema-shaped output via
+        # ``response_format`` triggered a class of brittleness across
+        # providers (model-specific JSON drift, tool-strategy + React
+        # END interaction, recursion_limit ceilings). Markdown is the
+        # native format every chat model writes well; the parse step
+        # happens in the framework, where leniency is in our control.
+        # The inner agent gets a checkpointer so a HITL pause inside
+        # ``interrupt()`` can be resumed via ``Command(resume=verdict)``
+        # on the SAME inner thread. langgraph 1.x semantics require the
+        # checkpointer here — without it ``Command(resume=...)`` raises
+        # ``RuntimeError: Cannot use Command(resume=...) without
+        # checkpointer``. The thread id is derived deterministically
+        # from session + agent + the upcoming agent_run index so it is:
+        #   * STABLE across the inner pause and the outer resume that
+        #     follows (both observe the same ``len(incident.agents_run)``
+        #     because no new run is recorded mid-pause), and
+        #   * UNIQUE per agent invocation so previous invocations of the
+        #     same agent within the same session don't bleed in.
         agent_executor = create_agent(
             model=llm,
             tools=run_tools,
             system_prompt=skill.system_prompt,
-            response_format=AgentTurnOutput,
+            checkpointer=checkpointer,
         )
+        inner_thread_id = (
+            f"{inc_id}:agent:{skill.name}:turn{len(incident.agents_run)}"
+        )
+        inner_cfg = {"configurable": {"thread_id": inner_thread_id}}
 
         # Phase 11 (FOC-04): reset per-turn confidence hint. The hint
         # is updated below after _harvest_tool_calls_and_patches; on
@@ -9749,9 +10169,15 @@ def make_agent_node(
             pass
 
         try:
-            result = await _ainvoke_with_retry(
-                agent_executor,
-                {"messages": [HumanMessage(content=_format_agent_input(incident))]},
+            result = await _drive_agent_with_resume(
+                agent_executor=agent_executor,
+                inner_cfg=inner_cfg,
+                inner_has_checkpointer=checkpointer is not None,
+                initial_input={
+                    "messages": [
+                        HumanMessage(content=_format_agent_input(incident))
+                    ]
+                },
             )
         except GraphInterrupt:
             # Phase 11 (FOC-04 / D-11-04): HITL pause is NOT an error.
@@ -9930,12 +10356,17 @@ def _decide_from_signal(inc: Session) -> str:
 
 
 _DEFAULT_STUB_CANNED: dict[str, str] = {
-    # Back-compat defaults for the four canonical agents.  Any YAML-defined
-    # agent can override or extend this via ``skill.stub_response``; new agents
-    # without an entry here fall through to StubChatModel's generic placeholder.
+    # Plain-text bodies; ``StubChatModel._generate`` wraps these in the
+    # D-22-03 markdown envelope using the per-agent stub_envelope_* fields
+    # (the framework parses the wrapped output via Path 4). Apps can
+    # override or extend via ``skill.stub_response``; new agents without
+    # an entry here fall through to ``StubChatModel``'s generic placeholder.
     "intake": "Created INC, no prior matches. Routing to triage.",
     "triage": "Severity medium, category latency. No recent deploys correlate.",
-    "deep_investigator": "Hypothesis: upstream payments timeout. Evidence: log line 'upstream_timeout target=payments'.",
+    "deep_investigator": (
+        "Hypothesis: upstream payments timeout. "
+        "Evidence: log line upstream_timeout target=payments."
+    ),
     "resolution": "Proposed fix: restart api service. Auto-applied. INC resolved.",
 }
 
@@ -10098,7 +10529,8 @@ def make_gate_node(
 
 def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
                        registry: ToolRegistry,
-                       event_log: "EventLog | None" = None) -> dict:
+                       event_log: "EventLog | None" = None,
+                       checkpointer: Any = None) -> dict:
     """Materialize agent nodes from skills + registry. Reused by main + resume graphs.
 
     Dispatches on ``skill.kind``:
@@ -10176,6 +10608,7 @@ def _build_agent_nodes(*, cfg: AppConfig, skills: dict, store: SessionStore,
             injected_args=cfg.orchestrator.injected_args,
             gate_policy=gate_policy,
             event_log=event_log,
+            checkpointer=checkpointer,
         )
     return nodes
 
@@ -10281,7 +10714,8 @@ async def build_graph(*, cfg: AppConfig, skills: dict, store: SessionStore,
 
     sg = StateGraph(GraphState)
     nodes = _build_agent_nodes(cfg=cfg, skills=skills, store=store,
-                                registry=registry, event_log=event_log)
+                                registry=registry, event_log=event_log,
+                                checkpointer=checkpointer)
     for agent_name, node in nodes.items():
         sg.add_node(agent_name, node)
     sg.add_node("gate", make_gate_node(
@@ -14055,6 +14489,29 @@ class Orchestrator(Generic[StateT]):
         async with self._locks.acquire(session_id):
             return self._finalize_session_status(session_id)
 
+    async def _is_graph_paused(self, session_id: str) -> bool:
+        """Return True iff the compiled graph has a pending step waiting
+        to resume (i.e. it's paused at an ``interrupt()`` boundary).
+
+        langgraph 1.x surfaces a HITL pause via the result dict's
+        ``__interrupt__`` field rather than raising
+        :class:`GraphInterrupt`. After ``astream_events`` (or
+        ``ainvoke``) returns, the only way to tell "the run paused"
+        from "the run completed" is to query the checkpointed graph
+        state — a non-empty ``next`` tuple means the graph has steps
+        queued to run when resumed. The stream/retry call sites use
+        this to skip ``_finalize_session_status_async`` on a pause —
+        finalizing on a pause would stamp ``default_terminal_status``
+        on a session that's actually waiting on operator approval, and
+        the orphaned ``pending_approval`` ToolCall row written by the
+        gateway would never get its resume.
+        """
+        try:
+            state = await self.graph.aget_state(self._thread_config(session_id))
+        except Exception:  # noqa: BLE001 — defensive; missing checkpoint == not paused
+            return False
+        return bool(getattr(state, "next", ()) or ())
+
     def _thread_config(self, incident_id: str) -> dict:
         """Build the LangGraph ``config`` dict for a per-session thread.
 
@@ -14264,10 +14721,18 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(inc.id),
         ):
             yield self._to_ui_event(ev, inc.id)
-        new_status = await self._finalize_session_status_async(inc.id)
-        if new_status:
-            yield {"event": "status_auto_finalized", "incident_id": inc.id,
-                   "status": new_status, "ts": _event_ts()}
+        # Skip finalize when the graph paused on an interrupt — the
+        # session is waiting for operator approval, not done. Stamping
+        # default_terminal_status here would orphan the pending_approval
+        # ToolCall row written by the gateway just before the pause.
+        if await self._is_graph_paused(inc.id):
+            yield {"event": "session_paused", "incident_id": inc.id,
+                   "ts": _event_ts()}
+        else:
+            new_status = await self._finalize_session_status_async(inc.id)
+            if new_status:
+                yield {"event": "status_auto_finalized", "incident_id": inc.id,
+                       "status": new_status, "ts": _event_ts()}
         yield {"event": "investigation_completed", "incident_id": inc.id, "ts": _event_ts()}
 
     async def stream_investigation(self, *, query: str, environment: str,
@@ -14540,10 +15005,17 @@ class Orchestrator(Generic[StateT]):
             config=self._thread_config(session_id),
         ):
             yield self._to_ui_event(ev, session_id)
-        new_status = await self._finalize_session_status_async(session_id)
-        if new_status:
-            yield {"event": "status_auto_finalized", "incident_id": session_id,
-                   "status": new_status, "ts": _event_ts()}
+        # See ``stream_session`` for why pause-detection guards the
+        # finalize call: a HITL pause must not be coerced into a
+        # terminal status.
+        if await self._is_graph_paused(session_id):
+            yield {"event": "session_paused", "incident_id": session_id,
+                   "ts": _event_ts()}
+        else:
+            new_status = await self._finalize_session_status_async(session_id)
+            if new_status:
+                yield {"event": "status_auto_finalized", "incident_id": session_id,
+                       "status": new_status, "ts": _event_ts()}
         yield {"event": "retry_completed", "incident_id": session_id,
                "ts": _event_ts()}
 
@@ -15236,6 +15708,16 @@ def build_app(cfg: AppConfig) -> FastAPI:
                     Command(resume=decision_payload),
                     config=orch._thread_config(session_id),
                 )
+                # Finalize after the verdict-driven run completes so
+                # the session row reflects the terminal status (or
+                # falls through to ``default_terminal_status``). Skip
+                # if a fresh interrupt re-paused the graph — the
+                # session is again awaiting operator input. Mirrors
+                # the same guard in the UI's
+                # ``_submit_approval_via_service`` and the
+                # ``stream_session`` finalize call site.
+                if not await orch._is_graph_paused(session_id):
+                    await orch._finalize_session_status_async(session_id)
 
         # Submit the resume onto the long-lived service loop so we
         # don't fight the lifespan thread for the same FastMCP/SQLite
