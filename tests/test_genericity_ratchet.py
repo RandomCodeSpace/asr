@@ -85,7 +85,33 @@ from check_genericity import count_runtime_leaks, total  # noqa: E402
 #                domain Session) on a structurally required code path —
 #                same pattern as the Phase 10/11/12 entries. Net +2
 #                ``incident`` token reuses, no new domain concept.
-BASELINE_TOTAL = 156
+#   156 ->  39   v1.5-B generic-noun pass. Three classes of change:
+#                  (1) ``incident`` local variables in graph.py /
+#                      responsive.py / supervisor.py / dedup.py /
+#                      session_store.py renamed to ``session`` via a
+#                      tokenize-based safe rename (~95 tokens removed).
+#                  (2) Docstring + exception-message text in graph.py /
+#                      state.py / dedup.py / orchestrator.py / service.py /
+#                      similarity.py / config.py / history_store.py /
+#                      session_store.py rewritten to use the framework's
+#                      generic vocabulary; explicit ``incident-management``
+#                      mentions are kept only where they label the example
+#                      app specifically.
+#                  (3) ``history_store.py`` internal dict key changed from
+#                      ``"incident"`` to ``"session"`` (private to that
+#                      module's similarity-search return shape).
+#                The remaining 39 are domain-coupled and intentionally
+#                preserved without functional change: the ``severity``
+#                / ``reporter_*`` SQLAlchemy columns on ``IncidentRow``
+#                (renaming requires a migration), the legacy
+#                ``/incidents/*`` URL routes (public API surface that
+#                v1.4 deprecated but did not remove), the ``reporter_id``
+#                / ``reporter_team`` deprecated kwargs on
+#                ``Orchestrator.start_session`` /
+#                ``OrchestratorService.start_session``, and the
+#                example-app references in dedup default prompts /
+#                docstring callouts.
+BASELINE_TOTAL = 39
 
 
 def test_runtime_leaks_at_or_below_baseline():

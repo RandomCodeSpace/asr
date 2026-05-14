@@ -69,7 +69,7 @@ def _assert_envelope_invariant_on_finalize(session: "Session") -> None:
 
 
 def _default_text_extractor(session) -> str:
-    """Default text extraction for the incident-management example.
+    """Default text extraction for the example incident-management app.
 
     Concatenates the operator-supplied ``query``, the intake-summary
     (when present), and any tags. Keeps the framework agnostic of the
@@ -1179,10 +1179,10 @@ class Orchestrator(Generic[StateT]):
         kwargs once the row schema is fully generic).
 
         ``submitter`` is a free-form dict the app interprets. For
-        incident-management it is ``{"id": "...", "team": "..."}``; for
+        the example incident-management app it is ``{"id": "...", "team": "..."}``; for
         other apps it can carry app-specific keys (e.g. code-review's
         ``{"id": "<github-username>", "pr_url": "..."}``). The framework
-        only projects ``id``/``team`` onto the row's reporter columns;
+        only projects ``id``/``team`` onto the row's submitter columns;
         apps unpack the rest via their own MCP tools.
 
         Deprecated kwargs (coerced into ``state_overrides`` / ``submitter``
@@ -1260,7 +1260,7 @@ class Orchestrator(Generic[StateT]):
                              ) -> AsyncIterator[dict]:
         """Start a new session and stream UI events as it runs.
 
-        Internally builds a ``submitter`` dict so the row's reporter
+        Internally builds a ``submitter`` dict so the row's submitter
         columns are populated through the same coercion path
         ``start_session`` uses.
         """
@@ -1310,7 +1310,7 @@ class Orchestrator(Generic[StateT]):
         """Deprecated alias for ``stream_session``.
 
         Forwards the legacy positional surface into ``stream_session``;
-        the underlying flow already coerces the reporter pair into
+        the underlying flow already coerces the submitter pair into
         a submitter dict internally so no runtime deprecation fires.
         """
         async for event in self.stream_session(

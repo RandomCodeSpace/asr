@@ -60,14 +60,14 @@ def test_list_recent_returns_newest_first(store):
 
 def test_load_invalid_id_raises_value_error(store):
     """IDs not matching INC-YYYYMMDD-NNN must be rejected before any DB ops."""
-    with pytest.raises(ValueError, match="Invalid incident id"):
+    with pytest.raises(ValueError, match="Invalid session id"):
         store.load("../../etc/passwd")
 
 
 def test_save_invalid_id_raises_value_error(store):
     inc = store.create(query="Q", environment="dev", reporter_id="u", reporter_team="t")
     inc.id = "../../malicious"
-    with pytest.raises(ValueError, match="Invalid incident id"):
+    with pytest.raises(ValueError, match="Invalid session id"):
         store.save(inc)
 
 
@@ -85,7 +85,7 @@ def test_load_missing_raises(store):
     "INC-20260430-1",  # too short sequence
 ])
 def test_load_rejects_traversal_and_malformed_ids(store, bad_id):
-    with pytest.raises(ValueError, match="Invalid incident id"):
+    with pytest.raises(ValueError, match="Invalid session id"):
         store.load(bad_id)
 
 

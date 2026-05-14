@@ -6,7 +6,7 @@ Stage 2 — LLM confirmation on the top-K candidates with Pydantic-typed
 structured output {is_duplicate, confidence, rationale}.
 
 The pipeline is **framework-level** and never imports the
-incident-management state class (R4 in the Phase-7 plan). Apps inject
+domain-specific Session subclass (R4 in the Phase-7 plan). Apps inject
 domain-specific text via a ``text_extractor: Callable[[Session], str]``
 callable.
 
@@ -61,7 +61,7 @@ class DedupConfig(BaseModel):
     All numeric thresholds are inclusive at the lower bound (``>=``),
     so a candidate hitting exactly ``stage1_threshold`` is considered.
 
-    Defaults are tuned for the incident-management example. Apps that
+    Defaults are tuned for the example app. Apps that
     want different policies override via YAML.
     """
 
@@ -93,7 +93,7 @@ class DedupConfig(BaseModel):
         """Fail fast if ``stage2_model`` is missing from the LLM registry.
 
         Called at orchestrator boot when dedup is enabled. Raising here
-        is preferred over discovering the typo on the first incident.
+        is preferred over discovering the typo on the first session.
         """
         if self.stage2_model not in llm_cfg.models:
             raise ValueError(
@@ -342,7 +342,7 @@ class DedupPipeline(Generic[StateT]):
             if env:
                 filter_kwargs["environment"] = env
         # ``status_filter`` is the resolved session bucket — only_closed
-        # maps to "resolved" in the incident-management vocabulary.
+        # maps to "resolved" in the example app vocabulary.
         # Apps that disable only_closed get all statuses other than
         # in-flight via the empty filter (HistoryStore default behaviour
         # already screens deleted rows).

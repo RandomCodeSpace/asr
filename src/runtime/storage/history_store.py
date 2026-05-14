@@ -11,8 +11,8 @@ than the framework default.
 
 ``find_similar`` accepts an arbitrary ``filter_kwargs`` mapping — keys
 must correspond to ``IncidentRow`` columns. This decouples the
-framework from incident-specific filter dimensions: apps with a
-``severity``-only schema, or a multi-tenant ``tenant_id`` schema, or
+framework from app-specific filter dimensions: apps with a
+schema with a single status-tier field, a multi-tenant ``tenant_id`` schema, or
 anything else, build their filter on the fly.
 """
 from __future__ import annotations
@@ -211,7 +211,7 @@ class HistoryStore(Generic[StateT]):
                     _ef(i, "summary", "") or "",
                     " ".join(_ef(i, "tags", []) or []),
                 ])),
-                "incident": i,
+                "session": i,
             }
             for i in candidates_inc
         ]
@@ -221,4 +221,4 @@ class HistoryStore(Generic[StateT]):
             threshold=self.similarity_threshold if threshold is None else threshold,
             limit=limit,
         )
-        return [(c["incident"], float(s)) for c, s in results]
+        return [(c["session"], float(s)) for c, s in results]
