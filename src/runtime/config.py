@@ -626,6 +626,21 @@ class UIDetailField(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
 
 
+class AppView(BaseModel):
+    """An app-overlay UI view registered by an app for the framework UI to link to.
+
+    The framework UI lists matching app views in its Selected-detail panel
+    ("App-specific views →") so apps can ship bespoke deep-dive pages
+    without forking the framework. Approach C (per the v2.0 design spec).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    applies_to: str  # "always" | "agent:<name>" | "tool:<name>"
+    url: str
+
+
 class UIConfig(BaseModel):
     """App-driven UI rendering knobs. Keeps the generic Streamlit shell
     in ``runtime/ui.py`` agnostic of any specific domain — colors, labels,
@@ -647,6 +662,11 @@ class UIConfig(BaseModel):
     drive the React shell's topbar brand block, environment switcher,
     and approval-rationale dropdown. Read at app boot via
     ``useUiHints()`` and cached for the session lifetime.
+
+    ``app_views`` is the Approach C extensibility surface — apps register
+    bespoke UI overlay views that the framework UI's Selected-detail
+    panel lists as "App-specific views →" links. Served via
+    ``GET /api/v1/apps/{app}/ui-views``.
     """
     badges: dict[str, dict[str, UIBadge]] = Field(default_factory=dict)
     detail_fields: list[UIDetailField] = Field(default_factory=list)
@@ -655,6 +675,7 @@ class UIConfig(BaseModel):
     brand_logo_url: str | None = None
     approval_rationale_templates: list[str] = Field(default_factory=list)
     hitl_question_templates: dict[str, str] = Field(default_factory=dict)
+    app_views: list[AppView] = Field(default_factory=list)
 
     model_config = {"frozen": True, "extra": "forbid"}
 

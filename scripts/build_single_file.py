@@ -196,6 +196,10 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # block, env switcher list, and approval-rationale dropdown. Same
     # side-car pattern as api_session_full.py.
     (RUNTIME_ROOT, "api_ui_hints.py"),
+    # App-overlay UI views endpoint — Approach C extensibility surface
+    # the framework UI's Selected-detail panel queries to render
+    # "App-specific views →" links. Same side-car pattern.
+    (RUNTIME_ROOT, "api_apps_overlay.py"),
 ]
 
 # Example app modules — flattened *after* the runtime modules in the
