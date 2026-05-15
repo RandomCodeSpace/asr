@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from runtime import api_session_full
 from runtime.config import AppConfig, load_config
 
 _log = logging.getLogger("runtime.api")
@@ -945,7 +946,6 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # Single round-trip the React UI calls on session open. Module
     # lives next door so this file stays focused on routing wiring.
     # ==================================================================
-    from runtime import api_session_full
     api_session_full.add_routes(api_v1)
 
     # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.

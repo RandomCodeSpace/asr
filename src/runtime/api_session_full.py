@@ -3,6 +3,11 @@
 GET /api/v1/sessions/{id}/full returns everything the UI needs to render
 the session in one round-trip — replaces the old pattern of multiple GETs.
 The same shape is then patched in place by SSE delta events.
+
+Registered only via :func:`runtime.api.build_app` (requires
+``app.state.orchestrator``); unlike :mod:`runtime.api_dedup`, this module
+is NOT suitable for lightweight test fixtures that construct a bare
+``FastAPI()`` app — use ``build_app(cfg)`` for tests.
 """
 from __future__ import annotations
 
@@ -34,7 +39,7 @@ def add_routes(api_v1: APIRouter) -> None:
         # delta events stitch onto the same view-model without gap or
         # overlap.
         event_log = getattr(orch, "event_log", None)
-        events: list[dict] = []
+        events: list[dict[str, Any]] = []
         vm_seq = 0
         if event_log is not None:
             for ev in event_log.iter_for(session_id, since=0):
@@ -54,7 +59,7 @@ def add_routes(api_v1: APIRouter) -> None:
         # server keys as the ref strings; ``Skill.routes`` is a
         # ``list[RouteRule]`` (when/next/gate) — flatten to the
         # signal->next mapping the UI consumes.
-        agent_definitions: dict[str, dict] = {}
+        agent_definitions: dict[str, dict[str, Any]] = {}
         for name, skill in orch.skills.items():
             agent_definitions[name] = {
                 "name": skill.name,
