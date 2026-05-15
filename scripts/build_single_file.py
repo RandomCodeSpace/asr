@@ -187,6 +187,11 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # api.py. Bundled after api.py so register_dedup_routes can be
     # invoked against the FastAPI app at the bottom of the bundle.
     (RUNTIME_ROOT, "api_dedup.py"),
+    # Bootstrap bundle endpoint — single round-trip the React UI hits
+    # on session open. Side-car module mounted on api_v1 inside
+    # ``api.build_app``; bundled after api.py for the same reason as
+    # api_dedup.py.
+    (RUNTIME_ROOT, "api_session_full.py"),
 ]
 
 # Example app modules — flattened *after* the runtime modules in the

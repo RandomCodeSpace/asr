@@ -940,6 +940,14 @@ def build_app(cfg: AppConfig) -> FastAPI:
             except Exception:  # noqa: BLE001
                 pass
 
+    # ==================================================================
+    # Bootstrap bundle: GET /api/v1/sessions/{id}/full
+    # Single round-trip the React UI calls on session open. Module
+    # lives next door so this file stays focused on routing wiring.
+    # ==================================================================
+    from runtime import api_session_full
+    api_session_full.add_routes(api_v1)
+
     # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
     # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)
     # keep working transparently. Removed in v2.1.
