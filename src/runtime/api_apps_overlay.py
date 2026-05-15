@@ -14,7 +14,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 
 
-def add_routes(api_v1: APIRouter) -> None:
+def add_apps_overlay_routes(api_v1: APIRouter) -> None:
+    """Mount the /apps/{app}/ui-views handler on the api_v1 router.
+
+    Module-qualified name so the bundler can flatten alongside sibling
+    ``api_*`` side-cars without ``add_routes`` collisions. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
+
     @api_v1.get("/apps/{app_name}/ui-views")
     async def list_app_views(app_name: str, request: Request) -> list[dict]:
         # app_name is informational for now; v2.0 has one app per deploy.

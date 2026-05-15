@@ -34,13 +34,11 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from runtime import (
-    api_apps_overlay,
-    api_recent_events,
-    api_session_full,
-    api_static,
-    api_ui_hints,
-)
+from runtime.api_apps_overlay import add_apps_overlay_routes
+from runtime.api_recent_events import add_recent_events_routes
+from runtime.api_session_full import add_session_full_routes
+from runtime.api_static import mount_static_assets
+from runtime.api_ui_hints import add_ui_hints_routes
 from runtime.config import AppConfig, load_config
 
 _log = logging.getLogger("runtime.api")
@@ -963,14 +961,14 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # Single round-trip the React UI calls on session open. Module
     # lives next door so this file stays focused on routing wiring.
     # ==================================================================
-    api_session_full.add_routes(api_v1)
+    add_session_full_routes(api_v1)
 
     # ==================================================================
     # UI hints: GET /api/v1/config/ui-hints
     # Drives the React shell's brand block, environment switcher list,
     # and approval-rationale dropdown. Read once at app boot.
     # ==================================================================
-    api_ui_hints.add_routes(api_v1)
+    add_ui_hints_routes(api_v1)
 
     # ==================================================================
     # App-overlay UI views: GET /api/v1/apps/{app}/ui-views
@@ -978,7 +976,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # (e.g. "Deploy diff") that the framework UI's Selected-detail
     # panel lists as "App-specific views →" links.
     # ==================================================================
-    api_apps_overlay.add_routes(api_v1)
+    add_apps_overlay_routes(api_v1)
 
     # ==================================================================
     # Cross-session SSE: GET /api/v1/sessions/recent/events
@@ -986,7 +984,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # session.status_changed / session.agent_running events across ALL
     # sessions, ordered by global seq.
     # ==================================================================
-    api_recent_events.add_routes(api_v1)
+    add_recent_events_routes(api_v1)
 
     # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
     # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)
@@ -1032,7 +1030,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # API route and legacy redirect. The fallback excludes /api/, /health,
     # and /docs so unknown API paths still return structured JSON 404s.
     # ==================================================================
-    api_static.mount(fastapi_app)
+    mount_static_assets(fastapi_app)
     return fastapi_app
 
 

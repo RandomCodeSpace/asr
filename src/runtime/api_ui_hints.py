@@ -13,8 +13,14 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 
-def add_routes(api_v1: APIRouter) -> None:
-    """Mount the /config/ui-hints handler on the api_v1 router."""
+def add_ui_hints_routes(api_v1: APIRouter) -> None:
+    """Mount the /config/ui-hints handler on the api_v1 router.
+
+    Module-qualified name (vs. bare ``add_routes``) so the bundler can
+    flatten this alongside its sibling ``api_*`` side-cars without the
+    four module-scope ``add_routes`` defs colliding. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
 
     @api_v1.get("/config/ui-hints")
     async def get_ui_hints(request: Request) -> dict[str, Any]:

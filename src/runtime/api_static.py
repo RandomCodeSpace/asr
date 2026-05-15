@@ -31,8 +31,15 @@ _NOT_FOUND_JSON = (
 )
 
 
-def mount(app: FastAPI) -> None:
-    """Mount static assets + SPA fallback. API routes must be registered first."""
+def mount_static_assets(app: FastAPI) -> None:
+    """Mount static assets + SPA fallback. API routes must be registered first.
+
+    Module-qualified name (vs. the bare ``mount`` we had pre-bundle-fix) so
+    the bundler can flatten this alongside its sibling ``api_*`` side-cars
+    without stepping on FastAPI's ``app.mount`` or any future bundled module
+    that happens to define a ``mount`` symbol. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
     web_dist_path = os.environ.get("ASR_WEB_DIST")
     if web_dist_path:
         web_dist = Path(web_dist_path)

@@ -16,8 +16,15 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 
-def add_routes(api_v1: APIRouter) -> None:
-    """Mount the /sessions/{id}/full handler on the api_v1 router."""
+def add_session_full_routes(api_v1: APIRouter) -> None:
+    """Mount the /sessions/{id}/full handler on the api_v1 router.
+
+    The function name is intentionally module-qualified (rather than the
+    bare ``add_routes`` we used pre-bundle-fix) so that ``scripts/build_single_file.py``
+    can flatten this module alongside its sibling ``api_*`` side-cars without
+    the four ``add_routes`` defs colliding at module scope. Source-side callers
+    import the symbol directly: ``from runtime.api_session_full import add_session_full_routes``.
+    """
 
     @api_v1.get("/sessions/{session_id}/full")
     async def get_session_full(

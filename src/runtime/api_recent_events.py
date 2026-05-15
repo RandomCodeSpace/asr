@@ -23,7 +23,14 @@ _SESSION_KINDS = frozenset({
 })
 
 
-def add_routes(api_v1: APIRouter) -> None:
+def add_recent_events_routes(api_v1: APIRouter) -> None:
+    """Mount the /sessions/recent/events SSE handler on the api_v1 router.
+
+    Module-qualified name so the bundler can flatten alongside sibling
+    ``api_*`` side-cars without ``add_routes`` collisions. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
+
     @api_v1.get("/sessions/recent/events")
     async def stream_recent_events(request: Request, since: int = 0):
         orch = request.app.state.orchestrator
