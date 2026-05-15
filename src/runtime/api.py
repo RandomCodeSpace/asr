@@ -30,7 +30,7 @@ from typing import AsyncIterator, Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -939,6 +939,39 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 await websocket.close(code=1011)
             except Exception:  # noqa: BLE001
                 pass
+
+    # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
+    # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)
+    # keep working transparently. Removed in v2.1.
+    @fastapi_app.api_route(
+        "/incidents", methods=["GET", "POST"], include_in_schema=False,
+    )
+    async def _legacy_incidents_collection() -> RedirectResponse:
+        return RedirectResponse(url="/api/v1/sessions", status_code=308)
+
+    @fastapi_app.api_route(
+        "/incidents/{path:path}",
+        methods=["GET", "POST", "DELETE", "PUT"],
+        include_in_schema=False,
+    )
+    async def _legacy_incidents_detail(path: str) -> RedirectResponse:
+        return RedirectResponse(url=f"/api/v1/sessions/{path}", status_code=308)
+
+    @fastapi_app.api_route(
+        "/investigate", methods=["POST"], include_in_schema=False,
+    )
+    async def _legacy_investigate() -> RedirectResponse:
+        return RedirectResponse(url="/api/v1/investigate", status_code=308)
+
+    @fastapi_app.api_route(
+        "/investigate/{path:path}",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def _legacy_investigate_subpath(path: str) -> RedirectResponse:
+        return RedirectResponse(
+            url=f"/api/v1/investigate/{path}", status_code=308,
+        )
 
     # Mount the versioned router. /health stays at root (registered
     # directly on ``fastapi_app`` above); everything else lives under
