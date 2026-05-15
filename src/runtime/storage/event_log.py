@@ -30,6 +30,12 @@ EventKind = Literal[
     "gate_fired",
     "status_changed",
     "lesson_extracted",
+    # Session-level lifecycle events — emitted on the cross-session SSE
+    # stream (/api/v1/sessions/recent/events) for the React UI's "Other
+    # Sessions" monitor panel. Lower frequency than per-step kinds.
+    "session.created",
+    "session.status_changed",
+    "session.agent_running",
 ]
 
 _VALID_EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
@@ -111,6 +117,32 @@ class EventLog:
             )
             if since is not None:
                 stmt = stmt.where(SessionEventRow.seq > since)
+            for row in s.execute(stmt).scalars():
+                yield SessionEvent(
+                    seq=row.seq,
+                    session_id=row.session_id,
+                    kind=row.kind,
+                    payload=row.payload,
+                    ts=row.ts,
+                )
+
+    def iter_recent(self, since: int = 0) -> Iterator[SessionEvent]:
+        """Iterate events across ALL sessions where seq > since, ordered
+        by global seq.
+
+        Used by the cross-session SSE stream
+        (``/api/v1/sessions/recent/events``) to deliver session.*
+        lifecycle events to the React UI's Other Sessions monitor panel.
+        Capped at 500 rows per call so a long-disconnected client can't
+        blow memory replaying years of history.
+        """
+        with Session(self.engine) as s:
+            stmt = (
+                select(SessionEventRow)
+                .where(SessionEventRow.seq > since)
+                .order_by(SessionEventRow.seq.asc())
+                .limit(500)
+            )
             for row in s.execute(stmt).scalars():
                 yield SessionEvent(
                     seq=row.seq,

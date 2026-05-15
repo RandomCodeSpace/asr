@@ -496,6 +496,20 @@ class OrchestratorService:
                 reporter_team=sub_team,
             )
             session_id = inc.id
+            # Emit session.created on the cross-session SSE stream so
+            # the React UI's Other Sessions monitor lights up the new
+            # tile in real time. Telemetry must not break start.
+            event_log = getattr(orch, "event_log", None)
+            if event_log is not None:
+                try:
+                    # ``session_id`` already lands on the row; the payload
+                    # carries no extra fields for ``session.created``.
+                    event_log.record(session_id, "session.created")
+                except Exception:  # noqa: BLE001 — telemetry must not break start
+                    _log.debug(
+                        "event_log.record(session.created) failed",
+                        exc_info=True,
+                    )
             # Stamp trigger provenance onto the row before the graph
             # runs so any crash mid-graph still leaves an audit trail.
             # ``inc.findings`` is a JSON dict on the row.

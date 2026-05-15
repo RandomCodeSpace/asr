@@ -34,7 +34,12 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from runtime import api_apps_overlay, api_session_full, api_ui_hints
+from runtime import (
+    api_apps_overlay,
+    api_recent_events,
+    api_session_full,
+    api_ui_hints,
+)
 from runtime.config import AppConfig, load_config
 
 _log = logging.getLogger("runtime.api")
@@ -965,6 +970,14 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # panel lists as "App-specific views →" links.
     # ==================================================================
     api_apps_overlay.add_routes(api_v1)
+
+    # ==================================================================
+    # Cross-session SSE: GET /api/v1/sessions/recent/events
+    # Drives the React UI's "Other Sessions" monitor — session.created /
+    # session.status_changed / session.agent_running events across ALL
+    # sessions, ordered by global seq.
+    # ==================================================================
+    api_recent_events.add_routes(api_v1)
 
     # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
     # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)

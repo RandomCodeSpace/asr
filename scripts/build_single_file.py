@@ -200,6 +200,11 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # the framework UI's Selected-detail panel queries to render
     # "App-specific views →" links. Same side-car pattern.
     (RUNTIME_ROOT, "api_apps_overlay.py"),
+    # Cross-session SSE endpoint — drives the React UI's "Other
+    # Sessions" monitor with session-level lifecycle events
+    # (session.created / session.status_changed / session.agent_running)
+    # across ALL sessions, ordered by global seq. Same side-car pattern.
+    (RUNTIME_ROOT, "api_recent_events.py"),
 ]
 
 # Example app modules — flattened *after* the runtime modules in the
