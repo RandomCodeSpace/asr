@@ -16119,7 +16119,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                         last_seq = ev.seq
                         yield f"data: {envelope.model_dump_json()}\n\n"
             except _asyncio.CancelledError:
-                return
+                raise
 
         return StreamingResponse(_stream(), media_type="text/event-stream")
 
