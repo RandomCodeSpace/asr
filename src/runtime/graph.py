@@ -599,7 +599,7 @@ def _try_recover_envelope_from_raw(raw: str) -> AgentTurnOutput | None:
     for candidate in candidates:
         try:
             payload = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:  # JSONDecodeError is a ValueError subclass
             continue
         if not isinstance(payload, dict):
             continue

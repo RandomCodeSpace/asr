@@ -299,7 +299,7 @@ def parse_envelope_from_result(
             continue
         try:
             payload = json.loads(content)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:  # JSONDecodeError is a ValueError subclass
             continue
         if not isinstance(payload, dict):
             continue

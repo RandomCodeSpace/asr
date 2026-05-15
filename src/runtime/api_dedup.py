@@ -63,7 +63,6 @@ def register_dedup_routes(
 
     @app.post(
         "/sessions/{session_id}/un-duplicate",
-        response_model=UnDuplicateResponse,
         status_code=200,
         tags=["dedup"],
     )

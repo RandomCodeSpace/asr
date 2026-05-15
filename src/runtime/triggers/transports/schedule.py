@@ -24,7 +24,6 @@ from runtime.triggers.base import TriggerTransport
 from runtime.triggers.config import ScheduleTriggerConfig
 
 if TYPE_CHECKING:
-    pass
     from runtime.triggers.registry import TriggerRegistry  # noqa: F401
 
 _log = logging.getLogger(__name__)
