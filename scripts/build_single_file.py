@@ -205,6 +205,11 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # (session.created / session.status_changed / session.agent_running)
     # across ALL sessions, ordered by global seq. Same side-car pattern.
     (RUNTIME_ROOT, "api_recent_events.py"),
+    # React SPA static-file mount + SPA fallback. Mounts onto the
+    # FastAPI root app (not the api_v1 router) via ``api_static.mount``,
+    # which build_app invokes as the LAST route-registration step.
+    # Bundled after api.py for the same reason as the side-cars above.
+    (RUNTIME_ROOT, "api_static.py"),
 ]
 
 # Example app modules — flattened *after* the runtime modules in the

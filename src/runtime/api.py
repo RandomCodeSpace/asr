@@ -38,6 +38,7 @@ from runtime import (
     api_apps_overlay,
     api_recent_events,
     api_session_full,
+    api_static,
     api_ui_hints,
 )
 from runtime.config import AppConfig, load_config
@@ -1016,6 +1017,14 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # directly on ``fastapi_app`` above); everything else lives under
     # /api/v1.
     fastapi_app.include_router(api_v1)
+    # ==================================================================
+    # React UI bundle: StaticFiles mount at / + SPA fallback.
+    # MUST be the last route-registration step in build_app — the
+    # catch-all ``GET /{full_path:path}`` would otherwise shadow every
+    # API route and legacy redirect. The fallback excludes /api/, /health,
+    # and /docs so unknown API paths still return structured JSON 404s.
+    # ==================================================================
+    api_static.mount(fastapi_app)
     return fastapi_app
 
 
