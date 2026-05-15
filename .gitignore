@@ -87,3 +87,9 @@ scripts/integration_scenarios.py
 # Coverage / CI artefacts
 coverage.xml
 junit.xml
+
+# React UI build artifacts (Phase 1+)
+web/node_modules
+web/dist
+web/playwright-report
+web/test-results

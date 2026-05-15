@@ -1,0 +1,14 @@
+node_modules
+dist
+playwright-report
+test-results
+*.log
+.vite
+.env.local
+
+# TypeScript project-references build artifacts (from `tsc -b`)
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
+vitest.config.d.ts
+vitest.config.js
