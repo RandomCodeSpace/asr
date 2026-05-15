@@ -16096,18 +16096,19 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 last_seq = ev.seq
                 yield f"data: {envelope.model_dump_json()}\n\n"
             # Tail: poll for new rows. Bounded by client-disconnect.
-            try:
-                while not await request.is_disconnected():
-                    await _asyncio.sleep(0.25)
-                    for ev in event_log.iter_for(session_id, since=last_seq):
-                        envelope = EventEnvelope(
-                            seq=ev.seq, session_id=ev.session_id,
-                            kind=ev.kind, payload=ev.payload, ts=ev.ts,
-                        )
-                        last_seq = ev.seq
-                        yield f"data: {envelope.model_dump_json()}\n\n"
-            except _asyncio.CancelledError:
-                return
+            # CancelledError (from task cancellation, e.g. when the
+            # client closes the connection) propagates naturally — no
+            # try/except needed; suppressing it would break asyncio's
+            # cancellation contract (Sonar python:S7497).
+            while not await request.is_disconnected():
+                await _asyncio.sleep(0.25)
+                for ev in event_log.iter_for(session_id, since=last_seq):
+                    envelope = EventEnvelope(
+                        seq=ev.seq, session_id=ev.session_id,
+                        kind=ev.kind, payload=ev.payload, ts=ev.ts,
+                    )
+                    last_seq = ev.seq
+                    yield f"data: {envelope.model_dump_json()}\n\n"
 
         return StreamingResponse(_stream(), media_type="text/event-stream")
 
