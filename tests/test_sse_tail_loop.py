@@ -61,7 +61,7 @@ def cfg(tmp_path):
 def _build_request(app, sid: str, *, is_disconnected) -> StarletteRequest:
     scope = {
         "type": "http", "method": "GET",
-        "path": f"/sessions/{sid}/events",
+        "path": f"/api/v1/sessions/{sid}/events",
         "query_string": b"since=0",
         "headers": [],
         "app": app,
@@ -74,7 +74,7 @@ def _build_request(app, sid: str, *, is_disconnected) -> StarletteRequest:
 def _sse_route(app):
     return next(
         r for r in app.router.routes
-        if getattr(r, "path", "") == "/sessions/{session_id}/events"
+        if getattr(r, "path", "") == "/api/v1/sessions/{session_id}/events"
     )
 
 

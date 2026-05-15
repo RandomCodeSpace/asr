@@ -80,7 +80,7 @@ async def test_health_returns_200(cfg):
 async def test_agents_endpoint_returns_4(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/agents")
+        res = await client.get("/api/v1/agents")
     assert res.status_code == 200
     names = {a["name"] for a in res.json()}
     assert names == {"intake", "triage", "deep_investigator", "resolution"}
@@ -91,7 +91,7 @@ async def test_investigate_endpoint_creates_incident(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         res = await client.post(
-            "/investigate",
+            "/api/v1/investigate",
             json={"query": "api latency", "environment": "production"},
         )
     assert res.status_code == 200
@@ -107,7 +107,7 @@ async def test_investigate_endpoint_creates_incident(cfg):
 async def test_environments_endpoint_returns_list(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/environments")
+        res = await client.get("/api/v1/environments")
     assert res.status_code == 200
     envs = res.json()
     assert isinstance(envs, list)
@@ -120,7 +120,7 @@ async def test_investigate_stream_emits_events(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         async with client.stream(
-            "POST", "/investigate/stream",
+            "POST", "/api/v1/investigate/stream",
             json={"query": "api latency", "environment": "production"},
         ) as res:
             assert res.status_code == 200
@@ -138,19 +138,19 @@ async def test_delete_endpoint_soft_deletes_incident(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         created = await client.post(
-            "/investigate",
+            "/api/v1/investigate",
             json={"query": "to be deleted", "environment": "production"},
         )
         inc_id = created.json()["incident_id"]
-        del_res = await client.delete(f"/incidents/{inc_id}")
+        del_res = await client.delete(f"/api/v1/incidents/{inc_id}")
         assert del_res.status_code == 200
         body = del_res.json()
         assert body["status"] == "deleted"
         assert body["deleted_at"] is not None
-        listing = await client.get("/incidents")
+        listing = await client.get("/api/v1/incidents")
         assert all(i["id"] != inc_id for i in listing.json()), \
             "deleted incident must be hidden from /incidents"
-        single = await client.get(f"/incidents/{inc_id}")
+        single = await client.get(f"/api/v1/incidents/{inc_id}")
         assert single.status_code == 200
         assert single.json()["status"] == "deleted"
 
@@ -162,7 +162,7 @@ async def test_resume_endpoint_streams_error_for_unknown_incident(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         async with client.stream(
-            "POST", "/incidents/INC-does-not-exist/resume",
+            "POST", "/api/v1/sessions/INC-does-not-exist/resume",
             json={"decision": "stop"},
         ) as res:
             assert res.status_code == 200
@@ -189,7 +189,7 @@ async def test_post_sessions_returns_201_with_session_id(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         res = await client.post(
-            "/sessions",
+            "/api/v1/sessions",
             json={
                 "query": "api latency",
                 "environment": "production",
@@ -211,7 +211,7 @@ async def test_post_sessions_omitting_submitter_uses_defaults(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         res = await client.post(
-            "/sessions",
+            "/api/v1/sessions",
             json={"query": "no submitter", "environment": "dev"},
         )
     assert res.status_code == 201
@@ -224,7 +224,7 @@ async def test_get_sessions_returns_list(cfg):
     the ``SessionStatus`` schema for any active rows."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/sessions")
+        res = await client.get("/api/v1/sessions")
     assert res.status_code == 200
     body = res.json()
     assert isinstance(body, list)
@@ -241,7 +241,7 @@ async def test_delete_session_endpoint_returns_204_or_501(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         start = await client.post(
-            "/sessions",
+            "/api/v1/sessions",
             json={
                 "query": "to be stopped",
                 "environment": "production",
@@ -250,7 +250,7 @@ async def test_delete_session_endpoint_returns_204_or_501(cfg):
         )
         assert start.status_code == 201
         sid = start.json()["session_id"]
-        res = await client.delete(f"/sessions/{sid}")
+        res = await client.delete(f"/api/v1/sessions/{sid}")
     # 204 = stopped cleanly; 501 = stop_session not wired up;
     # 404 = session already evicted.
     assert res.status_code in (204, 404, 501)
@@ -264,7 +264,7 @@ async def test_legacy_investigate_route_still_works(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         res = await client.post(
-            "/investigate",
+            "/api/v1/investigate",
             json={"query": "back-compat", "environment": "production"},
         )
     assert res.status_code in (200, 201)
@@ -286,7 +286,7 @@ async def test_legacy_investigate_route_emits_no_deprecation_warnings(cfg):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", DeprecationWarning)
             res = await client.post(
-                "/investigate",
+                "/api/v1/investigate",
                 json={
                     "query": "no-warn",
                     "environment": "production",
@@ -317,8 +317,8 @@ async def test_app_state_exposes_service_and_orchestrator(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         # Both legacy and new routes work in the same lifespan window.
-        legacy = await client.get("/agents")
-        new = await client.get("/sessions")
+        legacy = await client.get("/api/v1/agents")
+        new = await client.get("/api/v1/sessions")
     assert legacy.status_code == 200
     assert new.status_code == 200
     assert hasattr(app.state, "service")

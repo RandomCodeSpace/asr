@@ -101,7 +101,7 @@ async def test_list_pending_approvals_returns_only_pending_rows(cfg):
     async with _client_with_lifespan(app) as client:
         # Create a session via the public API so the lifespan and store
         # are wired identically to a real run.
-        start = await client.post("/sessions", json={
+        start = await client.post("/api/v1/sessions", json={
             "query": "test", "environment": "dev",
             "reporter_id": "u", "reporter_team": "t",
         })
@@ -128,7 +128,7 @@ async def test_list_pending_approvals_returns_only_pending_rows(cfg):
         ]
         orch.store.save(inc)
 
-        res = await client.get(f"/sessions/{sid}/approvals")
+        res = await client.get(f"/api/v1/sessions/{sid}/approvals")
 
     assert res.status_code == 200
     body = res.json()
@@ -147,13 +147,13 @@ async def test_list_pending_approvals_empty_for_clean_session(cfg):
     """A session with no pending approvals must return ``[]``, not 404."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        start = await client.post("/sessions", json={
+        start = await client.post("/api/v1/sessions", json={
             "query": "test", "environment": "dev",
             "reporter_id": "u", "reporter_team": "t",
         })
         sid = start.json()["session_id"]
 
-        res = await client.get(f"/sessions/{sid}/approvals")
+        res = await client.get(f"/api/v1/sessions/{sid}/approvals")
 
     assert res.status_code == 200
     assert res.json() == []
@@ -164,7 +164,7 @@ async def test_list_pending_approvals_404_for_unknown_session(cfg):
     """Unknown session id must return 404, not silently empty."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/sessions/INC-DOES-NOT-EXIST/approvals")
+        res = await client.get("/api/v1/sessions/INC-DOES-NOT-EXIST/approvals")
     assert res.status_code == 404
 
 
@@ -179,7 +179,7 @@ async def test_post_approval_404_for_unknown_session(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         res = await client.post(
-            "/sessions/INC-DOES-NOT-EXIST/approvals/0",
+            "/api/v1/sessions/INC-DOES-NOT-EXIST/approvals/0",
             json={"decision": "approve", "approver": "alice", "rationale": "ok"},
         )
     assert res.status_code == 404
@@ -191,13 +191,13 @@ async def test_post_approval_400_on_invalid_decision(cfg):
     ``{approve, reject}`` must yield 422 (FastAPI validation error)."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        start = await client.post("/sessions", json={
+        start = await client.post("/api/v1/sessions", json={
             "query": "test", "environment": "dev",
             "reporter_id": "u", "reporter_team": "t",
         })
         sid = start.json()["session_id"]
         res = await client.post(
-            f"/sessions/{sid}/approvals/0",
+            f"/api/v1/sessions/{sid}/approvals/0",
             json={"decision": "MAYBE", "approver": "alice"},
         )
     # FastAPI surfaces validation failures as 422; either 400 or 422
@@ -217,7 +217,7 @@ async def test_post_approval_happy_path_returns_decision_summary(cfg, monkeypatc
     """
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        start = await client.post("/sessions", json={
+        start = await client.post("/api/v1/sessions", json={
             "query": "test", "environment": "dev",
             "reporter_id": "u", "reporter_team": "t",
         })
@@ -241,7 +241,7 @@ async def test_post_approval_happy_path_returns_decision_summary(cfg, monkeypatc
         )
 
         res = await client.post(
-            f"/sessions/{sid}/approvals/0",
+            f"/api/v1/sessions/{sid}/approvals/0",
             json={
                 "decision": "approve",
                 "approver": "alice",
@@ -292,7 +292,7 @@ async def test_submit_approval_real_loop_no_deadlock(cfg):
     """
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        start = await client.post("/sessions", json={
+        start = await client.post("/api/v1/sessions", json={
             "query": "test", "environment": "dev",
             "reporter_id": "u", "reporter_team": "t",
         })
@@ -318,7 +318,7 @@ async def test_submit_approval_real_loop_no_deadlock(cfg):
         # would hang forever (no progress on the loop).
         res = await asyncio.wait_for(
             client.post(
-                f"/sessions/{sid}/approvals/0",
+                f"/api/v1/sessions/{sid}/approvals/0",
                 json={
                     "decision": "approve",
                     "approver": "bob",

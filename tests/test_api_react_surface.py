@@ -128,7 +128,7 @@ async def test_get_sessions_recent_returns_list(cfg):
     async with _client_with_lifespan(app) as client:
         orch = app.state.orchestrator
         _seed_resolved_session(orch, query="latency spike")
-        res = await client.get("/sessions/recent?limit=5")
+        res = await client.get("/api/v1/sessions/recent?limit=5")
     assert res.status_code == 200
     body = res.json()
     assert isinstance(body, list)
@@ -141,7 +141,7 @@ async def test_get_session_detail_404_for_unknown_id(cfg):
     on a 404."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/sessions/SES-DOES-NOT-EXIST")
+        res = await client.get("/api/v1/sessions/SES-DOES-NOT-EXIST")
     assert res.status_code == 404
     body = res.json()
     assert "error" in body
@@ -157,7 +157,7 @@ async def test_get_session_detail_returns_row(cfg):
     async with _client_with_lifespan(app) as client:
         orch = app.state.orchestrator
         sid = _seed_resolved_session(orch, query="api latency")
-        res = await client.get(f"/sessions/{sid}")
+        res = await client.get(f"/api/v1/sessions/{sid}")
     assert res.status_code == 200
     body = res.json()
     assert body["id"] == sid
@@ -171,7 +171,7 @@ async def test_get_retry_preview_404_for_unknown(cfg):
     branch, which the endpoint maps to 404."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/sessions/UNKNOWN/retry/preview")
+        res = await client.get("/api/v1/sessions/UNKNOWN/retry/preview")
     assert res.status_code == 404
     body = res.json()
     assert body["error"]["code"] == "not_found"
@@ -191,7 +191,7 @@ async def test_get_retry_preview_happy_path_returns_decision(cfg):
         inc.status = "error"
         inc.extra_fields["retry_count"] = 0
         orch.store.save(inc)
-        res = await client.get(f"/sessions/{inc.id}/retry/preview")
+        res = await client.get(f"/api/v1/sessions/{inc.id}/retry/preview")
     assert res.status_code == 200
     body = res.json()
     assert isinstance(body["retry"], bool)
@@ -214,7 +214,7 @@ async def test_get_session_lessons_returns_extracted_rows(cfg):
         sid = _seed_resolved_session(orch, query="payments-svc")
         # Drive the finalize hook so the M5 lesson row lands.
         orch._finalize_session_status(sid)
-        res = await client.get(f"/sessions/{sid}/lessons")
+        res = await client.get(f"/api/v1/sessions/{sid}/lessons")
     assert res.status_code == 200
     body = res.json()
     assert isinstance(body, list)
@@ -230,7 +230,7 @@ async def test_get_session_lessons_empty_when_no_corpus(cfg):
     """Sessions that never resolved produce no lessons."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/sessions/SES-EMPTY/lessons")
+        res = await client.get("/api/v1/sessions/SES-EMPTY/lessons")
     # No matching row -> empty list, not 404.
     assert res.status_code == 200
     assert res.json() == []
@@ -265,7 +265,7 @@ async def test_sse_events_replays_backlog(cfg):
         # Find the SSE route + invoke its handler directly.
         sse_route = next(
             r for r in app.router.routes
-            if getattr(r, "path", "") == "/sessions/{session_id}/events"
+            if getattr(r, "path", "") == "/api/v1/sessions/{session_id}/events"
         )
         # The handler is the async function under .endpoint.
         # Fake a Request with the orchestrator wired + a disconnect-False
@@ -278,7 +278,7 @@ async def test_sse_events_replays_backlog(cfg):
 
         scope = {
             "type": "http", "method": "GET",
-            "path": "/sessions/SES-SSE/events",
+            "path": "/api/v1/sessions/SES-SSE/events",
             "query_string": b"since=0",
             "headers": [],
             "app": app,
@@ -360,7 +360,7 @@ def test_post_resume_sse_returns_event_stream(cfg):
         orch = app.state.orchestrator
         sid = _seed_resolved_session(orch, query="resume-target")
         with client.stream(
-            "POST", f"/sessions/{sid}/resume",
+            "POST", f"/api/v1/sessions/{sid}/resume",
             json={"decision": "resume_with_input", "user_input": "go"},
         ) as resp:
             assert resp.status_code == 200
@@ -400,7 +400,7 @@ def test_post_retry_sse_returns_event_stream(cfg):
         orch.store.save(inc)
 
         with client.stream(
-            "POST", f"/sessions/{inc.id}/retry",
+            "POST", f"/api/v1/sessions/{inc.id}/retry",
         ) as resp:
             assert resp.status_code == 200
             assert resp.headers["content-type"].startswith("text/event-stream")
@@ -434,7 +434,7 @@ def test_websocket_event_stream_replays_backlog(cfg):
         orch.event_log.record("SES-WS", "agent_finished", agent="triage")
 
         with client.websocket_connect(
-            "/ws/sessions/SES-WS/events?since=0",
+            "/api/v1/ws/sessions/SES-WS/events?since=0",
         ) as ws:
             frames = [ws.receive_json() for _ in range(3)]
 
@@ -455,7 +455,7 @@ async def test_cors_allows_react_dev_origins(cfg):
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
         res = await client.options(
-            "/sessions",
+            "/api/v1/sessions",
             headers={
                 "Origin": "http://localhost:5173",
                 "Access-Control-Request-Method": "POST",
@@ -474,7 +474,7 @@ async def test_404_renders_structured_error_envelope(cfg):
     """HTTPException 404 -> {"error":{"code":"not_found", ...}}."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/sessions/NOPE")
+        res = await client.get("/api/v1/sessions/NOPE")
     assert res.status_code == 404
     body = res.json()
     assert set(body.keys()) == {"error"}
@@ -515,15 +515,15 @@ async def test_react_surface_e2e_terminal_session(cfg):
         orch._finalize_session_status(sid)
 
         # 1. GET /sessions/recent — session A is in the list.
-        recent = client.get("/sessions/recent").json()
+        recent = client.get("/api/v1/sessions/recent").json()
         assert any(r["id"] == sid for r in recent)
 
         # 2. GET /sessions/{sid} — terminal status.
-        detail = client.get(f"/sessions/{sid}").json()
+        detail = client.get(f"/api/v1/sessions/{sid}").json()
         assert detail["status"] == "resolved"
 
         # 3. GET /sessions/{sid}/lessons — at least one lesson row.
-        lessons = client.get(f"/sessions/{sid}/lessons").json()
+        lessons = client.get(f"/api/v1/sessions/{sid}/lessons").json()
         assert len(lessons) >= 1
         assert lessons[0]["outcome_status"] == "resolved"
 
@@ -533,7 +533,7 @@ async def test_react_surface_e2e_terminal_session(cfg):
         #    clean test-time disconnect.
         frames: list[dict] = []
         with client.websocket_connect(
-            f"/ws/sessions/{sid}/events?since=0",
+            f"/api/v1/ws/sessions/{sid}/events?since=0",
         ) as ws:
             # Pull all backlog frames quickly. We seeded the session
             # so the finalize emitted at least status_changed +
@@ -576,7 +576,7 @@ def test_post_resume_sse_yields_error_envelope_on_orchestrator_failure(cfg):
         orch.resume_investigation = _boom  # type: ignore[method-assign]
 
         with client.stream(
-            "POST", "/sessions/SES-RESUME-FAIL/resume",
+            "POST", "/api/v1/sessions/SES-RESUME-FAIL/resume",
             json={"decision": "resume_with_input", "user_input": "go"},
         ) as resp:
             assert resp.status_code == 200
@@ -607,7 +607,7 @@ def test_post_retry_sse_yields_error_envelope_on_orchestrator_failure(cfg):
         orch.retry_session = _boom  # type: ignore[method-assign]
 
         with client.stream(
-            "POST", "/sessions/SES-RETRY-FAIL/retry",
+            "POST", "/api/v1/sessions/SES-RETRY-FAIL/retry",
         ) as resp:
             assert resp.status_code == 200
             frames: list[dict] = []
@@ -631,7 +631,7 @@ def test_get_session_lessons_503_when_lesson_store_absent(cfg):
     with TestClient(app) as client:
         orch = app.state.orchestrator
         orch.lesson_store = None
-        res = client.get("/sessions/ANY/lessons")
+        res = client.get("/api/v1/sessions/ANY/lessons")
     assert res.status_code == 200
     assert res.json() == []
 
@@ -647,7 +647,7 @@ def test_websocket_close_when_event_log_absent(cfg):
         orch.event_log = None
         with pytest.raises(WebSocketDisconnect) as excinfo:
             with client.websocket_connect(
-                "/ws/sessions/ANY/events?since=0",
+                "/api/v1/ws/sessions/ANY/events?since=0",
             ) as ws:
                 ws.receive_json()
     assert excinfo.value.code == 1011
@@ -661,7 +661,7 @@ def test_websocket_handles_invalid_since_param(cfg):
         orch = app.state.orchestrator
         orch.event_log.record("SES-WS-BAD", "agent_started", agent="a")
         with client.websocket_connect(
-            "/ws/sessions/SES-WS-BAD/events?since=not-a-number",
+            "/api/v1/ws/sessions/SES-WS-BAD/events?since=not-a-number",
         ) as ws:
             f = ws.receive_json()
     assert f["kind"] == "agent_started"
