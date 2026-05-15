@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -345,6 +345,10 @@ def build_app(cfg: AppConfig) -> FastAPI:
         title="ASR — Agent Orchestrator",
         lifespan=_make_lifespan(cfg),
     )
+    # All framework routes (except /health) live under /api/v1 so the
+    # React client can stably target a versioned surface; /health stays
+    # at root for monitor / load-balancer health-check conventions.
+    api_v1 = APIRouter(prefix="/api/v1")
 
     # CORS: configure once with the AppConfig-supplied origins so the
     # React dev server (Vite at :5173, CRA/Next at :3000 by default) can
@@ -389,27 +393,27 @@ def build_app(cfg: AppConfig) -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-    @fastapi_app.get("/agents")
+    @api_v1.get("/agents")
     async def agents():
         return fastapi_app.state.orchestrator.list_agents()
 
-    @fastapi_app.get("/tools")
+    @api_v1.get("/tools")
     async def tools():
         return fastapi_app.state.orchestrator.list_tools()
 
-    @fastapi_app.get("/incidents")
+    @api_v1.get("/incidents")
     async def incidents(limit: int = 20):
         return fastapi_app.state.orchestrator.list_recent_incidents(limit=limit)
 
-    @fastapi_app.get("/incidents/{incident_id}")
+    @api_v1.get("/incidents/{incident_id}")
     async def incident(incident_id: str):
         return fastapi_app.state.orchestrator.get_incident(incident_id)
 
-    @fastapi_app.delete("/incidents/{incident_id}")
+    @api_v1.delete("/incidents/{incident_id}")
     async def delete_incident(incident_id: str):
         return fastapi_app.state.orchestrator.delete_incident(incident_id)
 
-    @fastapi_app.post("/investigate")
+    @api_v1.post("/investigate")
     async def investigate(req: InvestigateRequest, request: Request) -> InvestigateResponse:
         """Legacy alias for ``POST /sessions`` — kept for back-compat.
 
@@ -443,11 +447,11 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return InvestigateResponse(incident_id=sid)
 
-    @fastapi_app.get("/environments")
+    @api_v1.get("/environments")
     async def environments():
         return fastapi_app.state.environments
 
-    @fastapi_app.post("/investigate/stream")
+    @api_v1.post("/investigate/stream")
     async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
         orch = fastapi_app.state.orchestrator
 
@@ -460,7 +464,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.post("/incidents/{incident_id}/resume")
+    @api_v1.post("/incidents/{incident_id}/resume")
     async def resume_incident(incident_id: str, req: ResumeRequest) -> StreamingResponse:
         orch = fastapi_app.state.orchestrator
         decision: dict = {"action": req.decision}
@@ -492,7 +496,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # Multi-session endpoints
     # ------------------------------------------------------------------
 
-    @fastapi_app.post(
+    @api_v1.post(
         "/sessions",
         status_code=201,
     )
@@ -523,7 +527,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return SessionStartResponse(session_id=sid)
 
-    @fastapi_app.get("/sessions")
+    @api_v1.get("/sessions")
     async def list_sessions_endpoint(request: Request) -> list[SessionStatus]:
         """Snapshot of in-flight sessions (running / awaiting_input / error)."""
         svc = request.app.state.service
@@ -533,7 +537,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # HITL approval endpoints (risk-rated tool gateway)
     # ------------------------------------------------------------------
 
-    @fastapi_app.get("/sessions/{session_id}/approvals")
+    @api_v1.get("/sessions/{session_id}/approvals")
     async def list_pending_approvals(
         session_id: str, request: Request
     ) -> list[PendingApproval]:
@@ -575,7 +579,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 ))
         return out
 
-    @fastapi_app.post(
+    @api_v1.post(
         "/sessions/{session_id}/approvals/{tool_call_id}",
         status_code=200,
     )
@@ -661,7 +665,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             "rationale": body.rationale,
         }
 
-    @fastapi_app.delete("/sessions/{session_id}", status_code=204)
+    @api_v1.delete("/sessions/{session_id}", status_code=204)
     async def stop_session_endpoint(
         session_id: str, request: Request
     ) -> Response:
@@ -692,7 +696,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # T2: generic /sessions/* endpoints (React-ready, non-legacy).
     # ==================================================================
 
-    @fastapi_app.get("/sessions/recent")
+    @api_v1.get("/sessions/recent")
     async def recent_sessions(request: Request, limit: int = 20) -> list[dict]:
         """List recent sessions of ANY status — closed + active.
 
@@ -702,7 +706,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         return orch.list_recent_sessions(limit=limit)
 
-    @fastapi_app.get("/sessions/{session_id}")
+    @api_v1.get("/sessions/{session_id}")
     async def get_session_detail(session_id: str, request: Request) -> dict:
         """Full session detail. Generic equivalent of the legacy
         domain-flavoured detail route. 404 when the id is unknown."""
@@ -714,7 +718,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 status_code=404, detail=_SESSION_NOT_FOUND_DETAIL,
             ) from e
 
-    @fastapi_app.post("/sessions/{session_id}/resume")
+    @api_v1.post("/sessions/{session_id}/resume")
     async def resume_session_sse(
         session_id: str, req: ResumeRequest, request: Request,
     ) -> StreamingResponse:
@@ -748,7 +752,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.post("/sessions/{session_id}/retry")
+    @api_v1.post("/sessions/{session_id}/retry")
     async def retry_session_sse(
         session_id: str, request: Request,
     ) -> StreamingResponse:
@@ -771,7 +775,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.get("/sessions/{session_id}/retry/preview")
+    @api_v1.get("/sessions/{session_id}/retry/preview")
     async def preview_retry(
         session_id: str, request: Request,
     ) -> RetryDecisionPreview:
@@ -790,7 +794,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             reason=str(decision.reason),
         )
 
-    @fastapi_app.get("/sessions/{session_id}/lessons")
+    @api_v1.get("/sessions/{session_id}/lessons")
     async def list_session_lessons(
         session_id: str, request: Request,
     ) -> list[LessonResponse]:
@@ -835,7 +839,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # T3: SSE event stream + T4: WebSocket fallback.
     # ==================================================================
 
-    @fastapi_app.get("/sessions/{session_id}/events")
+    @api_v1.get("/sessions/{session_id}/events")
     async def sse_events(
         session_id: str, request: Request, since: int = 0,
     ) -> StreamingResponse:
@@ -889,7 +893,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_stream(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.websocket("/ws/sessions/{session_id}/events")
+    @api_v1.websocket("/ws/sessions/{session_id}/events")
     async def ws_events(websocket: WebSocket, session_id: str) -> None:
         """WebSocket fallback for the SSE event stream. Same payload
         shape (:class:`EventEnvelope`); clients that prefer WS over
@@ -936,6 +940,10 @@ def build_app(cfg: AppConfig) -> FastAPI:
             except Exception:  # noqa: BLE001
                 pass
 
+    # Mount the versioned router. /health stays at root (registered
+    # directly on ``fastapi_app`` above); everything else lives under
+    # /api/v1.
+    fastapi_app.include_router(api_v1)
     return fastapi_app
 
 
