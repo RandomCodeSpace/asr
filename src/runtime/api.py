@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from runtime import api_session_full
+from runtime import api_session_full, api_ui_hints
 from runtime.config import AppConfig, load_config
 
 _log = logging.getLogger("runtime.api")
@@ -259,6 +259,9 @@ def _make_lifespan(cfg: AppConfig):
         orch = svc.submit_and_wait(svc._ensure_orchestrator(), timeout=30.0)
         app.state.service = svc
         app.state.orchestrator = orch
+        # Surface the validated AppConfig so app.state.cfg-readers
+        # (e.g. /api/v1/config/ui-hints) don't have to re-load YAML.
+        app.state.cfg = cfg
         # Environments roster is app-specific (incident-management has
         # production/staging/dev/local; code-review doesn't expose one).
         # Read it from the YAML's top-level ``environments:`` block;
@@ -947,6 +950,13 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # lives next door so this file stays focused on routing wiring.
     # ==================================================================
     api_session_full.add_routes(api_v1)
+
+    # ==================================================================
+    # UI hints: GET /api/v1/config/ui-hints
+    # Drives the React shell's brand block, environment switcher list,
+    # and approval-rationale dropdown. Read once at app boot.
+    # ==================================================================
+    api_ui_hints.add_routes(api_v1)
 
     # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
     # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)

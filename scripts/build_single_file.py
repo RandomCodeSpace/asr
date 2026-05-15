@@ -192,6 +192,10 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # ``api.build_app``; bundled after api.py for the same reason as
     # api_dedup.py.
     (RUNTIME_ROOT, "api_session_full.py"),
+    # UI hints endpoint — read once at React boot for the topbar brand
+    # block, env switcher list, and approval-rationale dropdown. Same
+    # side-car pattern as api_session_full.py.
+    (RUNTIME_ROOT, "api_ui_hints.py"),
 ]
 
 # Example app modules — flattened *after* the runtime modules in the

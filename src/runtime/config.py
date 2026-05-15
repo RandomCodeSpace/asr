@@ -629,7 +629,8 @@ class UIDetailField(BaseModel):
 class UIConfig(BaseModel):
     """App-driven UI rendering knobs. Keeps the generic Streamlit shell
     in ``runtime/ui.py`` agnostic of any specific domain — colors, labels,
-    and tag prefixes come from YAML.
+    and tag prefixes come from YAML. Also drives the React UI (v2.0) shell
+    via ``GET /api/v1/config/ui-hints``.
 
     ``badges`` is a 2-level dict: ``{field_name: {value: UIBadge}}``.
     Example: ``{"status": {"open": {"label": "OPEN", "color": "red"}}}``.
@@ -640,10 +641,20 @@ class UIConfig(BaseModel):
     ``tags`` is an opaque key->tag-string map the UI consults for
     cross-skill signals (e.g. ``prior_match_supported`` -> the literal
     tag a skill emits).
+
+    React UI (v2.0) fields: ``brand_name``, ``brand_logo_url``,
+    ``approval_rationale_templates``, and ``hitl_question_templates``
+    drive the React shell's topbar brand block, environment switcher,
+    and approval-rationale dropdown. Read at app boot via
+    ``useUiHints()`` and cached for the session lifetime.
     """
     badges: dict[str, dict[str, UIBadge]] = Field(default_factory=dict)
     detail_fields: list[UIDetailField] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
+    brand_name: str = ""
+    brand_logo_url: str | None = None
+    approval_rationale_templates: list[str] = Field(default_factory=list)
+    hitl_question_templates: dict[str, str] = Field(default_factory=dict)
 
     model_config = {"frozen": True, "extra": "forbid"}
 
