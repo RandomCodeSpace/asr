@@ -15565,15 +15565,23 @@ def build_app(cfg: AppConfig) -> FastAPI:
         lifespan=_make_lifespan(cfg),
     )
 
-    # CORS: configure once with the AppConfig-supplied origins so the
-    # React dev server (Vite at :5173, CRA/Next at :3000 by default) can
-    # call every endpoint, SSE included. Production deployments lock
-    # the origin list down via YAML — same shape, narrower allow-list.
+    # CORS: env-driven so the React dev server (Vite at :5173) can call
+    # every endpoint, SSE included. Override via ``ASR_CORS_ORIGINS``
+    # (comma-separated) — production deployments lock the origin list
+    # down by setting the env var to the narrower allow-list.
+    # ``allow_credentials=False`` matches the bearer-token auth pattern
+    # (no cookies); methods are explicit so OPTIONS preflights are
+    # handled the same way for every route.
+    _cors_origins_raw = os.environ.get(
+        "ASR_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",  # Vite dev defaults
+    )
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
     fastapi_app.add_middleware(
         CORSMiddleware,
-        allow_origins=cfg.api.cors_origins,
-        allow_credentials=cfg.api.cors_allow_credentials,
-        allow_methods=["*"],
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
 
