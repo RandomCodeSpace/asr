@@ -17,7 +17,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
     from runtime.triggers.registry import TriggerRegistry  # noqa: F401
 
 

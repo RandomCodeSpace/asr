@@ -39,6 +39,13 @@ from runtime.config import AppConfig, load_config
 _log = logging.getLogger("runtime.api")
 
 
+# Wire-format constants (extracted to keep S1192 — duplicated literal
+# strings — in check; every SSE endpoint uses _SSE_MEDIA_TYPE, every
+# session-not-found path raises with _SESSION_NOT_FOUND_DETAIL).
+_SSE_MEDIA_TYPE = "text/event-stream"
+_SESSION_NOT_FOUND_DETAIL = "session not found"
+
+
 # HTTP status -> structured error code. Used by the global exception
 # handler to keep React's error UI from having to switch on every
 # integer status code.
@@ -451,7 +458,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             ):
                 yield f"data: {json.dumps(ev, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
     @fastapi_app.post("/incidents/{incident_id}/resume")
     async def resume_incident(incident_id: str, req: ResumeRequest) -> StreamingResponse:
@@ -479,7 +486,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 }
                 yield f"data: {json.dumps(err, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
     # ------------------------------------------------------------------
     # Multi-session endpoints
@@ -487,7 +494,6 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
     @fastapi_app.post(
         "/sessions",
-        response_model=SessionStartResponse,
         status_code=201,
     )
     async def start_session_endpoint(
@@ -517,7 +523,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return SessionStartResponse(session_id=sid)
 
-    @fastapi_app.get("/sessions", response_model=list[SessionStatus])
+    @fastapi_app.get("/sessions")
     async def list_sessions_endpoint(request: Request) -> list[SessionStatus]:
         """Snapshot of in-flight sessions (running / awaiting_input / error)."""
         svc = request.app.state.service
@@ -527,10 +533,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # HITL approval endpoints (risk-rated tool gateway)
     # ------------------------------------------------------------------
 
-    @fastapi_app.get(
-        "/sessions/{session_id}/approvals",
-        response_model=list[PendingApproval],
-    )
+    @fastapi_app.get("/sessions/{session_id}/approvals")
     async def list_pending_approvals(
         session_id: str, request: Request
     ) -> list[PendingApproval]:
@@ -545,13 +548,13 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             inc = orch.store.load(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             # ``ValueError`` covers the SessionStore id-format guard
             # (``Invalid incident id ...``) which we treat as a 404
             # at the API boundary — the client passed an id that
             # cannot exist, semantically equivalent to "not found".
             raise HTTPException(
-                status_code=404, detail="session not found"
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL
             ) from e
         # Defensive: ``svc`` is unused here today — the read goes through
         # the orchestrator's store. We keep the reference so a future
@@ -593,9 +596,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             orch.store.load(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             raise HTTPException(
-                status_code=404, detail="session not found"
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL
             ) from e
 
         decision_payload = {
@@ -706,9 +709,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             return orch.get_session(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             raise HTTPException(
-                status_code=404, detail="session not found",
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL,
             ) from e
 
     @fastapi_app.post("/sessions/{session_id}/resume")
@@ -743,7 +746,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 }
                 yield f"data: {json.dumps(err, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
     @fastapi_app.post("/sessions/{session_id}/retry")
     async def retry_session_sse(
@@ -766,12 +769,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 }
                 yield f"data: {json.dumps(err, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.get(
-        "/sessions/{session_id}/retry/preview",
-        response_model=RetryDecisionPreview,
-    )
+    @fastapi_app.get("/sessions/{session_id}/retry/preview")
     async def preview_retry(
         session_id: str, request: Request,
     ) -> RetryDecisionPreview:
@@ -781,19 +781,16 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             decision = orch.preview_retry_decision(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             raise HTTPException(
-                status_code=404, detail="session not found",
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL,
             ) from e
         return RetryDecisionPreview(
             retry=bool(decision.retry),
             reason=str(decision.reason),
         )
 
-    @fastapi_app.get(
-        "/sessions/{session_id}/lessons",
-        response_model=list[LessonResponse],
-    )
+    @fastapi_app.get("/sessions/{session_id}/lessons")
     async def list_session_lessons(
         session_id: str, request: Request,
     ) -> list[LessonResponse]:
@@ -890,7 +887,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                     last_seq = ev.seq
                     yield f"data: {envelope.model_dump_json()}\n\n"
 
-        return StreamingResponse(_stream(), media_type="text/event-stream")
+        return StreamingResponse(_stream(), media_type=_SSE_MEDIA_TYPE)
 
     @fastapi_app.websocket("/ws/sessions/{session_id}/events")
     async def ws_events(websocket: WebSocket, session_id: str) -> None:

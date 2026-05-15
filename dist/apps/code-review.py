@@ -690,8 +690,11 @@ import pydantic as _pydantic
 
 # Phase 11 (FOC-04): forward-reference imports for the should_gate
 # signature only; kept inside ``TYPE_CHECKING`` so the bundle's
-# intra-import stripper does not remove a load-bearing import. The
-# ``pass`` keeps the block syntactically valid after stripping.
+# intra-import stripper sees them. The bundler's
+# ``_ORPHANED_TYPE_CHECKING_RE`` rewrite injects a ``pass`` body when
+# the imports get stripped (build_single_file.py:292) — but its regex
+# requires the ``if TYPE_CHECKING:`` line to have no trailing comment,
+# so do not add one here.
 # ----- imports for runtime/agents/responsive.py -----
 """Responsive agent kind — the today-default LLM agent.
 
@@ -1397,6 +1400,9 @@ from typing import Any, AsyncIterator, Generic, Type, TypeVar
 
 
 
+# Forward-import: ``runtime.triggers.base`` only defines a dataclass and
+# the type appears in a method annotation. Kept inside ``TYPE_CHECKING``
+# to avoid a runtime circular import.
 # ----- imports for runtime/api.py -----
 """FastAPI app — health, listings, incident, and multi-session endpoints.
 
@@ -3643,6 +3649,12 @@ class Base(DeclarativeBase):
     pass
 
 
+# SQL fragment used as the partial-index predicate so soft-deleted
+# rows don't bloat the indexes (mirrors the application-layer
+# "exclude deleted" filter in SessionStore queries).
+_ACTIVE_ROW_SQL = "deleted_at IS NULL"
+
+
 class IncidentRow(Base):
     __tablename__ = "incidents"
 
@@ -3694,11 +3706,11 @@ class IncidentRow(Base):
 
     __table_args__ = (
         Index("ix_incidents_status_env_active", "status", "environment",
-              postgresql_where=text("deleted_at IS NULL"),
-              sqlite_where=text("deleted_at IS NULL")),
+              postgresql_where=text(_ACTIVE_ROW_SQL),
+              sqlite_where=text(_ACTIVE_ROW_SQL)),
         Index("ix_incidents_created_at_active", "created_at",
-              postgresql_where=text("deleted_at IS NULL"),
-              sqlite_where=text("deleted_at IS NULL")),
+              postgresql_where=text(_ACTIVE_ROW_SQL),
+              sqlite_where=text(_ACTIVE_ROW_SQL)),
         Index("ix_incidents_parent_session_id", "parent_session_id"),
     )
 
@@ -6852,7 +6864,7 @@ def parse_envelope_from_result(
             continue
         try:
             payload = json.loads(content)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:  # JSONDecodeError is a ValueError subclass
             continue
         if not isinstance(payload, dict):
             continue
@@ -8318,12 +8330,8 @@ class ApprovalWatchdog:
 
 # ====== module: runtime/policy.py ======
 
-if TYPE_CHECKING:  # pragma: no cover -- type checking only
-
-
-    pass  # noqa: PIE790 -- bundle survives even if imports are stripped
-
-
+if TYPE_CHECKING:
+    pass
 GateReason = Literal[
     "auto",
     "high_risk_tool",
@@ -10027,7 +10035,7 @@ def _try_recover_envelope_from_raw(raw: str) -> AgentTurnOutput | None:
     for candidate in candidates:
         try:
             payload = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:  # JSONDecodeError is a ValueError subclass
             continue
         if not isinstance(payload, dict):
             continue
@@ -11050,9 +11058,6 @@ async def make_checkpointer(
 
 if TYPE_CHECKING:
     pass
-
-
-
 @dataclass(frozen=True)
 class TriggerInfo:
     """Provenance attached to every session started via a trigger.
@@ -11522,9 +11527,6 @@ class APITransport(TriggerTransport):
 
 if TYPE_CHECKING:
     pass
-
-
-
 _log = logging.getLogger(__name__)
 
 
@@ -11617,7 +11619,7 @@ class WebhookTransport(TriggerTransport):
                 )
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
-            except (ValueError, TypeError, ValidationError) as exc:
+            except (ValueError, TypeError) as exc:  # pydantic ValidationError is a ValueError subclass
                 _log.warning(
                     "trigger %r transform/dispatch failed: %s", name, exc
                 )
@@ -11630,8 +11632,6 @@ class WebhookTransport(TriggerTransport):
 
 if TYPE_CHECKING:
     pass
-
-
 _log = logging.getLogger(__name__)
 
 
@@ -13593,15 +13593,7 @@ def gc_orphaned_checkpoints(engine: Engine) -> int:
 # ====== module: runtime/orchestrator.py ======
 
 if TYPE_CHECKING:
-    # Avoid a runtime circular import — ``runtime.triggers.base`` only
-    # defines a dataclass, and the type appears in a method annotation.
     pass
-
-
-
-
-
-
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
@@ -13618,6 +13610,12 @@ from langgraph.types import Command
 
 
 _log = logging.getLogger("runtime.orchestrator")
+
+
+# Marker that ``runtime.graph._handle_agent_failure`` writes onto the
+# AgentRun.summary of the failing turn. Read by the retry / extract-error
+# helpers below.
+_AGENT_FAILURE_MARKER = "agent failed:"
 
 
 def _assert_envelope_invariant_on_finalize(session: "Session") -> None:
@@ -14537,9 +14535,9 @@ class Orchestrator(Generic[StateT]):
         import pydantic as _pydantic
         for run in reversed(inc.agents_run):
             summary = (run.summary or "")
-            if not summary.startswith("agent failed:"):
+            if not summary.startswith(_AGENT_FAILURE_MARKER):
                 continue
-            body = summary.removeprefix("agent failed:").strip()
+            body = summary.removeprefix(_AGENT_FAILURE_MARKER).strip()
             if "EnvelopeMissingError" in body:
                 return _EnvelopeMissingError(
                     agent=run.agent or "unknown",
@@ -15117,7 +15115,7 @@ class Orchestrator(Generic[StateT]):
         # successful runs. Retry attempts then append fresh runs.
         inc.agents_run = [
             r for r in inc.agents_run
-            if not (r.summary or "").startswith("agent failed:")
+            if not (r.summary or "").startswith(_AGENT_FAILURE_MARKER)
         ]
         # Bump retry counter for unique LangGraph thread id (the prior
         # thread's checkpoint sits at a terminal node and would
@@ -15258,6 +15256,13 @@ def _event_ts() -> str:
 # ====== module: runtime/api.py ======
 
 _log = logging.getLogger("runtime.api")
+
+
+# Wire-format constants (extracted to keep S1192 — duplicated literal
+# strings — in check; every SSE endpoint uses _SSE_MEDIA_TYPE, every
+# session-not-found path raises with _SESSION_NOT_FOUND_DETAIL).
+_SSE_MEDIA_TYPE = "text/event-stream"
+_SESSION_NOT_FOUND_DETAIL = "session not found"
 
 
 # HTTP status -> structured error code. Used by the global exception
@@ -15672,7 +15677,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             ):
                 yield f"data: {json.dumps(ev, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
     @fastapi_app.post("/incidents/{incident_id}/resume")
     async def resume_incident(incident_id: str, req: ResumeRequest) -> StreamingResponse:
@@ -15700,7 +15705,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 }
                 yield f"data: {json.dumps(err, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
     # ------------------------------------------------------------------
     # Multi-session endpoints
@@ -15708,7 +15713,6 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
     @fastapi_app.post(
         "/sessions",
-        response_model=SessionStartResponse,
         status_code=201,
     )
     async def start_session_endpoint(
@@ -15738,7 +15742,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return SessionStartResponse(session_id=sid)
 
-    @fastapi_app.get("/sessions", response_model=list[SessionStatus])
+    @fastapi_app.get("/sessions")
     async def list_sessions_endpoint(request: Request) -> list[SessionStatus]:
         """Snapshot of in-flight sessions (running / awaiting_input / error)."""
         svc = request.app.state.service
@@ -15748,10 +15752,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # HITL approval endpoints (risk-rated tool gateway)
     # ------------------------------------------------------------------
 
-    @fastapi_app.get(
-        "/sessions/{session_id}/approvals",
-        response_model=list[PendingApproval],
-    )
+    @fastapi_app.get("/sessions/{session_id}/approvals")
     async def list_pending_approvals(
         session_id: str, request: Request
     ) -> list[PendingApproval]:
@@ -15766,13 +15767,13 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             inc = orch.store.load(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             # ``ValueError`` covers the SessionStore id-format guard
             # (``Invalid incident id ...``) which we treat as a 404
             # at the API boundary — the client passed an id that
             # cannot exist, semantically equivalent to "not found".
             raise HTTPException(
-                status_code=404, detail="session not found"
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL
             ) from e
         # Defensive: ``svc`` is unused here today — the read goes through
         # the orchestrator's store. We keep the reference so a future
@@ -15814,9 +15815,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             orch.store.load(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             raise HTTPException(
-                status_code=404, detail="session not found"
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL
             ) from e
 
         decision_payload = {
@@ -15927,9 +15928,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             return orch.get_session(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             raise HTTPException(
-                status_code=404, detail="session not found",
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL,
             ) from e
 
     @fastapi_app.post("/sessions/{session_id}/resume")
@@ -15964,7 +15965,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 }
                 yield f"data: {json.dumps(err, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
     @fastapi_app.post("/sessions/{session_id}/retry")
     async def retry_session_sse(
@@ -15987,12 +15988,9 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 }
                 yield f"data: {json.dumps(err, default=str)}\n\n"
 
-        return StreamingResponse(_events(), media_type="text/event-stream")
+        return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.get(
-        "/sessions/{session_id}/retry/preview",
-        response_model=RetryDecisionPreview,
-    )
+    @fastapi_app.get("/sessions/{session_id}/retry/preview")
     async def preview_retry(
         session_id: str, request: Request,
     ) -> RetryDecisionPreview:
@@ -16002,19 +16000,16 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         try:
             decision = orch.preview_retry_decision(session_id)
-        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+        except (FileNotFoundError, ValueError, LookupError) as e:  # KeyError is a LookupError subclass
             raise HTTPException(
-                status_code=404, detail="session not found",
+                status_code=404, detail=_SESSION_NOT_FOUND_DETAIL,
             ) from e
         return RetryDecisionPreview(
             retry=bool(decision.retry),
             reason=str(decision.reason),
         )
 
-    @fastapi_app.get(
-        "/sessions/{session_id}/lessons",
-        response_model=list[LessonResponse],
-    )
+    @fastapi_app.get("/sessions/{session_id}/lessons")
     async def list_session_lessons(
         session_id: str, request: Request,
     ) -> list[LessonResponse]:
@@ -16110,7 +16105,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                     last_seq = ev.seq
                     yield f"data: {envelope.model_dump_json()}\n\n"
 
-        return StreamingResponse(_stream(), media_type="text/event-stream")
+        return StreamingResponse(_stream(), media_type=_SSE_MEDIA_TYPE)
 
     @fastapi_app.websocket("/ws/sessions/{session_id}/events")
     async def ws_events(websocket: WebSocket, session_id: str) -> None:
@@ -16218,7 +16213,6 @@ def register_dedup_routes(
 
     @app.post(
         "/sessions/{session_id}/un-duplicate",
-        response_model=UnDuplicateResponse,
         status_code=200,
         tags=["dedup"],
     )

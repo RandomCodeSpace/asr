@@ -49,12 +49,14 @@ from runtime.agents.turn_output import EnvelopeMissingError
 
 # Phase 11 (FOC-04): forward-reference imports for the should_gate
 # signature only; kept inside ``TYPE_CHECKING`` so the bundle's
-# intra-import stripper does not remove a load-bearing import. The
-# ``pass`` keeps the block syntactically valid after stripping.
-if TYPE_CHECKING:  # pragma: no cover -- type checking only
+# intra-import stripper sees them. The bundler's
+# ``_ORPHANED_TYPE_CHECKING_RE`` rewrite injects a ``pass`` body when
+# the imports get stripped (build_single_file.py:292) — but its regex
+# requires the ``if TYPE_CHECKING:`` line to have no trailing comment,
+# so do not add one here.
+if TYPE_CHECKING:
     from runtime.config import OrchestratorConfig  # noqa: F401
     from runtime.state import ToolCall  # noqa: F401
-    pass  # noqa: PIE790 -- bundle survives even if imports are stripped
 
 
 GateReason = Literal[

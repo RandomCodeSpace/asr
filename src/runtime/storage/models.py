@@ -14,6 +14,12 @@ class Base(DeclarativeBase):
     pass
 
 
+# SQL fragment used as the partial-index predicate so soft-deleted
+# rows don't bloat the indexes (mirrors the application-layer
+# "exclude deleted" filter in SessionStore queries).
+_ACTIVE_ROW_SQL = "deleted_at IS NULL"
+
+
 class IncidentRow(Base):
     __tablename__ = "incidents"
 
@@ -65,11 +71,11 @@ class IncidentRow(Base):
 
     __table_args__ = (
         Index("ix_incidents_status_env_active", "status", "environment",
-              postgresql_where=text("deleted_at IS NULL"),
-              sqlite_where=text("deleted_at IS NULL")),
+              postgresql_where=text(_ACTIVE_ROW_SQL),
+              sqlite_where=text(_ACTIVE_ROW_SQL)),
         Index("ix_incidents_created_at_active", "created_at",
-              postgresql_where=text("deleted_at IS NULL"),
-              sqlite_where=text("deleted_at IS NULL")),
+              postgresql_where=text(_ACTIVE_ROW_SQL),
+              sqlite_where=text(_ACTIVE_ROW_SQL)),
         Index("ix_incidents_parent_session_id", "parent_session_id"),
     )
 

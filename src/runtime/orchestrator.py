@@ -20,10 +20,10 @@ from runtime.config import (
     resolve_framework_app_config,
 )
 
+# Forward-import: ``runtime.triggers.base`` only defines a dataclass and
+# the type appears in a method annotation. Kept inside ``TYPE_CHECKING``
+# to avoid a runtime circular import.
 if TYPE_CHECKING:
-    # Avoid a runtime circular import — ``runtime.triggers.base`` only
-    # defines a dataclass, and the type appears in a method annotation.
-    pass
     from runtime.triggers.base import TriggerInfo  # noqa: F401
 from runtime.dedup import DedupConfig, DedupPipeline, DedupResult
 from runtime.intake import IntakeContext
@@ -47,6 +47,12 @@ from runtime.storage.vector import build_vector_store
 from runtime.locks import SessionLockRegistry
 
 _log = logging.getLogger("runtime.orchestrator")
+
+
+# Marker that ``runtime.graph._handle_agent_failure`` writes onto the
+# AgentRun.summary of the failing turn. Read by the retry / extract-error
+# helpers below.
+_AGENT_FAILURE_MARKER = "agent failed:"
 
 
 def _assert_envelope_invariant_on_finalize(session: "Session") -> None:
@@ -971,9 +977,9 @@ class Orchestrator(Generic[StateT]):
         import pydantic as _pydantic
         for run in reversed(inc.agents_run):
             summary = (run.summary or "")
-            if not summary.startswith("agent failed:"):
+            if not summary.startswith(_AGENT_FAILURE_MARKER):
                 continue
-            body = summary.removeprefix("agent failed:").strip()
+            body = summary.removeprefix(_AGENT_FAILURE_MARKER).strip()
             if "EnvelopeMissingError" in body:
                 return _EnvelopeMissingError(
                     agent=run.agent or "unknown",
@@ -1551,7 +1557,7 @@ class Orchestrator(Generic[StateT]):
         # successful runs. Retry attempts then append fresh runs.
         inc.agents_run = [
             r for r in inc.agents_run
-            if not (r.summary or "").startswith("agent failed:")
+            if not (r.summary or "").startswith(_AGENT_FAILURE_MARKER)
         ]
         # Bump retry counter for unique LangGraph thread id (the prior
         # thread's checkpoint sits at a terminal node and would

@@ -30,7 +30,6 @@ from runtime.triggers.base import TriggerTransport
 from runtime.triggers.config import WebhookTriggerConfig
 
 if TYPE_CHECKING:
-    pass
     from runtime.triggers.idempotency import IdempotencyStore  # noqa: F401
     from runtime.triggers.registry import (  # noqa: F401
         TriggerRegistry, TriggerSpec,
@@ -128,7 +127,7 @@ class WebhookTransport(TriggerTransport):
                 )
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
-            except (ValueError, TypeError, ValidationError) as exc:
+            except (ValueError, TypeError) as exc:  # pydantic ValidationError is a ValueError subclass
                 _log.warning(
                     "trigger %r transform/dispatch failed: %s", name, exc
                 )
