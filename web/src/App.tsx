@@ -10,6 +10,7 @@ import { useSessionList } from '@/state/useSessionList';
 import { useApprovalsQueue } from '@/state/useApprovalsQueue';
 import { useAgentDefinitions } from '@/state/useAgentDefinitions';
 import { useSessionFull } from '@/state/useSessionFull';
+import { MonitorRail } from '@/monitors/MonitorRail';
 
 const UI_VERSION = 'v2.0.0-rc1';
 const RUNTIME_VERSION_FALLBACK = 'unknown';
@@ -27,14 +28,6 @@ const paneStyle: CSSProperties = {
   display: 'grid',
   gridTemplateColumns: '220px 1fr 340px',
   minHeight: 0,
-};
-
-const monitorRailPlaceholder: CSSProperties = {
-  background: 'var(--bg-page)',
-  borderLeft: '1px solid var(--hair)',
-  padding: 16,
-  fontSize: 11,
-  color: 'var(--ink-3)',
 };
 
 export function App() {
@@ -87,9 +80,15 @@ export function App() {
           onSelect={setActiveSid}
         />
         <SessionCanvas activeSid={activeSid} />
-        <div style={monitorRailPlaceholder}>
-          Ambient monitors (Phase 5)
-        </div>
+        <MonitorRail
+          sessions={sessionList.sessions}
+          activeSid={activeSid}
+          queue={approvals.queue}
+          agentsByName={agents.data?.byName ?? {}}
+          toolCalls={sessionFull.state.toolCalls}
+          sessionId={activeSid}
+          onSelectSession={setActiveSid}
+        />
       </div>
       <Statusbar
         connection={connection}
