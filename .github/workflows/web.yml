@@ -1,0 +1,59 @@
+name: Web CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web.yml'
+
+defaults:
+  run:
+    working-directory: web
+
+jobs:
+  quality:
+    name: Lint / Type-check / Test / Build / Size
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v6.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install (locked)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Unit tests with coverage
+        run: npx vitest run --coverage
+
+      - name: Production build
+        run: npm run build
+
+      - name: Bundle-size budget
+        run: npm run check:size
+
+      - name: Upload bundle (PR builds only)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 7

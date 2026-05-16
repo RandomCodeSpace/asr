@@ -33,7 +33,17 @@ uv run pytest tests/ -x
 # Run the incident-management app via the CLI entrypoint
 uv run python -m runtime --config config/incident_management.yaml
 
-# Streamlit UI
+# Backend API (serves the React SPA at / when web/dist exists)
+uv run uvicorn runtime.api:get_app --factory --port 8000
+
+# React UI (Vite dev server; proxy /api/v1 -> :8000)
+cd web && npm ci && npm run dev    # http://localhost:5173
+
+# Production: build once, then the backend serves it at http://localhost:8000
+cd web && npm run build && cd ..
+uv run uvicorn runtime.api:get_app --factory --port 8000
+
+# Legacy Streamlit UI (deprecated in v2; banner inside)
 ASR_LOG_LEVEL=INFO uv run streamlit run src/runtime/ui.py --server.port 37777
 ```
 
@@ -50,10 +60,16 @@ Set provider keys in `.env` (`OLLAMA_API_KEY`, `OPENROUTER_API_KEY`,
   contributor loop: setup, regenerating `dist/`, adding a runtime
   module.
 - **[`docs/AIRGAP_INSTALL.md`](docs/AIRGAP_INSTALL.md)** —
-  air-gapped / internal-mirror install procedure.
+  air-gapped / internal-mirror install procedure (includes the v2
+  React UI air-gap layout).
+- **[`docs/RELEASE.md`](docs/RELEASE.md)** — cutting a release
+  candidate; `npm run build` + `scripts/package_airgap.py` + git tag.
 
 ## Status
 
-`main` carries v1.0 → v1.5. v2.0 (React UI replacing the Streamlit
-prototype) is the next big move. See `docs/DESIGN.md` § 13 for the
-milestone history and § 14 for the pending list.
+`main` carries v1.0 → v1.5. **v2.0.0-rc1** ships the React UI
+(Vite + React 19 + TS + Tailwind v4 + Radix primitives) in `web/`
+which replaces the Streamlit prototype. The legacy Streamlit UI
+remains shippable behind a deprecation banner until parity is
+verified (`docs/REACT_UI_PARITY.md`). See `docs/DESIGN.md` § 13
+for the milestone history.

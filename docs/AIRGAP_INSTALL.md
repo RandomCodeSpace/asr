@@ -51,3 +51,38 @@ uv lock --check    # exit 0 = in sync; non-zero = regenerate with `uv lock`
   installs on any host (HARD-02 / CONCERNS C2).
 - Ship vendored wheels as a separate tarball if your host has no mirror at
   all; populate `~/.cache/uv` (or `UV_CACHE_DIR`) before running step 3.
+
+## v2.0 — React UI in the air-gap payload
+
+The React SPA in `web/` is built ahead of time and shipped as static
+assets alongside the Python bundle. The backend serves it from `/`
+via `runtime.api_static.mount_static_assets` so there is no separate
+Node process on the deploy host.
+
+```bash
+# On a host with internet (one time, or each release):
+cd web && npm ci && npm run build
+cd ..
+uv run python scripts/build_single_file.py    # framework + app bundles
+uv run python scripts/package_airgap.py       # composes dist/airgap/
+
+# Ship dist/airgap/ to the air-gap host. Layout:
+#   dist/airgap/
+#     app.py           # flattened framework + incident-management
+#     ui.py            # legacy Streamlit (deprecation banner)
+#     web/             # built React SPA (Vite output)
+#     README.txt
+```
+
+On the air-gap host:
+
+```bash
+ASR_WEB_DIST=./web \
+  python -m uvicorn app:get_app --factory --port 8000
+# open http://<host>:8000/
+```
+
+`ASR_WEB_DIST` is read by `runtime.api_static.mount_static_assets`.
+If unset, the backend falls back to `<bundle>/web/dist` (legacy dev
+layout). When neither resolves, the SPA mount is skipped silently and
+the API still serves on `/api/v1/*`.
