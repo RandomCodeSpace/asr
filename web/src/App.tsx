@@ -11,6 +11,7 @@ import { useApprovalsQueue } from '@/state/useApprovalsQueue';
 import { useAgentDefinitions } from '@/state/useAgentDefinitions';
 import { useSessionFull } from '@/state/useSessionFull';
 import { MonitorRail } from '@/monitors/MonitorRail';
+import { NewSessionModal } from '@/modals/NewSessionModal';
 
 const UI_VERSION = 'v2.0.0-rc1';
 const RUNTIME_VERSION_FALLBACK = 'unknown';
@@ -32,6 +33,7 @@ const paneStyle: CSSProperties = {
 
 export function App() {
   const [activeSid, setActiveSid] = useState<string | null>(null);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
 
   const uiHints = useUiHints();
   const sessionList = useSessionList();
@@ -65,7 +67,7 @@ export function App() {
         health={health}
         approvalsCount={approvals.count}
         onSearch={() => {/* Phase 6: open search overlay */}}
-        onNew={() => {/* Phase 6: open NewSessionModal */}}
+        onNew={() => setNewSessionOpen(true)}
         onApprovalsClick={() => {/* Phase 6: open approvals view */}}
       />
       <FlowStrip
@@ -97,6 +99,12 @@ export function App() {
         vmSeqState={vmSeqState}
         runtimeVersion={RUNTIME_VERSION_FALLBACK}
         uiVersion={UI_VERSION}
+      />
+      <NewSessionModal
+        open={newSessionOpen}
+        onOpenChange={setNewSessionOpen}
+        environments={uiHints.data?.environments ?? ['dev']}
+        onCreated={(sid) => setActiveSid(sid)}
       />
     </div>
   );
