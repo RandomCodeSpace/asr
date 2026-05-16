@@ -79,6 +79,8 @@ docs/*
 !docs/09-build-deploy-release.md
 !docs/10-known-risks-and-todos.md
 !docs/11-agent-handoff.md
+!docs/RELEASE.md
+!docs/REACT_UI_PARITY.md
 !docs/adr/
 !docs/adr/*.md
 REVIEW_*.md
