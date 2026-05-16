@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-const BASE = process.env.E2E_BASE_URL ?? 'https://clm.randomcodespace.dev';
+const BASE = process.env.E2E_BASE_URL ?? 'http://localhost:5173';
 
 test('shell renders + New Session creates a INC- id and opens canvas', async ({ page }) => {
   test.setTimeout(60_000);
