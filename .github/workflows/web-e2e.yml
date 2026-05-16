@@ -1,0 +1,100 @@
+name: Web E2E
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'src/runtime/**'
+      - '.github/workflows/web-e2e.yml'
+  workflow_dispatch:
+
+jobs:
+  playwright:
+    name: Build SPA + boot backend + Playwright
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      OLLAMA_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+      AZURE_OPENAI_KEY: ""
+      AZURE_DEPLOYMENT: ""
+      AZURE_ENDPOINT: https://ci-dummy.example/
+      EXTERNAL_MCP_URL: https://ci-dummy.example/
+      EXT_TOKEN: ci-dummy
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6.7.0
+        with:
+          version: "0.11.7"
+          enable-cache: true
+
+      - name: Install Python deps (locked)
+        run: uv sync --frozen --extra dev
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v6.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web deps (locked)
+        working-directory: web
+        run: npm ci
+
+      - name: Build SPA
+        working-directory: web
+        run: npm run build
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Boot backend (serves SPA + API)
+        run: |
+          mkdir -p logs
+          nohup uv run uvicorn runtime.api:app --port 8000 > logs/uvicorn.log 2>&1 &
+          echo $! > .backend.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/api/v1/ui/hints >/dev/null; then
+              echo "backend ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "backend failed to start"
+          tail -200 logs/uvicorn.log
+          exit 1
+
+      - name: Run Playwright
+        working-directory: web
+        env:
+          E2E_BASE_URL: http://localhost:8000
+        run: npx playwright test --reporter=list
+
+      - name: Stop backend
+        if: always()
+        run: |
+          if [ -f .backend.pid ]; then kill "$(cat .backend.pid)" 2>/dev/null || true; fi
+
+      - name: Upload Playwright report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report
+            web/test-results
+            logs/uvicorn.log
+          retention-days: 7
