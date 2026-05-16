@@ -1440,6 +1440,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 
+
 # ----- imports for runtime/api_dedup.py -----
 """Dedup retraction HTTP routes.
 
@@ -1462,8 +1463,9 @@ status flip via :meth:`SessionStore.un_duplicate`.
 """
 
 
+from typing import Any, Callable, Union
 
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 
 
 # ----- imports for runtime/api_session_full.py -----
@@ -16403,6 +16405,19 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # ==================================================================
     add_recent_events_routes(api_v1)
 
+    # ==================================================================
+    # Dedup retraction: POST /api/v1/sessions/{id}/un-duplicate
+    # Operator-triggered correction when the dedup pipeline flipped a
+    # session to status='duplicate' incorrectly. The store rewrites
+    # status back to a runnable state in the same transaction as the
+    # audit row (see SessionStore.un_duplicate). Mounted on api_v1 so
+    # the route inherits the /api/v1 prefix and CORS/exception envelope.
+    # ==================================================================
+    register_dedup_routes(
+        api_v1,
+        store_provider=lambda: fastapi_app.state.orchestrator.store,
+    )
+
     # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
     # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)
     # keep working transparently. Removed in v2.1.
@@ -16493,11 +16508,16 @@ class UnDuplicateResponse(BaseModel):
 
 
 def register_dedup_routes(
-    app: FastAPI,
+    app: Union[FastAPI, APIRouter],
     *,
     store_provider: Callable[[], Any],
 ) -> None:
     """Register the un-duplicate route on ``app``.
+
+    Accepts either a full ``FastAPI`` instance (used by lightweight
+    test fixtures so the URL has no prefix) or an ``APIRouter`` so
+    ``runtime.api.build_app`` can mount the route on the ``/api/v1``
+    router and inherit its prefix.
 
     ``store_provider`` is a no-arg callable that returns the live
     ``SessionStore``. We accept a callable (rather than the store

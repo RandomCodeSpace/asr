@@ -16,6 +16,13 @@ interface CanvasHeadProps {
   agentsTotal: number;
   onStop: () => void;
   onRetry: () => void;
+  /** When supplied, Retry is enabled iff retry.enabled; the reason is
+   *  shown as the button's title tooltip. Without it, legacy heuristic
+   *  applies (button visible only when status === 'error', always enabled). */
+  retry?: { enabled: boolean; reason: string };
+  /** Shown only when the session was flipped by the dedup pipeline
+   *  (status === 'duplicate'). Operator-triggered correction. */
+  onUnDuplicate?: () => void;
 }
 
 const wrap: CSSProperties = {
@@ -49,7 +56,12 @@ function truncate(s: string, n: number): string {
 
 export function CanvasHead(props: CanvasHeadProps) {
   const truncTitle = truncate(props.title, 80);
-  const showRetry = props.status === 'error';
+  const showRetry = props.retry !== undefined
+    ? props.retry.enabled
+    : props.status === 'error';
+  const retryEnabled = props.retry ? props.retry.enabled : true;
+  const retryReason = props.retry?.reason ?? '';
+  const isDuplicate = props.status === 'duplicate';
   const isActive = props.status === 'in_progress' || props.status === 'new';
   const eyebrowParts = [
     props.sessionId,
@@ -107,8 +119,19 @@ export function CanvasHead(props: CanvasHeadProps) {
           <Icon name="stop" size={12} /> Stop
         </Button>
         {showRetry && (
-          <Button variant="secondary" size="sm" onClick={props.onRetry}>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={props.onRetry}
+            disabled={!retryEnabled}
+            title={retryReason || undefined}
+          >
             <Icon name="retry" size={12} /> Retry
+          </Button>
+        )}
+        {isDuplicate && props.onUnDuplicate && (
+          <Button variant="secondary" size="sm" onClick={props.onUnDuplicate}>
+            Un-duplicate
           </Button>
         )}
       </div>

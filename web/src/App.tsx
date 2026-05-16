@@ -16,7 +16,7 @@ import { TabletShell } from '@/shell/TabletShell';
 import { MobileShell } from '@/shell/MobileShell';
 import { useBreakpoint } from '@/state/useBreakpoint';
 
-const UI_VERSION = 'v2.0.0-rc1';
+const UI_VERSION = 'v2.0.0-rc2';
 const RUNTIME_VERSION_FALLBACK = 'unknown';
 
 const shellStyle: CSSProperties = {
