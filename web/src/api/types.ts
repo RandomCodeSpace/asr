@@ -38,7 +38,7 @@ export interface ToolCall {
   result: unknown;
   ts: string;
   risk: 'low' | 'medium' | 'high' | null;
-  status: 'executed' | 'pending_approval' | 'approved' | 'rejected' | 'auto_rejected';
+  status: 'executed' | 'executed_with_notify' | 'pending_approval' | 'approved' | 'rejected' | 'timeout' | 'auto_rejected';
   approver: string | null;
   approved_at: string | null;
   approval_rationale: string | null;
