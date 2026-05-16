@@ -1672,9 +1672,31 @@ def _inject_global_css() -> None:
     )
 
 
+def _render_deprecation_banner() -> None:
+    """Banner pointing operators at the React UI shipped in v2.0.
+
+    Honours ``ASR_HIDE_STREAMLIT_DEPRECATION=1`` so operators with no
+    React rollout yet can suppress the noise. The banner is intentionally
+    declarative (st.warning + html link) — no JS / Streamlit experimental
+    APIs that could break across versions.
+    """
+    import os as _os
+    if _os.environ.get("ASR_HIDE_STREAMLIT_DEPRECATION") == "1":
+        return
+    react_url = _os.environ.get("ASR_REACT_URL", "http://localhost:8000/")
+    st.warning(
+        f"This Streamlit UI is **deprecated as of v2.0.0-rc1** and will "
+        f"be removed in v2.1. The supported UI is the React app at "
+        f"[{react_url}]({react_url}). Set "
+        f"`ASR_HIDE_STREAMLIT_DEPRECATION=1` to silence this banner.",
+        icon="⚠️",
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="ASR — Agent Orchestrator", layout="wide")
     _inject_global_css()
+    _render_deprecation_banner()
     cfg = load_config(CONFIG_PATH)
     app_cfg = _load_app_cfg(cfg)
     store = _make_repository(cfg)
