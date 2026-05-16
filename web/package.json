@@ -10,7 +10,8 @@
     "lint": "eslint .",
     "typecheck": "tsc -b",
     "test:unit": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "check:size": "node scripts/check-size.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.0",
