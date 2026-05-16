@@ -7,8 +7,10 @@ import { CanvasHead } from './CanvasHead';
 import { Transcript, type HITLContext } from './Transcript';
 import { ApproveRationaleModal } from '@/modals/ApproveRationaleModal';
 import { ConfirmModal } from '@/modals/ConfirmModal';
+import { UnDuplicateModal } from '@/modals/UnDuplicateModal';
 import { apiFetch } from '@/api/client';
 import { questionFromToolCall } from '@/lib/hitl/questionFromToolCall';
+import { useRetryPreview } from '@/state/useRetryPreview';
 import type { ToolCall } from '@/api/types';
 
 interface SessionCanvasProps {
@@ -61,8 +63,11 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
   const [rationaleOpen, setRationaleOpen] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
+  const [retryOpen, setRetryOpen] = useState(false);
+  const [unDupOpen, setUnDupOpen] = useState(false);
 
   const pending = useMemo(() => findPendingApproval(state.toolCalls), [state.toolCalls]);
+  const retryPreview = useRetryPreview(activeSid);
 
   if (activeSid === null) {
     return (
@@ -166,6 +171,22 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
     await apiFetch(`/sessions/${sessId}`, { method: 'DELETE' });
     refresh();
   }
+  async function handleRetry() {
+    // Backend returns SSE; we POST and let the existing useSessionFull
+    // SSE subscription pick up the new events. refresh() kicks the
+    // bootstrap bundle so the new turn id appears immediately.
+    const res = await fetch(`/api/v1/sessions/${sessId}/retry`, { method: 'POST' });
+    if (!res.ok) {
+      throw new Error(`retry failed: ${res.status} ${res.statusText}`);
+    }
+    // Drain the SSE body so the connection closes cleanly (we observe
+    // the post-retry state via the long-lived useSessionFull SSE).
+    if (res.body) {
+      const reader = res.body.getReader();
+      try { while (!(await reader.read()).done) { /* drain */ } } finally { reader.releaseLock(); }
+    }
+    refresh();
+  }
 
   return (
     <div style={wrap}>
@@ -182,7 +203,12 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
         agentsActive={state.agentsRun.length}
         agentsTotal={Object.keys(state.agentDefinitions).length || state.agentsRun.length}
         onStop={() => setStopOpen(true)}
-        onRetry={refresh}
+        onRetry={() => setRetryOpen(true)}
+        retry={{
+          enabled: retryPreview.data?.retry ?? false,
+          reason: retryPreview.data?.reason ?? 'checking…',
+        }}
+        onUnDuplicate={() => setUnDupOpen(true)}
       />
       <Transcript
         agentsRun={state.agentsRun}
@@ -231,6 +257,31 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
         confirmLabel="Stop session"
         destructive
         onConfirm={handleStop}
+      />
+      <ConfirmModal
+        open={retryOpen}
+        onOpenChange={setRetryOpen}
+        eyebrow="RETRY SESSION"
+        title="Re-run this session?"
+        body={
+          <>
+            <p style={{ margin: '0 0 8px' }}>
+              The framework will resume from the last terminal state.
+            </p>
+            <p style={{ margin: 0, fontFamily: 'var(--ff-mono)', fontSize: 11, color: 'var(--ink-3)' }}>
+              {retryPreview.data?.reason ?? 'preview unavailable'}
+            </p>
+          </>
+        }
+        confirmLabel="Retry"
+        onConfirm={handleRetry}
+      />
+      <UnDuplicateModal
+        open={unDupOpen}
+        onOpenChange={setUnDupOpen}
+        sessionId={sess.id}
+        parentSessionId={sess.parent_session_id}
+        onSuccess={refresh}
       />
     </div>
   );

@@ -1,11 +1,15 @@
 import type { CSSProperties, ReactNode } from 'react';
-import type { AgentDefinition, ToolCall } from '@/api/types';
+import type { AgentDefinition, AppView, ToolCall } from '@/api/types';
 import { useSelected } from '@/state/selectedRef';
+import { useAppViews, filterAppViews } from '@/state/useAppViews';
 import { Monitor } from './Monitor';
 
 interface SelectedPanelProps {
   agentsByName: Record<string, AgentDefinition>;
   toolCalls: ToolCall[];
+  /** App identifier used to fetch overlay views (Approach C).
+   *  v2 has one app per deploy; the backend ignores the value today. */
+  appName?: string;
 }
 
 const eyebrow: CSSProperties = {
@@ -138,8 +142,43 @@ function MessageBody({ id }: { id: string | undefined }): ReactNode {
   );
 }
 
-export function SelectedPanel({ agentsByName, toolCalls }: SelectedPanelProps) {
+function AppViewsBlock({ views }: { views: AppView[] }): ReactNode {
+  if (views.length === 0) return null;
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--hair)' }}>
+      <div style={{ ...eyebrow, marginBottom: 6 }}>App-specific views →</div>
+      <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
+        {views.map((v) => (
+          <li key={v.id} style={{ marginBottom: 4 }}>
+            <a
+              href={v.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-app-view={v.id}
+              style={{
+                fontFamily: 'var(--ff-sans)',
+                fontSize: 12,
+                color: 'var(--acc)',
+                textDecoration: 'underline',
+                textUnderlineOffset: 2,
+              }}
+            >
+              {v.title}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function SelectedPanel({ agentsByName, toolCalls, appName = 'runtime' }: SelectedPanelProps) {
   const selected = useSelected();
+  const appViews = useAppViews(appName);
+  const matchingViews = filterAppViews(appViews.data ?? [], {
+    kind: selected.kind,
+    id: selected.id ?? null,
+  });
   let body: ReactNode;
   if (selected.kind === null) {
     body = <Empty />;
@@ -155,6 +194,7 @@ export function SelectedPanel({ agentsByName, toolCalls }: SelectedPanelProps) {
   return (
     <Monitor title="Selected" pinned>
       {body}
+      {selected.kind !== null && <AppViewsBlock views={matchingViews} />}
     </Monitor>
   );
 }

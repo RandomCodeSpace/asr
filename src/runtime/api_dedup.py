@@ -19,9 +19,9 @@ status flip via :meth:`SessionStore.un_duplicate`.
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Union
 
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
@@ -49,11 +49,16 @@ class UnDuplicateResponse(BaseModel):
 
 
 def register_dedup_routes(
-    app: FastAPI,
+    app: Union[FastAPI, APIRouter],
     *,
     store_provider: Callable[[], Any],
 ) -> None:
     """Register the un-duplicate route on ``app``.
+
+    Accepts either a full ``FastAPI`` instance (used by lightweight
+    test fixtures so the URL has no prefix) or an ``APIRouter`` so
+    ``runtime.api.build_app`` can mount the route on the ``/api/v1``
+    router and inherit its prefix.
 
     ``store_provider`` is a no-arg callable that returns the live
     ``SessionStore``. We accept a callable (rather than the store

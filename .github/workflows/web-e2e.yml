@@ -1,12 +1,12 @@
 name: Web E2E
 
+# Manual-only for now. The backend's lifespan requires a reachable LLM
+# provider (Ollama by default per config/config.yaml), which CI runners
+# don't have. v2.1 will introduce an opt-in stub-provider config so this
+# can run on every PR; until then, run Playwright locally against the
+# Caddy-fronted backend (see docs/REACT_UI_PARITY.md "Verification"
+# section).
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - 'web/**'
-      - 'src/runtime/**'
-      - '.github/workflows/web-e2e.yml'
   workflow_dispatch:
 
 jobs:
@@ -64,10 +64,10 @@ jobs:
       - name: Boot backend (serves SPA + API)
         run: |
           mkdir -p logs
-          nohup uv run uvicorn runtime.api:app --port 8000 > logs/uvicorn.log 2>&1 &
+          nohup uv run uvicorn runtime.api:get_app --factory --port 8000 > logs/uvicorn.log 2>&1 &
           echo $! > .backend.pid
           for i in $(seq 1 60); do
-            if curl -sf http://localhost:8000/api/v1/ui/hints >/dev/null; then
+            if curl -sf http://localhost:8000/health >/dev/null; then
               echo "backend ready after ${i}s"
               exit 0
             fi
