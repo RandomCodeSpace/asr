@@ -79,3 +79,18 @@ body {
     animation-duration: 0.01ms !important;
   }
 }
+
+@keyframes asr-flow-halo {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(42, 67, 101, 0.0), 0 0 0 1.5px var(--acc);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(42, 67, 101, 0.18), 0 0 0 1.5px var(--acc);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-flow-node][data-active="true"] {
+    animation: none !important;
+  }
+}
