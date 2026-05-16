@@ -53,6 +53,11 @@ export function sessionReducer(state: SessionState, action: Action): SessionStat
             started_at: p.started_at ?? '',
             ended_at: p.ended_at ?? ev.ts,
             summary: p.summary ?? '',
+            token_usage: p.token_usage ?? {
+              input_tokens: Number(ev.payload.input_tokens ?? 0),
+              output_tokens: Number(ev.payload.output_tokens ?? 0),
+              total_tokens: Number(ev.payload.total_tokens ?? 0),
+            },
             confidence: p.confidence ?? null,
             confidence_rationale: p.confidence_rationale ?? null,
             signal: p.signal ?? null,
@@ -75,7 +80,8 @@ export function sessionReducer(state: SessionState, action: Action): SessionStat
           }];
           break;
         }
-        case 'approval_pending': {
+        case 'approval_pending':
+        case 'gate_fired': {
           const p = ev.payload as Partial<ToolCall>;
           toolCalls = [...toolCalls, {
             agent: p.agent ?? '',
@@ -92,8 +98,9 @@ export function sessionReducer(state: SessionState, action: Action): SessionStat
           break;
         }
         case 'status_changed': {
-          const p = ev.payload as { status?: Session['status'] };
-          if (session && p.status) session = { ...session, status: p.status };
+          const p = ev.payload as { status?: Session['status']; to?: Session['status'] };
+          const status = p.to ?? p.status;
+          if (session && status) session = { ...session, status };
           break;
         }
       }

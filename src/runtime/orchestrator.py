@@ -300,6 +300,19 @@ def _emit_status_changed_event(
         return
     status_def = statuses.statuses.get(to_status)
     if status_def is not None and status_def.terminal:
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc.id,
+                    "session.agent_running",
+                    id=inc.id,
+                    agent=None,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not break finalize
+                _log.debug(
+                    "event_log.record(session.agent_running) failed",
+                    exc_info=True,
+                )
         _extract_lesson_on_terminal(orch=orch, inc=inc)
 
 
@@ -1235,13 +1248,20 @@ class Orchestrator(Generic[StateT]):
         # ``__new__`` (bypassing ``__init__``) working.
         state_overrides_cls = getattr(self, "_state_overrides_cls", None)
         if state_overrides_cls is not None and state_overrides is not None:
-            state_overrides_cls.model_validate(state_overrides)
+            state_overrides = state_overrides_cls.model_validate(
+                state_overrides
+            ).model_dump(exclude_none=True)
         submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
         sub_id = (submitter or {}).get("id", "user-mock")
         sub_team = (submitter or {}).get("team", "platform")
         env = (state_overrides or {}).get("environment", "")
-        inc = self.store.create(query=query, environment=env,
-                                reporter_id=sub_id, reporter_team=sub_team)
+        inc = self.store.create(
+            query=query,
+            environment=env,
+            reporter_id=sub_id,
+            reporter_team=sub_team,
+            state_overrides=state_overrides,
+        )
         # Emit session.created on the cross-session SSE stream so the
         # React UI's Other Sessions monitor lights up the new tile in
         # real time. ``session_id`` already lands on the row; the
@@ -1271,6 +1291,8 @@ class Orchestrator(Generic[StateT]):
                        last_agent=None, error=None),
             config=self._thread_config(inc.id),
         )
+        if not await self._is_graph_paused(inc.id):
+            await self._finalize_session_status_async(inc.id)
         return inc.id
 
     async def start_investigation(self, *, query: str, environment: str,

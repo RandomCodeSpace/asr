@@ -23,8 +23,11 @@ Covers:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.orm import Session as SqlSession
 
 from runtime.config import (
     AppConfig,
@@ -39,6 +42,7 @@ from runtime.config import (
 )
 from runtime.orchestrator import Orchestrator
 from runtime.state import ToolCall
+from runtime.storage.models import IncidentRow
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +80,14 @@ _CODE_REVIEW_SERVERS = [
         category="code_review",
     ),
 ]
+
+
+class _NoopGraph:
+    async def ainvoke(self, state, *, config):
+        return {}
+
+    async def aget_state(self, config):
+        return SimpleNamespace(next=())
 
 
 def _base_cfg(
@@ -314,6 +326,44 @@ async def test_cross_app_rejection_code_review_rejects_incident_shape(tmp_path):
                     "severity": "critical",
                 },
             )
+    finally:
+        await orch.aclose()
+
+
+@pytest.mark.asyncio
+async def test_code_review_state_overrides_persist_extra_fields_and_environment(
+    tmp_path,
+):
+    cfg = _base_cfg(
+        tmp_path,
+        state_overrides_schema=(
+            "examples.code_review.state.CodeReviewStateOverrides"
+        ),
+        skills_dir="examples/code_review/skills",
+    )
+    orch = await Orchestrator.create(cfg)
+    try:
+        orch.graph = _NoopGraph()
+        sid = await orch.start_session(
+            query="Review PR",
+            state_overrides={
+                "pr_url": "https://github.com/foo/bar/pull/1",
+                "repo": "foo/bar",
+                "environment": "staging",
+            },
+        )
+        inc = orch.store.load(sid)
+        assert inc.extra_fields["pr_url"] == "https://github.com/foo/bar/pull/1"
+        assert inc.extra_fields["repo"] == "foo/bar"
+        assert inc.extra_fields.get("environment") == "staging"
+        with SqlSession(orch.store.engine) as db:
+            row = db.get(IncidentRow, sid)
+            assert row is not None
+            assert row.environment == "staging"
+            assert row.extra_fields == {
+                "pr_url": "https://github.com/foo/bar/pull/1",
+                "repo": "foo/bar",
+            }
     finally:
         await orch.aclose()
 

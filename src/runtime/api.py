@@ -26,7 +26,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -120,6 +120,7 @@ class ResumeRequest(BaseModel):
 class SessionStartBody(BaseModel):
     query: str
     environment: str
+    state_overrides: dict[str, Any] | None = None
     # Generic submitter dict — the framework projects ``id``/``team``
     # onto the row's reporter columns; apps interpret the rest. The
     # legacy ``reporter_id`` / ``reporter_team`` fields were removed
@@ -359,22 +360,13 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # at root for monitor / load-balancer health-check conventions.
     api_v1 = APIRouter(prefix="/api/v1")
 
-    # CORS: env-driven so the React dev server (Vite at :5173) can call
-    # every endpoint, SSE included. Override via ``ASR_CORS_ORIGINS``
-    # (comma-separated) — production deployments lock the origin list
-    # down by setting the env var to the narrower allow-list.
-    # ``allow_credentials=False`` matches the bearer-token auth pattern
-    # (no cookies); methods are explicit so OPTIONS preflights are
-    # handled the same way for every route.
-    _cors_origins_raw = os.environ.get(
-        "ASR_CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",  # Vite dev defaults
-    )
-    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    # CORS is config-driven via ``cfg.api``. ``ASR_CONFIG`` selects the
+    # config file; deployments set origins/credentials in YAML rather
+    # than via a second env-var override path.
     fastapi_app.add_middleware(
         CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=False,
+        allow_origins=cfg.api.cors_origins,
+        allow_credentials=cfg.api.cors_allow_credentials,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
@@ -529,9 +521,34 @@ def build_app(cfg: AppConfig) -> FastAPI:
         """
         svc = request.app.state.service
         try:
+            if (
+                body.state_overrides is not None
+                and "environment" in body.state_overrides
+                and body.environment != body.state_overrides["environment"]
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": {
+                            "code": "conflicting_environment",
+                            "message": (
+                                "environment and state_overrides.environment "
+                                "must match when both are supplied"
+                            ),
+                            "details": {
+                                "environment": body.environment,
+                                "state_overrides_environment": (
+                                    body.state_overrides["environment"]
+                                ),
+                            },
+                        }
+                    },
+                )
+            state_overrides = dict(body.state_overrides or {})
+            state_overrides.setdefault("environment", body.environment)
             sid = svc.start_session(
                 query=body.query,
-                state_overrides={"environment": body.environment},
+                state_overrides=state_overrides,
                 submitter=body.submitter,
             )
         except Exception as e:  # noqa: BLE001

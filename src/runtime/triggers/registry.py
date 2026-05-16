@@ -23,6 +23,7 @@ Plugin transports are merged from two sources:
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 import logging
 from datetime import datetime, timezone
@@ -277,9 +278,14 @@ class TriggerRegistry:
         if spec is None:
             raise KeyError(f"unknown trigger: {name!r}")
 
-        # Idempotency hit: return cached session id without invoking
-        # transform / orchestrator. Per R3 in the plan, transform errors
-        # are NOT cached — only successful dispatches.
+        ttl = (
+            spec.config.idempotency_ttl_hours
+            if isinstance(spec.config, WebhookTriggerConfig)
+            else 24
+        )
+
+        # Fast idempotency hit: return cached session id without
+        # invoking transform / orchestrator.
         if idempotency_key and self._idempotency is not None:
             cached = self._idempotency.get(name, idempotency_key)
             if cached is not None:
@@ -304,15 +310,25 @@ class TriggerRegistry:
             received_at=datetime.now(timezone.utc),
         )
 
+        # Idempotency reservation: only the caller that atomically
+        # inserts the key may start a session. Followers wait briefly
+        # for the first caller to publish the resulting session id.
+        if idempotency_key and self._idempotency is not None:
+            if not self._idempotency.reserve(name, idempotency_key, ttl_hours=ttl):
+                for _ in range(100):
+                    cached = self._idempotency.get(name, idempotency_key)
+                    if cached is not None:
+                        return cached
+                    await asyncio.sleep(0.01)
+                raise RuntimeError(
+                    f"idempotency key {idempotency_key!r} for trigger "
+                    f"{name!r} is still in flight"
+                )
+
         session_id = await self._start_session_fn(trigger=info, **kwargs)
 
         # Record successful dispatch for idempotency.
         if idempotency_key and self._idempotency is not None:
-            ttl = (
-                spec.config.idempotency_ttl_hours
-                if isinstance(spec.config, WebhookTriggerConfig)
-                else 24
-            )
             self._idempotency.put(name, idempotency_key, session_id, ttl_hours=ttl)
 
         return session_id

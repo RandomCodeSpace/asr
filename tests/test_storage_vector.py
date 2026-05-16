@@ -2,9 +2,12 @@
 from __future__ import annotations
 from pathlib import Path
 import pytest
+from sqlalchemy import create_engine
 
 from runtime.config import EmbeddingConfig, ProviderConfig, VectorConfig
 from runtime.storage.embeddings import build_embedder
+from runtime.storage.models import Base
+from runtime.storage.session_store import SessionStore
 
 
 def _stub_embedder(dim: int = 8):
@@ -82,3 +85,31 @@ def test_distance_to_similarity_unknown_raises():
     from runtime.storage.vector import distance_to_similarity
     with pytest.raises(ValueError, match="unknown distance strategy"):
         distance_to_similarity(0.5, "manhattan")
+
+
+class _FailingVectorStore:
+    def delete(self, *, ids):
+        raise KeyError(ids[0])
+
+    def add_documents(self, documents, *, ids):
+        raise RuntimeError("vector write failed")
+
+
+def test_session_store_save_persists_sql_when_vector_refresh_fails(tmp_path, caplog):
+    engine = create_engine(f"sqlite:///{tmp_path / 't.db'}")
+    Base.metadata.create_all(engine)
+    store = SessionStore(
+        engine=engine,
+        embedder=_stub_embedder(),
+    )
+    inc = store.create(query="first", environment="dev")
+    store.vector_store = _FailingVectorStore()  # type: ignore[assignment]
+    inc.extra_fields["query"] = "changed"
+
+    with caplog.at_level("WARNING", logger="runtime.storage.session_store"):
+        store.save(inc)
+
+    loaded = store.load(inc.id)
+    assert loaded.extra_fields["query"] == "changed"
+    assert any("vector delete failed" in rec.getMessage() for rec in caplog.records)
+    assert any("vector refresh failed" in rec.getMessage() for rec in caplog.records)

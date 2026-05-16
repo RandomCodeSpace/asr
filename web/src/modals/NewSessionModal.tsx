@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import type { CSSProperties } from 'react';
 import { Modal } from '@/components/Modal';
 import { apiFetch, ApiClientError } from '@/api/client';
+import type { SessionStartBody } from '@/api/types';
 
 interface NewSessionModalProps {
   open: boolean;
@@ -80,7 +81,11 @@ export function NewSessionModal({ open, onOpenChange, environments, onCreated }:
     try {
       const res = await apiFetch<StartResponse>('/sessions', {
         method: 'POST',
-        json: { query: query.trim(), environment, submitter: { id: 'operator' } },
+        json: {
+          query: query.trim(),
+          environment,
+          submitter: { id: 'operator' },
+        } satisfies SessionStartBody,
       });
       onCreated(res.session_id);
       onOpenChange(false);

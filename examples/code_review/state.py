@@ -23,5 +23,6 @@ class CodeReviewStateOverrides(BaseModel):
 
     pr_url: str | None = None
     repo: str | None = None
+    environment: str | None = None
     base_branch: str | None = None
     pr_number: int | None = None

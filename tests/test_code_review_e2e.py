@@ -103,6 +103,7 @@ async def test_code_review_e2e_approves_clean_pr(tmp_path):
         inc.tool_calls.append(_exec_set_recommendation(
             recommendation="approve", summary="LGTM",
         ))
+        inc.status = "in_progress"
         inc.extra_fields["overall_recommendation"] = "approve"
         orch.store.save(inc)
 
@@ -155,6 +156,7 @@ async def test_code_review_e2e_request_changes_on_critical(tmp_path):
             recommendation="request_changes",
             summary="Critical bug found",
         ))
+        inc.status = "in_progress"
         orch.store.save(inc)
 
         new_status = await orch._finalize_session_status_async(sid)
@@ -183,6 +185,7 @@ async def test_code_review_e2e_comment_on_warnings(tmp_path):
             recommendation="comment",
             summary="Minor nits",
         ))
+        inc.status = "in_progress"
         orch.store.save(inc)
 
         new_status = await orch._finalize_session_status_async(sid)
@@ -256,6 +259,7 @@ async def test_code_review_e2e_no_incident_imports(tmp_path):
         inc.tool_calls.append(_exec_set_recommendation(
             recommendation="approve",
         ))
+        inc.status = "in_progress"
         orch.store.save(inc)
         await orch._finalize_session_status_async(sid)
     finally:

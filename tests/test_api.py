@@ -219,6 +219,44 @@ async def test_post_sessions_omitting_submitter_uses_defaults(cfg):
 
 
 @pytest.mark.asyncio
+async def test_post_sessions_accepts_state_overrides(cfg):
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        res = await client.post(
+            "/api/v1/sessions",
+            json={
+                "query": "review PR",
+                "environment": "staging",
+                "state_overrides": {
+                    "pr_url": "https://github.com/foo/bar/pull/1",
+                    "repo": "foo/bar",
+                },
+            },
+        )
+        assert res.status_code == 201
+        sid = res.json()["session_id"]
+        inc = app.state.orchestrator.store.load(sid)
+        assert inc.extra_fields["pr_url"] == "https://github.com/foo/bar/pull/1"
+        assert inc.extra_fields["repo"] == "foo/bar"
+
+
+@pytest.mark.asyncio
+async def test_post_sessions_rejects_conflicting_environment(cfg):
+    app = build_app(cfg)
+    async with _client_with_lifespan(app) as client:
+        res = await client.post(
+            "/api/v1/sessions",
+            json={
+                "query": "conflict",
+                "environment": "staging",
+                "state_overrides": {"environment": "production"},
+            },
+        )
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == "conflicting_environment"
+
+
+@pytest.mark.asyncio
 async def test_get_sessions_returns_list(cfg):
     """GET /sessions returns a JSON list (possibly empty); shape matches
     the ``SessionStatus`` schema for any active rows."""

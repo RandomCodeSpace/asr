@@ -9,6 +9,7 @@ from runtime.skill import Skill, RouteRule
 from runtime.llm import StubChatModel
 from runtime.storage.embeddings import build_embedder
 from runtime.storage.engine import build_engine
+from runtime.storage.event_log import EventLog
 from runtime.storage.models import Base
 from runtime.storage.session_store import SessionStore
 
@@ -51,6 +52,7 @@ async def test_agent_node_runs_llm_records_agent_run_and_routes(incident):
         skill=skill, llm=llm, tools=[],
         decide_route=lambda inc: "default",
         store=store,
+        event_log=EventLog(engine=store.engine),
         terminal_tool_names=_TEST_TERMINAL_NAMES,
         patch_tool_names=_TEST_PATCH_NAMES,
     )
@@ -74,6 +76,10 @@ async def test_agent_node_runs_llm_records_agent_run_and_routes(incident):
     # The runner stamps these onto the AgentRun.
     assert intake_runs[0].confidence == approx(0.85)
     assert intake_runs[0].confidence_rationale == "stub envelope rationale"
+    events = list(EventLog(engine=store.engine).iter_for(inc.id))
+    running = [e for e in events if e.kind == "session.agent_running"]
+    assert running
+    assert running[0].payload == {"id": inc.id, "agent": "intake"}
 
 
 @pytest.mark.asyncio

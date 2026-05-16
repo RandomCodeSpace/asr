@@ -304,7 +304,8 @@ supplied.
 
 import json
 from datetime import datetime, timezone
-from typing import Generic, Optional, Type, TypeVar
+import logging
+from typing import Any, Generic, Optional, Type, TypeVar
 
 from pydantic import BaseModel
 from sqlalchemy import desc, select
@@ -312,11 +313,6 @@ from sqlalchemy.orm import Session as SqlSession
 
 
 
-# The legacy ``INC-YYYYMMDD-NNN`` pattern stays here for back-compat
-# validation against on-disk rows minted before the ``Session.id_format``
-# hook existed. New rows are validated by ``_SESSION_ID_RE`` which
-# accepts any ``PREFIX-YYYYMMDD-NNN`` shape the app's ``id_format`` may
-# emit (e.g. ``CR-...`` for code-review).
 # ----- imports for runtime/storage/event_log.py -----
 """Append-only session event log.
 
@@ -398,7 +394,6 @@ the M7 refresher can re-embed.
 """
 
 
-import logging
 
 
 
@@ -937,6 +932,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import DateTime, String, delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session as SqlaSession, mapped_column
 
 
@@ -1427,7 +1423,7 @@ The module-level ``get_app()`` is a no-arg factory suitable for
 ``config/config.yaml``) and returns a fresh app.
 """
 
-from typing import AsyncIterator, Literal
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -1530,6 +1526,7 @@ that construct a bare ``FastAPI()`` app — use ``build_app(cfg)`` for tests.
 """
 
 from fastapi.responses import StreamingResponse
+
 
 # ----- imports for runtime/api_static.py -----
 """StaticFiles mount + SPA fallback for the React UI bundle.
@@ -2470,7 +2467,13 @@ def resolve_framework_app_config(
 
 
 class ApiConfig(BaseModel):
-    """API surface knobs surfaced to the React frontend."""
+    """API surface knobs surfaced to the React frontend.
+
+    Values come from the loaded runtime config. Environment variables
+    choose the config file (``ASR_CONFIG``) but do not override these
+    CORS fields directly; deployments that need different origins
+    should set them in YAML.
+    """
 
     # CORS origins allowed by the FastAPI CORSMiddleware. Default
     # covers the two common React dev-server URLs (Vite, CRA/Next).
@@ -2614,6 +2617,16 @@ _UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 # Per-call audit metadata for the risk-rated tool gateway.
+SessionStatus = Literal[
+    "new",
+    "in_progress",
+    "awaiting_input",
+    "resolved",
+    "escalated",
+    "stopped",
+    "error",
+    "duplicate",
+]
 ToolRisk = Literal["low", "medium", "high"]
 ToolStatus = Literal[
     "executed",                 # auto / legacy default
@@ -4335,6 +4348,13 @@ class HistoryStore(Generic[StateT]):
 
 # ====== module: runtime/storage/session_store.py ======
 
+_log = logging.getLogger(__name__)
+
+# The legacy ``INC-YYYYMMDD-NNN`` pattern stays here for back-compat
+# validation against on-disk rows minted before the ``Session.id_format``
+# hook existed. New rows are validated by ``_SESSION_ID_RE`` which
+# accepts any ``PREFIX-YYYYMMDD-NNN`` shape the app's ``id_format`` may
+# emit (e.g. ``CR-...`` for code-review).
 _INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
 _SESSION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-\d{8}-\d{3}$")
 
@@ -4502,7 +4522,12 @@ class SessionStore(Generic[StateT]):
     # ---------- public API ----------
     def create(self, *, query: str, environment: str,
                reporter_id: str = "user-mock",
-               reporter_team: str = "platform") -> StateT:
+               reporter_team: str = "platform",
+               state_overrides: dict[str, Any] | None = None) -> StateT:
+        extra_fields = {
+            k: v for k, v in (state_overrides or {}).items()
+            if k not in self._ROW_TYPED_DOMAIN_COLUMNS
+        }
         with SqlSession(self.engine) as session:
             now = _now()
             inc_id = self._next_id(session)
@@ -4521,6 +4546,7 @@ class SessionStore(Generic[StateT]):
                 tool_calls=[],
                 findings={},
                 user_inputs=[],
+                extra_fields=extra_fields,
             )
             session.add(row)
             session.commit()
@@ -4572,7 +4598,10 @@ class SessionStore(Generic[StateT]):
                 for k, v in data.items():
                     setattr(existing, k, v)
             db_session.commit()
-        self._refresh_vector(session, prior_text=prior_text)
+        try:
+            self._refresh_vector(session, prior_text=prior_text)
+        except Exception as exc:  # noqa: BLE001 — SQL commit already succeeded
+            self._log_vector_warning("refresh", session.id, exc)
 
     def delete(self, incident_id: str) -> StateT:
         with SqlSession(self.engine) as session:
@@ -4724,13 +4753,27 @@ class SessionStore(Generic[StateT]):
             return
         if prior_text == text:
             return
-        self.vector_store.delete(ids=[inc.id])
+        try:
+            self.vector_store.delete(ids=[inc.id])
+        except Exception as exc:  # noqa: BLE001 — vector delete is idempotent
+            self._log_vector_warning("delete", inc.id, exc)
         from langchain_core.documents import Document
         self.vector_store.add_documents(
             [Document(page_content=text, metadata={"id": inc.id})],
             ids=[inc.id],
         )
         self._persist_vector()
+
+    def _log_vector_warning(self, operation: str, sid: str, exc: Exception) -> None:
+        backend = type(self.vector_store).__name__ if self.vector_store is not None else "None"
+        _log.warning(
+            "session vector %s failed sid=%s backend=%s exc=%s",
+            operation,
+            sid,
+            backend,
+            type(exc).__name__,
+            exc_info=True,
+        )
 
     # ---------- mapping helpers ----------
     #
@@ -6395,7 +6438,6 @@ class OrchestratorService:
         )
         sub_id = (resolved_submitter or {}).get("id", "user-mock")
         sub_team = (resolved_submitter or {}).get("team", "platform")
-        env = (resolved_overrides or {}).get("environment", "")
 
         async def _scheduler() -> str:
             # Enforce the concurrency cap on the loop thread so the
@@ -6405,6 +6447,13 @@ class OrchestratorService:
             if len(self._registry) >= self.max_concurrent_sessions:
                 raise SessionCapExceeded(self.max_concurrent_sessions)
             orch = await self._ensure_orchestrator()
+            overrides_for_create = resolved_overrides
+            state_overrides_cls = getattr(orch, "_state_overrides_cls", None)
+            if state_overrides_cls is not None and overrides_for_create is not None:
+                overrides_for_create = state_overrides_cls.model_validate(
+                    overrides_for_create
+                ).model_dump(exclude_none=True)
+            env_for_create = (overrides_for_create or {}).get("environment", "")
             # Allocate the row (and its id) synchronously on the loop
             # so the caller gets a stable id back. The graph then runs
             # in a separate task — registration happens here, before
@@ -6412,9 +6461,10 @@ class OrchestratorService:
             # entry immediately.
             inc = orch.store.create(
                 query=query,
-                environment=env,
+                environment=env_for_create,
                 reporter_id=sub_id,
                 reporter_team=sub_team,
+                state_overrides=overrides_for_create,
             )
             session_id = inc.id
             # Emit session.created on the cross-session SSE stream so
@@ -6462,8 +6512,8 @@ class OrchestratorService:
                     raise SessionBusy(session_id)
                 # Hold the per-session lock for the full graph turn,
                 # including any HITL interrupt() pause (D-01).
-                async with orch._locks.acquire(session_id):
-                    try:
+                try:
+                    async with orch._locks.acquire(session_id):
                         await orch.graph.ainvoke(
                             GraphState(
                                 session=inc,
@@ -6473,34 +6523,36 @@ class OrchestratorService:
                             ),
                             config=orch._thread_config(session_id),
                         )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is a
-                        # pending-approval pause, not a failure. Don't stamp
-                        # status='error' on the registry entry -- let
-                        # LangGraph's checkpointer hold the paused state
-                        # and let the UI's Approve/Reject action drive
-                        # resume.
-                        try:
-                            from langgraph.errors import GraphInterrupt
-                            if isinstance(exc, GraphInterrupt):
-                                # Propagate so the underlying Task
-                                # observer (stop_session etc.) still
-                                # sees the exception, but skip the
-                                # status='error' write.
-                                raise
-                        except ImportError:  # pragma: no cover
-                            pass
-                        # Mark the registry entry so any concurrent snapshot
-                        # observes the failure before the done-callback
-                        # evicts it. The exception itself is preserved on
-                        # the task object for ``stop_session`` and any
-                        # other observer that holds a Task reference.
-                        e = self._registry.get(session_id)
-                        if e is not None:
-                            e.status = "error"
-                        raise
+                    if not await orch._is_graph_paused(session_id):
+                        await orch._finalize_session_status_async(session_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is a
+                    # pending-approval pause, not a failure. Don't stamp
+                    # status='error' on the registry entry -- let
+                    # LangGraph's checkpointer hold the paused state
+                    # and let the UI's Approve/Reject action drive
+                    # resume.
+                    try:
+                        from langgraph.errors import GraphInterrupt
+                        if isinstance(exc, GraphInterrupt):
+                            # Propagate so the underlying Task
+                            # observer (stop_session etc.) still
+                            # sees the exception, but skip the
+                            # status='error' write.
+                            raise
+                    except ImportError:  # pragma: no cover
+                        pass
+                    # Mark the registry entry so any concurrent snapshot
+                    # observes the failure before the done-callback
+                    # evicts it. The exception itself is preserved on
+                    # the task object for ``stop_session`` and any
+                    # other observer that holds a Task reference.
+                    e = self._registry.get(session_id)
+                    if e is not None:
+                        e.status = "error"
+                    raise
 
             task = asyncio.create_task(_run(), name=f"session:{session_id}")
             entry.task = task
@@ -10357,6 +10409,12 @@ def make_agent_node(
                     inc_id, "agent_started",
                     agent=skill.name, started_at=started_at,
                 )
+                event_log.record(
+                    inc_id,
+                    "session.agent_running",
+                    id=inc_id,
+                    agent=skill.name,
+                )
             except Exception:  # noqa: BLE001 — telemetry must not break the agent
                 logger.debug(
                     "event_log.record(agent_started) failed", exc_info=True,
@@ -11546,7 +11604,7 @@ class IdempotencyStore:
             if cache is not None and key in cache:
                 # Bump recency
                 cache.move_to_end(key)
-                return cache[key]
+                return cache[key] or None
         # SQLite fall-through (outside the threading lock — sqlite3 has
         # its own locking, and this path is rare).
         with SqlaSession(self._engine) as s:
@@ -11574,6 +11632,8 @@ class IdempotencyStore:
                 s.commit()
                 return None
             session_id = row.session_id
+            if not session_id:
+                return None
         # Refill LRU.
         with self._lock:
             cache = self._lru.setdefault(trigger_name, OrderedDict())
@@ -11621,6 +11681,51 @@ class IdempotencyStore:
         # Opportunistic purge of expired rows so a long-running process
         # doesn't accumulate dead records. Cheap (range-bounded delete).
         self.purge_expired()
+
+    def reserve(
+        self,
+        trigger_name: str,
+        key: str,
+        *,
+        ttl_hours: int = 24,
+    ) -> bool:
+        """Atomically reserve a fresh idempotency key.
+
+        Returns ``True`` only for the caller that inserted the row. A
+        ``False`` result means another request has either already
+        completed and stored ``session_id`` or is still in flight.
+        """
+        now = _utc_now()
+        expires_at = now + timedelta(hours=ttl_hours)
+        with SqlaSession(self._engine) as s:
+            existing = s.get(IdempotencyRow, (trigger_name, key))
+            if existing is not None:
+                existing_expires = existing.expires_at
+                if existing_expires.tzinfo is None:
+                    existing_expires = existing_expires.replace(tzinfo=timezone.utc)
+                if existing_expires <= now:
+                    s.delete(existing)
+                    s.commit()
+                else:
+                    return False
+            s.add(IdempotencyRow(
+                trigger_name=trigger_name,
+                key=key,
+                session_id="",
+                created_at=now,
+                expires_at=expires_at,
+            ))
+            try:
+                s.commit()
+            except IntegrityError:
+                s.rollback()
+                return False
+        with self._lock:
+            cache = self._lru.setdefault(trigger_name, OrderedDict())
+            cache[key] = ""
+            cache.move_to_end(key)
+            self._evict_if_needed(cache)
+        return True
 
     def purge_expired(self) -> int:
         """Delete all rows whose ``expires_at`` is in the past. Returns
@@ -12109,9 +12214,14 @@ class TriggerRegistry:
         if spec is None:
             raise KeyError(f"unknown trigger: {name!r}")
 
-        # Idempotency hit: return cached session id without invoking
-        # transform / orchestrator. Per R3 in the plan, transform errors
-        # are NOT cached — only successful dispatches.
+        ttl = (
+            spec.config.idempotency_ttl_hours
+            if isinstance(spec.config, WebhookTriggerConfig)
+            else 24
+        )
+
+        # Fast idempotency hit: return cached session id without
+        # invoking transform / orchestrator.
         if idempotency_key and self._idempotency is not None:
             cached = self._idempotency.get(name, idempotency_key)
             if cached is not None:
@@ -12136,15 +12246,25 @@ class TriggerRegistry:
             received_at=datetime.now(timezone.utc),
         )
 
+        # Idempotency reservation: only the caller that atomically
+        # inserts the key may start a session. Followers wait briefly
+        # for the first caller to publish the resulting session id.
+        if idempotency_key and self._idempotency is not None:
+            if not self._idempotency.reserve(name, idempotency_key, ttl_hours=ttl):
+                for _ in range(100):
+                    cached = self._idempotency.get(name, idempotency_key)
+                    if cached is not None:
+                        return cached
+                    await asyncio.sleep(0.01)
+                raise RuntimeError(
+                    f"idempotency key {idempotency_key!r} for trigger "
+                    f"{name!r} is still in flight"
+                )
+
         session_id = await self._start_session_fn(trigger=info, **kwargs)
 
         # Record successful dispatch for idempotency.
         if idempotency_key and self._idempotency is not None:
-            ttl = (
-                spec.config.idempotency_ttl_hours
-                if isinstance(spec.config, WebhookTriggerConfig)
-                else 24
-            )
             self._idempotency.put(name, idempotency_key, session_id, ttl_hours=ttl)
 
         return session_id
@@ -14041,6 +14161,19 @@ def _emit_status_changed_event(
         return
     status_def = statuses.statuses.get(to_status)
     if status_def is not None and status_def.terminal:
+        if event_log is not None:
+            try:
+                event_log.record(
+                    inc.id,
+                    "session.agent_running",
+                    id=inc.id,
+                    agent=None,
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not break finalize
+                _log.debug(
+                    "event_log.record(session.agent_running) failed",
+                    exc_info=True,
+                )
         _extract_lesson_on_terminal(orch=orch, inc=inc)
 
 
@@ -14971,13 +15104,20 @@ class Orchestrator(Generic[StateT]):
         # ``__new__`` (bypassing ``__init__``) working.
         state_overrides_cls = getattr(self, "_state_overrides_cls", None)
         if state_overrides_cls is not None and state_overrides is not None:
-            state_overrides_cls.model_validate(state_overrides)
+            state_overrides = state_overrides_cls.model_validate(
+                state_overrides
+            ).model_dump(exclude_none=True)
         submitter = _coerce_submitter(submitter, reporter_id, reporter_team)
         sub_id = (submitter or {}).get("id", "user-mock")
         sub_team = (submitter or {}).get("team", "platform")
         env = (state_overrides or {}).get("environment", "")
-        inc = self.store.create(query=query, environment=env,
-                                reporter_id=sub_id, reporter_team=sub_team)
+        inc = self.store.create(
+            query=query,
+            environment=env,
+            reporter_id=sub_id,
+            reporter_team=sub_team,
+            state_overrides=state_overrides,
+        )
         # Emit session.created on the cross-session SSE stream so the
         # React UI's Other Sessions monitor lights up the new tile in
         # real time. ``session_id`` already lands on the row; the
@@ -15007,6 +15147,8 @@ class Orchestrator(Generic[StateT]):
                        last_agent=None, error=None),
             config=self._thread_config(inc.id),
         )
+        if not await self._is_graph_paused(inc.id):
+            await self._finalize_session_status_async(inc.id)
         return inc.id
 
     async def start_investigation(self, *, query: str, environment: str,
@@ -15539,6 +15681,7 @@ class ResumeRequest(BaseModel):
 class SessionStartBody(BaseModel):
     query: str
     environment: str
+    state_overrides: dict[str, Any] | None = None
     # Generic submitter dict — the framework projects ``id``/``team``
     # onto the row's reporter columns; apps interpret the rest. The
     # legacy ``reporter_id`` / ``reporter_team`` fields were removed
@@ -15778,22 +15921,13 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # at root for monitor / load-balancer health-check conventions.
     api_v1 = APIRouter(prefix="/api/v1")
 
-    # CORS: env-driven so the React dev server (Vite at :5173) can call
-    # every endpoint, SSE included. Override via ``ASR_CORS_ORIGINS``
-    # (comma-separated) — production deployments lock the origin list
-    # down by setting the env var to the narrower allow-list.
-    # ``allow_credentials=False`` matches the bearer-token auth pattern
-    # (no cookies); methods are explicit so OPTIONS preflights are
-    # handled the same way for every route.
-    _cors_origins_raw = os.environ.get(
-        "ASR_CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",  # Vite dev defaults
-    )
-    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    # CORS is config-driven via ``cfg.api``. ``ASR_CONFIG`` selects the
+    # config file; deployments set origins/credentials in YAML rather
+    # than via a second env-var override path.
     fastapi_app.add_middleware(
         CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=False,
+        allow_origins=cfg.api.cors_origins,
+        allow_credentials=cfg.api.cors_allow_credentials,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
@@ -15948,9 +16082,34 @@ def build_app(cfg: AppConfig) -> FastAPI:
         """
         svc = request.app.state.service
         try:
+            if (
+                body.state_overrides is not None
+                and "environment" in body.state_overrides
+                and body.environment != body.state_overrides["environment"]
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": {
+                            "code": "conflicting_environment",
+                            "message": (
+                                "environment and state_overrides.environment "
+                                "must match when both are supplied"
+                            ),
+                            "details": {
+                                "environment": body.environment,
+                                "state_overrides_environment": (
+                                    body.state_overrides["environment"]
+                                ),
+                            },
+                        }
+                    },
+                )
+            state_overrides = dict(body.state_overrides or {})
+            state_overrides.setdefault("environment", body.environment)
             sid = svc.start_session(
                 query=body.query,
-                state_overrides={"environment": body.environment},
+                state_overrides=state_overrides,
                 submitter=body.submitter,
             )
         except Exception as e:  # noqa: BLE001
@@ -16698,6 +16857,29 @@ _SESSION_KINDS = frozenset({
 })
 
 
+def _event_payload(orch, ev: SessionEvent) -> dict:
+    payload = dict(ev.payload or {})
+    payload.setdefault("id", ev.session_id)
+    if ev.kind == "session.status_changed":
+        payload.setdefault("status", payload.get("to"))
+    if ev.kind == "session.created":
+        try:
+            session = orch.store.load(ev.session_id)
+        except Exception:  # noqa: BLE001 — SSE enrichment is best effort
+            session = None
+        if session is not None:
+            payload.setdefault("status", session.status)
+            payload.setdefault("created_at", session.created_at)
+            payload.setdefault("updated_at", session.updated_at)
+            label = (
+                getattr(session, "query", None)
+                or (session.extra_fields or {}).get("query")
+                or session.id
+            )
+            payload.setdefault("label", label)
+    return payload
+
+
 def add_recent_events_routes(api_v1: APIRouter) -> None:
     """Mount the /sessions/recent/events SSE handler on the api_v1 router.
 
@@ -16722,7 +16904,8 @@ def add_recent_events_routes(api_v1: APIRouter) -> None:
                 if ev.kind in _SESSION_KINDS:
                     payload = {"seq": ev.seq, "kind": ev.kind,
                                "session_id": ev.session_id,
-                               "payload": ev.payload, "ts": ev.ts}
+                               "payload": _event_payload(orch, ev),
+                               "ts": ev.ts}
                     last_seq = ev.seq
                     yield f"data: {json.dumps(payload)}\n\n"
             # Tail: poll for new rows; exit on client disconnect
@@ -16732,7 +16915,8 @@ def add_recent_events_routes(api_v1: APIRouter) -> None:
                     if ev.kind in _SESSION_KINDS:
                         payload = {"seq": ev.seq, "kind": ev.kind,
                                    "session_id": ev.session_id,
-                                   "payload": ev.payload, "ts": ev.ts}
+                                   "payload": _event_payload(orch, ev),
+                                   "ts": ev.ts}
                         last_seq = ev.seq
                         yield f"data: {json.dumps(payload)}\n\n"
 
