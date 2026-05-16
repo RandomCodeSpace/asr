@@ -6,6 +6,7 @@ import { useUiHints } from '@/state/useUiHints';
 import { CanvasHead } from './CanvasHead';
 import { Transcript, type HITLContext } from './Transcript';
 import { ApproveRationaleModal } from '@/modals/ApproveRationaleModal';
+import { ConfirmModal } from '@/modals/ConfirmModal';
 import { apiFetch } from '@/api/client';
 import { questionFromToolCall } from '@/lib/hitl/questionFromToolCall';
 import type { ToolCall } from '@/api/types';
@@ -58,6 +59,8 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
   const setSelected = useSetSelected();
   const uiHints = useUiHints();
   const [rationaleOpen, setRationaleOpen] = useState(false);
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [stopOpen, setStopOpen] = useState(false);
 
   const pending = useMemo(() => findPendingApproval(state.toolCalls), [state.toolCalls]);
 
@@ -151,6 +154,18 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
     });
     refresh();
   }
+  async function handleReject() {
+    if (!pending) return;
+    await apiFetch(`/sessions/${sessId}/approvals/${pending.idx}`, {
+      method: 'POST',
+      json: { decision: 'reject', approver: 'operator', rationale: null },
+    });
+    refresh();
+  }
+  async function handleStop() {
+    await apiFetch(`/sessions/${sessId}`, { method: 'DELETE' });
+    refresh();
+  }
 
   return (
     <div style={wrap}>
@@ -166,7 +181,7 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
         toolCount={state.toolCalls.length}
         agentsActive={state.agentsRun.length}
         agentsTotal={Object.keys(state.agentDefinitions).length || state.agentsRun.length}
-        onStop={() => { /* Phase 6 / Task 53 confirm modal */ }}
+        onStop={() => setStopOpen(true)}
         onRetry={refresh}
       />
       <Transcript
@@ -176,19 +191,47 @@ export function SessionCanvas({ activeSid }: SessionCanvasProps) {
         hitlContext={hitlContext}
         onSelectTool={onSelectTool}
         onApprove={() => { void handleApprove(); }}
-        onReject={() => { /* Task 53: confirm modal */ }}
+        onReject={() => { if (pending) setRejectOpen(true); }}
         onApproveWithRationale={() => { if (pending) setRationaleOpen(true); }}
       />
       {pending && (
-        <ApproveRationaleModal
-          open={rationaleOpen}
-          onOpenChange={setRationaleOpen}
-          sessionId={sess.id}
-          toolCallId={String(pending.idx)}
-          templates={uiHints.data?.approval_rationale_templates ?? []}
-          onApproved={refresh}
-        />
+        <>
+          <ApproveRationaleModal
+            open={rationaleOpen}
+            onOpenChange={setRationaleOpen}
+            sessionId={sess.id}
+            toolCallId={String(pending.idx)}
+            templates={uiHints.data?.approval_rationale_templates ?? []}
+            onApproved={refresh}
+          />
+          <ConfirmModal
+            open={rejectOpen}
+            onOpenChange={setRejectOpen}
+            eyebrow="REJECT TOOL CALL"
+            title="Reject this tool call?"
+            body={
+              <>
+                <code>{pending.toolCall.tool}</code> requested by{' '}
+                <code>{pending.toolCall.agent}</code> will be skipped and
+                the session resumes without it.
+              </>
+            }
+            confirmLabel="Reject"
+            destructive
+            onConfirm={handleReject}
+          />
+        </>
       )}
+      <ConfirmModal
+        open={stopOpen}
+        onOpenChange={setStopOpen}
+        eyebrow="STOP SESSION"
+        title="Stop this session?"
+        body="The session will be cancelled and any in-flight tool calls will be aborted. This cannot be undone."
+        confirmLabel="Stop session"
+        destructive
+        onConfirm={handleStop}
+      />
     </div>
   );
 }
