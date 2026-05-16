@@ -1,9 +1,9 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Topbar, type Health } from '@/shell/Topbar';
 import { Statusbar, type ConnectionState, type VmSeqState } from '@/shell/Statusbar';
 import { SessionsRail } from '@/shell/SessionsRail';
-import { FlowStrip } from '@/shell/FlowStrip';
+import { FlowStrip, type NodeStatus } from '@/shell/FlowStrip';
 import { SessionCanvas } from '@/canvas/SessionCanvas';
 import { useUiHints } from '@/state/useUiHints';
 import { useSessionList } from '@/state/useSessionList';
@@ -62,6 +62,29 @@ export function App() {
   const vmSeqState: VmSeqState = 'in-sync';
   const vmSeq = sessionFull.state.vmSeq;
 
+  // FlowStrip feedback: active agent (live) + statusByAgent (history).
+  // Sourced from the cross-session SSE that drives sessionList.sessions —
+  // the active row's active_agent field updates in real time via
+  // session.agent_running deltas; agents that appear in agents_run on
+  // the selected session are marked 'done'; the last one flips to 'error'
+  // when the session terminates in an error state.
+  const activeSession = activeSid
+    ? sessionList.sessions.find((s) => s.id === activeSid)
+    : null;
+  const activeAgent = activeSession?.active_agent ?? null;
+  const statusByAgent = useMemo<Record<string, NodeStatus>>(() => {
+    const m: Record<string, NodeStatus> = {};
+    for (const run of sessionFull.state.agentsRun) {
+      m[run.agent] = 'done';
+    }
+    const sess = sessionFull.state.session;
+    if (sess?.status === 'error' && !activeAgent) {
+      const last = sessionFull.state.agentsRun.at(-1);
+      if (last) m[last.agent] = 'error';
+    }
+    return m;
+  }, [sessionFull.state.agentsRun, sessionFull.state.session, activeAgent]);
+
   return (
     <div style={shellStyle}>
       <Topbar
@@ -76,8 +99,9 @@ export function App() {
       />
       <FlowStrip
         agents={agents.data?.list ?? []}
-        activeAgent={null}
+        activeAgent={activeAgent}
         graphVersion={`v${agents.data?.list.length ?? 0}`}
+        statusByAgent={statusByAgent}
       />
       {breakpoint === 'mobile' ? (
         <MobileShell
