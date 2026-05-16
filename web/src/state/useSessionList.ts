@@ -26,7 +26,11 @@ export function useSessionList(): UseSessionListResult {
 
   useEffect(() => {
     let cancelled = false;
-    apiFetch<SessionSummary[]>('/sessions')
+    // Hit /sessions/recent (history) instead of /sessions (in-flight only)
+    // so the rail shows past sessions even when nothing is currently
+    // running. The cross-session SSE below still pushes live status +
+    // agent_running deltas onto the same list.
+    apiFetch<SessionSummary[]>('/sessions/recent?limit=50')
       .then((list) => {
         if (cancelled) return;
         setSessions(list);
