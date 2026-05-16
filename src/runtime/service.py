@@ -559,7 +559,11 @@ class OrchestratorService:
                             ),
                             config=orch._thread_config(session_id),
                         )
-                    if not await orch._is_graph_paused(session_id):
+                    if await orch._is_graph_paused(session_id):
+                        # Issue #42: mark the row awaiting_input so UIs
+                        # filtering by that status see the paused session.
+                        await orch._mark_session_paused_async(session_id)
+                    else:
                         await orch._finalize_session_status_async(session_id)
                 except asyncio.CancelledError:
                     raise

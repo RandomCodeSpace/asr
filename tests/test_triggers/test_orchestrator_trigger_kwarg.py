@@ -12,6 +12,14 @@ async def _always_paused() -> bool:
     return True
 
 
+async def _noop_paused_write() -> None:
+    # Issue #42 stub: the new _mark_session_paused_async would touch
+    # self._locks; these tests bypass __init__ and never wire the
+    # lock manager. The trigger-stamp tests only care that the
+    # paused-branch is taken, not that the row gets a status write.
+    return None
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_start_session_records_trigger(tmp_path, monkeypatch):
     """``Orchestrator.start_session(trigger=...)`` stamps provenance on
@@ -51,6 +59,10 @@ async def test_orchestrator_start_session_records_trigger(tmp_path, monkeypatch)
     orch.graph = _FakeGraph()
     orch._thread_config = lambda sid: {"configurable": {"thread_id": sid}}
     orch._is_graph_paused = lambda sid: _always_paused()
+    # Issue #42: paused branch now calls _mark_session_paused_async,
+    # which uses orch._locks. Stub it out since this test bypasses
+    # __init__ and never wires the lock manager.
+    orch._mark_session_paused_async = lambda sid: _noop_paused_write()
     # Tests that bypass __init__ must set the dedup pipeline
     # attribute to ``None`` so the dedup-check shortcut returns False
     # without touching the (uninitialised) attribute.
@@ -96,6 +108,7 @@ async def test_orchestrator_start_session_without_trigger_skips_stamp():
     orch.graph = _FakeGraph()
     orch._thread_config = lambda sid: {"configurable": {"thread_id": sid}}
     orch._is_graph_paused = lambda sid: _always_paused()
+    orch._mark_session_paused_async = lambda sid: _noop_paused_write()
     orch.dedup_pipeline = None
 
     sid = await orch.start_session(query="q", environment="dev")

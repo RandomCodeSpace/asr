@@ -70,6 +70,13 @@ class _StubOrch:
     async def _finalize_session_status_async(self, sid: str) -> str | None:
         return self._finalized
 
+    async def _mark_session_paused_async(self, sid: str) -> str | None:
+        # Issue #42: retry path now writes 'awaiting_input' on the
+        # paused branch in addition to the existing finalize call.
+        # The stub records that it was called (paused branch flag).
+        self._marked_paused_calls = getattr(self, "_marked_paused_calls", 0) + 1
+        return "awaiting_input" if self._paused else None
+
 
 @pytest.fixture
 def store(tmp_path) -> SessionStore:
