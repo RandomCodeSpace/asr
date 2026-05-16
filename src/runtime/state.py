@@ -22,6 +22,16 @@ _UTC_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 # Per-call audit metadata for the risk-rated tool gateway.
+SessionStatus = Literal[
+    "new",
+    "in_progress",
+    "awaiting_input",
+    "resolved",
+    "escalated",
+    "stopped",
+    "error",
+    "duplicate",
+]
 ToolRisk = Literal["low", "medium", "high"]
 ToolStatus = Literal[
     "executed",                 # auto / legacy default

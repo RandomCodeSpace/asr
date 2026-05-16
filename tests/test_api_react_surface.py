@@ -490,7 +490,7 @@ async def test_unknown_endpoint_returns_404_envelope(cfg):
     automatic 404 raised by Starlette for unknown routes)."""
     app = build_app(cfg)
     async with _client_with_lifespan(app) as client:
-        res = await client.get("/this-route-does-not-exist")
+        res = await client.get("/api/v1/this-route-does-not-exist")
     assert res.status_code == 404
     body = res.json()
     # Starlette's default 404 body is ``{"detail": "Not Found"}``; the

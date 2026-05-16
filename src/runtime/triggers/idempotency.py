@@ -28,6 +28,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import DateTime, String, delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Engine, create_engine
 from sqlalchemy.orm import Mapped, Session as SqlaSession, mapped_column
 from sqlalchemy.pool import NullPool
@@ -106,7 +107,7 @@ class IdempotencyStore:
             if cache is not None and key in cache:
                 # Bump recency
                 cache.move_to_end(key)
-                return cache[key]
+                return cache[key] or None
         # SQLite fall-through (outside the threading lock — sqlite3 has
         # its own locking, and this path is rare).
         with SqlaSession(self._engine) as s:
@@ -134,6 +135,8 @@ class IdempotencyStore:
                 s.commit()
                 return None
             session_id = row.session_id
+            if not session_id:
+                return None
         # Refill LRU.
         with self._lock:
             cache = self._lru.setdefault(trigger_name, OrderedDict())
@@ -181,6 +184,51 @@ class IdempotencyStore:
         # Opportunistic purge of expired rows so a long-running process
         # doesn't accumulate dead records. Cheap (range-bounded delete).
         self.purge_expired()
+
+    def reserve(
+        self,
+        trigger_name: str,
+        key: str,
+        *,
+        ttl_hours: int = 24,
+    ) -> bool:
+        """Atomically reserve a fresh idempotency key.
+
+        Returns ``True`` only for the caller that inserted the row. A
+        ``False`` result means another request has either already
+        completed and stored ``session_id`` or is still in flight.
+        """
+        now = _utc_now()
+        expires_at = now + timedelta(hours=ttl_hours)
+        with SqlaSession(self._engine) as s:
+            existing = s.get(IdempotencyRow, (trigger_name, key))
+            if existing is not None:
+                existing_expires = existing.expires_at
+                if existing_expires.tzinfo is None:
+                    existing_expires = existing_expires.replace(tzinfo=timezone.utc)
+                if existing_expires <= now:
+                    s.delete(existing)
+                    s.commit()
+                else:
+                    return False
+            s.add(IdempotencyRow(
+                trigger_name=trigger_name,
+                key=key,
+                session_id="",
+                created_at=now,
+                expires_at=expires_at,
+            ))
+            try:
+                s.commit()
+            except IntegrityError:
+                s.rollback()
+                return False
+        with self._lock:
+            cache = self._lru.setdefault(trigger_name, OrderedDict())
+            cache[key] = ""
+            cache.move_to_end(key)
+            self._evict_if_needed(cache)
+        return True
 
     def purge_expired(self) -> int:
         """Delete all rows whose ``expires_at`` is in the past. Returns

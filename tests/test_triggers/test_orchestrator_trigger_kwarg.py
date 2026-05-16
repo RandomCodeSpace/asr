@@ -8,6 +8,10 @@ import pytest
 from runtime.triggers.base import TriggerInfo
 
 
+async def _always_paused() -> bool:
+    return True
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_start_session_records_trigger(tmp_path, monkeypatch):
     """``Orchestrator.start_session(trigger=...)`` stamps provenance on
@@ -46,6 +50,7 @@ async def test_orchestrator_start_session_records_trigger(tmp_path, monkeypatch)
     orch.store = _FakeStore()
     orch.graph = _FakeGraph()
     orch._thread_config = lambda sid: {"configurable": {"thread_id": sid}}
+    orch._is_graph_paused = lambda sid: _always_paused()
     # Tests that bypass __init__ must set the dedup pipeline
     # attribute to ``None`` so the dedup-check shortcut returns False
     # without touching the (uninitialised) attribute.
@@ -90,6 +95,7 @@ async def test_orchestrator_start_session_without_trigger_skips_stamp():
     orch.store = _FakeStore()
     orch.graph = _FakeGraph()
     orch._thread_config = lambda sid: {"configurable": {"thread_id": sid}}
+    orch._is_graph_paused = lambda sid: _always_paused()
     orch.dedup_pipeline = None
 
     sid = await orch.start_session(query="q", environment="dev")

@@ -17,7 +17,8 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from typing import Generic, Optional, Type, TypeVar
+import logging
+from typing import Any, Generic, Optional, Type, TypeVar
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
@@ -28,6 +29,8 @@ from sqlalchemy.orm import Session as SqlSession
 
 from runtime.state import AgentRun, Session, TokenUsage, ToolCall
 from runtime.storage.models import IncidentRow
+
+_log = logging.getLogger(__name__)
 
 # The legacy ``INC-YYYYMMDD-NNN`` pattern stays here for back-compat
 # validation against on-disk rows minted before the ``Session.id_format``
@@ -201,7 +204,12 @@ class SessionStore(Generic[StateT]):
     # ---------- public API ----------
     def create(self, *, query: str, environment: str,
                reporter_id: str = "user-mock",
-               reporter_team: str = "platform") -> StateT:
+               reporter_team: str = "platform",
+               state_overrides: dict[str, Any] | None = None) -> StateT:
+        extra_fields = {
+            k: v for k, v in (state_overrides or {}).items()
+            if k not in self._ROW_TYPED_DOMAIN_COLUMNS
+        }
         with SqlSession(self.engine) as session:
             now = _now()
             inc_id = self._next_id(session)
@@ -220,6 +228,7 @@ class SessionStore(Generic[StateT]):
                 tool_calls=[],
                 findings={},
                 user_inputs=[],
+                extra_fields=extra_fields,
             )
             session.add(row)
             session.commit()
@@ -271,7 +280,10 @@ class SessionStore(Generic[StateT]):
                 for k, v in data.items():
                     setattr(existing, k, v)
             db_session.commit()
-        self._refresh_vector(session, prior_text=prior_text)
+        try:
+            self._refresh_vector(session, prior_text=prior_text)
+        except Exception as exc:  # noqa: BLE001 — SQL commit already succeeded
+            self._log_vector_warning("refresh", session.id, exc)
 
     def delete(self, incident_id: str) -> StateT:
         with SqlSession(self.engine) as session:
@@ -423,13 +435,27 @@ class SessionStore(Generic[StateT]):
             return
         if prior_text == text:
             return
-        self.vector_store.delete(ids=[inc.id])
+        try:
+            self.vector_store.delete(ids=[inc.id])
+        except Exception as exc:  # noqa: BLE001 — vector delete is idempotent
+            self._log_vector_warning("delete", inc.id, exc)
         from langchain_core.documents import Document
         self.vector_store.add_documents(
             [Document(page_content=text, metadata={"id": inc.id})],
             ids=[inc.id],
         )
         self._persist_vector()
+
+    def _log_vector_warning(self, operation: str, sid: str, exc: Exception) -> None:
+        backend = type(self.vector_store).__name__ if self.vector_store is not None else "None"
+        _log.warning(
+            "session vector %s failed sid=%s backend=%s exc=%s",
+            operation,
+            sid,
+            backend,
+            type(exc).__name__,
+            exc_info=True,
+        )
 
     # ---------- mapping helpers ----------
     #

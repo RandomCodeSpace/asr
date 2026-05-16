@@ -743,6 +743,12 @@ def make_agent_node(
                     inc_id, "agent_started",
                     agent=skill.name, started_at=started_at,
                 )
+                event_log.record(
+                    inc_id,
+                    "session.agent_running",
+                    id=inc_id,
+                    agent=skill.name,
+                )
             except Exception:  # noqa: BLE001 — telemetry must not break the agent
                 logger.debug(
                     "event_log.record(agent_started) failed", exc_info=True,

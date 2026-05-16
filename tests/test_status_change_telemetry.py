@@ -98,6 +98,11 @@ async def test_finalize_with_mark_resolved_emits_status_changed(tmp_path):
         assert e.payload["from"] == "in_progress"
         assert e.payload["to"] == "resolved"
         assert e.payload["cause"] == "mark_resolved"
+        clear_events = [
+            e for e in events
+            if e.kind == "session.agent_running"
+        ]
+        assert clear_events[-1].payload == {"id": inc.id, "agent": None}
     finally:
         await orch.aclose()
 

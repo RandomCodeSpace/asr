@@ -474,7 +474,6 @@ class OrchestratorService:
         )
         sub_id = (resolved_submitter or {}).get("id", "user-mock")
         sub_team = (resolved_submitter or {}).get("team", "platform")
-        env = (resolved_overrides or {}).get("environment", "")
 
         async def _scheduler() -> str:
             # Enforce the concurrency cap on the loop thread so the
@@ -484,6 +483,13 @@ class OrchestratorService:
             if len(self._registry) >= self.max_concurrent_sessions:
                 raise SessionCapExceeded(self.max_concurrent_sessions)
             orch = await self._ensure_orchestrator()
+            overrides_for_create = resolved_overrides
+            state_overrides_cls = getattr(orch, "_state_overrides_cls", None)
+            if state_overrides_cls is not None and overrides_for_create is not None:
+                overrides_for_create = state_overrides_cls.model_validate(
+                    overrides_for_create
+                ).model_dump(exclude_none=True)
+            env_for_create = (overrides_for_create or {}).get("environment", "")
             # Allocate the row (and its id) synchronously on the loop
             # so the caller gets a stable id back. The graph then runs
             # in a separate task — registration happens here, before
@@ -491,9 +497,10 @@ class OrchestratorService:
             # entry immediately.
             inc = orch.store.create(
                 query=query,
-                environment=env,
+                environment=env_for_create,
                 reporter_id=sub_id,
                 reporter_team=sub_team,
+                state_overrides=overrides_for_create,
             )
             session_id = inc.id
             # Emit session.created on the cross-session SSE stream so
@@ -541,8 +548,8 @@ class OrchestratorService:
                     raise SessionBusy(session_id)
                 # Hold the per-session lock for the full graph turn,
                 # including any HITL interrupt() pause (D-01).
-                async with orch._locks.acquire(session_id):
-                    try:
+                try:
+                    async with orch._locks.acquire(session_id):
                         await orch.graph.ainvoke(
                             GraphState(
                                 session=inc,
@@ -552,34 +559,36 @@ class OrchestratorService:
                             ),
                             config=orch._thread_config(session_id),
                         )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is a
-                        # pending-approval pause, not a failure. Don't stamp
-                        # status='error' on the registry entry -- let
-                        # LangGraph's checkpointer hold the paused state
-                        # and let the UI's Approve/Reject action drive
-                        # resume.
-                        try:
-                            from langgraph.errors import GraphInterrupt
-                            if isinstance(exc, GraphInterrupt):
-                                # Propagate so the underlying Task
-                                # observer (stop_session etc.) still
-                                # sees the exception, but skip the
-                                # status='error' write.
-                                raise
-                        except ImportError:  # pragma: no cover
-                            pass
-                        # Mark the registry entry so any concurrent snapshot
-                        # observes the failure before the done-callback
-                        # evicts it. The exception itself is preserved on
-                        # the task object for ``stop_session`` and any
-                        # other observer that holds a Task reference.
-                        e = self._registry.get(session_id)
-                        if e is not None:
-                            e.status = "error"
-                        raise
+                    if not await orch._is_graph_paused(session_id):
+                        await orch._finalize_session_status_async(session_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Phase 11 (FOC-04 / D-11-04): GraphInterrupt is a
+                    # pending-approval pause, not a failure. Don't stamp
+                    # status='error' on the registry entry -- let
+                    # LangGraph's checkpointer hold the paused state
+                    # and let the UI's Approve/Reject action drive
+                    # resume.
+                    try:
+                        from langgraph.errors import GraphInterrupt
+                        if isinstance(exc, GraphInterrupt):
+                            # Propagate so the underlying Task
+                            # observer (stop_session etc.) still
+                            # sees the exception, but skip the
+                            # status='error' write.
+                            raise
+                    except ImportError:  # pragma: no cover
+                        pass
+                    # Mark the registry entry so any concurrent snapshot
+                    # observes the failure before the done-callback
+                    # evicts it. The exception itself is preserved on
+                    # the task object for ``stop_session`` and any
+                    # other observer that holds a Task reference.
+                    e = self._registry.get(session_id)
+                    if e is not None:
+                        e.status = "error"
+                    raise
 
             task = asyncio.create_task(_run(), name=f"session:{session_id}")
             entry.task = task

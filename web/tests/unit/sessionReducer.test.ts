@@ -47,11 +47,13 @@ describe('sessionReducer', () => {
       const state = sessionReducer(initialSessionState, { type: 'bootstrap', bundle: baseBundle });
       const finished: SessionEvent = {
         seq: 1, kind: 'agent_finished', ts: 'x',
-        payload: { agent: 'intake', summary: 'done', confidence: 0.9 },
+        payload: { agent: 'intake', input_tokens: 3, output_tokens: 4, total_tokens: 7 },
       };
       const next = sessionReducer(state, { type: 'event', event: finished });
       expect(next.agentsRun).toHaveLength(1);
       expect(next.agentsRun[0]?.agent).toBe('intake');
+      expect(next.agentsRun[0]?.summary).toBe('');
+      expect(next.agentsRun[0]?.token_usage?.total_tokens).toBe(7);
     });
 
     it('event "tool_invoked" appends a ToolCall with status="executed"', () => {
@@ -76,14 +78,35 @@ describe('sessionReducer', () => {
       expect(next.toolCalls[0]?.risk).toBe('high');
     });
 
+    it('event "gate_fired" inserts a pending tool call', () => {
+      const state = sessionReducer(initialSessionState, { type: 'bootstrap', bundle: baseBundle });
+      const ev: SessionEvent = {
+        seq: 1, kind: 'gate_fired', ts: 'x',
+        payload: { agent: 'investigate', tool: 'rem:propose_fix', reason: 'high_risk' },
+      };
+      const next = sessionReducer(state, { type: 'event', event: ev });
+      expect(next.toolCalls[0]?.status).toBe('pending_approval');
+      expect(next.toolCalls[0]?.tool).toBe('rem:propose_fix');
+    });
+
     it('event "status_changed" updates session.status', () => {
       const state = sessionReducer(initialSessionState, { type: 'bootstrap', bundle: baseBundle });
       const ev: SessionEvent = {
         seq: 1, kind: 'status_changed', ts: 'x',
-        payload: { status: 'resolved' },
+        payload: { from: 'in_progress', to: 'resolved', cause: 'mark_resolved' },
       };
       const next = sessionReducer(state, { type: 'event', event: ev });
       expect(next.session?.status).toBe('resolved');
+    });
+
+    it('event "status_changed" keeps backwards-compatible status payload', () => {
+      const state = sessionReducer(initialSessionState, { type: 'bootstrap', bundle: baseBundle });
+      const ev: SessionEvent = {
+        seq: 1, kind: 'status_changed', ts: 'x',
+        payload: { status: 'error' },
+      };
+      const next = sessionReducer(state, { type: 'event', event: ev });
+      expect(next.session?.status).toBe('error');
     });
   });
 });

@@ -14,6 +14,7 @@ import json
 from typing import AsyncIterator
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from runtime.storage.event_log import SessionEvent
 
 _SSE_MEDIA_TYPE = "text/event-stream"
 _SESSION_KINDS = frozenset({
@@ -21,6 +22,29 @@ _SESSION_KINDS = frozenset({
     "session.status_changed",
     "session.agent_running",
 })
+
+
+def _event_payload(orch, ev: SessionEvent) -> dict:
+    payload = dict(ev.payload or {})
+    payload.setdefault("id", ev.session_id)
+    if ev.kind == "session.status_changed":
+        payload.setdefault("status", payload.get("to"))
+    if ev.kind == "session.created":
+        try:
+            session = orch.store.load(ev.session_id)
+        except Exception:  # noqa: BLE001 — SSE enrichment is best effort
+            session = None
+        if session is not None:
+            payload.setdefault("status", session.status)
+            payload.setdefault("created_at", session.created_at)
+            payload.setdefault("updated_at", session.updated_at)
+            label = (
+                getattr(session, "query", None)
+                or (session.extra_fields or {}).get("query")
+                or session.id
+            )
+            payload.setdefault("label", label)
+    return payload
 
 
 def add_recent_events_routes(api_v1: APIRouter) -> None:
@@ -47,7 +71,8 @@ def add_recent_events_routes(api_v1: APIRouter) -> None:
                 if ev.kind in _SESSION_KINDS:
                     payload = {"seq": ev.seq, "kind": ev.kind,
                                "session_id": ev.session_id,
-                               "payload": ev.payload, "ts": ev.ts}
+                               "payload": _event_payload(orch, ev),
+                               "ts": ev.ts}
                     last_seq = ev.seq
                     yield f"data: {json.dumps(payload)}\n\n"
             # Tail: poll for new rows; exit on client disconnect
@@ -57,7 +82,8 @@ def add_recent_events_routes(api_v1: APIRouter) -> None:
                     if ev.kind in _SESSION_KINDS:
                         payload = {"seq": ev.seq, "kind": ev.kind,
                                    "session_id": ev.session_id,
-                                   "payload": ev.payload, "ts": ev.ts}
+                                   "payload": _event_payload(orch, ev),
+                                   "ts": ev.ts}
                         last_seq = ev.seq
                         yield f"data: {json.dumps(payload)}\n\n"
 

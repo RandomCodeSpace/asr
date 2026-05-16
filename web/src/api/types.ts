@@ -5,7 +5,7 @@ export type SessionId = string;  // SES-YYYYMMDD-NNN
 
 export interface Session {
   id: SessionId;
-  status: 'in_progress' | 'awaiting_input' | 'matched' | 'resolved' | 'escalated' | 'stopped' | 'error' | 'new';
+  status: 'new' | 'in_progress' | 'awaiting_input' | 'resolved' | 'escalated' | 'stopped' | 'error' | 'duplicate';
   created_at: string;  // ISO UTC
   updated_at: string;
   deleted_at: string | null;
@@ -38,7 +38,7 @@ export interface ToolCall {
   result: unknown;
   ts: string;
   risk: 'low' | 'medium' | 'high' | null;
-  status: 'executed' | 'executed_with_notify' | 'pending_approval' | 'approved' | 'rejected' | 'timeout' | 'auto_rejected';
+  status: 'executed' | 'executed_with_notify' | 'pending_approval' | 'approved' | 'rejected' | 'timeout';
   approver: string | null;
   approved_at: string | null;
   approval_rationale: string | null;
@@ -68,6 +68,13 @@ export interface SessionFullBundle {
   events: SessionEvent[];
   agent_definitions: Record<string, AgentDefinition>;
   vm_seq: number;
+}
+
+export interface SessionStartBody {
+  query: string;
+  environment: string;
+  submitter?: Record<string, unknown> | null;
+  state_overrides?: Record<string, unknown>;
 }
 
 export interface UiHints {

@@ -1,6 +1,8 @@
 """TriggerRegistry tests — resolution, lifecycle, dispatch, idempotency."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from runtime.triggers import TriggerRegistry
@@ -126,6 +128,41 @@ async def test_idempotency_returns_cached_session_id(tmp_path):
     s2 = await reg.dispatch("pd", p, idempotency_key="K-1")
     assert s1 == s2
     assert len(calls) == 1  # only one call to start_session
+
+
+@pytest.mark.asyncio
+async def test_idempotency_reservation_allows_one_concurrent_start(tmp_path):
+    """Concurrent duplicate keys must not both start sessions."""
+    calls = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_start(*, trigger=None, **kw):
+        calls.append(kw)
+        started.set()
+        await release.wait()
+        return f"INC-{len(calls)}"
+
+    store = IdempotencyStore.connect(f"sqlite:///{tmp_path / 'idem.db'}")
+    reg = TriggerRegistry.create(
+        [_webhook_cfg()], start_session_fn=fake_start, idempotency=store
+    )
+    from tests.test_triggers.conftest import PagerDutyPayload
+
+    payload = PagerDutyPayload(incident_id="P-1", summary="boom")
+    first = asyncio.create_task(
+        reg.dispatch("pd", payload, idempotency_key="K-race")
+    )
+    await started.wait()
+    second = asyncio.create_task(
+        reg.dispatch("pd", payload, idempotency_key="K-race")
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    s1, s2 = await asyncio.gather(first, second)
+    assert s1 == s2
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio

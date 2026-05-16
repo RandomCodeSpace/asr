@@ -761,7 +761,13 @@ def resolve_framework_app_config(
 
 
 class ApiConfig(BaseModel):
-    """API surface knobs surfaced to the React frontend."""
+    """API surface knobs surfaced to the React frontend.
+
+    Values come from the loaded runtime config. Environment variables
+    choose the config file (``ASR_CONFIG``) but do not override these
+    CORS fields directly; deployments that need different origins
+    should set them in YAML.
+    """
 
     # CORS origins allowed by the FastAPI CORSMiddleware. Default
     # covers the two common React dev-server URLs (Vite, CRA/Next).

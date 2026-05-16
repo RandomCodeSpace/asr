@@ -1,55 +1,41 @@
-"""Cross-session SSE — emits session-level events across all sessions."""
-import asyncio
+"""Cross-session SSE payload enrichment."""
+from __future__ import annotations
+
 import json
-from fastapi.testclient import TestClient
-from runtime.api import build_app
-from tests.test_api_v1_url_move import _cfg
+from types import SimpleNamespace
+
+from sqlalchemy import create_engine
+
+from runtime.api_recent_events import _event_payload
+from runtime.storage.event_log import EventLog
+from runtime.storage.models import Base
+from runtime.storage.session_store import SessionStore
 
 
-def test_recent_events_replays_session_creates(tmp_path):
-    """Two POST /sessions calls each emit a session.created event;
-    the recent SSE stream replays them on connect."""
-    app = build_app(_cfg(tmp_path))
-    with TestClient(app) as client:
-        # Create two sessions
-        for q in ["alpha", "beta"]:
-            r = client.post("/api/v1/sessions", json={
-                "query": q, "environment": "dev",
-                "submitter": {"id": "u1", "team": "p"},
-            })
-            assert r.status_code == 201
+def test_recent_events_session_created_payload_matches_session_summary(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 't.db'}")
+    Base.metadata.create_all(engine)
+    store = SessionStore(engine=engine)
+    log = EventLog(engine=engine)
+    inc = store.create(query="alpha", environment="dev")
+    log.record(inc.id, "session.created")
+    ev = list(log.iter_recent())[0]
 
-        # Direct-call the SSE handler with a forced-disconnect to drain
-        # the backlog (avoids long-poll deadlock in TestClient).
-        from starlette.requests import Request as StarletteRequest
+    payload = {
+        "seq": ev.seq,
+        "kind": ev.kind,
+        "session_id": ev.session_id,
+        "payload": _event_payload(SimpleNamespace(store=store), ev),
+        "ts": ev.ts,
+    }
+    frame = f"data: {json.dumps(payload)}\n\n"
+    decoded = json.loads(frame.split("data: ", 1)[1])
 
-        async def _disc():
-            return True  # exit tail loop after backlog drain
-
-        sse_route = next(
-            r for r in app.router.routes
-            if getattr(r, "path", "") == "/api/v1/sessions/recent/events"
-        )
-        scope = {
-            "type": "http", "method": "GET",
-            "path": "/api/v1/sessions/recent/events",
-            "query_string": b"since=0", "headers": [], "app": app,
-        }
-        request = StarletteRequest(scope)
-        request.is_disconnected = _disc  # type: ignore[method-assign]
-        response = asyncio.run(
-            sse_route.endpoint(request=request, since=0)  # type: ignore[attr-defined]
-        )
-
-        async def _drain():
-            frames = []
-            async for chunk in response.body_iterator:
-                text = chunk.decode() if isinstance(chunk, bytes) else chunk
-                for line in text.splitlines():
-                    if line.startswith("data: "):
-                        frames.append(json.loads(line[len("data: "):]))
-            return frames
-
-        frames = asyncio.run(_drain())
-        kinds = [f["kind"] for f in frames]
-        assert kinds.count("session.created") == 2
+    assert decoded["kind"] == "session.created"
+    assert decoded["payload"]["id"] == inc.id
+    assert {
+        "id",
+        "status",
+        "created_at",
+        "updated_at",
+    } <= decoded["payload"].keys()
