@@ -12,6 +12,9 @@ import { useAgentDefinitions } from '@/state/useAgentDefinitions';
 import { useSessionFull } from '@/state/useSessionFull';
 import { MonitorRail } from '@/monitors/MonitorRail';
 import { NewSessionModal } from '@/modals/NewSessionModal';
+import { TabletShell } from '@/shell/TabletShell';
+import { MobileShell } from '@/shell/MobileShell';
+import { useBreakpoint } from '@/state/useBreakpoint';
 
 const UI_VERSION = 'v2.0.0-rc1';
 const RUNTIME_VERSION_FALLBACK = 'unknown';
@@ -40,6 +43,7 @@ export function App() {
   const approvals = useApprovalsQueue();
   const agents = useAgentDefinitions();
   const sessionFull = useSessionFull(activeSid);
+  const breakpoint = useBreakpoint();
 
   const brandName = uiHints.data?.brand_name ?? 'ASR';
   const envName = uiHints.data?.environments?.[0] ?? 'dev';
@@ -75,23 +79,43 @@ export function App() {
         activeAgent={null}
         graphVersion={`v${agents.data?.list.length ?? 0}`}
       />
-      <div style={paneStyle}>
-        <SessionsRail
+      {breakpoint === 'mobile' ? (
+        <MobileShell
           sessions={sessionList.sessions}
           activeSid={activeSid}
-          onSelect={setActiveSid}
-        />
-        <SessionCanvas activeSid={activeSid} />
-        <MonitorRail
-          sessions={sessionList.sessions}
-          activeSid={activeSid}
+          onSelectSession={setActiveSid}
           queue={approvals.queue}
           agentsByName={agents.data?.byName ?? {}}
           toolCalls={sessionFull.state.toolCalls}
-          sessionId={activeSid}
-          onSelectSession={setActiveSid}
         />
-      </div>
+      ) : breakpoint === 'tablet' ? (
+        <TabletShell
+          sessions={sessionList.sessions}
+          activeSid={activeSid}
+          onSelectSession={setActiveSid}
+          queue={approvals.queue}
+          agentsByName={agents.data?.byName ?? {}}
+          toolCalls={sessionFull.state.toolCalls}
+        />
+      ) : (
+        <div style={paneStyle}>
+          <SessionsRail
+            sessions={sessionList.sessions}
+            activeSid={activeSid}
+            onSelect={setActiveSid}
+          />
+          <SessionCanvas activeSid={activeSid} />
+          <MonitorRail
+            sessions={sessionList.sessions}
+            activeSid={activeSid}
+            queue={approvals.queue}
+            agentsByName={agents.data?.byName ?? {}}
+            toolCalls={sessionFull.state.toolCalls}
+            sessionId={activeSid}
+            onSelectSession={setActiveSid}
+          />
+        </div>
+      )}
       <Statusbar
         connection={connection}
         sseEventCount={sessionFull.state.events.length}
