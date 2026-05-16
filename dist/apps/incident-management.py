@@ -6523,7 +6523,11 @@ class OrchestratorService:
                             ),
                             config=orch._thread_config(session_id),
                         )
-                    if not await orch._is_graph_paused(session_id):
+                    if await orch._is_graph_paused(session_id):
+                        # Issue #42: mark the row awaiting_input so UIs
+                        # filtering by that status see the paused session.
+                        await orch._mark_session_paused_async(session_id)
+                    else:
                         await orch._finalize_session_status_async(session_id)
                 except asyncio.CancelledError:
                     raise
@@ -14947,6 +14951,54 @@ class Orchestrator(Generic[StateT]):
         async with self._locks.acquire(session_id):
             return self._finalize_session_status(session_id)
 
+    async def _mark_session_paused_async(
+        self, session_id: str,
+    ) -> str | None:
+        """Lock-guarded write that flips a paused session to
+        ``"awaiting_input"`` and emits the matching ``status_changed``
+        events.
+
+        Companion to :meth:`_finalize_session_status_async`. The
+        finalizer handles graph-completed runs; this handles
+        graph-paused runs (HITL gate). Without it, sessions that
+        pause at a gate keep their old status (typically ``"new"`` /
+        ``"in_progress"``) and UIs that filter by ``"awaiting_input"``
+        (the approvals queue, the rail's Active group) miss them — see
+        issue #42.
+
+        No-op (returns ``None``) when the session is already at
+        ``"awaiting_input"``, already in a terminal status (a late
+        pause-write must not unwind a finalize that landed in
+        between), or the row is missing. Otherwise transitions the
+        row to ``"awaiting_input"`` and emits both per-session
+        ``status_changed`` and cross-session
+        ``session.status_changed`` events via
+        :func:`_emit_status_changed_event`.
+        """
+        async with self._locks.acquire(session_id):
+            try:
+                inc = self.store.load(session_id)
+            except (FileNotFoundError, ValueError, KeyError, LookupError):
+                return None
+            if inc.status == "awaiting_input":
+                return None
+            statuses = getattr(getattr(self, "cfg", None), "orchestrator", None)
+            if statuses is not None:
+                current_def = statuses.statuses.get(inc.status)
+                if current_def is not None and current_def.terminal:
+                    return None
+            from_status = inc.status
+            inc.status = "awaiting_input"
+            self.store.save(inc)
+            _emit_status_changed_event(
+                orch=self,
+                inc=inc,
+                from_status=from_status,
+                to_status="awaiting_input",
+                cause="gate_paused",
+            )
+            return "awaiting_input"
+
     async def _is_graph_paused(self, session_id: str) -> bool:
         """Return True iff the compiled graph has a pending step waiting
         to resume (i.e. it's paused at an ``interrupt()`` boundary).
@@ -15147,7 +15199,9 @@ class Orchestrator(Generic[StateT]):
                        last_agent=None, error=None),
             config=self._thread_config(inc.id),
         )
-        if not await self._is_graph_paused(inc.id):
+        if await self._is_graph_paused(inc.id):
+            await self._mark_session_paused_async(inc.id)
+        else:
             await self._finalize_session_status_async(inc.id)
         return inc.id
 
@@ -15205,7 +15259,10 @@ class Orchestrator(Generic[StateT]):
         # session is waiting for operator approval, not done. Stamping
         # default_terminal_status here would orphan the pending_approval
         # ToolCall row written by the gateway just before the pause.
+        # Issue #42: still flip the session row to awaiting_input so
+        # the approvals queue + sessions rail Active group pick it up.
         if await self._is_graph_paused(inc.id):
+            await self._mark_session_paused_async(inc.id)
             yield {"event": "session_paused", "incident_id": inc.id,
                    "ts": _event_ts()}
         else:
@@ -15487,8 +15544,10 @@ class Orchestrator(Generic[StateT]):
             yield self._to_ui_event(ev, session_id)
         # See ``stream_session`` for why pause-detection guards the
         # finalize call: a HITL pause must not be coerced into a
-        # terminal status.
+        # terminal status. Issue #42: still flip to awaiting_input so
+        # UIs filtering by that status see the retried session.
         if await self._is_graph_paused(session_id):
+            await self._mark_session_paused_async(session_id)
             yield {"event": "session_paused", "incident_id": session_id,
                    "ts": _event_ts()}
         else:
