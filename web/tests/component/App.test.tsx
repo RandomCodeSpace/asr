@@ -31,6 +31,16 @@ describe('<App>', () => {
           status: 200, headers: { 'content-type': 'application/json' },
         }));
       }
+      if (url.includes('/tools') || url.includes('/lessons')) {
+        return Promise.resolve(new Response(JSON.stringify([]), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        }));
+      }
+      if (url.includes('/health')) {
+        return Promise.resolve(new Response(JSON.stringify({ status: 'ok' }), {
+          status: 200, headers: { 'content-type': 'application/json' },
+        }));
+      }
       return Promise.resolve(new Response('{}', { status: 200 }));
     });
     // @ts-expect-error -- jsdom does not provide EventSource
