@@ -4,6 +4,7 @@ import { Topbar, type Health } from '@/shell/Topbar';
 import { Statusbar, type ConnectionState, type VmSeqState } from '@/shell/Statusbar';
 import { SessionsRail } from '@/shell/SessionsRail';
 import { FlowStrip } from '@/shell/FlowStrip';
+import { SessionCanvas } from '@/canvas/SessionCanvas';
 import { useUiHints } from '@/state/useUiHints';
 import { useSessionList } from '@/state/useSessionList';
 import { useApprovalsQueue } from '@/state/useApprovalsQueue';
@@ -26,15 +27,6 @@ const paneStyle: CSSProperties = {
   display: 'grid',
   gridTemplateColumns: '220px 1fr 340px',
   minHeight: 0,
-};
-
-const canvasEmptyStyle: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  background: 'var(--bg-elev)',
-  borderRight: '1px solid var(--hair)',
-  padding: 32,
 };
 
 const monitorRailPlaceholder: CSSProperties = {
@@ -94,11 +86,7 @@ export function App() {
           activeSid={activeSid}
           onSelect={setActiveSid}
         />
-        <div style={canvasEmptyStyle}>
-          <span style={{ fontSize: 13, color: 'var(--ink-3)' }}>
-            Select a session from the rail or create a new one.
-          </span>
-        </div>
+        <SessionCanvas activeSid={activeSid} />
         <div style={monitorRailPlaceholder}>
           Ambient monitors (Phase 5)
         </div>
