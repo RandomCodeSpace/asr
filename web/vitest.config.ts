@@ -1,5 +1,5 @@
 // web/vitest.config.ts
-import { defineConfig } from 'vitest/config';
+import { defineConfig, configDefaults } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath } from 'node:url';
 
@@ -15,6 +15,7 @@ export default defineConfig({
     setupFiles: ['./tests/setup.ts'],
     globals: true,
     css: false,
+    exclude: [...configDefaults.exclude, 'tests/e2e/**'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov'],

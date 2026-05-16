@@ -5,6 +5,7 @@ interface PrimaryAction {
   label: string;
   onClick: () => void;
   disabled?: boolean;
+  destructive?: boolean;
 }
 
 interface ModalProps {
@@ -169,15 +170,16 @@ export function Modal({
                 type="button"
                 onClick={primaryAction.onClick}
                 disabled={primaryAction.disabled}
+                data-destructive={primaryAction.destructive ? 'true' : undefined}
                 style={{
                   height: 28,
                   padding: '0 14px',
                   fontFamily: 'var(--ff-sans)',
                   fontSize: 'var(--t-body)',
                   fontWeight: 500,
-                  color: 'var(--bg-elev)',
-                  background: 'var(--ink-1)',
-                  border: '1px solid var(--ink-1)',
+                  color: primaryAction.destructive ? 'var(--bg-elev)' : 'var(--bg-elev)',
+                  background: primaryAction.destructive ? 'var(--danger)' : 'var(--ink-1)',
+                  border: `1px solid ${primaryAction.destructive ? 'var(--danger)' : 'var(--ink-1)'}`,
                   borderRadius: 0,
                   cursor: primaryAction.disabled ? 'not-allowed' : 'pointer',
                   opacity: primaryAction.disabled ? 0.5 : 1,
