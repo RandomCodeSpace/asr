@@ -1429,10 +1429,15 @@ The module-level ``get_app()`` is a no-arg factory suitable for
 
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
+
+
+
 
 
 # ----- imports for runtime/api_dedup.py -----
@@ -1459,6 +1464,87 @@ status flip via :meth:`SessionStore.un_duplicate`.
 
 
 from fastapi import FastAPI, HTTPException
+
+
+# ----- imports for runtime/api_session_full.py -----
+"""Bootstrap endpoint for the React UI's single view-model.
+
+GET /api/v1/sessions/{id}/full returns everything the UI needs to render
+the session in one round-trip — replaces the old pattern of multiple GETs.
+The same shape is then patched in place by SSE delta events.
+
+Registered only via :func:`runtime.api.build_app` (requires
+``app.state.orchestrator``); unlike :mod:`runtime.api_dedup`, this module
+is NOT suitable for lightweight test fixtures that construct a bare
+``FastAPI()`` app — use ``build_app(cfg)`` for tests.
+"""
+
+
+
+from fastapi import APIRouter, HTTPException, Request
+
+
+# ----- imports for runtime/api_ui_hints.py -----
+"""UI hints endpoint — drives the React shell's brand and templates.
+
+GET /api/v1/config/ui-hints returns the runtime-configured ui block plus
+the environments list. Read once at React-app boot and cached for the
+session lifetime via `useUiHints()`.
+
+Registered only via :func:`runtime.api.build_app` (requires
+``app.state.cfg``); not suitable for lightweight test fixtures that
+construct a bare ``FastAPI()`` app — use ``build_app(cfg)`` for tests.
+"""
+
+from fastapi import APIRouter, Request
+
+
+# ----- imports for runtime/api_apps_overlay.py -----
+"""App-overlay UI views discovery — Approach C extensibility.
+
+GET /api/v1/apps/{app}/ui-views returns the app-registered overlay views.
+The framework UI's Selected-detail panel renders matching views as
+"App-specific views →" links. v2.0 ships with one app per deployment;
+multi-app per-app filtering is v2.1 scope (the path's app_name is
+currently informational).
+
+Registered only via :func:`runtime.api.build_app` (requires
+``app.state.cfg``); not suitable for lightweight test fixtures that
+construct a bare ``FastAPI()`` app — use ``build_app(cfg)`` for tests.
+"""
+
+
+
+# ----- imports for runtime/api_recent_events.py -----
+"""Cross-session SSE — used by the React UI's Other Sessions monitor.
+
+Emits session-level events (not per-session detail events): session.created,
+session.status_changed, session.agent_running. Lower frequency than the
+per-session stream.
+
+Registered only via :func:`runtime.api.build_app` (requires
+``app.state.orchestrator``); not suitable for lightweight test fixtures
+that construct a bare ``FastAPI()`` app — use ``build_app(cfg)`` for tests.
+"""
+
+from fastapi.responses import StreamingResponse
+
+# ----- imports for runtime/api_static.py -----
+"""StaticFiles mount + SPA fallback for the React UI bundle.
+
+The React build output lives at $ASR_WEB_DIST (default: ../web/dist relative
+to repo root). FastAPI serves /assets/* and /fonts/* directly; any unknown
+path that isn't /api/v1/*, /health, or /docs falls back to index.html so
+the React Router can pick up the URL.
+
+Registered only via :func:`runtime.api.build_app` (mounts onto the root
+FastAPI app, not the api_v1 router). Must be invoked AFTER all API routes
+are registered so the catch-all SPA fallback doesn't shadow them.
+"""
+
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 
 # ----- imports for examples/code_review/state.py -----
@@ -2235,10 +2321,26 @@ class UIDetailField(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
 
 
+class AppView(BaseModel):
+    """An app-overlay UI view registered by an app for the framework UI to link to.
+
+    The framework UI lists matching app views in its Selected-detail panel
+    ("App-specific views →") so apps can ship bespoke deep-dive pages
+    without forking the framework. Approach C (per the v2.0 design spec).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    applies_to: str  # "always" | "agent:<name>" | "tool:<name>"
+    url: str
+
+
 class UIConfig(BaseModel):
     """App-driven UI rendering knobs. Keeps the generic Streamlit shell
     in ``runtime/ui.py`` agnostic of any specific domain — colors, labels,
-    and tag prefixes come from YAML.
+    and tag prefixes come from YAML. Also drives the React UI (v2.0) shell
+    via ``GET /api/v1/config/ui-hints``.
 
     ``badges`` is a 2-level dict: ``{field_name: {value: UIBadge}}``.
     Example: ``{"status": {"open": {"label": "OPEN", "color": "red"}}}``.
@@ -2249,10 +2351,26 @@ class UIConfig(BaseModel):
     ``tags`` is an opaque key->tag-string map the UI consults for
     cross-skill signals (e.g. ``prior_match_supported`` -> the literal
     tag a skill emits).
+
+    React UI (v2.0) fields: ``brand_name``, ``brand_logo_url``,
+    ``approval_rationale_templates``, and ``hitl_question_templates``
+    drive the React shell's topbar brand block, environment switcher,
+    and approval-rationale dropdown. Read at app boot via
+    ``useUiHints()`` and cached for the session lifetime.
+
+    ``app_views`` is the Approach C extensibility surface — apps register
+    bespoke UI overlay views that the framework UI's Selected-detail
+    panel lists as "App-specific views →" links. Served via
+    ``GET /api/v1/apps/{app}/ui-views``.
     """
     badges: dict[str, dict[str, UIBadge]] = Field(default_factory=dict)
     detail_fields: list[UIDetailField] = Field(default_factory=list)
     tags: dict[str, str] = Field(default_factory=dict)
+    brand_name: str = ""
+    brand_logo_url: str | None = None
+    approval_rationale_templates: list[str] = Field(default_factory=list)
+    hitl_question_templates: dict[str, str] = Field(default_factory=dict)
+    app_views: list[AppView] = Field(default_factory=list)
 
     model_config = {"frozen": True, "extra": "forbid"}
 
@@ -4879,6 +4997,12 @@ EventKind = Literal[
     "gate_fired",
     "status_changed",
     "lesson_extracted",
+    # Session-level lifecycle events — emitted on the cross-session SSE
+    # stream (/api/v1/sessions/recent/events) for the React UI's "Other
+    # Sessions" monitor panel. Lower frequency than per-step kinds.
+    "session.created",
+    "session.status_changed",
+    "session.agent_running",
 ]
 
 _VALID_EVENT_KINDS: frozenset[str] = frozenset(get_args(EventKind))
@@ -4960,6 +5084,32 @@ class EventLog:
             )
             if since is not None:
                 stmt = stmt.where(SessionEventRow.seq > since)
+            for row in s.execute(stmt).scalars():
+                yield SessionEvent(
+                    seq=row.seq,
+                    session_id=row.session_id,
+                    kind=row.kind,
+                    payload=row.payload,
+                    ts=row.ts,
+                )
+
+    def iter_recent(self, since: int = 0) -> Iterator[SessionEvent]:
+        """Iterate events across ALL sessions where seq > since, ordered
+        by global seq.
+
+        Used by the cross-session SSE stream
+        (``/api/v1/sessions/recent/events``) to deliver session.*
+        lifecycle events to the React UI's Other Sessions monitor panel.
+        Capped at 500 rows per call so a long-disconnected client can't
+        blow memory replaying years of history.
+        """
+        with Session(self.engine) as s:
+            stmt = (
+                select(SessionEventRow)
+                .where(SessionEventRow.seq > since)
+                .order_by(SessionEventRow.seq.asc())
+                .limit(500)
+            )
             for row in s.execute(stmt).scalars():
                 yield SessionEvent(
                     seq=row.seq,
@@ -6253,6 +6403,20 @@ class OrchestratorService:
                 reporter_team=sub_team,
             )
             session_id = inc.id
+            # Emit session.created on the cross-session SSE stream so
+            # the React UI's Other Sessions monitor lights up the new
+            # tile in real time. Telemetry must not break start.
+            event_log = getattr(orch, "event_log", None)
+            if event_log is not None:
+                try:
+                    # ``session_id`` already lands on the row; the payload
+                    # carries no extra fields for ``session.created``.
+                    event_log.record(session_id, "session.created")
+                except Exception:  # noqa: BLE001 — telemetry must not break start
+                    _log.debug(
+                        "event_log.record(session.created) failed",
+                        exc_info=True,
+                    )
             # Stamp trigger provenance onto the row before the graph
             # runs so any crash mid-graph still leaves an audit trail.
             # ``inc.findings`` is a JSON dict on the row.
@@ -13839,6 +14003,21 @@ def _emit_status_changed_event(
             _log.debug(
                 "event_log.record(status_changed) failed", exc_info=True,
             )
+        # Mirror onto the cross-session SSE stream for the React UI's
+        # Other Sessions monitor (see api_recent_events.py).
+        # ``session_id`` already lands on the row; the payload carries
+        # the new ``status`` only.
+        try:
+            event_log.record(
+                inc.id,
+                "session.status_changed",
+                status=to_status,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break finalize
+            _log.debug(
+                "event_log.record(session.status_changed) failed",
+                exc_info=True,
+            )
 
     # M5 hook point: when ``to_status`` is terminal per app config,
     # invoke the lesson extractor. M4 leaves it as a no-op; M5 swaps
@@ -14785,6 +14964,19 @@ class Orchestrator(Generic[StateT]):
         env = (state_overrides or {}).get("environment", "")
         inc = self.store.create(query=query, environment=env,
                                 reporter_id=sub_id, reporter_team=sub_team)
+        # Emit session.created on the cross-session SSE stream so the
+        # React UI's Other Sessions monitor lights up the new tile in
+        # real time. ``session_id`` already lands on the row; the
+        # payload carries no extra fields. Telemetry must not break
+        # the start path.
+        event_log = getattr(self, "event_log", None)
+        if event_log is not None:
+            try:
+                event_log.record(inc.id, "session.created")
+            except Exception:  # noqa: BLE001 — telemetry must not break start
+                _log.debug(
+                    "event_log.record(session.created) failed", exc_info=True,
+                )
         if trigger is not None:
             inc.findings["trigger"] = {
                 "name": trigger.name,
@@ -15477,6 +15669,9 @@ def _make_lifespan(cfg: AppConfig):
         orch = svc.submit_and_wait(svc._ensure_orchestrator(), timeout=30.0)
         app.state.service = svc
         app.state.orchestrator = orch
+        # Surface the validated AppConfig so app.state.cfg-readers
+        # (e.g. /api/v1/config/ui-hints) don't have to re-load YAML.
+        app.state.cfg = cfg
         # Environments roster is app-specific (incident-management has
         # production/staging/dev/local; code-review doesn't expose one).
         # Read it from the YAML's top-level ``environments:`` block;
@@ -15564,16 +15759,28 @@ def build_app(cfg: AppConfig) -> FastAPI:
         title="ASR — Agent Orchestrator",
         lifespan=_make_lifespan(cfg),
     )
+    # All framework routes (except /health) live under /api/v1 so the
+    # React client can stably target a versioned surface; /health stays
+    # at root for monitor / load-balancer health-check conventions.
+    api_v1 = APIRouter(prefix="/api/v1")
 
-    # CORS: configure once with the AppConfig-supplied origins so the
-    # React dev server (Vite at :5173, CRA/Next at :3000 by default) can
-    # call every endpoint, SSE included. Production deployments lock
-    # the origin list down via YAML — same shape, narrower allow-list.
+    # CORS: env-driven so the React dev server (Vite at :5173) can call
+    # every endpoint, SSE included. Override via ``ASR_CORS_ORIGINS``
+    # (comma-separated) — production deployments lock the origin list
+    # down by setting the env var to the narrower allow-list.
+    # ``allow_credentials=False`` matches the bearer-token auth pattern
+    # (no cookies); methods are explicit so OPTIONS preflights are
+    # handled the same way for every route.
+    _cors_origins_raw = os.environ.get(
+        "ASR_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",  # Vite dev defaults
+    )
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
     fastapi_app.add_middleware(
         CORSMiddleware,
-        allow_origins=cfg.api.cors_origins,
-        allow_credentials=cfg.api.cors_allow_credentials,
-        allow_methods=["*"],
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -15608,27 +15815,27 @@ def build_app(cfg: AppConfig) -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-    @fastapi_app.get("/agents")
+    @api_v1.get("/agents")
     async def agents():
         return fastapi_app.state.orchestrator.list_agents()
 
-    @fastapi_app.get("/tools")
+    @api_v1.get("/tools")
     async def tools():
         return fastapi_app.state.orchestrator.list_tools()
 
-    @fastapi_app.get("/incidents")
+    @api_v1.get("/incidents")
     async def incidents(limit: int = 20):
         return fastapi_app.state.orchestrator.list_recent_incidents(limit=limit)
 
-    @fastapi_app.get("/incidents/{incident_id}")
+    @api_v1.get("/incidents/{incident_id}")
     async def incident(incident_id: str):
         return fastapi_app.state.orchestrator.get_incident(incident_id)
 
-    @fastapi_app.delete("/incidents/{incident_id}")
+    @api_v1.delete("/incidents/{incident_id}")
     async def delete_incident(incident_id: str):
         return fastapi_app.state.orchestrator.delete_incident(incident_id)
 
-    @fastapi_app.post("/investigate")
+    @api_v1.post("/investigate")
     async def investigate(req: InvestigateRequest, request: Request) -> InvestigateResponse:
         """Legacy alias for ``POST /sessions`` — kept for back-compat.
 
@@ -15662,11 +15869,11 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return InvestigateResponse(incident_id=sid)
 
-    @fastapi_app.get("/environments")
+    @api_v1.get("/environments")
     async def environments():
         return fastapi_app.state.environments
 
-    @fastapi_app.post("/investigate/stream")
+    @api_v1.post("/investigate/stream")
     async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
         orch = fastapi_app.state.orchestrator
 
@@ -15679,7 +15886,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.post("/incidents/{incident_id}/resume")
+    @api_v1.post("/incidents/{incident_id}/resume")
     async def resume_incident(incident_id: str, req: ResumeRequest) -> StreamingResponse:
         orch = fastapi_app.state.orchestrator
         decision: dict = {"action": req.decision}
@@ -15711,7 +15918,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # Multi-session endpoints
     # ------------------------------------------------------------------
 
-    @fastapi_app.post(
+    @api_v1.post(
         "/sessions",
         status_code=201,
     )
@@ -15742,7 +15949,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return SessionStartResponse(session_id=sid)
 
-    @fastapi_app.get("/sessions")
+    @api_v1.get("/sessions")
     async def list_sessions_endpoint(request: Request) -> list[SessionStatus]:
         """Snapshot of in-flight sessions (running / awaiting_input / error)."""
         svc = request.app.state.service
@@ -15752,7 +15959,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # HITL approval endpoints (risk-rated tool gateway)
     # ------------------------------------------------------------------
 
-    @fastapi_app.get("/sessions/{session_id}/approvals")
+    @api_v1.get("/sessions/{session_id}/approvals")
     async def list_pending_approvals(
         session_id: str, request: Request
     ) -> list[PendingApproval]:
@@ -15794,7 +16001,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 ))
         return out
 
-    @fastapi_app.post(
+    @api_v1.post(
         "/sessions/{session_id}/approvals/{tool_call_id}",
         status_code=200,
     )
@@ -15880,7 +16087,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             "rationale": body.rationale,
         }
 
-    @fastapi_app.delete("/sessions/{session_id}", status_code=204)
+    @api_v1.delete("/sessions/{session_id}", status_code=204)
     async def stop_session_endpoint(
         session_id: str, request: Request
     ) -> Response:
@@ -15911,7 +16118,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # T2: generic /sessions/* endpoints (React-ready, non-legacy).
     # ==================================================================
 
-    @fastapi_app.get("/sessions/recent")
+    @api_v1.get("/sessions/recent")
     async def recent_sessions(request: Request, limit: int = 20) -> list[dict]:
         """List recent sessions of ANY status — closed + active.
 
@@ -15921,7 +16128,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         return orch.list_recent_sessions(limit=limit)
 
-    @fastapi_app.get("/sessions/{session_id}")
+    @api_v1.get("/sessions/{session_id}")
     async def get_session_detail(session_id: str, request: Request) -> dict:
         """Full session detail. Generic equivalent of the legacy
         domain-flavoured detail route. 404 when the id is unknown."""
@@ -15933,7 +16140,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 status_code=404, detail=_SESSION_NOT_FOUND_DETAIL,
             ) from e
 
-    @fastapi_app.post("/sessions/{session_id}/resume")
+    @api_v1.post("/sessions/{session_id}/resume")
     async def resume_session_sse(
         session_id: str, req: ResumeRequest, request: Request,
     ) -> StreamingResponse:
@@ -15967,7 +16174,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.post("/sessions/{session_id}/retry")
+    @api_v1.post("/sessions/{session_id}/retry")
     async def retry_session_sse(
         session_id: str, request: Request,
     ) -> StreamingResponse:
@@ -15990,7 +16197,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.get("/sessions/{session_id}/retry/preview")
+    @api_v1.get("/sessions/{session_id}/retry/preview")
     async def preview_retry(
         session_id: str, request: Request,
     ) -> RetryDecisionPreview:
@@ -16009,7 +16216,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             reason=str(decision.reason),
         )
 
-    @fastapi_app.get("/sessions/{session_id}/lessons")
+    @api_v1.get("/sessions/{session_id}/lessons")
     async def list_session_lessons(
         session_id: str, request: Request,
     ) -> list[LessonResponse]:
@@ -16053,7 +16260,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # T3: SSE event stream + T4: WebSocket fallback.
     # ==================================================================
 
-    @fastapi_app.get("/sessions/{session_id}/events")
+    @api_v1.get("/sessions/{session_id}/events")
     async def sse_events(
         session_id: str, request: Request, since: int = 0,
     ) -> StreamingResponse:
@@ -16107,7 +16314,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_stream(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.websocket("/ws/sessions/{session_id}/events")
+    @api_v1.websocket("/ws/sessions/{session_id}/events")
     async def ws_events(websocket: WebSocket, session_id: str) -> None:
         """WebSocket fallback for the SSE event stream. Same payload
         shape (:class:`EventEnvelope`); clients that prefer WS over
@@ -16154,6 +16361,81 @@ def build_app(cfg: AppConfig) -> FastAPI:
             except Exception:  # noqa: BLE001
                 pass
 
+    # ==================================================================
+    # Bootstrap bundle: GET /api/v1/sessions/{id}/full
+    # Single round-trip the React UI calls on session open. Module
+    # lives next door so this file stays focused on routing wiring.
+    # ==================================================================
+    add_session_full_routes(api_v1)
+
+    # ==================================================================
+    # UI hints: GET /api/v1/config/ui-hints
+    # Drives the React shell's brand block, environment switcher list,
+    # and approval-rationale dropdown. Read once at app boot.
+    # ==================================================================
+    add_ui_hints_routes(api_v1)
+
+    # ==================================================================
+    # App-overlay UI views: GET /api/v1/apps/{app}/ui-views
+    # Approach C extensibility — apps register bespoke deep-dive pages
+    # (e.g. "Deploy diff") that the framework UI's Selected-detail
+    # panel lists as "App-specific views →" links.
+    # ==================================================================
+    add_apps_overlay_routes(api_v1)
+
+    # ==================================================================
+    # Cross-session SSE: GET /api/v1/sessions/recent/events
+    # Drives the React UI's "Other Sessions" monitor — session.created /
+    # session.status_changed / session.agent_running events across ALL
+    # sessions, ordered by global seq.
+    # ==================================================================
+    add_recent_events_routes(api_v1)
+
+    # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
+    # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)
+    # keep working transparently. Removed in v2.1.
+    @fastapi_app.api_route(
+        "/incidents", methods=["GET", "POST"], include_in_schema=False,
+    )
+    async def _legacy_incidents_collection() -> RedirectResponse:
+        return RedirectResponse(url="/api/v1/sessions", status_code=308)
+
+    @fastapi_app.api_route(
+        "/incidents/{path:path}",
+        methods=["GET", "POST", "DELETE", "PUT"],
+        include_in_schema=False,
+    )
+    async def _legacy_incidents_detail(path: str) -> RedirectResponse:
+        return RedirectResponse(url=f"/api/v1/sessions/{path}", status_code=308)
+
+    @fastapi_app.api_route(
+        "/investigate", methods=["POST"], include_in_schema=False,
+    )
+    async def _legacy_investigate() -> RedirectResponse:
+        return RedirectResponse(url="/api/v1/investigate", status_code=308)
+
+    @fastapi_app.api_route(
+        "/investigate/{path:path}",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def _legacy_investigate_subpath(path: str) -> RedirectResponse:
+        return RedirectResponse(
+            url=f"/api/v1/investigate/{path}", status_code=308,
+        )
+
+    # Mount the versioned router. /health stays at root (registered
+    # directly on ``fastapi_app`` above); everything else lives under
+    # /api/v1.
+    fastapi_app.include_router(api_v1)
+    # ==================================================================
+    # React UI bundle: StaticFiles mount at / + SPA fallback.
+    # MUST be the last route-registration step in build_app — the
+    # catch-all ``GET /{full_path:path}`` would otherwise shadow every
+    # API route and legacy redirect. The fallback excludes /api/, /health,
+    # and /docs so unknown API paths still return structured JSON 404s.
+    # ==================================================================
+    mount_static_assets(fastapi_app)
     return fastapi_app
 
 
@@ -16262,6 +16544,230 @@ def register_dedup_routes(
             retracted_by=payload.retracted_by,
             note=payload.note,
         )
+
+# ====== module: runtime/api_session_full.py ======
+
+def add_session_full_routes(api_v1: APIRouter) -> None:
+    """Mount the /sessions/{id}/full handler on the api_v1 router.
+
+    The function name is intentionally module-qualified (rather than the
+    bare ``add_routes`` we used pre-bundle-fix) so that ``scripts/build_single_file.py``
+    can flatten this module alongside its sibling ``api_*`` side-cars without
+    the four ``add_routes`` defs colliding at module scope. Source-side callers
+    import the symbol directly: ``from runtime.api_session_full import add_session_full_routes``.
+    """
+
+    @api_v1.get("/sessions/{session_id}/full")
+    async def get_session_full(
+        session_id: str, request: Request,
+    ) -> dict[str, Any]:
+        orch = request.app.state.orchestrator
+        try:
+            inc = orch.store.load(session_id)
+        except (FileNotFoundError, ValueError, KeyError, LookupError) as e:
+            # ``ValueError`` covers the SessionStore id-format guard
+            # (``Invalid session id ...``); semantically a 404 at the
+            # API boundary — same convention as other /sessions/* GETs.
+            raise HTTPException(
+                status_code=404, detail="session not found",
+            ) from e
+
+        # Replay the EventLog backlog. ``vm_seq`` is the high-water mark
+        # the UI uses to ?since=N when it later opens the SSE stream, so
+        # delta events stitch onto the same view-model without gap or
+        # overlap.
+        event_log = getattr(orch, "event_log", None)
+        events: list[dict[str, Any]] = []
+        vm_seq = 0
+        if event_log is not None:
+            for ev in event_log.iter_for(session_id, since=0):
+                events.append({
+                    "seq": ev.seq,
+                    "kind": ev.kind,
+                    "payload": ev.payload,
+                    "ts": ev.ts,
+                })
+                if ev.seq > vm_seq:
+                    vm_seq = ev.seq
+
+        # Agent definitions: skill metadata the UI needs to render the
+        # graph diagram + per-agent header chips. ``orch.skills`` is a
+        # ``dict[str, Skill]`` keyed by name. ``Skill.tools`` is itself
+        # a ``dict[str, list[str]]`` (server -> tool list) — expose the
+        # server keys as the ref strings; ``Skill.routes`` is a
+        # ``list[RouteRule]`` (when/next/gate) — flatten to the
+        # signal->next mapping the UI consumes.
+        agent_definitions: dict[str, dict[str, Any]] = {}
+        for name, skill in orch.skills.items():
+            agent_definitions[name] = {
+                "name": skill.name,
+                "kind": skill.kind,
+                "model": skill.model or orch.cfg.llm.default,
+                "tools": list(skill.tools or {}),
+                "routes": {r.when: r.next for r in skill.routes},
+                "system_prompt_excerpt": (skill.system_prompt or "")[:500],
+            }
+
+        return {
+            "session": inc.model_dump(mode="json"),
+            "agents_run": [r.model_dump(mode="json") for r in inc.agents_run],
+            "tool_calls": [tc.model_dump(mode="json") for tc in inc.tool_calls],
+            "events": events,
+            "agent_definitions": agent_definitions,
+            "vm_seq": vm_seq,
+        }
+
+# ====== module: runtime/api_ui_hints.py ======
+
+def add_ui_hints_routes(api_v1: APIRouter) -> None:
+    """Mount the /config/ui-hints handler on the api_v1 router.
+
+    Module-qualified name (vs. bare ``add_routes``) so the bundler can
+    flatten this alongside its sibling ``api_*`` side-cars without the
+    four module-scope ``add_routes`` defs colliding. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
+
+    @api_v1.get("/config/ui-hints")
+    async def get_ui_hints(request: Request) -> dict[str, Any]:
+        cfg = request.app.state.cfg
+        ui = cfg.ui
+        return {
+            "brand_name": ui.brand_name,
+            "brand_logo_url": ui.brand_logo_url,
+            "approval_rationale_templates": list(ui.approval_rationale_templates),
+            "hitl_question_templates": dict(ui.hitl_question_templates),
+            "environments": list(cfg.environments or []),
+        }
+
+# ====== module: runtime/api_apps_overlay.py ======
+
+def add_apps_overlay_routes(api_v1: APIRouter) -> None:
+    """Mount the /apps/{app}/ui-views handler on the api_v1 router.
+
+    Module-qualified name so the bundler can flatten alongside sibling
+    ``api_*`` side-cars without ``add_routes`` collisions. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
+
+    @api_v1.get("/apps/{app_name}/ui-views")
+    async def list_app_views(app_name: str, request: Request) -> list[dict]:
+        # app_name is informational for now; v2.0 has one app per deploy.
+        cfg = request.app.state.cfg
+        return [v.model_dump() for v in cfg.ui.app_views]
+
+# ====== module: runtime/api_recent_events.py ======
+
+_SSE_MEDIA_TYPE = "text/event-stream"
+_SESSION_KINDS = frozenset({
+    "session.created",
+    "session.status_changed",
+    "session.agent_running",
+})
+
+
+def add_recent_events_routes(api_v1: APIRouter) -> None:
+    """Mount the /sessions/recent/events SSE handler on the api_v1 router.
+
+    Module-qualified name so the bundler can flatten alongside sibling
+    ``api_*`` side-cars without ``add_routes`` collisions. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
+
+    @api_v1.get("/sessions/recent/events")
+    async def stream_recent_events(request: Request, since: int = 0):
+        orch = request.app.state.orchestrator
+        event_log = getattr(orch, "event_log", None)
+        if event_log is None:
+            raise HTTPException(
+                status_code=503, detail="event_log not configured",
+            )
+
+        async def _stream() -> AsyncIterator[str]:
+            last_seq = since
+            # Backlog: emit session-level events past `since`
+            for ev in event_log.iter_recent(since=last_seq):
+                if ev.kind in _SESSION_KINDS:
+                    payload = {"seq": ev.seq, "kind": ev.kind,
+                               "session_id": ev.session_id,
+                               "payload": ev.payload, "ts": ev.ts}
+                    last_seq = ev.seq
+                    yield f"data: {json.dumps(payload)}\n\n"
+            # Tail: poll for new rows; exit on client disconnect
+            while not await request.is_disconnected():
+                await _asyncio.sleep(0.5)
+                for ev in event_log.iter_recent(since=last_seq):
+                    if ev.kind in _SESSION_KINDS:
+                        payload = {"seq": ev.seq, "kind": ev.kind,
+                                   "session_id": ev.session_id,
+                                   "payload": ev.payload, "ts": ev.ts}
+                        last_seq = ev.seq
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+        return StreamingResponse(_stream(), media_type=_SSE_MEDIA_TYPE)
+
+# ====== module: runtime/api_static.py ======
+
+_BUILD_HINT = """<!DOCTYPE html>
+<html><body style="font-family:sans-serif;padding:32px;background:#fbfaf6;color:#15110a">
+<h1>React UI not built yet</h1>
+<p>Run <code style="background:#eee;padding:2px 6px">cd web && npm ci && npm run build</code>
+to populate <code>web/dist/</code>.</p>
+<p>Then refresh.</p>
+</body></html>
+"""
+
+_NOT_FOUND_JSON = (
+    '{"error":{"code":"not_found","message":"unknown api path","details":{}}}'
+)
+
+
+def mount_static_assets(app: FastAPI) -> None:
+    """Mount static assets + SPA fallback. API routes must be registered first.
+
+    Module-qualified name (vs. the bare ``mount`` we had pre-bundle-fix) so
+    the bundler can flatten this alongside its sibling ``api_*`` side-cars
+    without stepping on FastAPI's ``app.mount`` or any future bundled module
+    that happens to define a ``mount`` symbol. See
+    ``runtime.api_session_full.add_session_full_routes``.
+    """
+    web_dist_path = os.environ.get("ASR_WEB_DIST")
+    if web_dist_path:
+        web_dist = Path(web_dist_path)
+    else:
+        # Default: web/dist relative to repo root.
+        web_dist = (
+            Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+        )
+
+    if not (web_dist / "index.html").exists():
+        # Stub fallback when the bundle isn't built — useful in dev.
+        @app.get("/", include_in_schema=False)
+        async def _missing_root() -> HTMLResponse:
+            return HTMLResponse(content=_BUILD_HINT, status_code=503)
+        return
+
+    # Serve assets at /assets/* (Vite output)
+    assets_dir = web_dist / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+    # Serve fonts at /fonts/* (vendored)
+    fonts_dir = web_dist / "fonts"
+    if fonts_dir.exists():
+        app.mount("/fonts", StaticFiles(directory=fonts_dir), name="fonts")
+
+    # SPA fallback: anything not matched by API or other static mounts → index.html
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _spa_fallback(full_path: str, request: Request) -> Response:
+        # Reserve API/health/docs paths
+        if (full_path.startswith("api/") or full_path == "health"
+                or full_path.startswith("docs") or full_path == "openapi.json"):
+            return Response(
+                content=_NOT_FOUND_JSON,
+                status_code=404,
+                media_type="application/json",
+            )
+        return FileResponse(web_dist / "index.html")
 
 # ====== module: examples/code_review/state.py ======
 

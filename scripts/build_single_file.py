@@ -187,6 +187,29 @@ RUNTIME_MODULE_ORDER: list[tuple[Path, str]] = [
     # api.py. Bundled after api.py so register_dedup_routes can be
     # invoked against the FastAPI app at the bottom of the bundle.
     (RUNTIME_ROOT, "api_dedup.py"),
+    # Bootstrap bundle endpoint — single round-trip the React UI hits
+    # on session open. Side-car module mounted on api_v1 inside
+    # ``api.build_app``; bundled after api.py for the same reason as
+    # api_dedup.py.
+    (RUNTIME_ROOT, "api_session_full.py"),
+    # UI hints endpoint — read once at React boot for the topbar brand
+    # block, env switcher list, and approval-rationale dropdown. Same
+    # side-car pattern as api_session_full.py.
+    (RUNTIME_ROOT, "api_ui_hints.py"),
+    # App-overlay UI views endpoint — Approach C extensibility surface
+    # the framework UI's Selected-detail panel queries to render
+    # "App-specific views →" links. Same side-car pattern.
+    (RUNTIME_ROOT, "api_apps_overlay.py"),
+    # Cross-session SSE endpoint — drives the React UI's "Other
+    # Sessions" monitor with session-level lifecycle events
+    # (session.created / session.status_changed / session.agent_running)
+    # across ALL sessions, ordered by global seq. Same side-car pattern.
+    (RUNTIME_ROOT, "api_recent_events.py"),
+    # React SPA static-file mount + SPA fallback. Mounts onto the
+    # FastAPI root app (not the api_v1 router) via ``api_static.mount``,
+    # which build_app invokes as the LAST route-registration step.
+    # Bundled after api.py for the same reason as the side-cars above.
+    (RUNTIME_ROOT, "api_static.py"),
 ]
 
 # Example app modules — flattened *after* the runtime modules in the

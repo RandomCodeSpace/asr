@@ -276,6 +276,21 @@ def _emit_status_changed_event(
             _log.debug(
                 "event_log.record(status_changed) failed", exc_info=True,
             )
+        # Mirror onto the cross-session SSE stream for the React UI's
+        # Other Sessions monitor (see api_recent_events.py).
+        # ``session_id`` already lands on the row; the payload carries
+        # the new ``status`` only.
+        try:
+            event_log.record(
+                inc.id,
+                "session.status_changed",
+                status=to_status,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break finalize
+            _log.debug(
+                "event_log.record(session.status_changed) failed",
+                exc_info=True,
+            )
 
     # M5 hook point: when ``to_status`` is terminal per app config,
     # invoke the lesson extractor. M4 leaves it as a no-op; M5 swaps
@@ -1227,6 +1242,19 @@ class Orchestrator(Generic[StateT]):
         env = (state_overrides or {}).get("environment", "")
         inc = self.store.create(query=query, environment=env,
                                 reporter_id=sub_id, reporter_team=sub_team)
+        # Emit session.created on the cross-session SSE stream so the
+        # React UI's Other Sessions monitor lights up the new tile in
+        # real time. ``session_id`` already lands on the row; the
+        # payload carries no extra fields. Telemetry must not break
+        # the start path.
+        event_log = getattr(self, "event_log", None)
+        if event_log is not None:
+            try:
+                event_log.record(inc.id, "session.created")
+            except Exception:  # noqa: BLE001 — telemetry must not break start
+                _log.debug(
+                    "event_log.record(session.created) failed", exc_info=True,
+                )
         if trigger is not None:
             inc.findings["trigger"] = {
                 "name": trigger.name,

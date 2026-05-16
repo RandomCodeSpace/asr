@@ -1,0 +1,75 @@
+/* web/src/styles/tokens.css
+   Single source of truth for design tokens.
+   Components NEVER use raw hex/px values — read from these vars.
+   Mirrored in web/src/tokens/*.ts for TS-side access (Task 14). */
+:root {
+  /* surfaces — warm off-white, not pure white */
+  --bg-page:     #FBFAF6;
+  --bg-elev:     #FFFFFF;
+  --bg-subtle:   #F4F2EC;
+  --bg-deep:     #ECE7DB;
+  --bg-tint:     #FAF6EA;
+
+  /* ink — deep warm */
+  --ink-1: #15110A;
+  --ink-2: #4A4540;
+  --ink-3: #918A80;
+  --ink-4: #C8C2B6;
+
+  /* hairlines */
+  --hair:        #E6E1D4;
+  --hair-strong: #D4CDB8;
+
+  /* accent — Deep Slate Navy */
+  --acc:      #2A4365;
+  --acc-dim:  #1F3147;
+  --acc-soft: rgba(42, 67, 101, 0.08);
+  --acc-mid:  rgba(42, 67, 101, 0.18);
+
+  /* semantic */
+  --warn:    #B4814A;
+  --warn-bg: rgba(180, 129, 74, 0.08);
+  --danger:   #B85A4F;
+  --danger-bg: rgba(184, 90, 79, 0.08);
+  --good:    #5C8862;
+  --good-bg: rgba(92, 136, 98, 0.08);
+  --info:    #4F6F8E;
+
+  /* spacing — strict 4px grid */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+
+  /* type families */
+  --ff-sans: "Geist", "Inter", -apple-system, system-ui, sans-serif;
+  --ff-mono: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+
+  /* type sizes (px) */
+  --t-micro:   10px;
+  --t-meta:    11px;
+  --t-body:    13px;
+  --t-lead:    14px;
+  --t-h3:      15px;
+  --t-h2:      18px;
+  --t-h1:      24px;
+  --t-display: 30px;
+
+  /* component sizes */
+  --h-topbar:    48px;
+  --h-strip:     92px;
+  --h-statusbar: 24px;
+  --h-control:   28px;
+  --h-control-sm: 22px;
+  --avatar:      22px;
+
+  /* elevation */
+  --elev-1: 0 1px 2px rgba(21, 17, 10, 0.04), 0 0 0 1px var(--hair);
+  --elev-2: 0 2px 4px rgba(21, 17, 10, 0.05), 0 8px 16px rgba(21, 17, 10, 0.04), 0 0 0 1px var(--hair);
+  --elev-3: 0 4px 12px rgba(21, 17, 10, 0.07), 0 16px 32px rgba(21, 17, 10, 0.06), 0 0 0 1px var(--hair-strong);
+
+  /* radius — sharp by project convention */
+  --r: 0;
+}

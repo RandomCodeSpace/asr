@@ -28,12 +28,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from runtime.api_apps_overlay import add_apps_overlay_routes
+from runtime.api_recent_events import add_recent_events_routes
+from runtime.api_session_full import add_session_full_routes
+from runtime.api_static import mount_static_assets
+from runtime.api_ui_hints import add_ui_hints_routes
 from runtime.config import AppConfig, load_config
 
 _log = logging.getLogger("runtime.api")
@@ -258,6 +263,9 @@ def _make_lifespan(cfg: AppConfig):
         orch = svc.submit_and_wait(svc._ensure_orchestrator(), timeout=30.0)
         app.state.service = svc
         app.state.orchestrator = orch
+        # Surface the validated AppConfig so app.state.cfg-readers
+        # (e.g. /api/v1/config/ui-hints) don't have to re-load YAML.
+        app.state.cfg = cfg
         # Environments roster is app-specific (incident-management has
         # production/staging/dev/local; code-review doesn't expose one).
         # Read it from the YAML's top-level ``environments:`` block;
@@ -345,16 +353,28 @@ def build_app(cfg: AppConfig) -> FastAPI:
         title="ASR — Agent Orchestrator",
         lifespan=_make_lifespan(cfg),
     )
+    # All framework routes (except /health) live under /api/v1 so the
+    # React client can stably target a versioned surface; /health stays
+    # at root for monitor / load-balancer health-check conventions.
+    api_v1 = APIRouter(prefix="/api/v1")
 
-    # CORS: configure once with the AppConfig-supplied origins so the
-    # React dev server (Vite at :5173, CRA/Next at :3000 by default) can
-    # call every endpoint, SSE included. Production deployments lock
-    # the origin list down via YAML — same shape, narrower allow-list.
+    # CORS: env-driven so the React dev server (Vite at :5173) can call
+    # every endpoint, SSE included. Override via ``ASR_CORS_ORIGINS``
+    # (comma-separated) — production deployments lock the origin list
+    # down by setting the env var to the narrower allow-list.
+    # ``allow_credentials=False`` matches the bearer-token auth pattern
+    # (no cookies); methods are explicit so OPTIONS preflights are
+    # handled the same way for every route.
+    _cors_origins_raw = os.environ.get(
+        "ASR_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",  # Vite dev defaults
+    )
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
     fastapi_app.add_middleware(
         CORSMiddleware,
-        allow_origins=cfg.api.cors_origins,
-        allow_credentials=cfg.api.cors_allow_credentials,
-        allow_methods=["*"],
+        allow_origins=_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -389,27 +409,27 @@ def build_app(cfg: AppConfig) -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-    @fastapi_app.get("/agents")
+    @api_v1.get("/agents")
     async def agents():
         return fastapi_app.state.orchestrator.list_agents()
 
-    @fastapi_app.get("/tools")
+    @api_v1.get("/tools")
     async def tools():
         return fastapi_app.state.orchestrator.list_tools()
 
-    @fastapi_app.get("/incidents")
+    @api_v1.get("/incidents")
     async def incidents(limit: int = 20):
         return fastapi_app.state.orchestrator.list_recent_incidents(limit=limit)
 
-    @fastapi_app.get("/incidents/{incident_id}")
+    @api_v1.get("/incidents/{incident_id}")
     async def incident(incident_id: str):
         return fastapi_app.state.orchestrator.get_incident(incident_id)
 
-    @fastapi_app.delete("/incidents/{incident_id}")
+    @api_v1.delete("/incidents/{incident_id}")
     async def delete_incident(incident_id: str):
         return fastapi_app.state.orchestrator.delete_incident(incident_id)
 
-    @fastapi_app.post("/investigate")
+    @api_v1.post("/investigate")
     async def investigate(req: InvestigateRequest, request: Request) -> InvestigateResponse:
         """Legacy alias for ``POST /sessions`` — kept for back-compat.
 
@@ -443,11 +463,11 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return InvestigateResponse(incident_id=sid)
 
-    @fastapi_app.get("/environments")
+    @api_v1.get("/environments")
     async def environments():
         return fastapi_app.state.environments
 
-    @fastapi_app.post("/investigate/stream")
+    @api_v1.post("/investigate/stream")
     async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
         orch = fastapi_app.state.orchestrator
 
@@ -460,7 +480,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.post("/incidents/{incident_id}/resume")
+    @api_v1.post("/incidents/{incident_id}/resume")
     async def resume_incident(incident_id: str, req: ResumeRequest) -> StreamingResponse:
         orch = fastapi_app.state.orchestrator
         decision: dict = {"action": req.decision}
@@ -492,7 +512,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # Multi-session endpoints
     # ------------------------------------------------------------------
 
-    @fastapi_app.post(
+    @api_v1.post(
         "/sessions",
         status_code=201,
     )
@@ -523,7 +543,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             raise
         return SessionStartResponse(session_id=sid)
 
-    @fastapi_app.get("/sessions")
+    @api_v1.get("/sessions")
     async def list_sessions_endpoint(request: Request) -> list[SessionStatus]:
         """Snapshot of in-flight sessions (running / awaiting_input / error)."""
         svc = request.app.state.service
@@ -533,7 +553,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # HITL approval endpoints (risk-rated tool gateway)
     # ------------------------------------------------------------------
 
-    @fastapi_app.get("/sessions/{session_id}/approvals")
+    @api_v1.get("/sessions/{session_id}/approvals")
     async def list_pending_approvals(
         session_id: str, request: Request
     ) -> list[PendingApproval]:
@@ -575,7 +595,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 ))
         return out
 
-    @fastapi_app.post(
+    @api_v1.post(
         "/sessions/{session_id}/approvals/{tool_call_id}",
         status_code=200,
     )
@@ -661,7 +681,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             "rationale": body.rationale,
         }
 
-    @fastapi_app.delete("/sessions/{session_id}", status_code=204)
+    @api_v1.delete("/sessions/{session_id}", status_code=204)
     async def stop_session_endpoint(
         session_id: str, request: Request
     ) -> Response:
@@ -692,7 +712,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # T2: generic /sessions/* endpoints (React-ready, non-legacy).
     # ==================================================================
 
-    @fastapi_app.get("/sessions/recent")
+    @api_v1.get("/sessions/recent")
     async def recent_sessions(request: Request, limit: int = 20) -> list[dict]:
         """List recent sessions of ANY status — closed + active.
 
@@ -702,7 +722,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
         orch = request.app.state.orchestrator
         return orch.list_recent_sessions(limit=limit)
 
-    @fastapi_app.get("/sessions/{session_id}")
+    @api_v1.get("/sessions/{session_id}")
     async def get_session_detail(session_id: str, request: Request) -> dict:
         """Full session detail. Generic equivalent of the legacy
         domain-flavoured detail route. 404 when the id is unknown."""
@@ -714,7 +734,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
                 status_code=404, detail=_SESSION_NOT_FOUND_DETAIL,
             ) from e
 
-    @fastapi_app.post("/sessions/{session_id}/resume")
+    @api_v1.post("/sessions/{session_id}/resume")
     async def resume_session_sse(
         session_id: str, req: ResumeRequest, request: Request,
     ) -> StreamingResponse:
@@ -748,7 +768,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.post("/sessions/{session_id}/retry")
+    @api_v1.post("/sessions/{session_id}/retry")
     async def retry_session_sse(
         session_id: str, request: Request,
     ) -> StreamingResponse:
@@ -771,7 +791,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_events(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.get("/sessions/{session_id}/retry/preview")
+    @api_v1.get("/sessions/{session_id}/retry/preview")
     async def preview_retry(
         session_id: str, request: Request,
     ) -> RetryDecisionPreview:
@@ -790,7 +810,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             reason=str(decision.reason),
         )
 
-    @fastapi_app.get("/sessions/{session_id}/lessons")
+    @api_v1.get("/sessions/{session_id}/lessons")
     async def list_session_lessons(
         session_id: str, request: Request,
     ) -> list[LessonResponse]:
@@ -835,7 +855,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
     # T3: SSE event stream + T4: WebSocket fallback.
     # ==================================================================
 
-    @fastapi_app.get("/sessions/{session_id}/events")
+    @api_v1.get("/sessions/{session_id}/events")
     async def sse_events(
         session_id: str, request: Request, since: int = 0,
     ) -> StreamingResponse:
@@ -889,7 +909,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
         return StreamingResponse(_stream(), media_type=_SSE_MEDIA_TYPE)
 
-    @fastapi_app.websocket("/ws/sessions/{session_id}/events")
+    @api_v1.websocket("/ws/sessions/{session_id}/events")
     async def ws_events(websocket: WebSocket, session_id: str) -> None:
         """WebSocket fallback for the SSE event stream. Same payload
         shape (:class:`EventEnvelope`); clients that prefer WS over
@@ -936,6 +956,81 @@ def build_app(cfg: AppConfig) -> FastAPI:
             except Exception:  # noqa: BLE001
                 pass
 
+    # ==================================================================
+    # Bootstrap bundle: GET /api/v1/sessions/{id}/full
+    # Single round-trip the React UI calls on session open. Module
+    # lives next door so this file stays focused on routing wiring.
+    # ==================================================================
+    add_session_full_routes(api_v1)
+
+    # ==================================================================
+    # UI hints: GET /api/v1/config/ui-hints
+    # Drives the React shell's brand block, environment switcher list,
+    # and approval-rationale dropdown. Read once at app boot.
+    # ==================================================================
+    add_ui_hints_routes(api_v1)
+
+    # ==================================================================
+    # App-overlay UI views: GET /api/v1/apps/{app}/ui-views
+    # Approach C extensibility — apps register bespoke deep-dive pages
+    # (e.g. "Deploy diff") that the framework UI's Selected-detail
+    # panel lists as "App-specific views →" links.
+    # ==================================================================
+    add_apps_overlay_routes(api_v1)
+
+    # ==================================================================
+    # Cross-session SSE: GET /api/v1/sessions/recent/events
+    # Drives the React UI's "Other Sessions" monitor — session.created /
+    # session.status_changed / session.agent_running events across ALL
+    # sessions, ordered by global seq.
+    # ==================================================================
+    add_recent_events_routes(api_v1)
+
+    # Legacy /incidents/* and /investigate redirects to /api/v1/* equivalents.
+    # 308 preserves method + body so legacy POSTs (e.g. /incidents/{id}/resume)
+    # keep working transparently. Removed in v2.1.
+    @fastapi_app.api_route(
+        "/incidents", methods=["GET", "POST"], include_in_schema=False,
+    )
+    async def _legacy_incidents_collection() -> RedirectResponse:
+        return RedirectResponse(url="/api/v1/sessions", status_code=308)
+
+    @fastapi_app.api_route(
+        "/incidents/{path:path}",
+        methods=["GET", "POST", "DELETE", "PUT"],
+        include_in_schema=False,
+    )
+    async def _legacy_incidents_detail(path: str) -> RedirectResponse:
+        return RedirectResponse(url=f"/api/v1/sessions/{path}", status_code=308)
+
+    @fastapi_app.api_route(
+        "/investigate", methods=["POST"], include_in_schema=False,
+    )
+    async def _legacy_investigate() -> RedirectResponse:
+        return RedirectResponse(url="/api/v1/investigate", status_code=308)
+
+    @fastapi_app.api_route(
+        "/investigate/{path:path}",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def _legacy_investigate_subpath(path: str) -> RedirectResponse:
+        return RedirectResponse(
+            url=f"/api/v1/investigate/{path}", status_code=308,
+        )
+
+    # Mount the versioned router. /health stays at root (registered
+    # directly on ``fastapi_app`` above); everything else lives under
+    # /api/v1.
+    fastapi_app.include_router(api_v1)
+    # ==================================================================
+    # React UI bundle: StaticFiles mount at / + SPA fallback.
+    # MUST be the last route-registration step in build_app — the
+    # catch-all ``GET /{full_path:path}`` would otherwise shadow every
+    # API route and legacy redirect. The fallback excludes /api/, /health,
+    # and /docs so unknown API paths still return structured JSON 404s.
+    # ==================================================================
+    mount_static_assets(fastapi_app)
     return fastapi_app
 
 

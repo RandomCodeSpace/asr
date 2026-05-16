@@ -87,4 +87,9 @@ def test_event_kind_literal_lists_full_vocabulary():
         "gate_fired",
         "status_changed",
         "lesson_extracted",
+        # v2.0 cross-session SSE kinds — drive the React UI's "Other
+        # Sessions" monitor (api_recent_events.py).
+        "session.created",
+        "session.status_changed",
+        "session.agent_running",
     })

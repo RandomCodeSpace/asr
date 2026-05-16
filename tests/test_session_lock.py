@@ -996,7 +996,7 @@ async def test_api_resume_session_busy_returns_429_with_retry_after():
                 # Seed a session with a pending_approval ToolCall so the
                 # endpoint's pre-flight ``orch.store.load`` succeeds and
                 # the request reaches ``svc.submit_async``.
-                start = await client.post("/sessions", json={
+                start = await client.post("/api/v1/sessions", json={
                     "query": "test", "environment": "dev",
                     "reporter_id": "u", "reporter_team": "t",
                 })
@@ -1038,7 +1038,7 @@ async def test_api_resume_session_busy_returns_429_with_retry_after():
                 # surfaces as a test failure.
                 res = await asyncio.wait_for(
                     client.post(
-                        f"/sessions/{sid}/approvals/0",
+                        f"/api/v1/sessions/{sid}/approvals/0",
                         json={
                             "decision": "approve",
                             "approver": "alice",
