@@ -13,6 +13,7 @@ import { useSessionFull } from '@/state/useSessionFull';
 import { MonitorRail } from '@/monitors/MonitorRail';
 import { NewSessionModal } from '@/modals/NewSessionModal';
 import { TabletShell } from '@/shell/TabletShell';
+import { MobileShell } from '@/shell/MobileShell';
 import { useBreakpoint } from '@/state/useBreakpoint';
 
 const UI_VERSION = 'v2.0.0-rc1';
@@ -78,7 +79,16 @@ export function App() {
         activeAgent={null}
         graphVersion={`v${agents.data?.list.length ?? 0}`}
       />
-      {breakpoint === 'tablet' ? (
+      {breakpoint === 'mobile' ? (
+        <MobileShell
+          sessions={sessionList.sessions}
+          activeSid={activeSid}
+          onSelectSession={setActiveSid}
+          queue={approvals.queue}
+          agentsByName={agents.data?.byName ?? {}}
+          toolCalls={sessionFull.state.toolCalls}
+        />
+      ) : breakpoint === 'tablet' ? (
         <TabletShell
           sessions={sessionList.sessions}
           activeSid={activeSid}

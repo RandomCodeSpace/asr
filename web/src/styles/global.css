@@ -104,3 +104,8 @@ body {
   0%, 50% { opacity: 1; }
   51%, 100% { opacity: 0; }
 }
+
+@keyframes asr-sheet-slide-up {
+  from { opacity: 0; transform: translateY(8%); }
+  to   { opacity: 1; transform: translateY(0); }
+}
